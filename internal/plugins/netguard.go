@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"strings"
 	"time"
 )
 
@@ -108,14 +107,4 @@ func guardedDialer(addr net.IP, port string) func(ctx context.Context, network, 
 	return func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return dialer.DialContext(ctx, network, target)
 	}
-}
-
-// splitHostPort is a small helper so the proxy can keep the original port when
-// it swaps the hostname for the pinned address.
-func splitHostPort(authority string) (string, string) {
-	host, port, err := net.SplitHostPort(authority)
-	if err != nil {
-		return authority, ""
-	}
-	return strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"), port
 }

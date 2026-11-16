@@ -152,7 +152,8 @@ func (m *Manager) proxy(ctx context.Context, id string, grants Grants, vault *cr
 	// Resolve once, validate every answer, then dial that literal address. The
 	// authorization above checked a name; this check is what makes the name and
 	// the socket agree even if DNS changes between the two.
-	host, port := splitHostPort(parsed.Host)
+	host := parsed.Hostname()
+	port := parsed.Port()
 	if port == "" {
 		if parsed.Scheme == "https" {
 			port = "443"

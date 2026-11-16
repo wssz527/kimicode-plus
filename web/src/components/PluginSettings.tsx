@@ -60,6 +60,51 @@ const PLAIN_STATE: Record<string, string> = {
   UNINSTALLED: "已卸载",
 };
 
+const FAULT_REASONS: Record<string, string> = {
+  PLUGIN_ACTIVATION_FAILED: "插件启动失败",
+  PLUGIN_MOUNT_FAILED: "插件界面挂载失败",
+  PLUGIN_DECORATE_FAILED: "插件装饰宿主内容失败",
+  PLUGIN_EVENT_FAILED: "插件处理事件失败",
+  PLUGIN_EVENT_POLL_FAILED: "插件事件订阅中断",
+  PLUGIN_SETTINGS_FAILED: "插件设置页加载失败",
+  RENDERER_ERROR: "插件运行时报错",
+};
+
+function describeFault(reason: string): { title: string; detail: string; code: string | null } {
+  const trimmed = reason.trim();
+  const match = /^([A-Z][A-Z0-9_]{2,}):\s*([\s\S]*)$/.exec(trimmed);
+  if (!match) {
+    return { title: trimmed || "插件已停止", detail: trimmed, code: null };
+  }
+  const code = match[1] ?? "";
+  const detail = (match[2] ?? "").trim() || trimmed;
+  return {
+    title: FAULT_REASONS[code] ?? "插件已停止",
+    detail,
+    code: code || null,
+  };
+}
+
+function PluginFaultNotice({ reason }: { reason: string }) {
+  const fault = describeFault(reason);
+  return (
+    <div className="notice notice-error" role="alert">
+      <Icon name="alert" size={18} />
+      <div className="notice-copy">
+        <strong>{fault.title}</strong>
+        <p>{fault.detail}</p>
+        <p className="notice-recovery">插件已停用。修正文件或更换插件后可以重新启用。</p>
+        {fault.code ? (
+          <details className="notice-diagnostics">
+            <summary>诊断信息</summary>
+            <code>{reason}</code>
+          </details>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 /**
  * Hosts a plugin's own settings module. The page owns the container and the
  * lifetime: switching detail, disabling, uninstalling or leaving the panel all
@@ -294,7 +339,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
           <ErrorNotice message={errorMessage(action.error)} recovery={errorRecovery(action.error)} onDismiss={action.clearError} />
         ) : null}
 
-        {current.error ? <ErrorNotice message={current.error} recovery="插件已停用。修正文件或更换插件后可以重新启用。" /> : null}
+        {current.error ? <PluginFaultNotice reason={current.error} /> : null}
 
         <div className="plugins-detail-grid">
           <Panel title="能力">

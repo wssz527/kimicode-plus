@@ -103,8 +103,12 @@ func TestBlockedAddressPolicy(t *testing.T) {
 			t.Fatalf("%s was treated as a public address", address)
 		}
 	}
-	for _, address := range []string{"1.1.1.1", "2606:4700:4700::1111", "93.184.216.34"} {
-		if isBlockedAddress(net.ParseIP(address)) {
+	for _, address := range []string{"1.1.1.1", "8.8.4.4", "2606:4700:4700::1111"} {
+		ip := net.ParseIP(address)
+		if ip == nil {
+			t.Fatalf("%s is not a valid IP literal; the public-address case is meaningless", address)
+		}
+		if isBlockedAddress(ip) {
 			t.Fatalf("%s was treated as private", address)
 		}
 	}
@@ -134,16 +138,16 @@ func TestResolveApprovedAddrRejectsPrivateAnswers(t *testing.T) {
 
 	// A mixed answer is refused as a whole: taking the first address would let
 	// the answer order decide whether the request is safe.
-	if _, err := resolveApprovedAddr(ctx, ipLookup("93.184.216.34", "127.0.0.1"), "mixed.example"); err == nil {
+	if _, err := resolveApprovedAddr(ctx, ipLookup("8.8.4.4", "127.0.0.1"), "mixed.example"); err == nil {
 		t.Fatal("a mixed public/private answer was approved")
 	}
 
 	// A public answer is approved and the return value is the literal to dial.
-	addr, err := resolveApprovedAddr(ctx, ipLookup("93.184.216.34"), "public.example")
+	addr, err := resolveApprovedAddr(ctx, ipLookup("8.8.4.4"), "public.example")
 	if err != nil {
 		t.Fatalf("a public answer was refused: %v", err)
 	}
-	if addr.String() != "93.184.216.34" {
+	if addr.String() != "8.8.4.4" {
 		t.Fatalf("approved %s", addr)
 	}
 }
@@ -307,3 +311,51 @@ func newTestManagerWithResolver(t *testing.T, resolver *net.Resolver) *Manager {
 // noVault is the nil vault the net.fetch tests pass: none of them inject a
 // credential, so the proxy never reads it.
 func noVault() *credentials.Vault { return nil }
+
+// TestProxyHandlesIPv6LiteralWithoutBrackets covers the URL form that used to
+// leak into the resolver: for "http://[::1]:port/x" parsed.Host is "[::1]:port",
+// and a bare "http://[::1]/x" has no port at all. Reading Hostname() gives the
+// literal without brackets and Port() gives "" which the proxy fills in; reading
+// parsed.Host would hand the resolver "[::1]".
+func TestProxyHandlesIPv6LiteralWithoutBrackets(t *testing.T) {
+	for _, raw := range []string{"http://[::1]/v1", "http://[::1]:8080/v1", "https://[2001:db8::1]/v1"} {
+		parsed, err := parseProxyURL(raw)
+		if err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		host := parsed.Hostname()
+		if host == "" {
+			t.Fatalf("%s produced an empty hostname", raw)
+		}
+		if strings.ContainsAny(host, "[]") {
+			t.Fatalf("%s produced hostname %q with brackets", raw, host)
+		}
+		// The hostname must be a literal the guard accepts and normalises, not a
+		// name that would need a second DNS lookup.
+		if _, ok := canonicalIP(host); !ok {
+			t.Fatalf("%s hostname %q is not a canonical literal", raw, host)
+		}
+		port := parsed.Port()
+		want := map[string]string{"http://[::1]/v1": "", "http://[::1]:8080/v1": "8080", "https://[2001:db8::1]/v1": ""}[raw]
+		if port != want {
+			t.Fatalf("%s port = %q, want %q", raw, port, want)
+		}
+	}
+}
+
+// TestResolveApprovedAddrAcceptsIPv6LiteralNotBracketed is the dial-side half:
+// the literal the proxy passes must resolve without any lookup, so a bracketed
+// value would have been treated as a name and failed.
+func TestResolveApprovedAddrAcceptsIPv6LiteralNotBracketed(t *testing.T) {
+	neverCalled := func(context.Context, string) ([]net.IPAddr, error) {
+		t.Fatal("an IPv6 literal was resolved through DNS")
+		return nil, nil
+	}
+	addr, err := resolveApprovedAddr(context.Background(), neverCalled, "::1")
+	if err != nil {
+		t.Fatalf("explicit v6 literal refused: %v", err)
+	}
+	if addr.String() != "::1" {
+		t.Fatalf("approved %s", addr)
+	}
+}
