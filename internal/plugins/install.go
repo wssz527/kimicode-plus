@@ -658,7 +658,7 @@ func (m *Manager) adopt(ctx context.Context, id, dir, source string) error {
 	item := &entry{
 		manifest: manifest, grants: grants, declared: manifest.CapabilityNames(),
 		source: source, dir: dir, state: StateDisabled, enabled: desired,
-		forced: desired && !m.compatible(manifest),
+		forced:  desired && !m.compatible(manifest),
 		updated: now, installed: now,
 	}
 	if existing != nil {

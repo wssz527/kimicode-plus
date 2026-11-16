@@ -1,9 +1,14 @@
 package plugins
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -553,5 +558,201 @@ func TestListReportsUninstalledBundledPluginWithoutDeadlock(t *testing.T) {
 		if plugin.ID == "test.sample" && plugin.Restorable {
 			t.Fatal("a restored plugin is still listed as restorable")
 		}
+	}
+}
+
+// TestCloseConcurrentWithLifecycleIsRaceFree drives the real shutdown path while
+// other goroutines uninstall, disable and enable plugins. Close used to walk
+// m.entries after releasing the lock, so a concurrent Uninstall could delete a
+// key under it; the write-back now runs from a snapshot taken under the lock.
+func TestCloseConcurrentWithLifecycleIsRaceFree(t *testing.T) {
+	root := t.TempDir()
+	manager, err := newManagerAt(t, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	ids := []string{"test.one", "test.two", "test.three"}
+	for index, id := range ids {
+		manifest := `{
+  "id": "` + id + `",
+  "name": "Sample ` + id + `",
+  "version": "1.0.` + itoa(index) + `",
+  "apiVersion": 1,
+  "hostVersions": ["1.*"],
+  "entry": {"renderer": "renderer.js"},
+  "capabilities": ["ui:sidebar"]
+}`
+		source := writePluginDir(t, filepath.Join(t.TempDir(), "source-"+id), manifest, nil)
+		if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+			t.Fatalf("install %s: %v", id, err)
+		}
+		if _, err := manager.Enable(ctx, id); err != nil {
+			t.Fatalf("enable %s: %v", id, err)
+		}
+	}
+
+	var wait sync.WaitGroup
+	start := make(chan struct{})
+	for index, id := range ids {
+		wait.Add(1)
+		go func(index int, id string) {
+			defer wait.Done()
+			<-start
+			for round := 0; round < 10; round++ {
+				switch index % 3 {
+				case 0:
+					_ = manager.Uninstall(ctx, id)
+				case 1:
+					_ = manager.Disable(ctx, id)
+					_, _ = manager.Enable(ctx, id)
+				default:
+					_, _ = manager.Enable(ctx, id)
+					_ = manager.List()
+				}
+			}
+		}(index, id)
+	}
+	// Close races the lifecycle goroutines above: it flips every entry and writes
+	// the disabled state back, exactly what a real shutdown does.
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		<-start
+		_ = manager.Close()
+	}()
+	close(start)
+	wait.Wait()
+
+	// Close is idempotent and a closed manager refuses a late enable rather than
+	// reviving a plugin the shutdown already released.
+	if err := manager.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	if _, err := manager.Enable(ctx, "test.one"); err == nil {
+		t.Fatal("a closed manager enabled a plugin")
+	}
+}
+
+// reportRequest builds the request a renderer's report.error carries. The body is
+// the action envelope the HTTP route decodes, so this exercises the same
+// parameter path production uses instead of handing the manager a pre-decoded
+// payload.
+func reportRequest(t *testing.T, params any) *http.Request {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"params": params})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return httptest.NewRequest("POST", "/enhance/v1/plugins/test.sample/action/report.error", bytes.NewReader(body))
+}
+
+// TestFatalReportFaultsThePluginAndKeepsTheReason is the behaviour the plugin
+// page depends on: a renderer-reported fatal error stops the plugin, the reason
+// survives in the record, and the identity token dies with it. The renderer used
+// to call the plain disable route, which left state=DISABLED with an empty
+// reason — that is exactly what the earlier real-host evidence showed.
+func TestFatalReportFaultsThePluginAndKeepsTheReason(t *testing.T) {
+	root := t.TempDir()
+	manager, err := newManagerAt(t, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+		t.Fatal(err)
+	}
+	enabled, err := manager.Enable(ctx, "test.sample")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enabled.Token == "" {
+		t.Fatal("enable issued no token")
+	}
+
+	// A non-fatal report is an activity row only: the plugin keeps running.
+	if _, err := manager.Call(ctx, "test.sample", "report.error", enabled.Token, reportRequest(t, map[string]any{
+		"message": "recovered hiccup", "code": "RENDERER_ERROR",
+	})); err != nil {
+		t.Fatalf("non-fatal report: %v", err)
+	}
+	running := manager.Get2("test.sample")
+	if running.State != StateEnabled || !running.Enabled {
+		t.Fatalf("a non-fatal report stopped the plugin: %#v", running)
+	}
+
+	value, err := manager.Call(ctx, "test.sample", "report.error", enabled.Token, reportRequest(t, map[string]any{
+		"message": "activate blew up", "code": "PLUGIN_ACTIVATION_FAILED", "fatal": true,
+	}))
+	if err != nil {
+		t.Fatalf("fatal report: %v", err)
+	}
+	result, _ := value.(map[string]any)
+	if stopped, _ := result["stopped"].(bool); !stopped {
+		t.Fatalf("fatal report did not stop the plugin: %#v", result)
+	}
+
+	faulted, ok := manager.Get("test.sample")
+	if !ok {
+		t.Fatal("the plugin disappeared")
+	}
+	if faulted.State != StateFaulted || faulted.Enabled {
+		t.Fatalf("fatal report left the plugin %s enabled=%v", faulted.State, faulted.Enabled)
+	}
+	if !strings.Contains(faulted.Error, "PLUGIN_ACTIVATION_FAILED") {
+		t.Fatalf("the reason lost its code: %q", faulted.Error)
+	}
+
+	// The token is revoked: the same identity cannot act after the stop.
+	late, err := manager.Call(ctx, "test.sample", "report.error", enabled.Token, reportRequest(t, map[string]any{"message": "late"}))
+	if err == nil {
+		t.Fatalf("the revoked token still authorized an action: %#v", late)
+	}
+
+	// The state and reason are what the next process reads back.
+	reopened := reopen(t, manager, root)
+	reloaded, _ := reopened.Get("test.sample")
+	if reloaded.State != StateFaulted || reloaded.Error == "" {
+		t.Fatalf("fault did not persist: %#v", reloaded)
+	}
+	if reloaded.Desired {
+		t.Fatalf("a faulted plugin came back desired: %#v", reloaded)
+	}
+}
+
+// TestLateFatalReportKeepsTheFirstReason covers the race after a stop: the
+// renderer may still deliver one report after the core already faulted the
+// plugin, and that late text must not replace the reason the user will read.
+func TestLateFatalReportKeepsTheFirstReason(t *testing.T) {
+	manager, _ := testManager(t, func() bool { return false })
+	ctx := context.Background()
+	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+		t.Fatal(err)
+	}
+	enabled, err := manager.Enable(ctx, "test.sample")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Call(ctx, "test.sample", "report.error", enabled.Token, reportRequest(t, map[string]any{
+		"message": "mount failed in the sidebar", "code": "PLUGIN_MOUNT_FAILED", "fatal": true,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	first := manager.Get2("test.sample")
+	if first.State != StateFaulted {
+		t.Fatalf("not faulted: %#v", first)
+	}
+	// A later report from a still-dying renderer arrives with no valid token; the
+	// manager refuses it and the recorded reason stays.
+	if _, err := manager.Call(ctx, "test.sample", "report.error", enabled.Token, reportRequest(t, map[string]any{
+		"message": "a later and less specific failure", "fatal": true,
+	})); err == nil {
+		t.Fatal("a revoked token reported again")
+	}
+	after := manager.Get2("test.sample")
+	if after.Error != first.Error {
+		t.Fatalf("reason changed from %q to %q", first.Error, after.Error)
 	}
 }

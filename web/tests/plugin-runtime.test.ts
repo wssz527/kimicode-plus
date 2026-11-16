@@ -462,3 +462,70 @@ test("the settings bridge resolves to the host's release function", async () => 
     else scope.window = original;
   }
 });
+
+test("a failed activation is reported with a phase code the host can treat as fatal", async () => {
+  const reported: Array<{ id: string; code?: string; message: string }> = [];
+  const runtime = createPluginRuntime({
+    slots: { sidebar: () => fakeElement() },
+    request: async () => ({ value: {} }),
+    onError: (id, error) => {
+      reported.push({
+        id,
+        code: (error as { code?: string }).code,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    },
+  });
+  await assert.rejects(
+    () =>
+      runtime.activate(
+        {
+          activate: () => {
+            throw new Error("fixture: activation always fails");
+          },
+        },
+        { id: "test.throws", version: "1.0.0", granted: ["ui:sidebar"], token: "t" },
+      ),
+    /activation always fails/,
+  );
+  assert.equal(reported.length, 1, "the activation failure was not reported once");
+  assert.equal(reported[0].id, "test.throws");
+  assert.equal(
+    reported[0].code,
+    "PLUGIN_ACTIVATION_FAILED",
+    "the host cannot tell a failed activation from a later mount error",
+  );
+  // Nothing was registered as active, so the plugin cannot be disposed twice or
+  // keep a surface it never finished mounting.
+  assert.equal(runtime.get("test.throws"), null);
+  runtime.dispose();
+});
+
+test("a mount failure inside an activation is tagged with its own phase", async () => {
+  const codes: string[] = [];
+  const runtime = createPluginRuntime({
+    slots: { sidebar: () => fakeElement() },
+    request: async () => ({ value: {} }),
+    onError: (_id, error) => codes.push((error as { code?: string }).code ?? "none"),
+  });
+  // A mount that throws propagates out of activate as well, so the assertion has
+  // to let the rejection through and check what was reported alongside it.
+  await assert.rejects(
+    () =>
+      runtime.activate(
+        {
+          activate: context => {
+            context.ui.mount("sidebar", () => {
+              throw new Error("render crashed");
+            });
+          },
+        },
+        { id: "test.mount", version: "1.0.0", granted: ["ui:sidebar"], token: "t" },
+      ),
+    /render crashed/,
+  );
+  // Exactly one report: the mount phase already named the failure, so activating
+  // the same error again would count one broken render as two faults.
+  assert.deepEqual(codes, ["PLUGIN_MOUNT_FAILED"]);
+  runtime.dispose();
+});

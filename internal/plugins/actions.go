@@ -172,13 +172,23 @@ func (m *Manager) runtimeInfoLocked(item *entry) map[string]any {
 	}
 }
 
-// reportError records a runtime failure the plugin could not handle itself. The
-// count is per plugin and time window so the renderer can turn a plugin that
-// keeps throwing into a stopped one instead of a broken surface.
+// reportError records a runtime failure the plugin could not handle itself.
+//
+// A fatal report is the renderer telling the core that this plugin's activation
+// threw, which is a different event from a plugin that misbehaves occasionally:
+// the plugin must be stopped before its next poll, the reason must survive for
+// the plugin page, and its identity token must die with it. A non-fatal report is
+// just an activity row; the renderer applies its own rate window before it
+// escalates one of those to fatal, so the core never accumulates a threshold of
+// its own on top of the renderer's.
+//
+// The failure goes through fail() rather than Disable(): Disable clears errText,
+// which would leave a faulted plugin listed as "disabled" with no explanation.
 func (m *Manager) reportError(ctx context.Context, id string, r *http.Request, params json.RawMessage) (any, error) {
 	var input struct {
 		Message string `json:"message"`
 		Code    string `json:"code"`
+		Fatal   bool   `json:"fatal"`
 	}
 	if err := decodeInto(ctx, r, params, &input); err != nil {
 		return nil, err
@@ -192,8 +202,23 @@ func (m *Manager) reportError(ctx context.Context, id string, r *http.Request, p
 	if code != "" {
 		detail = code + ": " + message
 	}
-	_ = recordActivity(ctx, m.db, id, ActivityError, detail, m.now())
-	return map[string]any{"recorded": true}, nil
+	if !input.Fatal {
+		_ = recordActivity(ctx, m.db, id, ActivityError, detail, m.now())
+		return map[string]any{"recorded": true}, nil
+	}
+	// A plugin that is already stopped keeps its recorded reason: a late report
+	// from a dying renderer must not overwrite the first, more specific one.
+	m.mu.Lock()
+	item := m.entries[id]
+	alreadyStopped := item == nil || (item.state != StateEnabled && item.errText != "")
+	m.mu.Unlock()
+	if alreadyStopped {
+		_ = recordActivity(ctx, m.db, id, ActivityError, detail, m.now())
+		return map[string]any{"recorded": true, "stopped": false}, nil
+	}
+	now := m.now()
+	m.fail(ctx, id, StateFaulted, detail, ActivityError, now)
+	return map[string]any{"recorded": true, "stopped": true, "state": StateFaulted}, nil
 }
 
 // coreFailure keeps a coded plugin error as-is and hides everything else. The

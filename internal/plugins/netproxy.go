@@ -26,15 +26,18 @@ const (
 
 var proxyHeaderPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
 
-// proxyClient is the shared outbound client. It is created per manager rather
-// than per request so connections are reused, and it never follows a redirect to
-// a host the plugin did not declare.
-func newProxyClient() *http.Client {
+// proxyClient builds a one-shot client pinned to the address the guard just
+// approved. The transport is not shared: a pooled connection belongs to one
+// host's resolution, and reusing it for another host would let a keep-alive
+// socket outlive the check that authorized it.
+func newProxyClient(dial func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Client {
 	transport := &http.Transport{
 		Proxy:                 nil,
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           dial,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          16,
+		MaxIdleConns:          1,
+		MaxIdleConnsPerHost:   1,
+		DisableKeepAlives:     true,
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
@@ -146,7 +149,22 @@ func (m *Manager) proxy(ctx context.Context, id string, grants Grants, vault *cr
 	outbound.Header = headers
 	outbound.Header.Set("Accept-Encoding", "identity")
 
-	client := m.proxyClient()
+	// Resolve once, validate every answer, then dial that literal address. The
+	// authorization above checked a name; this check is what makes the name and
+	// the socket agree even if DNS changes between the two.
+	host, port := splitHostPort(parsed.Host)
+	if port == "" {
+		if parsed.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	addr, err := resolveApprovedAddr(ctx, m.resolver().LookupIPAddr, host)
+	if err != nil {
+		return nil, err
+	}
+	client := newProxyClient(guardedDialer(addr, port))
 	response, err := client.Do(outbound)
 	if err != nil {
 		// The error text can contain the URL; it cannot contain the injected
@@ -231,24 +249,14 @@ func parseProxyURL(raw string) (*url.URL, error) {
 	return parsed, nil
 }
 
-// proxyClient lazily creates the outbound client and keeps it per manager.
-func (m *Manager) proxyClient() *http.Client {
+// resolver returns the resolver used for outbound plugin requests. Tests inject
+// one so a rebinding or private-address answer is exercised without touching the
+// network; production uses the system resolver.
+func (m *Manager) resolver() *net.Resolver {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.client == nil {
-		m.client = newProxyClient()
+	if m.lookup == nil {
+		m.lookup = net.DefaultResolver
 	}
-	return m.client
-}
-
-// CloseIdleConnections releases pooled connections at shutdown.
-func (m *Manager) CloseIdleConnections() {
-	m.mu.Lock()
-	client := m.client
-	m.mu.Unlock()
-	if client != nil {
-		if transport, ok := client.Transport.(*http.Transport); ok {
-			transport.CloseIdleConnections()
-		}
-	}
+	return m.lookup
 }

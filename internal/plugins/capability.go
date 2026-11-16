@@ -3,6 +3,7 @@ package plugins
 import (
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"sort"
 	"strings"
@@ -41,7 +42,72 @@ var (
 	netHostPattern      = regexp.MustCompile(`^(\*\.)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
 	netHostLocalPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 	credentialPattern   = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
+	// netHostNumericPattern matches anything that only looks like an address: a
+	// bare number, a short group count, or 0x/octal notation. Go's resolver would
+	// happily turn those into an IP, so a host that matches this and is not the
+	// canonical dotted form is refused instead of being read as a name.
+	netHostNumericPattern = regexp.MustCompile(`^[0-9a-fx.]+$`)
 )
+
+// parseNetHost validates one `net:` host entry. A canonical IP literal is
+// accepted and normalised so what the user approved is exactly what the dialer
+// connects to; a non-canonical numeric form is refused, because "0x7f000001",
+// "2130706433" and "127.1" all resolve to loopback while looking like names.
+func parseNetHost(host string) (string, error) {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return "", errors.New("net: 后必须写明主机名")
+	}
+	// Literals first: an IPv6 address contains colons that the name grammar
+	// rejects, so the character check below must not run before this.
+	if literal, ok := canonicalIP(host); ok {
+		return literal, nil
+	}
+	if strings.ContainsAny(host, "/:@ \t\n?#") {
+		return "", fmt.Errorf("net:%s 只能包含主机名，不含协议、端口或路径", host)
+	}
+	if strings.HasPrefix(host, "*.") {
+		// A wildcard only makes sense over a name: there is no subdomain of an
+		// address, and accepting one would let `*.127.0.0.1` read as a scope.
+		base := strings.TrimPrefix(host, "*.")
+		if _, isLiteral := canonicalIP(base); isLiteral {
+			return "", fmt.Errorf("net:%s 不能在 IP 地址上使用通配符", host)
+		}
+		if netHostNumericPattern.MatchString(base) {
+			return "", fmt.Errorf("net:%s 不是规范域名", host)
+		}
+		if !netHostPattern.MatchString(host) {
+			return "", fmt.Errorf("net:%s 不是有效主机名", host)
+		}
+		return host, nil
+	}
+	if netHostNumericPattern.MatchString(host) {
+		return "", fmt.Errorf("net:%s 不是规范 IP 字面量；数字、缩写或十六进制形式不接受，请写完整的点分地址", host)
+	}
+	if !netHostPattern.MatchString(host) && !netHostLocalPattern.MatchString(host) {
+		return "", fmt.Errorf("net:%s 不是有效主机名", host)
+	}
+	if !strings.Contains(host, ".") && host != "localhost" {
+		return "", fmt.Errorf("net:%s 是单标签主机名；只接受 localhost 或完整域名", host)
+	}
+	return host, nil
+}
+
+// canonicalIP reports whether host is a dotted IP literal and returns its
+// canonical form. net.ParseIP accepts exactly the standard notations, so a value
+// it rejects is not a literal at all.
+func canonicalIP(host string) (string, bool) {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "", false
+	}
+	if ipv4 := ip.To4(); ipv4 != nil {
+		return ipv4.String(), true
+	}
+	// IPv6 literals arrive without brackets from url.Hostname; keep the canonical
+	// compressed form so grants and dials compare the same string.
+	return ip.String(), true
+}
 
 // Grants is a parsed capability list. The zero value grants nothing, so a
 // missing or unreadable grant always denies rather than allows.
@@ -92,20 +158,6 @@ func ParseCapabilities(names []string) (Grants, error) {
 	sort.Strings(grants.hosts)
 	sort.Strings(grants.credentials)
 	return grants, nil
-}
-
-func parseNetHost(host string) (string, error) {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if host == "" {
-		return "", errors.New("net: 后必须写明主机名")
-	}
-	if strings.ContainsAny(host, "/:@ \t\n?#") {
-		return "", fmt.Errorf("net:%s 只能包含主机名，不含协议、端口或路径", host)
-	}
-	if !netHostPattern.MatchString(host) && !netHostLocalPattern.MatchString(host) {
-		return "", fmt.Errorf("net:%s 不是有效主机名", host)
-	}
-	return host, nil
 }
 
 // Has reports a parameterless capability.

@@ -749,12 +749,45 @@ async function installNativeRenderer(options) {
   const pluginRequest = (path, body) => corePost(path, body);
 
   // A plugin that keeps throwing is stopped instead of being left half-alive in
-  // the page. The threshold is per plugin and per window so one bad render does
-  // not disable an otherwise healthy plugin.
+  // the page. Two paths reach that stop and they are deliberately different:
+  //
+  // - activate() throwing is immediate: the plugin never came up, so there is no
+  //   half-working surface worth keeping and no reason to wait for a second
+  //   failure.
+  // - an error inside a mount, decorator or event listener is counted per plugin
+  //   per window, so one bad render does not stop an otherwise healthy plugin.
+  //
+  // Both are reported as fatal to the core, which records FAULTED with the
+  // reason and revokes the token. Calling the plain /disable route instead would
+  // clear the reason, and the plugin page would show a stopped plugin with no
+  // explanation for why.
   const faultWindowMs = 60000;
   const faultLimit = 5;
   const faults = new Map();
+
+  // A poll the core refuses because the plugin is no longer authorized is not a
+  // plugin bug: the renderer is simply still holding a token the core revoked.
+  // Counting those would turn every normal disable into a reported failure and,
+  // worse, would let a permanent 401 accumulate into a code-fault verdict.
+  const passiveRefusals = new Set(['PLUGIN_IDENTITY_REJECTED', 'PLUGIN_DISABLED', 'MANAGER_CLOSED', 'SAFE_MODE', 'PLUGIN_NOT_FOUND']);
+  function isPassiveRefusal(error) {
+    return passiveRefusals.has(error?.code) || error?.status === 401;
+  }
+
+  function reportFault(id, error, fatal) {
+    const message = error?.message || String(error);
+    void corePost('/plugin-runtime/report.error', {
+      token: state.pluginTokens.get(id) || '',
+      params: { message, code: error?.code || 'RENDERER_ERROR', fatal: Boolean(fatal) },
+    }).then(async result => {
+      if (!fatal || result?.stopped === false) return;
+      await syncPlugins();
+    }).catch(() => {});
+    return message;
+  }
+
   function noteFault(id, error) {
+    if (isPassiveRefusal(error)) return;
     const now = Date.now();
     const entry = faults.get(id) || { count: 0, since: now };
     if (now - entry.since > faultWindowMs) {
@@ -762,23 +795,20 @@ async function installNativeRenderer(options) {
       entry.since = now;
     }
     entry.count += 1;
-    faults.set(id, entry);
-    const message = error?.message || String(error);
-    void corePost('/plugin-runtime/report.error', {
-      token: state.pluginTokens.get(id) || '',
-      params: { message, code: error?.code || 'RENDERER_ERROR' },
-    }).catch(() => {});
-    if (entry.count < faultLimit) return;
+    if (entry.count < faultLimit) {
+      faults.set(id, entry);
+      reportFault(id, error, false);
+      return;
+    }
     faults.delete(id);
-    console.warn('plugin disabled after repeated failures', id, message);
-    void (async () => {
-      try {
-        await corePost('/plugins/' + encodeURIComponent(id) + '/disable');
-      } catch (failure) {
-        console.warn('plugin auto-disable failed', id, failure?.message || failure);
-      }
-      await syncPlugins();
-    })();
+    reportFault(id, error, true);
+  }
+
+  // An activation failure is fatal on the first occurrence.
+  function noteActivationFault(id, error) {
+    if (isPassiveRefusal(error)) return;
+    faults.delete(id);
+    reportFault(id, error, true);
   }
 
   state.plugins = null;
@@ -867,9 +897,10 @@ async function installNativeRenderer(options) {
         });
         state.pluginReleases.set(plugin.id, () => state.plugins.deactivate(plugin.id));
       } catch (error) {
-        // One plugin failing to activate must not stop the others. The core
-        // records activation refusals; this only covers renderer-side failures.
-        noteFault(plugin.id, error);
+        // One plugin failing to activate must not stop the others. The plugin
+        // that failed is stopped by the core with the reason recorded.
+        noteActivationFault(plugin.id, error);
+        state.pluginTokens.delete(plugin.id);
       }
     }
   }

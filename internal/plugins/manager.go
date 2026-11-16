@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -56,6 +57,9 @@ type Options struct {
 	// Bundled supplies the embedded plugin set for restore and release. The core
 	// injects it so this package never imports the plugin bundle.
 	Bundled func() (map[string]map[string][]byte, error)
+	// Resolver overrides DNS for outbound plugin requests. Nil means the system
+	// resolver; a test supplies one to exercise rebinding deterministically.
+	Resolver *net.Resolver
 }
 
 // Option mutates Options during construction.
@@ -68,6 +72,12 @@ func WithVault(v *credentials.Vault) Option { return func(o *Options) { o.Vault 
 
 func WithBundled(load func() (map[string]map[string][]byte, error)) Option {
 	return func(o *Options) { o.Bundled = load }
+}
+
+// WithResolver replaces the resolver used for outbound plugin requests. Tests
+// use it to prove what a name resolves to without touching the network.
+func WithResolver(resolver *net.Resolver) Option {
+	return func(o *Options) { o.Resolver = resolver }
 }
 
 // Core is the narrow slice of the App the plugin host needs. nativeService
@@ -169,7 +179,7 @@ type Manager struct {
 	entries map[string]*entry
 	order   []string
 	tokens  map[string]string
-	client  *http.Client
+	lookup  *net.Resolver
 	closed  bool
 }
 
@@ -204,6 +214,7 @@ func New(db *sql.DB, safe func() bool, options ...Option) (*Manager, error) {
 		now:     opts.Now,
 		entries: make(map[string]*entry),
 		tokens:  make(map[string]string),
+		lookup:  opts.Resolver,
 	}
 	if err := manager.load(); err != nil {
 		return nil, err
@@ -675,7 +686,11 @@ func (m *Manager) Disable(ctx context.Context, id string) error {
 	item, ok := m.entries[id]
 	if !ok {
 		m.mu.Unlock()
-		return apiError(http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件未安装")
+		// Reaching here while the page is open means the plugin was uninstalled
+		// between the click and this call. The plain not-found code would tell the
+		// user they never had it, so the message names the real situation while
+		// keeping the status a client already handles.
+		return apiError(http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件已不存在，可能已被卸载")
 	}
 	item.state = StateDisabled
 	item.enabled = false
@@ -795,20 +810,31 @@ func (m *Manager) Close() error {
 	m.closed = true
 	// Shutdown releases live resources but preserves the user's enable intent, so
 	// the next renderer can adopt the plugin without the user re-enabling it.
+	//
+	// Everything the write-back needs is copied here: the entries map can lose
+	// keys to a concurrent Uninstall and every entry field is mutable under this
+	// lock, so iterating m.entries after the unlock reads memory another
+	// goroutine may be rewriting or deleting.
+	stopped := make([]record, 0, len(m.entries))
 	for id, item := range m.entries {
 		if item.state == StateEnabled {
 			item.state = StateDisabled
 		}
-		_ = id
+		stopped = append(stopped, record{
+			id:      id,
+			state:   item.state,
+			desired: item.enabled,
+			err:     item.errText,
+		})
 	}
 	m.tokens = make(map[string]string)
 	m.mu.Unlock()
 	ctx := context.Background()
 	var failures []string
-	for id, item := range m.entries {
-		// desired stays true: it records what the user asked for, not what this
+	for _, item := range stopped {
+		// desired stays as recorded: it is what the user asked for, not what this
 		// process managed to keep running.
-		if err := setState(ctx, m.db, id, item.state, item.enabled, item.errText, m.now()); err != nil {
+		if err := setState(ctx, m.db, item.id, item.state, item.desired, item.err, m.now()); err != nil {
 			failures = append(failures, err.Error())
 		}
 	}

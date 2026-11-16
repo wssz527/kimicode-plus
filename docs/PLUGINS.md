@@ -136,7 +136,7 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 - 主机必须在清单里逐个列出。URL 不能内嵌凭据。
 - 不跟随重定向。3xx 会连同 `redirectTo` 一起返回，需要时由插件显式重试，目标主机同样要过白名单。
 - 响应体上限 8 MiB，请求体上限 1 MiB，`Set-Cookie` 会被剥掉。
-- 凭据明文只在 Go 侧读取一次并拼进出站请求头；返回值、活动记录和错误文案都不含明文。凭据库锁定时返回 `PLUGIN_LOCKED` 类错误，需要先在凭据页解锁。
+- 凭据明文只在 Go 侧读取一次并拼进出站请求头；返回值、活动记录和错误文案都不含明文。凭据库锁定时返回 `PLUGIN_CREDENTIAL_LOCKED`（HTTP 423），需要先在凭据页解锁。
 
 ## 生命周期
 
@@ -183,7 +183,7 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 - zip：条目数 ≤ 64，单文件 ≤ 4 MiB，解压总量 ≤ 16 MiB。
 - 拒绝绝对路径、`..` 越界、符号链接条目（zip slip）。
 - 文件夹安装同样拒绝符号链接和非普通文件。
-- 先解包到临时目录并完整校验，通过后才原子替换到 `<dataDir>/plugins/<id>`；失败时原插件保留。
+- 先解包到临时目录并完整校验，通过后才替换 `<dataDir>/plugins/<id>`：现有目录先重命名为 `<id>.previous`，新目录就位后删除备份；新目录就位失败时把备份改回原名，原插件保留。替换期间插件先被停用，因此不存在新旧文件同时被加载的窗口。
 
 ## 活动记录
 

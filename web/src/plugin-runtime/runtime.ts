@@ -69,7 +69,15 @@ export function createPluginRuntime(options: RuntimeOptions) {
   }
 
   function reportFailure(id: string, error: unknown, code: string, message: string): void {
-    options.onError?.(id, error);
+    // The host reports this code to the core, which records it as the reason a
+    // plugin was stopped. A raw error often carries no code of its own, so the
+    // failure is tagged here instead of letting it arrive as the generic
+    // RENDERER_ERROR with no hint about which phase broke.
+    const tagged =
+      error instanceof Error
+        ? Object.assign(error, { code: (error as { code?: string }).code || code })
+        : Object.assign(new Error(message), { code, cause: error });
+    options.onError?.(id, tagged);
     if (typeof console !== "undefined") console.warn(`[plugin:${id}] ${code}`, message, error);
   }
 
@@ -186,7 +194,18 @@ export function createPluginRuntime(options: RuntimeOptions) {
       // surface behind: nothing recorded this scope as active, so without this
       // the nodes, listeners and timers it created would outlive every retry.
       scope.dispose();
-      throw error;
+      // A failure raised inside a mount or decorator was already reported there
+      // with its own phase code; reporting it again here would turn one broken
+      // render into two faults. Only a throw with no phase tag is the plugin's
+      // own activation failure, and that one is what the host treats as fatal on
+      // the first occurrence.
+      const existing = (error as { code?: string } | null)?.code;
+      const failure = Object.assign(
+        error instanceof Error ? error : new Error(String(error)),
+        { code: existing || "PLUGIN_ACTIVATION_FAILED" },
+      );
+      if (!existing) reportFailure(install.id, failure, failure.code, "插件激活失败");
+      throw failure;
     }
     if (result && typeof result === "object" && "dispose" in result && typeof result.dispose === "function") {
       scope.add(() => result.dispose());
