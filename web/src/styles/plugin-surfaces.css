@@ -1,0 +1,175 @@
+/*
+ * Plugin surfaces. Everything here inherits the host tokens: a plugin that
+ * shipped its own palette would read as a foreign panel inside the official
+ * sidebar. The mount containers deliberately paint nothing, so the host's glass
+ * material shows through.
+ */
+
+.ekdp-slot,
+.ekdp-settings-mount {
+  min-width: 0;
+  color: inherit;
+  font: inherit;
+}
+
+.ekdp-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ekdp-settings-mount {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ekdp-slot-sidebar {
+  padding: 2px 6px 6px;
+}
+
+.ekdp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  color: var(--color-text, currentColor);
+  font: inherit;
+  font-size: 13px;
+}
+
+.ekdp-row:hover {
+  background: var(--color-hover, rgb(255 255 255 / 6%));
+}
+
+.ekdp-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--blue, #4c8dff);
+  flex: none;
+}
+
+.ekdp-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ekdp-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--color-line, rgba(128, 128, 128, 0.25));
+  border-radius: 10px;
+}
+
+.ekdp-settings h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.ekdp-settings p {
+  margin: 0;
+  line-height: 1.6;
+  color: var(--color-text-secondary, inherit);
+  font-size: 13px;
+}
+
+.ekdp-muted {
+  margin-top: 10px;
+  color: var(--color-text-secondary, inherit);
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ekdp-row {
+    transition: none;
+  }
+}
+
+.capability-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.capability-choice input {
+  margin-top: 3px;
+  flex: none;
+}
+
+.capability-choice span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.capability-detail {
+  color: var(--color-text-secondary, inherit);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.plugin-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--color-line, rgb(255 255 255 / 12%));
+  border-radius: 10px;
+  background: var(--color-hover, rgb(255 255 255 / 4%));
+}
+
+.plugin-confirm p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.ekdp-sidebar-anchor {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 0 8px 4px;
+}
+
+.ekds-plugins .notice-error .notice-copy p {
+  color: var(--danger, #ff8a8c);
+}
+
+.ekds-plugins .notice-error .notice-copy .notice-recovery {
+  color: var(--ink-faint, #aaa) !important;
+}
+
+.ekds-plugins .notice-diagnostics {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--ink-muted, #b4b4b4);
+}
+
+.ekds-plugins .notice-diagnostics summary {
+  cursor: pointer;
+  color: var(--ink-faint, #aaa);
+}
+
+.ekds-plugins .notice-diagnostics code {
+  display: block;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--surface-sunken, rgb(255 255 255 / 6%));
+  color: var(--ink-muted, #b4b4b4);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

@@ -370,20 +370,62 @@ export interface PluginRecord {
   id: string;
   name: string;
   version?: string;
-  kind?: string;
   description?: string;
-  hostRange?: string;
-  capabilities?: string[];
-  builtin?: boolean;
-  sandbox?: string;
+  author?: string;
+  license?: string;
+  source?: "BUNDLED" | "LOCAL";
   state: string;
   enabled?: boolean;
-  faults?: number;
   error?: string;
-  resources?: number;
+  capabilities?: string[];
+  declaredCapabilities?: string[];
+  slots?: string[];
+  hostVersions?: string[];
+  compatible?: boolean;
+  hasSettings?: boolean;
+  upstream?: string;
+  installedAt?: string;
   updatedAt?: string;
-  safeMode?: boolean;
-  controlled?: string;
+  /** Only present in the enable response: the renderer identity token. */
+  token?: string;
+  /**
+   * A bundled plugin the user uninstalled. It is listed only so the page can
+   * offer to restore the embedded copy; it has no files, no capabilities and is
+   * never running.
+   */
+  restorable?: boolean;
+}
+
+/** A validated package, before the user grants anything. Mirrors plugins.PackagePreview. */
+export interface PluginPreview {
+  id: string;
+  name: string;
+  version: string;
+  description?: string;
+  author?: string;
+  license?: string;
+  hostVersions: string[];
+  capabilities: string[];
+  compatible: boolean;
+  installed: boolean;
+  source: string;
+  upstream?: string;
+}
+
+export interface PluginActivity {
+  id: number;
+  pluginId: string;
+  kind: string;
+  detail: string;
+  at: string;
+}
+
+export interface PluginList {
+  items: PluginRecord[];
+  total: number;
+  safeMode: boolean;
+  hostVersion?: string;
+  apiVersion?: number;
 }
 
 export interface ChatSource {
@@ -832,9 +874,20 @@ export const api = {
       request<OutboxRecord>(`/tasks/${encodeURIComponent(id)}/reconcile`, { method: "POST", body: {} }),
   },
   plugins: {
-    list: async () => asList<PluginRecord>(await request<unknown>("/plugins")),
-    action: (id: string, action: "ENABLE" | "DISABLE" | "FAULT") =>
-      request<PluginRecord>(`/plugins/${encodeURIComponent(id)}`, { method: "POST", body: { action } }),
+    list: () => request<PluginList>("/plugins"),
+    get: (id: string) => request<PluginRecord>(`/plugins/${encodeURIComponent(id)}`),
+    enable: (id: string) => request<PluginRecord>(`/plugins/${encodeURIComponent(id)}/enable`, { method: "POST", body: {} }),
+    disable: (id: string) => request<PluginRecord>(`/plugins/${encodeURIComponent(id)}/disable`, { method: "POST", body: {} }),
+    uninstall: (id: string) =>
+      request<{ id: string; uninstalled: boolean }>(`/plugins/${encodeURIComponent(id)}/uninstall`, { method: "POST", body: {} }),
+    preview: (root: string) => request<PluginPreview>("/plugins/preview", { method: "POST", body: { root } }),
+    install: (root: string, capabilities: string[]) =>
+      request<PluginRecord>("/plugins/install", { method: "POST", body: { root, capabilities } }),
+    restore: (id: string) => request<PluginRecord>(`/plugins/${encodeURIComponent(id)}/restore`, { method: "POST", body: {} }),
+    forceEnable: (id: string) =>
+      request<PluginRecord>(`/plugins/${encodeURIComponent(id)}/force-enable`, { method: "POST", body: {} }),
+    activity: async (id: string, before = 0) =>
+      asList<PluginActivity>(await request<unknown>(`/plugins/${encodeURIComponent(id)}/activity`, { query: { before, limit: 50 } })),
   },
   chat: {
     sources: async () => asList<ChatSource>(await request<unknown>("/chat/sources")),

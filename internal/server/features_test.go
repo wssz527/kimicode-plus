@@ -23,7 +23,11 @@ func TestProviderChatVaultAndLocalFeatures(t *testing.T) {
 	}
 	defer db.Close()
 	guard := security.New("127.0.0.1:43125")
-	app, err := New(db, guard, false)
+	// A real plugin root: the bundled example plugin is released here, so the
+	// install/enable paths are exercised against actual files instead of an
+	// empty manager that would pass every test by having nothing to enable.
+	dataDir := t.TempDir()
+	app, err := NewWithNative(db, guard, false, "", NativeOptions{DataDir: dataDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,6 +47,18 @@ func TestProviderChatVaultAndLocalFeatures(t *testing.T) {
 		if w.Code != status {
 			t.Fatalf("HTTP %d expected %d: %s", w.Code, status, w.Body.String())
 		}
+	}
+	actionWithToken := func(action string, params map[string]any, token string) *httptest.ResponseRecorder {
+		data, _ := json.Marshal(map[string]any{"params": params})
+		r := httptest.NewRequest("POST", "http://127.0.0.1:43125/enhance/v1/plugins/kimicode-plus.example-hello/action/"+action, bytes.NewReader(data))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Authorization", "Bearer "+guard.PairingToken())
+		if token != "" {
+			r.Header.Set("X-Plugin-Token", token)
+		}
+		w := httptest.NewRecorder()
+		app.Handler.ServeHTTP(w, r)
+		return w
 	}
 	require(call("POST", "/credentials/unlock", map[string]any{"password": "synthetic-vault-password"}, ""), 200)
 	require(call("PUT", "/credentials", map[string]any{"ref": "provider/demo", "value": "synthetic-provider-credential"}, ""), 200)
@@ -187,12 +203,40 @@ func TestProviderChatVaultAndLocalFeatures(t *testing.T) {
 		if !strings.Contains(w.Body.String(), "BLOCKED_NATIVE_UNCONNECTED") {
 			t.Fatal(w.Body.String())
 		}
-		require(call("POST", "/plugins/kct", map[string]string{"action": "ENABLE"}, ""), 200)
-		w = call("POST", "/plugins/kct/render", map[string]string{"goal": "synthetic goal", "context": "user content", "constraints": "no external calls"}, "")
+		// Plugins are now real local installs. The assertions keep the original
+		// intent: an installed plugin can be enabled, and its action endpoint goes
+		// through the capability gate rather than answering 404.
+		w = call("GET", "/plugins", nil, "")
 		require(w, 200)
-		if !strings.Contains(w.Body.String(), "PORTABLE_GO") {
+		if !strings.Contains(w.Body.String(), "kimicode-plus.example-hello") {
+			t.Fatalf("bundled plugin missing from list: %s", w.Body.String())
+		}
+		enable := call("POST", "/plugins/kimicode-plus.example-hello/enable", map[string]any{}, "")
+		require(enable, 200)
+		var enabled struct {
+			Token string `json:"token"`
+		}
+		if err := json.Unmarshal(enable.Body.Bytes(), &enabled); err != nil || enabled.Token == "" {
+			t.Fatalf("enable did not return a plugin identity token: %s", enable.Body.String())
+		}
+		// The identity token is what makes an action attributable. Without it the
+		// call must be refused, and with it the granted capability applies.
+		w = call("POST", "/plugins/kimicode-plus.example-hello/action/runtime.info", map[string]any{}, "")
+		if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "PLUGIN_IDENTITY_REJECTED") {
+			t.Fatalf("action without an identity token was not refused: %d %s", w.Code, w.Body.String())
+		}
+		w = actionWithToken("runtime.info", map[string]any{}, enabled.Token)
+		require(w, 200)
+		if !strings.Contains(w.Body.String(), "kimicode-plus.example-hello") {
 			t.Fatal(w.Body.String())
 		}
+		// The action route exists, so an ungranted capability must be refused with
+		// the documented code instead of falling through to NOT_FOUND.
+		w = actionWithToken("config.save", map[string]any{"patch": map[string]any{"x": 1}}, enabled.Token)
+		if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "PLUGIN_CAPABILITY_DENIED") {
+			t.Fatalf("capability gate did not deny config.save: %d %s", w.Code, w.Body.String())
+		}
+		require(call("POST", "/plugins/kimicode-plus.example-hello/disable", map[string]any{}, ""), 200)
 	})
 	require(call("POST", "/credentials/lock", map[string]any{}, ""), 200)
 	app.Close()

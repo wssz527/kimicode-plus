@@ -56,6 +56,20 @@ for name, info in lock.get('packages', {}).items():
         output.extend(['\n--- ' + file.name + ' ---', file.read_text(errors='replace')])
 for file in sorted((ROOT / 'web/public/fonts').glob('OFL-*.txt')):
     output.extend(['\n\n=== Bundled font: ' + file.name + ' ===', file.read_text()])
+# Plugins are shipped inside the binary, so their licenses belong in the same
+# notice file. Each bundled plugin directory must carry a LICENSE; a plugin
+# without one is a packaging error, not a reason to silently omit it.
+for plugin in sorted((ROOT / 'plugins').iterdir()):
+    if not plugin.is_dir() or plugin.name.startswith('.'):
+        continue
+    license_file = plugin / 'LICENSE'
+    if not license_file.is_file():
+        raise SystemExit('Missing plugin license: ' + plugin.name)
+    manifest = json.loads((plugin / 'plugin.json').read_text())
+    output.extend([
+        '\n\n=== Bundled plugin: ' + manifest.get('id', plugin.name) + '@' + manifest.get('version', '') + ' (' + manifest.get('license', 'UNKNOWN') + ') ===',
+        license_file.read_text(errors='replace'),
+    ])
 (ROOT / 'dist').mkdir(exist_ok=True)
 target = ROOT / 'dist/THIRD_PARTY_NOTICES.txt'
 target.write_text('\n'.join(output) + '\n')

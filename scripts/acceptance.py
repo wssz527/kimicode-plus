@@ -10,7 +10,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from scenarios import verify_bridge, verify_plugins, verify_registry_usage
+from scenarios import verify_bridge, verify_plugin_safe_mode, verify_plugins, verify_registry_usage
 
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -94,15 +94,14 @@ def run(binary):
             results.append('independent lightweight Mock chat and durable message idempotency')
             verify_registry_usage(core, results)
             recovery = verify_bridge(core, results)
-            verify_plugins(core, results)
+            plugins = verify_plugins(core, results, folder)
             settings = core.request('/settings')
             settings['safeMode'] = True
             core.request('/settings', settings, method='PUT')
             core.request('/settings', settings, method='PUT', expected=409)
             assert core.request('/health')['safeMode'] is True
-            assert all(v['resources'] == 0 for v in core.request('/plugins')['items'])
-            core.request('/plugins/monitor', {'action': 'ENABLE'}, expected=409)
-            results.append('settings CAS and safe mode stop plugin resources and prevent activation')
+            verify_plugin_safe_mode(core, results, plugins['bundled'], plugins['token'])
+            results.append('settings CAS and safe mode stop plugins and prevent activation')
             core.stop()
             core = Core(binary, folder)
             assert core.request('/health')['safeMode'] is True
@@ -119,7 +118,7 @@ def run(binary):
             core.request('/settings', settings, method='PUT')
             replayed = core.request('/tasks', {'intent': 'release-empty:1', 'task': recovery['task'], 'confirmed': True})
             assert replayed['state'] == 'UNKNOWN' and replayed['replayed'] is True
-            assert core.request('/plugins/monitor', {'action': 'ENABLE'})['state'] == 'ENABLED'
+            assert core.request('/plugins/' + plugins['bundled'] + '/enable', {})['state'] == 'ENABLED'
             results.append('leaving safe mode permits a fresh plugin activation')
             previous_token = core.token
             core.stop(hard=True)

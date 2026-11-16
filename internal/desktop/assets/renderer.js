@@ -600,6 +600,16 @@ async function installNativeRenderer(options) {
     state.observer?.disconnect();
     state.unsubscribeSession?.();
     state.unsubscribeFeatures?.();
+    state.unsubscribePlugins?.();
+    document.removeEventListener('visibilitychange', pluginRefresh);
+    window.removeEventListener('focus', pluginRefresh);
+    for (const release of [...state.pluginReleases.values()]) release();
+    state.pluginReleases.clear();
+    for (const release of [...state.pluginSettings.values()]) release.dispose();
+    state.pluginSettings.clear();
+    state.plugins?.dispose();
+    state.plugins = null;
+    delete window.__ekdPlugins;
     document.removeEventListener('click', nativeTabClick, true);
     document.removeEventListener('click', settingsTabClick, true);
     document.removeEventListener('scroll', settingsScroll, true);
@@ -665,5 +675,271 @@ async function installNativeRenderer(options) {
   window.__ekdNativeUI.openOfficial = openOfficial;
   window.__ekdNativeUI.activateSession = activateSession;
   window.__ekdNativeUI.openSettings = openSettings;
+  // Plugin host wiring. The runtime implementation lives in the host bundle
+  // (exported from host-entry); this file only supplies mount points and drives
+  // the lifecycle.
+  //
+  // All plugin traffic goes through `core.fetch`, which is the only channel the
+  // bridge allows, so the plugin runtime sees the same authenticated core the
+  // settings surface does. The identity token travels in the body: the bridge
+  // forwards a fixed header allowlist and would drop a custom header.
+  //
+  // Reads are GET and actions are POST. Sending a POST to a GET-only route is not
+  // a harmless mismatch: the router answers 405, so every list and asset fetch
+  // failed and no plugin ever activated.
+  // A plugin surface goes above the official footer, not below it: the footer is
+  // the settings/help entry and must stay the last row of the column. The host
+  // owns this anchor, so a plugin cannot reorder the official sidebar.
+  const sidebarAnchor = () => {
+    const footer = document.querySelector('.side-footer');
+    const column = footer?.parentElement;
+    if (!footer || !column) return null;
+    let anchor = column.querySelector('[data-ekdp-sidebar-anchor]');
+    if (!anchor) {
+      anchor = document.createElement('div');
+      anchor.dataset.ekdpSidebarAnchor = '';
+      anchor.className = 'ekdp-sidebar-anchor';
+      column.insertBefore(anchor, footer);
+    } else if (anchor.nextElementSibling !== footer) {
+      // The official UI may re-render the column; keep the anchor adjacent.
+      column.insertBefore(anchor, footer);
+    }
+    return anchor;
+  };
+  const pluginSlots = {
+    sidebar: sidebarAnchor,
+    settings: () => state.settingsBody,
+    thinking: () => document.querySelector('.chat-main') ?? null,
+    message: () => document.querySelector('.chat-main') ?? null,
+  };
+  // `core.fetch` carries the request body as base64 (`bodyBase64`) and ignores a
+  // string `body`; this mirrors `createCoreTransport` in native.ts, which is the
+  // one place that encoding is defined.
+  const coreFetch = async (method, path, body) => {
+    let encoded = '';
+    if (body !== undefined) {
+      const bytes = new TextEncoder().encode(JSON.stringify(body ?? {}));
+      let binary = '';
+      for (let index = 0; index < bytes.length; index += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+      }
+      encoded = btoa(binary);
+    }
+    const result = await transport.request('core.fetch', {
+      path: '/enhance/v1' + path,
+      method,
+      headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+      bodyBase64: encoded,
+    });
+    const text = result?.bodyBase64
+      ? new TextDecoder().decode(Uint8Array.from(atob(result.bodyBase64), character => character.charCodeAt(0)))
+      : '';
+    const parsed = text ? JSON.parse(text) : null;
+    if (result?.status >= 400) {
+      const error = new Error(parsed?.error?.message || `核心返回 HTTP ${result.status}`);
+      error.code = parsed?.error?.code || 'CORE_ERROR';
+      error.status = result.status;
+      throw error;
+    }
+    return parsed;
+  };
+  const coreGet = path => coreFetch('GET', path);
+  const corePost = (path, body) => coreFetch('POST', path, body ?? {});
+  // The plugin runtime sends `(path, body)` and expects the parsed body back.
+  const pluginRequest = (path, body) => corePost(path, body);
+
+  // A plugin that keeps throwing is stopped instead of being left half-alive in
+  // the page. Two paths reach that stop and they are deliberately different:
+  //
+  // - activate() throwing is immediate: the plugin never came up, so there is no
+  //   half-working surface worth keeping and no reason to wait for a second
+  //   failure.
+  // - an error inside a mount, decorator or event listener is counted per plugin
+  //   per window, so one bad render does not stop an otherwise healthy plugin.
+  //
+  // Both are reported as fatal to the core, which records FAULTED with the
+  // reason and revokes the token. Calling the plain /disable route instead would
+  // clear the reason, and the plugin page would show a stopped plugin with no
+  // explanation for why.
+  const faultWindowMs = 60000;
+  const faultLimit = 5;
+  const faults = new Map();
+
+  // A poll the core refuses because the plugin is no longer authorized is not a
+  // plugin bug: the renderer is simply still holding a token the core revoked.
+  // Counting those would turn every normal disable into a reported failure and,
+  // worse, would let a permanent 401 accumulate into a code-fault verdict.
+  const passiveRefusals = new Set(['PLUGIN_IDENTITY_REJECTED', 'PLUGIN_DISABLED', 'MANAGER_CLOSED', 'SAFE_MODE', 'PLUGIN_NOT_FOUND']);
+  function isPassiveRefusal(error) {
+    return passiveRefusals.has(error?.code) || error?.status === 401;
+  }
+
+  function reportFault(id, error, fatal) {
+    const message = error?.message || String(error);
+    void corePost('/plugin-runtime/report.error', {
+      token: state.pluginTokens.get(id) || '',
+      params: { message, code: error?.code || 'RENDERER_ERROR', fatal: Boolean(fatal) },
+    }).then(async result => {
+      if (!fatal || result?.stopped === false) return;
+      await syncPlugins();
+    }).catch(() => {});
+    return message;
+  }
+
+  function noteFault(id, error) {
+    if (isPassiveRefusal(error)) return;
+    const now = Date.now();
+    const entry = faults.get(id) || { count: 0, since: now };
+    if (now - entry.since > faultWindowMs) {
+      entry.count = 0;
+      entry.since = now;
+    }
+    entry.count += 1;
+    if (entry.count < faultLimit) {
+      faults.set(id, entry);
+      reportFault(id, error, false);
+      return;
+    }
+    faults.delete(id);
+    reportFault(id, error, true);
+  }
+
+  // An activation failure is fatal on the first occurrence.
+  function noteActivationFault(id, error) {
+    if (isPassiveRefusal(error)) return;
+    faults.delete(id);
+    reportFault(id, error, true);
+  }
+
+  state.plugins = null;
+  state.pluginReleases = new Map();
+  state.pluginTokens = new Map();
+  state.pluginAssets = new Map();
+  state.pluginSettings = new Map();
+  let syncPromise = null;
+  let syncPending = false;
+
+  async function loadPluginAsset(id, entryPath, requiredExport = 'activate') {
+    const key = id + '/' + entryPath + '/' + requiredExport;
+    if (state.pluginAssets.has(key)) return state.pluginAssets.get(key);
+    const asset = await coreGet('/plugins/' + encodeURIComponent(id) + '/assets/' + entryPath.split('/').map(encodeURIComponent).join('/'));
+    const loaded = await module.loadPluginModule(asset?.source || '', requiredExport);
+    state.pluginAssets.set(key, loaded);
+    return loaded;
+  }
+
+  async function syncPlugins() {
+    if (state.removed) return;
+    // Concurrent triggers (a settings action plus a feature change) must not run
+    // two reconciliations against the same maps.
+    if (syncPromise) {
+      syncPending = true;
+      return syncPromise;
+    }
+    syncPromise = (async () => {
+      do {
+        syncPending = false;
+        await reconcilePlugins();
+      } while (syncPending);
+    })();
+    try {
+      await syncPromise;
+    } finally {
+      syncPromise = null;
+    }
+  }
+
+  async function reconcilePlugins() {
+    let list;
+    try {
+      list = await coreGet('/plugins');
+    } catch (error) {
+      console.warn('plugin list unavailable', error?.message || error);
+      return;
+    }
+    if (state.removed) return;
+    const items = list?.items || [];
+    state.pluginList = items;
+    const enabled = items.filter(plugin => plugin.enabled);
+    if (!state.plugins) {
+      state.plugins = module.createPluginRuntime({
+        slots: pluginSlots,
+        request: pluginRequest,
+        onError: (id, error) => noteFault(id, error),
+      });
+    }
+    // A plugin the runtime reports as stopped must leave the page: dropping the
+    // module, the token and the DOM together is what makes "disabled" observable.
+    const wanted = new Set(enabled.map(plugin => plugin.id));
+    for (const id of [...state.pluginReleases.keys()]) {
+      if (wanted.has(id)) continue;
+      state.pluginSettings.get(id)?.dispose();
+      state.pluginSettings.delete(id);
+      state.pluginReleases.get(id)?.();
+      state.pluginReleases.delete(id);
+      state.pluginTokens.delete(id);
+      for (const key of [...state.pluginAssets.keys()]) {
+        if (key.startsWith(id + '/')) state.pluginAssets.delete(key);
+      }
+    }
+    for (const plugin of enabled) {
+      if (state.pluginReleases.has(plugin.id)) continue;
+      try {
+        const token = plugin.token || (await corePost('/plugins/' + encodeURIComponent(plugin.id) + '/token'))?.token;
+        if (!token) continue;
+        state.pluginTokens.set(plugin.id, token);
+        const entry = await loadPluginAsset(plugin.id, module.pluginEntryPath(plugin.entry?.renderer || 'renderer.js'));
+        await state.plugins.activate(entry, {
+          id: plugin.id,
+          version: plugin.version,
+          granted: plugin.capabilities || [],
+          token,
+        });
+        state.pluginReleases.set(plugin.id, () => state.plugins.deactivate(plugin.id));
+      } catch (error) {
+        // One plugin failing to activate must not stop the others. The plugin
+        // that failed is stopped by the core with the reason recorded.
+        noteActivationFault(plugin.id, error);
+        state.pluginTokens.delete(plugin.id);
+      }
+    }
+  }
+
+  // The settings surface owns the settings module lifecycle: it asks for the
+  // module and the container, and closing the page releases both. The runtime
+  // never mounts a plugin's settings page on its own, because the host's own
+  // settings body belongs to the official client.
+  async function mountPluginSettings(id, element) {
+    if (state.removed) throw new Error('插件宿主已卸载');
+    const plugin = (state.pluginList || []).find(item => item.id === id);
+    const active = state.plugins?.get(id);
+    if (!active) throw new Error('插件未运行，无法打开设置页');
+    if (!plugin?.entry?.settings) throw new Error('这个插件没有设置页');
+    const settingsModule = await loadPluginAsset(id, module.pluginEntryPath(plugin.entry.settings), 'renderSettings');
+    const release = await active.mountSettings(settingsModule, element);
+    state.pluginSettings.set(id, release);
+    return () => {
+      release.dispose();
+      if (state.pluginSettings.get(id) === release) state.pluginSettings.delete(id);
+    };
+  }
+  window.__ekdPlugins = {
+    sync: syncPlugins,
+    mountSettings: mountPluginSettings,
+    list: () => state.pluginList || [],
+  };
+
+  state.syncPlugins = syncPlugins;
+  state.mountPluginSettings = mountPluginSettings;
+  void syncPlugins();
+  // Plugin state changes come from outside this renderer (the settings page is a
+  // separate window), so the host re-reads the list whenever the surface becomes
+  // visible again instead of only once at startup.
+  const pluginRefresh = () => { void syncPlugins(); };
+  document.addEventListener('visibilitychange', pluginRefresh);
+  window.addEventListener('focus', pluginRefresh);
+  // Features carry the enable/disable decisions this App made; the same event
+  // also refreshes the plugin list so the page and the DOM agree.
+  state.unsubscribePlugins = makeHost(() => {}).subscribe('features', () => { void syncPlugins(); });
   return { status: 'installed', surface: 'host', domRevision: 1 };
 }

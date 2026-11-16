@@ -1,0 +1,12 @@
+{
+  "id": "kimicode-plus.example-hello",
+  "name": "示例插件",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "description": "最小示例插件：在侧栏挂一行文字，演示清单、能力申请、存储与设置页。",
+  "author": "KimiCode+",
+  "license": "MIT",
+  "hostVersions": ["1.*"],
+  "entry": { "renderer": "renderer.js", "settings": "settings.js" },
+  "capabilities": ["ui:sidebar", "ui:settings", "storage"]
+}

@@ -11,8 +11,14 @@ import { AuthProvider } from "./auth";
 import { MonitorSurface, PlannerSurface, SettingsWindow } from "./components/Surfaces";
 import { SessionGrid } from "./components/SessionGrid";
 import "./styles/surfaces.css";
+import "./styles/plugin-surfaces.css";
 
 export { createCoreTransport, createEventChannel, createNativeHost };
+// The plugin runtime has exactly one implementation, exported here so the
+// renderer loads it instead of shipping a copy.
+export { createPluginRuntime } from "./plugin-runtime/runtime";
+export { loadModule as loadPluginModule, entryPath as pluginEntryPath } from "./plugin-runtime/loader";
+export type { ActivePlugin, PluginRuntime } from "./plugin-runtime/runtime";
 import "./styles/workbench.css";
 
 function HostScopeProvider({ host, children }: { host: NativeHost | null; children: ReactNode }) {
