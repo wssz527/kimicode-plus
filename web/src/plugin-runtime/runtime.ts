@@ -322,7 +322,7 @@ function createEventPump(reportFailure: (id: string, error: unknown, code: strin
     if (running || stopped) return;
     running = true;
     try {
-      while (!stopped) {
+      while (!stopped && groups.size > 0) {
         let worked = false;
         for (const [id, group] of groups) {
           if (stopped) break;
@@ -390,6 +390,7 @@ function createEventPump(reportFailure: (id: string, error: unknown, code: strin
         // deactivating one plugin cannot stop the loop for the others.
         group!.subscriptions.delete(subscription);
         if (group!.subscriptions.size === 0) groups.delete(id);
+        if (groups.size === 0) wake?.();
       };
       owner.add(release);
       return { dispose: release };
@@ -397,6 +398,7 @@ function createEventPump(reportFailure: (id: string, error: unknown, code: strin
     /** Drops every subscription of one plugin; other plugins keep polling. */
     release(id: string): void {
       groups.delete(id);
+      if (groups.size === 0) wake?.();
     },
     stop(): void {
       // The loop leaves on its next boundary; `running` then drops to zero in the
