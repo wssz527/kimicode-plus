@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"enhancedkimi/internal/storage"
 )
 
 type managedUsageWindow struct {
@@ -108,7 +110,7 @@ func recoveryEntry(entries []RecoveryEntry, kind, id string) *RecoveryEntry {
 
 func saveRecoveryIntent(ctx context.Context, s *NativeService, kind, id, model, revision, state, note string, now time.Time) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO automation_intents(id,kind,host_id,session_id,model_id,context_revision,state,created_at,updated_at,result) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET model_id=excluded.model_id,context_revision=excluded.context_revision,state=excluded.state,updated_at=excluded.updated_at,result=excluded.result`,
-		recoveryIntentID(kind, id), "recovery", kind, id, model, revision, state, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), note)
+		recoveryIntentID(kind, id), "recovery", kind, id, model, revision, state, storage.SortableTime(now), storage.SortableTime(now), note)
 	return err
 }
 

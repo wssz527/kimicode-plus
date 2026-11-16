@@ -120,3 +120,46 @@ Monitor 位于会话侧栏，默认约 233px 的紧凑布局，详情折叠。�
 | 发布 | 五平台纯 Go 交叉构建、macOS ARM64 运行 | 其他平台原生运行、签名公证、Windows ACL |
 
 单实例锁只保护增强软件自己的数据目录，不能代表官方会话所有权。官方升级或适配器失配只停用相应能力，核心、本地配置和历史仍能启动。
+
+## 缓存与额度（M2）
+
+数据来自本机 `KIMI_CODE_HOME/sessions/<桶>/<会话>/` 的只读解析，不写任何官方文件。`KIMI_CODE_HOME` 存在时以它为根，否则用默认目录。
+
+### 读取与存储
+
+- 按文件 inode + device 加偏移量增量读取；文件被替换（inode/device 变化）或截断（size 小于已读偏移）时从头重读。
+- 无 fsnotify 依赖（`go.mod` 确认不存在），用定时扫描，间隔不短于 5 秒；该下限在 Store 内部二次强制，调用方无论怎么 tick 都不会更密。
+- 跨读取的未完成行在同一次扫描内拼接继续读，只有文件末尾真正未完成的行才不推进偏移，下一轮连同新内容一起重读。官方记录存在单行约 360KB 的超长行，早期实现因此在大文件上只吃掉首个读缓冲，已修复并有回归测试。
+- `cache_steps(session_id, agent, step_uuid, model, time, ...)` 主键 `(session_id, agent, step_uuid)`；`cache_sessions` 存会话元数据；`cache_live` 存三项**状态**信号：未返回的后台子代理数、主代理是否处于阻塞等待、最近一次用户输入时间。这三项无法从已完成步骤推导，所以单列。
+
+### 字段语义（真实样本确认）
+
+- 模型只能从 `usage.record` 关联：`step.end` 不含 model，按 usage 四字段完全相等配对，且只接受 `usageScope == "turn"`（`session` 是累计值）。配对失败记 `UNKNOWN`；usage 为空的 `error`/`interrupted` 步骤不入库。
+- 解码时长取 `llmServerDecodeMs`。实测 `llmStreamDurationMs == llmServerDecodeMs + llmClientConsumeMs`（160690/160692），而 `llmFirstTokenLatencyMs` 是从请求发出起算的累计延迟，在 109239/160692 条样本中大于 `llmStreamDurationMs`，相减会为负，因此不使用 `stream - firstToken`。
+- 命中率 = `input_cache_read / (input_other + input_cache_read + input_cache_creation)`。
+- **未上报判定**：某模型在统计窗口内 `input_cache_read` 与 `input_cache_creation` 双零时返回 `NOT_REPORTED`，界面显示"供应商未上报缓存数据"，不显示 0%。有非零缓存字段的模型才计算命中率（可以是真实的低百分比）。
+
+### 动作
+
+| 动作 | 权限 | 内容 |
+|---|---|---|
+| `cache.summary` | `usage:read` | 近 1 小时与今日总计、按模型分组、平均速度、`quota` 子对象（未知保持 UNKNOWN） |
+| `cache.sessions` | `usage:read` | 活跃会话：标题、模型、距上次请求、最近 5 步命中率、上下文 token 估计、后台子代理数、是否阻塞 |
+| `cache.history` | `usage:read` | `range = 24h / 7d / 30d`，按小时或按天聚合 |
+| `cache.retention` | `usage:read` | 按空闲时长分桶统计"空闲后第一次请求"的命中率，作为保活阈值的观测参考，不换算倒计时 |
+| `cache.receipts` | `usage:read` | 保活/压缩/恢复的执行回执，区分"官方已接收"与"官方已完成" |
+
+`monitor.summary` 在 Monitor 插件化之前保留为**过渡兼容层**：把 `cache.summary` 的数据映射回旧结构，并带 `compat` 说明。core 不新增常驻缓存指示（D10）。
+
+### 缓存策略
+
+- **后台等待保活**（默认关闭）：条件是会话运行中、存在未返回的后台子代理、主代理自己的最近一次模型请求距今达到阈值（默认 25 分钟，范围 5–60），且没有待审批、无 Goal 阻塞。时钟取 `cache_steps` 中 `agent='main'` 的最后一步，**子代理活动不刷新该时钟**。
+- 保活文案固定为 `[缓存保活] 这是自动发送的缓存保活消息，不需要任何操作或回复，请继续等待后台任务完成。`，不使用"继续"这类会改变主代理行为的指令。
+- **闭环**：发送后异步轮询主代理下一步——`input_cache_read > 0` 记成功；`= 0` 且该模型从未上报缓存字段记 `unknown`（不伪造成功）；`= 0` 但有上报则记无效；5 分钟内没有新步骤也记无效。**不自动重试。**
+- **阻塞等待不可保活**：主代理停在阻塞调用里时消息只排队到等待结束。检测到该状态记 `skipped` 并说明原因，不发送、不记成功。
+- **空闲自动压缩**（默认关闭）与**额度恢复**（默认关闭）保留；同一会话不会同时保活和压缩——运行中只可能保活，空闲时只可能压缩。压缩仍遵守"ACK 只记已接收，官方完成事件才记完成"。
+- 三项分别授权，界面说明保活会消耗一次请求额度并在主会话留下一条消息。
+
+### 设置页
+
+`web/src/components/CacheSettings.tsx` 分五组：概览、会话、策略、实际用量、最近执行记录。只用宿主 CSS 变量与原生结构（`ekds-*` / `eks-*`），不铺不透明背景，不展示推测 TTL（D4）。表单规则：开关即时保存；数字失焦且校验通过才提交；后台 `automation` 事件不得覆盖正在编辑的草稿或写入中的策略。

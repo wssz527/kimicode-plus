@@ -391,7 +391,13 @@ async function installNativeRenderer(options) {
   nativeStyle.textContent = `
     [data-ekd-containment=planner]>:not(.ekd-planner-host),[data-ekd-containment=sessions]>:not(.ekd-session-host),[data-ekd-containment=settings]>:not(.ekd-settings-mount){display:none!important}
     .ekd-planner-host,.ekd-session-host{display:flex;flex:1;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden}
-    .ekd-settings-mount{display:block;width:100%;min-width:0;min-height:0;box-sizing:border-box;flex:none}
+    /* The official settings body is a fixed-height box that does not scroll. The
+       mount therefore owns the scroll for the enhanced page only: it is clamped to
+       the body's height and scrolls its own content. Without this the tail of the
+       panel sits below the dialog and cannot be reached by wheel, keyboard or
+       scripted scrolling. flex:1 1 auto covers a flex body, max-height:100% covers
+       a block body; both resolve against the body's definite height. */
+    .ekd-settings-mount{display:block;width:100%;min-width:0;min-height:0;flex:1 1 auto;max-height:100%;box-sizing:border-box;overflow-y:auto;overscroll-behavior:contain}
     .ekd-native-entry{position:relative}
     .ekd-native-entry[data-error="true"]{color:var(--red,#ff8a8c)}
     .ekd-session-picker{width:min(520px,calc(100vw - 40px));max-height:min(680px,calc(100vh - 60px));padding:0;border:1px solid var(--color-line,#8884);border-radius:8px;background:var(--color-bg,#121212);color:var(--color-text,#eee);font:13px/1.5 var(--font-ui,system-ui);box-shadow:0 16px 50px rgba(0,0,0,.24)}

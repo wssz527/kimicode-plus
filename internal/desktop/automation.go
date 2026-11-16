@@ -8,11 +8,17 @@ import (
 	"time"
 )
 
+// KeepAliveSettings configures the background-wait keepalive only.
+//
+// D8: this never applies to an idle session. Minutes counts from the main agent's
+// own last model request, not from session or subagent activity.
 type KeepAliveSettings struct {
 	Enabled bool `json:"enabled"`
 	Minutes int  `json:"minutes"`
 }
 
+// CompactionSettings configures idle auto-compaction, which replaces keepalive for
+// idle sessions. It only ever runs when the session is neither busy nor active.
 type CompactionSettings struct {
 	Enabled          bool `json:"enabled"`
 	IdleMinutes      int  `json:"idleMinutes"`
@@ -67,9 +73,17 @@ func (s *NativeService) automationSettings(ctx context.Context) (AutomationSetti
 	return settings, validateAutomationSettings(settings)
 }
 
+// keepAliveMinMinutes / keepAliveMaxMinutes bound the main-agent inactivity
+// threshold. The plan fixes the range at 5 to 60 minutes; the user's measured
+// cache loss is around 30.
+const (
+	keepAliveMinMinutes = 5
+	keepAliveMaxMinutes = 60
+)
+
 func validateAutomationSettings(settings AutomationSettings) error {
-	if settings.KeepAlive.Minutes < 5 || settings.KeepAlive.Minutes > 120 {
-		return errors.New("保活阈值须为 5–120 分钟")
+	if settings.KeepAlive.Minutes < keepAliveMinMinutes || settings.KeepAlive.Minutes > keepAliveMaxMinutes {
+		return errors.New("保活阈值须为 5–60 分钟")
 	}
 	if settings.Compaction.IdleMinutes < 5 || settings.Compaction.IdleMinutes > 1440 {
 		return errors.New("空闲阈值须为 5–1440 分钟")

@@ -100,7 +100,7 @@ func nativeActionPermission(action string) string {
 		return "core:read"
 	case "session.view", "session.watch", "session.unwatch":
 		return "tasks:read"
-	case "managed.usage", "monitor.summary":
+	case "managed.usage", "monitor.summary", "cache.summary", "cache.sessions", "cache.history", "cache.retention", "cache.receipts":
 		return "usage:read"
 	case "config.save", "automation.set", "recovery.set":
 		return "settings:write"
