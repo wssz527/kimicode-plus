@@ -4,11 +4,11 @@ import { PageHeader, Panel } from "../components/ui";
 import { useResource } from "../lib/useResource";
 import { api } from "../api";
 import { useHostContext } from "../host";
-import { getDemoHost } from "../native";
+import { useHost } from "../native";
 export function HomePage() {
   const tasks = useResource("home/tasks", () => api.tasks.list(0, 5));
   const context = useHostContext();
-  const native = getDemoHost();
+  const native = useHost();
   const routes = native ? ROUTES.filter(r => !["/chat", "/handoff", "/workspace", "/browser"].includes(r.path)) : ROUTES;
   return <div className="page"><PageHeader title="增强设置" description={context ? `继续 ${context.title || context.sessionId} 的工作。` : "管理模型、查看用量和组织任务。本地数据保存在增强核心中。"} />
     <div className="feature-list">{routes.filter(r => r.path !== "/").map(route => <button className="feature-row" key={route.path} onClick={() => navigate(route.path)}><Icon name={route.icon} size={19} /><span><strong>{route.label}</strong><small>{route.summary}</small></span><span aria-hidden="true">›</span></button>)}</div>

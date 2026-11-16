@@ -54,6 +54,7 @@ type NativeService struct {
 	wg           sync.WaitGroup
 	cache        map[string]cachedSession
 	planner      PlannerActions
+	attach       AttachConfig
 }
 
 const addonFeaturesKey = "features"
@@ -261,6 +262,12 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 	case "managed.usage":
 		raw, err := s.kap.Request(ctx, http.MethodGet, "/oauth/usage", nil)
 		return rawAsAny(raw), err
+	case "attach.status":
+		return s.attachStatus(ctx), nil
+	case "attach.enable":
+		return s.enableAttach(ctx, input)
+	case "attach.disable":
+		return s.disableAttach()
 	case "monitor.summary":
 		return s.monitorSummary(ctx), nil
 	case "automation.get":

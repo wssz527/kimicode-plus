@@ -25,11 +25,20 @@ fi
 mkdir -p "$DATA_DIR"
 echo "数据目录：$DATA_DIR"
 echo "日志：$LOG"
+RUNTIME="$DATA_DIR/runtime.json"
+# A previous run killed by SIGKILL or a power loss never reached its `defer
+# os.Remove`, so a stale file would hand this script the old port and the old
+# (already invalid) pairing token. Remove only this data directory's file before
+# starting, so the wait loop below can only observe the new process's record.
+if [ -e "$RUNTIME" ]; then
+  echo "清理上次异常退出残留的 runtime.json"
+  rm -f "$RUNTIME"
+fi
+
 "./dist/enhanced-kimi" --data-dir "$DATA_DIR" --port "$PORT" >>"$LOG" 2>&1 &
 PID=$!
 trap 'kill "$PID" 2>/dev/null || true' EXIT INT TERM
 
-RUNTIME="$DATA_DIR/runtime.json"
 for _ in $(seq 1 100); do
   if [ -f "$RUNTIME" ]; then break; fi
   if ! kill -0 "$PID" 2>/dev/null; then

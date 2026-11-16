@@ -95,60 +95,92 @@ func (k *KAPClient) Unwatch(id string) {
 }
 
 func (k *KAPClient) RunEvents(ctx context.Context, onFrame func(NativeFrame)) {
+	backoff := k.backoffMin
 	for ctx.Err() == nil {
-		endpoint, token, err := k.websocketURL()
-		if err == nil {
-			var conn *websocket.Conn
-			conn, _, err = websocket.Dial(ctx, endpoint, &websocket.DialOptions{Subprotocols: []string{"kimi-code.bearer." + token}, HTTPHeader: http.Header{"User-Agent": []string{"EKD/0.3"}}})
-			if err == nil {
-				conn.SetReadLimit(8 << 20)
-				k.mu.Lock()
-				k.socket = conn
-				watched := make([]string, 0, len(k.watched))
-				for id := range k.watched {
-					watched = append(watched, id)
-				}
-				k.mu.Unlock()
-				for _, id := range watched {
-					_ = k.sendFrame(map[string]any{"type": "subscribe", "request_id": id, "session_id": id})
-				}
-				for ctx.Err() == nil {
-					_, data, readErr := conn.Read(ctx)
-					if readErr != nil {
-						break
-					}
-					frames := []NativeFrame{}
-					if len(data) > 0 && data[0] == '[' {
-						if json.Unmarshal(data, &frames) != nil {
-							continue
-						}
-					} else {
-						var frame NativeFrame
-						if json.Unmarshal(data, &frame) != nil {
-							continue
-						}
-						frames = append(frames, frame)
-					}
-					for _, frame := range frames {
-						if frame.Type == "ping" {
-							_ = k.sendFrame(map[string]any{"type": "pong"})
-							continue
-						}
-						onFrame(frame)
-					}
-				}
-			}
+		connected, err := k.runEventConnection(ctx, onFrame)
+		if ctx.Err() != nil {
+			return
 		}
-		k.mu.Lock()
-		if k.socket != nil {
-			_ = k.socket.Close(websocket.StatusNormalClosure, "reconnect")
-			k.socket = nil
+		// A socket that carried traffic earns a fresh short backoff. A socket
+		// that never opened keeps doubling, so a quit official client is found
+		// within seconds instead of being polled every 1.5s forever.
+		if connected {
+			backoff = k.backoffMin
+		} else if err != nil && k.home != "" {
+			// The recorded port and token belong to the process that wrote them.
+			k.invalidate()
 		}
-		k.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(1500 * time.Millisecond):
+		case <-time.After(backoff):
+		}
+		if backoff < k.backoffMax {
+			if backoff *= 2; backoff > k.backoffMax {
+				backoff = k.backoffMax
+			}
 		}
 	}
+}
+
+// runEventConnection keeps one socket alive and reports whether it ever became
+// usable, so the caller can decide how far to back off.
+func (k *KAPClient) runEventConnection(ctx context.Context, onFrame func(NativeFrame)) (bool, error) {
+	endpoint, token, err := k.websocketURL()
+	if err != nil {
+		return false, err
+	}
+	conn, _, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{Subprotocols: []string{"kimi-code.bearer." + token}, HTTPHeader: http.Header{"User-Agent": []string{"EKD/0.3"}}})
+	if err != nil {
+		return false, err
+	}
+	conn.SetReadLimit(8 << 20)
+	k.mu.Lock()
+	k.socket = conn
+	watched := make([]string, 0, len(k.watched))
+	for id := range k.watched {
+		watched = append(watched, id)
+	}
+	k.mu.Unlock()
+	for _, id := range watched {
+		if err = k.sendFrame(map[string]any{"type": "subscribe", "request_id": id, "session_id": id}); err != nil {
+			break
+		}
+	}
+	subscribed := err == nil
+	for ctx.Err() == nil {
+		_, data, readErr := conn.Read(ctx)
+		if readErr != nil {
+			break
+		}
+		frames := []NativeFrame{}
+		if len(data) > 0 && data[0] == '[' {
+			if json.Unmarshal(data, &frames) != nil {
+				continue
+			}
+		} else {
+			var frame NativeFrame
+			if json.Unmarshal(data, &frame) != nil {
+				continue
+			}
+			frames = append(frames, frame)
+		}
+		for _, frame := range frames {
+			if frame.Type == "ping" {
+				_ = k.sendFrame(map[string]any{"type": "pong"})
+				continue
+			}
+			onFrame(frame)
+		}
+	}
+	k.mu.Lock()
+	if k.socket == conn {
+		_ = conn.Close(websocket.StatusNormalClosure, "reconnect")
+		k.socket = nil
+	}
+	k.mu.Unlock()
+	if !subscribed {
+		return false, errors.New("官方事件连接未能恢复订阅")
+	}
+	return true, nil
 }

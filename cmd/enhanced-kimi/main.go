@@ -47,11 +47,15 @@ func newHTTPServer(handler http.Handler) *http.Server {
 }
 
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "attach" {
+		return runAttach(os.Args[2:])
+	}
 	dir := flag.String("data-dir", "", "independent data directory (default: OS user config/EnhancedKimiDesktop)")
 	port := flag.Int("port", 0, "loopback port (0 selects an available port)")
 	safe := flag.Bool("safe-mode", false, "persist safe mode and disable task/plugin effects")
-	hostProfile := flag.String("host-profile", "", "explicit isolated Kimi Code profile to attach")
-	kimiHome := flag.String("kimi-home", "", "KIMI_CODE_HOME belonging to the isolated host")
+	hostProfile := flag.String("host-profile", "", "isolated Kimi Code profile to attach")
+	kimiHome := flag.String("kimi-home", "", "KIMI_CODE_HOME of the host")
+	allowDaily := flag.Bool("allow-daily-instance", false, "attach to the client you actually use (requires explicit consent)")
 	workspace := flag.String("workspace", "", "default planning workspace (defaults to the official session or process directory)")
 	version := flag.Bool("version", false, "print version")
 	flag.Parse()
@@ -106,7 +110,14 @@ func run() error {
 		}
 		cwd = filepath.Clean(*workspace)
 	}
-	app, err := server.NewWithNative(db, guard, *safe, gatewayToken, server.NativeOptions{Home: *kimiHome, CWD: cwd})
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	app, err := server.NewWithNative(db, guard, *safe, gatewayToken, server.NativeOptions{
+		Home: *kimiHome, CWD: cwd, DataDir: instance.Dir, Executable: executable,
+		Profile: *hostProfile, CoreURL: "http://" + listener.Addr().String(), PairingToken: guard.PairingToken(),
+	})
 	if err != nil {
 		return err
 	}
@@ -132,9 +143,9 @@ func run() error {
 	}()
 	var hostResult *desktop.AttachResult
 	hostError := ""
-	if *hostProfile != "" {
+	if *hostProfile != "" || *allowDaily {
 		attachCtx, attachCancel := context.WithTimeout(ctx, 90*time.Second)
-		hostResult, err = desktop.AttachNative(attachCtx, desktop.AttachOptions{Profile: *hostProfile, CoreURL: base, PairingToken: guard.PairingToken()})
+		hostResult, err = desktop.AttachNative(attachCtx, desktop.AttachOptions{Profile: *hostProfile, CoreURL: base, PairingToken: guard.PairingToken(), AllowDailyInstance: *allowDaily})
 		attachCancel()
 		if err != nil {
 			hostError = err.Error()

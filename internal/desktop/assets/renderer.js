@@ -22,25 +22,32 @@ async function installNativeRenderer(options) {
   };
   const moduleURL = URL.createObjectURL(new Blob([options.moduleSource], { type: 'text/javascript' }));
   const module = await import(moduleURL);
+  // One poll loop for the whole renderer. Every surface shares it, so three open
+  // panels no longer run three overlapping events.poll requests.
+  const channel = module.createEventChannel(transport);
   const state = {
     module,
     request: transport.request,
+    channel,
     features: { planner: false, multiSession: false },
     handles: new Set(),
-    entries: [],
+    entries: new Set(),
+    sidebarRefs: 0,
+    sidebarCollapsed: null,
     observer: null,
     panel: null,
     plannerHostElement: null,
     plannerHandle: null,
     plannerRelease: null,
+    plannerSidebarRelease: null,
     plannerTab: null,
     returnTabId: null,
     wasVisible: false,
-    collapsed: false,
     sessionContainer: null,
     sessionHostElement: null,
     sessionHandle: null,
     sessionRelease: null,
+    sessionSidebarRelease: null,
     picker: null,
     settingsDialog: null,
     settingsList: null,
@@ -64,7 +71,7 @@ async function installNativeRenderer(options) {
       close,
       popout: async source => { await transport.request('window.popout', { surface: 'planner', sourceSessionId: activeSession(), initialSource: source || 'web' }); close(); },
       pickSession: exclude => options.popout ? transport.request('host.pickSession', { exclude }) : pickSession(exclude),
-    });
+    }, channel);
   }
   function mount(element, surface, host, extra = {}) {
     const handle = module.mountSurface(element, surface, {
@@ -108,13 +115,32 @@ async function installNativeRenderer(options) {
     walk(document.querySelector('#app')?._vnode);
     return found;
   }
+  // Reference-counted sidebar collapse. The state before the first acquire is
+  // remembered so the last release restores exactly what the user had, and a
+  // sidebar that was already collapsed is never expanded by us.
+  function acquireSidebarCollapse() {
+    if (!state.sidebarRefs) {
+      const collapse = document.querySelector('button.sidebar-toggle-btn[aria-label="收起侧边栏"]');
+      state.sidebarCollapsed = collapse ? (collapse.click(), true) : null;
+    }
+    state.sidebarRefs += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      state.sidebarRefs = Math.max(0, state.sidebarRefs - 1);
+      if (state.sidebarRefs > 0) return;
+      const shouldExpand = state.sidebarCollapsed === true;
+      state.sidebarCollapsed = null;
+      if (shouldExpand) document.querySelector('button.sidebar-toggle-btn[aria-label="展开侧边栏"]')?.click();
+    };
+  }
   function collapseSidebar() {
-    const button = document.querySelector('button.sidebar-toggle-btn[aria-label="收起侧边栏"]');
-    if (button) { button.click(); state.collapsed = true; }
+    state.plannerSidebarRelease ??= acquireSidebarCollapse();
   }
   function restoreSidebar() {
-    if (state.collapsed) document.querySelector('button.sidebar-toggle-btn[aria-label="展开侧边栏"]')?.click();
-    state.collapsed = false;
+    state.plannerSidebarRelease?.();
+    state.plannerSidebarRelease = null;
   }
   function closePlanner(restore = true) {
     unmountHandle(state.plannerHandle);
@@ -168,7 +194,8 @@ async function installNativeRenderer(options) {
     state.sessionRelease?.();
     state.sessionRelease = null;
     state.sessionContainer = null;
-    restoreSidebar();
+    state.sessionSidebarRelease?.();
+    state.sessionSidebarRelease = null;
   }
   async function mountSessions(extraIds) {
     if (!state.features.multiSession) throw new Error('多屏会话是附加功能，请先在 KimiCode+ 设置中开启');
@@ -177,7 +204,7 @@ async function installNativeRenderer(options) {
     const composer = document.querySelector('.composer');
     const container = composer?.closest('.chat-main') || chat?.closest('.chat-main');
     if (!container || !composer) throw new Error('主聊天区契约未就绪');
-    collapseSidebar();
+    state.sessionSidebarRelease ??= acquireSidebarCollapse();
     state.sessionContainer = container;
     state.sessionRelease = contain(container, 'sessions');
     const element = document.createElement('div');
@@ -432,7 +459,7 @@ async function installNativeRenderer(options) {
       }
     });
     after.insertAdjacentElement('afterend', button);
-    state.entries.push(button);
+    state.entries.add(button);
     return button;
   }
   function addonEntryPlan() {
@@ -442,10 +469,10 @@ async function installNativeRenderer(options) {
     return plan;
   }
   function removeEntry(action) {
-    for (const element of state.entries) {
-      if (element.dataset?.ekdEntry === action) element.remove();
+    for (const element of [...state.entries]) {
+      if (element.dataset?.ekdEntry === action) { element.remove(); state.entries.delete(element); }
     }
-    state.entries = state.entries.filter(element => element.isConnected);
+    for (const element of [...state.entries]) if (!element.isConnected) state.entries.delete(element);
     if (action === 'planner') {
       state.plannerTab?.parentElement?.remove();
       state.plannerTab = null;
@@ -471,18 +498,49 @@ async function installNativeRenderer(options) {
       applyFeatures(null, true);
     }
   }
+  // Entry injection is per container. Each visible host menu container (the
+  // empty-panel `.sit` list and the `+` dropdown `.pl`) is checked on its own, so
+  // a container that the host re-rendered gets its entry back without a stale
+  // module-level reference deciding whether it "already exists".
+  function entryContainers() {
+    const containers = [];
+    for (const list of document.querySelectorAll('.pt-body .sit, .pt-body .pl')) containers.push(list);
+    return containers;
+  }
+  function sideChatIn(container) {
+    return [...container.querySelectorAll('button.sit-link, button.ui-menu-item')].find(button =>
+      button.querySelector('.sit-name')?.textContent.trim() === '侧边聊天'
+      || [...button.childNodes].some(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim() === '侧边聊天')) || null;
+  }
   function syncNativeEntries() {
-    state.entries = state.entries.filter(element => element.isConnected);
+    const live = new Set();
     const addonEntries = addonEntryPlan();
-    const sideChat = addonEntries.length ? [...document.querySelectorAll('button.sit-link, .pt-body .pl button.ui-menu-item')].find(button => button.querySelector('.sit-name')?.textContent.trim() === '侧边聊天' || [...button.childNodes].some(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim() === '侧边聊天')) : null;
-    if (sideChat) {
-      let anchor = sideChat;
+    for (const container of entryContainers()) {
+      const anchorHost = sideChatIn(container);
+      if (!anchorHost) continue;
+      let anchor = anchorHost;
       for (const { action, label } of addonEntries) {
-        let entry = state.entries.find(button => button.dataset.ekdEntry === action);
-        if (!entry?.isConnected) entry = makeEntry(label, action, anchor, sideChat);
+        // Duplicate guard lives inside this container: exactly one entry with
+        // this action may exist here, and a re-rendered anchor gets a new entry.
+        const existing = [...container.querySelectorAll(`button.ekd-native-entry[data-ekd-entry="${action}"]`)];
+        let entry = existing[0];
+        for (const extra of existing.slice(1)) { extra.remove(); live.delete(extra); }
+        if (!entry || entry.previousElementSibling !== anchor) {
+          entry?.remove();
+          entry = makeEntry(label, action, anchor, anchorHost);
+        }
         anchor = entry;
+        live.add(entry);
       }
     }
+    // Entries whose host container went away are dropped from the registry.
+    // Only entry buttons are owned by the container loop. Other tracked nodes
+    // (the planner tab, the Monitor host) are kept so remove() can still clean
+    // them; dropping them here is what used to leave an orphan Monitor behind.
+    for (const entry of [...state.entries]) {
+      if (entry.classList?.contains('ekd-native-entry') && !live.has(entry)) state.entries.delete(entry);
+    }
+    for (const element of live) state.entries.add(element);
     const tabs = document.querySelector('.ptb-tabs');
     if (tabs && state.features.planner && !state.plannerTab?.isConnected) {
       const wrapper = document.createElement('div'); wrapper.className = 'ptb-tab'; wrapper.dataset.ekdPlannerTab = '';
@@ -490,17 +548,23 @@ async function installNativeRenderer(options) {
       button.addEventListener('click', () => void openPlanner('web'));
       const attributes = [...tabs.attributes].filter(attribute => attribute.name.startsWith('data-v-'));
       for (const element of [wrapper, button]) for (const attribute of attributes) element.setAttribute(attribute.name, attribute.value);
-      wrapper.append(button); tabs.append(wrapper); state.plannerTab = button; state.entries.push(wrapper);
+      wrapper.append(button); tabs.append(wrapper); state.plannerTab = button; state.entries.add(wrapper);
     }
     const footer = document.querySelector('.side-footer');
     const column = footer?.closest('.col');
     if (footer && column) {
+      // Remove any Monitor host this instance does not track. A previous runtime
+      // that was removed mid-flight can leave one behind, and mounting a second
+      // would show two Monitors in the same sidebar.
+      for (const stale of document.querySelectorAll('[data-ekd-monitor]')) {
+        if (stale !== state.monitorHost) { state.entries.delete(stale); stale.remove(); }
+      }
       if (!state.monitorHost?.isConnected) {
         unmountHandle(state.monitorHandle);
         const element = document.createElement('div'); element.className = 'ekd-monitor-host'; element.dataset.ekdMonitor = '';
         footer.before(element); state.monitorHost = element;
-        const host = makeHost(() => { unmountHandle(state.monitorHandle); state.monitorHandle = null; element.remove(); });
-        state.monitorHandle = mount(element, 'monitor', host); state.entries.push(element);
+        const host = makeHost(() => { unmountHandle(state.monitorHandle); state.monitorHandle = null; element.remove(); state.entries.delete(element); });
+        state.monitorHandle = mount(element, 'monitor', host); state.entries.add(element);
       }
     }
     syncSettingsTab();

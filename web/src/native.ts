@@ -1,3 +1,4 @@
+import { createContext, useContext } from "react";
 export interface PlannerOptions {
   context: boolean;
   skills: boolean;
@@ -110,14 +111,27 @@ export function preferPlannerThread(current: PlannerThread | null, next: Planner
 
 export type DemoHost = NativeHost;
 
-let nativeHost: NativeHost | null = null;
-export function installNativeHost(host: NativeHost | null) { nativeHost = host; }
-export function installDemoHost(host: NativeHost | null) { installNativeHost(host); }
-export function getNativeHost() { return nativeHost; }
-export function getDemoHost() { return nativeHost; }
-export function demoRequest<T = unknown>(action: string, payload?: Record<string, unknown>): Promise<T> {
-  if (!nativeHost) return Promise.reject(new Error("请从 Kimi Code 的增强入口打开此功能。"));
-  return nativeHost.request<T>(action, payload);
+/**
+ * Per-mount host scope. A module-level singleton was installed and then cleared
+ * by whichever panel unmounted first, so opening and closing the settings tab
+ * detached every other panel. Each mount now owns its own scope.
+ */
+export interface HostScopeValue {
+  host: NativeHost | null;
+}
+
+export const detachedHostScope: HostScopeValue = { host: null };
+
+export const HostScopeContext = createContext<HostScopeValue>(detachedHostScope);
+
+/** The host of the surface currently rendering; null outside a native mount. */
+export function useHost(): NativeHost | null {
+  return useContext(HostScopeContext).host;
+}
+
+export function requireHost(host: NativeHost | null): NativeHost {
+  if (!host) throw new Error("请从 Kimi Code 的增强入口打开此功能。");
+  return host;
 }
 
 interface EventPage {
@@ -126,28 +140,62 @@ interface EventPage {
   reset?: boolean;
 }
 
-export function createNativeHost(transport: NativeTransport, hooks: NativeHooks): NativeHost {
-  const listeners = new Map<string, Set<(value: unknown) => void>>();
+type Listener = (value: unknown) => void;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+export interface EventChannel {
+  subscribe: (scope: string, listener: Listener) => () => void;
+  close: () => void;
+}
+
+/**
+ * One poll loop per host scope. Every surface of that scope shares it, so the
+ * renderer never runs several overlapping `events.poll` requests and a scope
+ * that unmounts stops its loop.
+ */
+export function createEventChannel(transport: NativeTransport, retryMs = 1500): EventChannel {
+  const listeners = new Map<string, Set<Listener>>();
   let cursor = -1;
   let polling = false;
   let disposed = false;
+  let wake: (() => void) | null = null;
+
+  function notifyError(cause: unknown) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    for (const listener of listeners.get("native:error") ?? []) listener(message);
+  }
+
+  function nextScopes(): string[] {
+    return [...listeners.keys()].filter(scope => scope !== "native:error" && (listeners.get(scope)?.size ?? 0) > 0);
+  }
 
   async function poll() {
     if (polling || disposed) return;
     polling = true;
     try {
-      while (!disposed && listeners.size > 0) {
-        const scopes = [...listeners.keys()].filter(scope => scope !== "native:error");
+      while (!disposed) {
+        const scopes = nextScopes();
         if (!scopes.length) break;
+        const started = Date.now();
         try {
           const page = await transport.request<EventPage>("events.poll", { after: cursor, scopes, waitMs: 8000 });
+          if (disposed) return;
           cursor = page.next;
+          if (page.reset && page.events.length) cursor = page.events[page.events.length - 1]!.sequence;
           for (const event of page.events) {
-            for (const listener of listeners.get(event.scope) ?? []) listener(event.value);
+            for (const listener of [...(listeners.get(event.scope) ?? [])]) listener(event.value);
           }
+          // The server long-polls, so an immediate empty answer means the wait
+          // was cut short. Yielding keeps a broken hop from spinning the loop.
+          if (!page.events.length && Date.now() - started < 50) await sleep(50);
         } catch (cause) {
-          for (const listener of listeners.get("native:error") ?? []) listener(cause instanceof Error ? cause.message : String(cause));
-          await new Promise(resolve => setTimeout(resolve, 1500));
+          if (disposed) return;
+          notifyError(cause);
+          await new Promise<void>(resolve => { wake = resolve; setTimeout(resolve, retryMs); });
+          wake = null;
         }
       }
     } finally {
@@ -155,21 +203,39 @@ export function createNativeHost(transport: NativeTransport, hooks: NativeHooks)
     }
   }
 
+  return {
+    subscribe(scope, listener) {
+      let group = listeners.get(scope);
+      if (!group) {
+        group = new Set();
+        listeners.set(scope, group);
+      }
+      group.add(listener);
+      if (scope !== "native:error") void poll();
+      return () => {
+        const current = listeners.get(scope);
+        current?.delete(listener);
+        if (current?.size === 0) listeners.delete(scope);
+      };
+    },
+    close() {
+      if (disposed) return;
+      disposed = true;
+      listeners.clear();
+      wake?.();
+    },
+  };
+}
+
+export function createNativeHost(transport: NativeTransport, hooks: NativeHooks, scope?: EventChannel): NativeHost {
+  const channel = scope ?? createEventChannel(transport);
+  let disposed = false;
+
   const host: NativeHost = {
     onActiveSession: hooks.onActiveSession,
     onAddSession: hooks.onAddSession,
     request: transport.request,
-    subscribe(scope, listener) {
-      let group = listeners.get(scope);
-      if (!group) { group = new Set(); listeners.set(scope, group); }
-      group.add(listener as (value: unknown) => void);
-      void poll();
-      return () => {
-        const current = listeners.get(scope);
-        current?.delete(listener as (value: unknown) => void);
-        if (current?.size === 0) listeners.delete(scope);
-      };
-    },
+    subscribe: (scopeName, listener) => channel.subscribe(scopeName, listener as Listener),
     activeSession: hooks.activeSession,
     openSession: async id => { await transport.request("host.openSession", { id }); },
     openBrowser: async (url, mode = "plan") => { await transport.request("host.openBrowser", { url, mode }); },
@@ -179,7 +245,14 @@ export function createNativeHost(transport: NativeTransport, hooks: NativeHooks)
     popout: hooks.popout ?? (async source => { await transport.request("window.popout", { surface: "planner", initialSource: source ?? "web" }); }),
     openSettings: async () => { await transport.request("window.openSettings"); },
     pickSession: hooks.pickSession ?? (async exclude => transport.request<string>("host.pickSession", { exclude })),
-    close: () => { disposed = true; hooks.close(); },
+    close: () => {
+      if (disposed) return;
+      disposed = true;
+      // A shared channel belongs to the scope: one surface closing must not cut
+      // the event stream the remaining surfaces still use.
+      if (!scope) channel.close();
+      hooks.close();
+    },
   };
   return host;
 }

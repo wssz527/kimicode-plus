@@ -10,9 +10,15 @@ Go Core 仍可独立运行。当前原生路径已在隔离 Kimi Code 1.3.5 / El
 
 官方界面以 Vue #app 为根，使用 data-color-scheme 与字体变量。`internal/desktop/assets/renderer.js` 在官方右侧 `pt-body` 挂载规划，在主聊天 `.chat-main` 挂载多会话，在侧栏 `side-footer` 前挂载 Monitor 和设置入口。统一“规划”入口默认网页，来源与配置位于菜单；入口分别克隆已有会话侧栏行和空会话工具菜单行。容器属性与 CSS 持续隐藏 Vue 重建的官方子节点，切回原生工具或单会话时释放。内容采用 Shadow DOM 隔离 CSS，并同步宿主主题。
 
-设置嵌入官方设置对话框，KimiCode+ 标签在“已归档”前，不默认创建独立 BrowserWindow。首页为单层 11 项列表与子页返回，复用已有核心页面、开关和请求链路，替代旧七分类和嵌套导航。原生标签恢复、动态重附着、窄宽度和保存读回已实机通过。侧栏 Monitor 不依赖右侧工具起始页，设置入口直接克隆原生侧栏按钮；浏览器标签已打开、工具模板不存在时，核心重连仍可恢复这两项。侧栏宿主重建时先卸载旧 Monitor，避免遗留订阅和定时器。
+入口注入按容器判重：`syncNativeEntries` 遍历每个可见的宿主菜单容器（空面板 `.sit`、`+` 下拉 `.pl`），在该容器内查同动作入口，多于一个则删除多余项，锚点行被重建则重新插入。判断依据是容器内是否已有入口，不使用全局单引用加 `isConnected`，因此官方重渲染任一容器后入口都能恢复且不会重复。
 
-`web/src/host-entry.tsx` 同时保留独立管理页的 mountEnhancement 与原生 mountSurface。原生 surface 使用 createNativeHost 调用本地 RPC；设置中的 Core 数据经 `core.fetch` 由主进程转发，renderer 不持有核心 Bearer token。每个 WebContents 使用独立 bridge key，服务端校验 loopback、Origin、WebContents 归属、协议和动作名，卸载时清理连接与界面。请求 ID 在 `crypto.randomUUID()` 不可用的 opaque origin 中使用随机回退；布局、权限和缓存保存已实机通过。
+侧栏开合由 `layout.acquireSidebarCollapse()` 引用计数管理：第一次 acquire 时记录当前开合状态，最后一次 release 时按记录恢复；本来就折叠的侧栏不会被展开。规划和同屏各持一份 release，互不影响。
+
+设置嵌入官方设置对话框，KimiCode+ 标签在“已归档”前，不默认创建独立 BrowserWindow。首页为单层列表与子页返回，复用已有核心页面、开关和请求链路。原生标签恢复、动态重附着、窄宽度和保存读回已实机通过。侧栏 Monitor 不依赖右侧工具起始页；侧栏宿主重建时先卸载旧 Monitor，避免遗留订阅和定时器。
+
+`web/src/host-entry.tsx` 同时保留独立管理页的 mountEnhancement 与原生 mountSurface。宿主对象按挂载实例经 React Context 注入（`HostScopeContext` / `useHost`），不再有模块级单例，卸载任一面板不会清空其他面板的宿主。核心传输与内嵌导航按挂载数引用计数，最后一个面板卸载后才断开。`host.ts` 的 `releaseHost(expected)` 只在连接仍是自己安装的那个时才清除。
+
+渲染进程只保留一条 `events.poll` 长轮询：`createEventChannel` 在 renderer 中创建一次，所有面板的 host 共享并在进程内广播，面板关闭时只退订自己的 scope。全部面板关闭后循环自然结束。空页且往返过快时让出 50ms，避免等待被提前切断时自旋。设置中的 Core 数据经 `core.fetch` 由主进程转发，renderer 不持有核心 Bearer token。每个 WebContents 使用独立 bridge key，服务端校验 loopback、Origin、WebContents 归属、协议和动作名，卸载时清理连接与界面。请求 ID 在 `crypto.randomUUID()` 不可用的 opaque origin 中使用随机回退；布局、权限和缓存保存已实机通过。
 
 ## 内置浏览器入口（2026-11-12 的历史验证）
 
@@ -24,14 +30,50 @@ Go Core 仍可独立运行。当前原生路径已在隔离 Kimi Code 1.3.5 / El
 
 当前产品接入器使用用户已授权的运行时路径，不改包体：
 
-1. 向运行中的 Kimi Code 主进程发送 SIGUSR1，触发 Node inspector 监听 127.0.0.1:9229（Node 内置能力，无需启动参数）。
-2. 经 `/json/list` 取 node 目标的 webSocketDebuggerUrl，用 CDP `Runtime.evaluate` 在主进程加载接入钩子。
-3. 钩子借主进程 webContents 向 renderer 注入 UI，并在 `did-finish-load` 后重新挂载；卸载与核心重启时清理入口、视图和连接，注入完成后关闭 inspector，不留调试端口。
-4. 附着前核对可执行路径、显式隔离 profile、唯一主进程、PID、进程类型、应用/Electron 版本与 renderer DOM 契约，失配则降级停用，不盲目注入。
+1. 发现唯一主进程，核对进程身份（uid、启动时间、可执行路径）、运行镜像 inode、Electron fuse 与 renderer DOM 契约。任一项不满足即停用，不盲目注入。
+2. 向运行中的 Kimi Code 主进程发送 SIGUSR1，触发 Node inspector 监听 127.0.0.1:9229（Node 内置能力，无需启动参数）。
+3. 端口出现后先用 `lsof` 确认监听者就是目标 PID，再经 `/json/list` 取 node 目标的 webSocketDebuggerUrl。
+4. 第一条 inspector 命令即安装 12 秒自动关闭的 deadline，并校验 `process.pid`、`process.type` 与 Electron 版本。
+5. 钩子借主进程 webContents 向 renderer 注入 UI，并在 `did-finish-load` 后重新挂载；卸载与核心重启时清理入口、视图和连接。
+6. 关闭时清除 deadline 并自宿主内部关闭 inspector，随后最多轮询 15 秒确认端口真的关闭；关不掉时明确报告，而不是留下调试端口。
 
-EKD 当前由 `internal/desktop/inject.go`、`cdp.go` 和内嵌 JS 实现该机制。仅接受明确列出的宿主版本；当前契约为 1.3.4/1.3.5 + Electron 45.1.0 + DOM revision 1。附着要求显式 `--host-profile` 和对应 `--kimi-home`，避免误附着开发主实例。核心重启会清理旧 HTTP 连接、撤销旧界面并重新配对；MutationObserver 自旋和空会话选择器问题已修复。
+EKD 由 `internal/desktop/inject.go`、`cdp.go`、`inspector_fuse.go` 和内嵌 JS 实现该机制。仅接受明确列出的宿主版本；当前契约为 1.3.4/1.3.5 + Electron 45.1.0 + DOM revision 1。
 
-早期 1.3.3 独立 BrowserWindow 与 1.3.4 设置内嵌样例是历史验证。当前 1.3.5 已使用正式本地 RPC，不再经 console-message 演示桥。真实 KAP 由 Go 客户端读取指定隔离 KIMI_CODE_HOME 下的实例记录和 `server.token`，访问 `/api/v1`；不会扫描或接管其他 profile。
+**不再要求 `--user-data-dir`**。这一条曾把接入限制成"只能接隔离副本"，而从程序坞正常启动的实例没有该参数。现在的规则：
+
+- `--host-profile` 为空时，「接入」（`attach --kimi-home <home>`）与自动发现都接受当前唯一主进程，并把它识别为**日常实例**。
+- 日常实例必须由用户在设置里显式同意（`--allow-daily-instance` / 设置页的同意勾选）。没有这份同意时返回"需要授权"，绝不静默附着。
+- 带 `--user-data-dir`、`--remote-debugging`、`--inspect` 的实例一律视为调试实例，不自动接入。
+
+### 可选的 LaunchAgent 事件驱动接入
+
+`launch_agent.go` 提供默认关闭、用户显式开启的常驻接入：
+
+- plist 使用 `WatchPaths` 指向 `KIMI_CODE_HOME/server/instances` 与 `server.token`。这两个文件在官方客户端每次启动时被重写，因此重启或刷新会触发一次接入；**不使用 `StartInterval`，不轮询进程**。
+- 同时设置 `RunAtLoad`（开启时客户端已在运行也能立刻接入）与 `ThrottleInterval 5`（避免一次启动写出多份 profile 文件时反复拉起）。
+- 安装采用"写 `.next` 再 rename"的原子替换；旧的已加载 job 先 `bootout` 再 `bootstrap`，避免 EEXIST。卸载幂等。
+- 状态判定要求"plist 存在**且** job 已加载"，只有两者都成立才在界面上显示为已开启。
+- **plist 的 `ProgramArguments` 携带接入所需的全部参数，包括 `--core-url` 与 `--pairing-token`。** launchd 唤醒 agent 时没有任何其他输入渠道，缺任一项都会让每次唤醒失败，而界面仍显示"已开启"。因此这两项与 plist、程序化安装共用同一个参数构造函数（`AttachArguments`），plist 渲染结果与 CLI 参数集合由回归测试逐项比对，防止再次漂移。凭据排在参数末尾，避免含 `=`/`-` 的 token 被当作 flag。
+- **plist 含配对凭据，权限固定 `0600`（仅属主可读写）**；仅在用户显式开启后台接入时写入 `~/Library/LaunchAgents/`，卸载时一并删除。凭据不写入日志；`attach.log` 与 `attach-state.json` 只记录结果与错误原因。
+- 安装前先用真实 flag 集合解析一遍渲染出的参数；解析或必填项校验失败时**不写入** plist，避免留下一个必然失败的 agent。
+
+### Electron fuse 位次与版本绑定
+
+- Node inspector 信号 fuse 的**位次是 Electron 源码顺序的属性，不是从二进制里推得出来的**，跨大版本可能移动。因此位次按 Electron 版本显式绑定在 `VerifiedFuseLayouts` 表中（当前仅 `45.1.0`：block version 1、9 个 fuse、信号位次 3），并与宿主契约共用同一个 `SupportedElectron` 常量。
+- 表中没有的 Electron 版本**失败关闭**，返回"该 Electron 版本未经验证 fuse 布局"，不猜测新布局。声明数量、block version 与位次表不一致时同样判为未知布局，而不是照旧读取可能已指向别的 fuse 的位置。
+- 读取不再整文件加载（本机 `Electron Framework` 约 207MB，而 `attach.status` 会被设置页反复轮询）：改为 1MB 分块流式扫描并保留跨块 carry，内存与文件大小无关；同一文件（size + mtime）与同一 Electron 版本的结果缓存，文件变化即失效。
+- 每次运行的结论写入 `attach-state.json`；需要授权时该文件带 `consentRequired: true`，设置页据此给出说明而不是只显示一个失败状态。
+
+命令行入口：
+
+```
+enhanced-kimi attach --kimi-home <home> --core-url <url> --pairing-token <token> [--host-profile <path>] [--allow-daily-instance]
+enhanced-kimi attach --kimi-home <home> --core-url <url> --pairing-token <token> --install
+enhanced-kimi attach --uninstall
+enhanced-kimi attach --status --data-dir <dir>
+```
+
+早期 1.3.3 独立 BrowserWindow 与 1.3.4 设置内嵌样例是历史验证。当前 1.3.5 已使用正式本地 RPC，不再经 console-message 演示桥。真实 KAP 由 Go 客户端读取指定隔离 KIMI_CODE_HOME 下的实例记录和 `server.token`，访问 `/api/v1`；不会扫描或接管其他 profile。实例记录和凭据在连接失败或 401 时重新解析一次再重试，非幂等请求不会被盲目重发。
 
 ## 网页、自动化与 Monitor
 

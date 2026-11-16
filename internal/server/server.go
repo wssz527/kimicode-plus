@@ -35,8 +35,13 @@ type Module struct {
 	Message string `json:"message,omitempty"`
 }
 type NativeOptions struct {
-	Home string
-	CWD  string
+	Home         string
+	CWD          string
+	DataDir      string
+	Executable   string
+	Profile      string
+	CoreURL      string
+	PairingToken string
 }
 
 type App struct {
