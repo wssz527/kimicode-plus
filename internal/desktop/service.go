@@ -23,6 +23,13 @@ type PlannerActions interface {
 	PlannerModels(context.Context) (any, error)
 }
 
+// AddonFeatureState are the optional surfaces kept out of the core product.
+// Both default to false: an unset or unreadable row never enables an addon.
+type AddonFeatureState struct {
+	Planner      bool `json:"planner"`
+	MultiSession bool `json:"multiSession"`
+}
+
 type cachedSession struct {
 	session      NativeSession
 	turns        []NativeTurn
@@ -43,9 +50,57 @@ type NativeService struct {
 
 	mu           sync.Mutex
 	automationMu sync.Mutex
+	featureMu    sync.Mutex
 	wg           sync.WaitGroup
 	cache        map[string]cachedSession
 	planner      PlannerActions
+}
+
+const addonFeaturesKey = "features"
+
+func (s *NativeService) addonFeatures(ctx context.Context) (AddonFeatureState, error) {
+	state := AddonFeatureState{}
+	var raw string
+	err := s.db.QueryRowContext(ctx, `SELECT data FROM native_state WHERE key=?`, addonFeaturesKey).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return state, nil
+	}
+	if err != nil {
+		return state, err
+	}
+	if err = json.Unmarshal([]byte(raw), &state); err != nil {
+		return AddonFeatureState{}, errors.New("附加功能设置无法读取，请重新保存")
+	}
+	return state, nil
+}
+
+func (s *NativeService) storeAddonFeatures(ctx context.Context, state AddonFeatureState) error {
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO native_state(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data`, addonFeaturesKey, string(data))
+	return err
+}
+
+func (s *NativeService) setAddonFeatures(ctx context.Context, payload json.RawMessage) (AddonFeatureState, error) {
+	s.featureMu.Lock()
+	defer s.featureMu.Unlock()
+	state, err := s.addonFeatures(ctx)
+	if err != nil {
+		return state, err
+	}
+	previous := state
+	if err = json.Unmarshal(payload, &state); err != nil {
+		return previous, errors.New("附加功能设置格式无效")
+	}
+	if err = s.storeAddonFeatures(ctx, state); err != nil {
+		return previous, err
+	}
+	if state != previous {
+		s.bus.Publish("features", state)
+	}
+	return state, nil
 }
 
 func NewNativeService(db *sql.DB, kap *KAPClient, cwd string, safe func() bool) (*NativeService, error) {
@@ -124,6 +179,13 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		}
 	}
 	if strings.HasPrefix(action, "planner.") {
+		features, err := s.addonFeatures(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !features.Planner {
+			return nil, errors.New("规划是附加功能，请先在设置中开启")
+		}
 		s.mu.Lock()
 		planner := s.planner
 		s.mu.Unlock()
@@ -135,6 +197,10 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 	switch action {
 	case "bootstrap":
 		return s.bootstrap(ctx)
+	case "features.get":
+		return s.addonFeatures(ctx)
+	case "features.set":
+		return s.setAddonFeatures(ctx, payload)
 	case "events.poll":
 		after, _ := input["after"].(float64)
 		wait, _ := input["waitMs"].(float64)
@@ -254,12 +320,16 @@ func (s *NativeService) bootstrap(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	features, err := s.addonFeatures(ctx)
+	if err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	planner := s.planner
 	s.mu.Unlock()
 	threads := any([]any{})
 	modelList := any(models)
-	if planner != nil {
+	if planner != nil && features.Planner {
 		threads, err = planner.PlannerThreads(ctx)
 		if err != nil {
 			return nil, err
@@ -273,7 +343,7 @@ func (s *NativeService) bootstrap(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"cwd": s.cwd, "models": modelList, "nativeModels": models, "threads": threads, "sessions": sessions, "recovery": recovery.Recovery}, nil
+	return map[string]any{"cwd": s.cwd, "models": modelList, "nativeModels": models, "threads": threads, "sessions": sessions, "recovery": recovery.Recovery, "features": features}, nil
 }
 
 func (s *NativeService) nativeTurns(ctx context.Context, id string, count int) ([]NativeTurn, error) {
