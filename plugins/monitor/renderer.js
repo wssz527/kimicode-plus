@@ -1038,7 +1038,7 @@ export async function activate(ctx) {
     // Points are one bucket each: cache.history aggregates per hour for 24h and per
     // day for 7d/30d, so calling a point "one request" would describe the data
     // wrongly. A gap is a bucket with no reported hit rate.
-    const unit = model.unit === "day" ? "天" : "小时";
+    const unit = state.range === "24h" ? "小时" : "天";
     module.append(node("p", "ksb-footnote", `每个点是该${unit}的聚合命中率；断开的区间表示该${unit}供应商未上报。`));
     return [module];
   }

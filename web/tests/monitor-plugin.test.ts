@@ -650,6 +650,7 @@ test("the trend window follows the sidebar range instead of a fixed label", () =
   assert.doesNotMatch(rendererSource, /"近 24 小时"/);
   // A point is one aggregated bucket, not a single request.
   assert.match(trend, /聚合命中率/);
+  assert.match(trend, /state\.range === "24h" \? "小时" : "天"/);
   assert.doesNotMatch(trend, /一次真实上报/);
 });
 

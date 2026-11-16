@@ -573,7 +573,6 @@ func (h *syncHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.inner.ServeHTTP(w, r)
 }
 
-
 // TestAutomationIntentsLegacyTimestampsAreBackfilled covers the table the reviewer
 // asked about: its cooldown, supersede and expire queries all compare timestamps as
 // text, so a legacy variable-width row must not survive a restart.
