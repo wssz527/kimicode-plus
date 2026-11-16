@@ -338,6 +338,40 @@ func TestConcurrentEnableAndActionIsRaceFree(t *testing.T) {
 	wait.Wait()
 }
 
+// TestEnableAlreadyEnabledReturnsCurrentState pins the fast path: enabling a
+// plugin that is already running returns the entry's current projection instead
+// of re-issuing work. That projection has to be built under the manager lock —
+// a concurrent Disable rewrites the same fields — so the returned value must
+// reflect a coherent state rather than a mix of pre- and post-transition reads.
+func TestEnableAlreadyEnabledReturnsCurrentState(t *testing.T) {
+	manager, _ := testManager(t, func() bool { return false })
+	ctx := context.Background()
+	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := manager.Enable(ctx, "test.sample")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := manager.Enable(ctx, "test.sample")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.State != StateEnabled || !again.Enabled || !again.Desired {
+		t.Fatalf("re-enable did not report the running state: %#v", again)
+	}
+	if again.Token != "" {
+		t.Fatalf("re-enable returned a token; only the first enable issues one: %#v", again)
+	}
+	if first.Token == "" {
+		t.Fatal("the first enable issued no token")
+	}
+	if again.ID != first.ID || again.Version != first.Version {
+		t.Fatalf("re-enable changed identity: %#v vs %#v", again, first)
+	}
+}
+
 func TestReportErrorIsRecordedWithoutCore(t *testing.T) {
 	manager, _ := testManager(t, func() bool { return false })
 	ctx := context.Background()

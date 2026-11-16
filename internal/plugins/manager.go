@@ -317,7 +317,7 @@ func (m *Manager) snapshot() []Plugin {
 			continue
 		}
 		installed[id] = true
-		out = append(out, m.present(item))
+		out = append(out, m.presentLocked(item))
 	}
 	m.mu.Unlock()
 	// Restorable entries need the embedded set and the tombstone rows, and both
@@ -366,7 +366,11 @@ func (m *Manager) restorable(installed map[string]bool) []Plugin {
 	return out
 }
 
-func (m *Manager) present(item *entry) Plugin {
+// presentLocked builds the API projection of one entry. The caller must hold
+// m.mu: every field it reads (state, enabled, forced, errText, updated) is
+// written by Enable/Disable/Fail under that same lock, so building the projection
+// after unlocking would race with a concurrent transition.
+func (m *Manager) presentLocked(item *entry) Plugin {
 	plugin := Plugin{
 		ID:           item.manifest.ID,
 		Name:         item.manifest.Name,
@@ -446,7 +450,7 @@ func (m *Manager) Get(id string) (Plugin, bool) {
 	if !ok {
 		return Plugin{}, false
 	}
-	return m.present(item), true
+	return m.presentLocked(item), true
 }
 
 // GrantsFor returns the granted capabilities of an enabled plugin. The zero
@@ -571,8 +575,11 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 		return Plugin{}, apiError(http.StatusConflict, "MANAGER_CLOSED", "插件管理器已关闭")
 	}
 	if item.state == StateEnabled {
+		// Build the projection while the lock is still held: presentLocked reads
+		// fields that a concurrent Disable writes under the same lock.
+		plugin := m.presentLocked(item)
 		m.mu.Unlock()
-		return m.present(item), nil
+		return plugin, nil
 	}
 	safe := m.safe()
 	manifest := item.manifest
@@ -607,7 +614,7 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 	item.forced = force && !m.compatible(manifest)
 	item.updated = now
 	token, tokenErr := m.issueTokenLocked(id)
-	plugin := m.present(item)
+	plugin := m.presentLocked(item)
 	m.mu.Unlock()
 
 	if tokenErr != nil {

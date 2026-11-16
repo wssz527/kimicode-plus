@@ -228,7 +228,7 @@ func (m *Manager) Install(ctx context.Context, request InstallRequest) (Plugin, 
 		m.order = append(m.order, manifest.ID)
 		sortStrings(m.order)
 	}
-	plugin := m.present(item)
+	plugin := m.presentLocked(item)
 	m.mu.Unlock()
 	_ = recordActivity(ctx, m.db, manifest.ID, ActivityInstall, "已从本地安装 "+manifest.Name+" "+manifest.Version, now)
 	return plugin, nil
