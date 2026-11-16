@@ -34,8 +34,17 @@ func nativeTestSession(id string, contextTokens int64, contextLimit *int64) map[
 
 func newAutomationTestService(t *testing.T, handler http.Handler) (*NativeService, *sql.DB) {
 	t.Helper()
+	return newAutomationTestServiceWithHome(t, handler, "")
+}
+
+// newAutomationTestServiceWithHome injects the isolated KIMI_CODE_HOME before the
+// service starts. The client's home must not be written after construction: the
+// background event loop and the automation scheduler are already running and read it,
+// so a post-start assignment is a data race and, with -race, a test failure.
+func newAutomationTestServiceWithHome(t *testing.T, handler http.Handler, home string) (*NativeService, *sql.DB) {
+	t.Helper()
 	server := httptest.NewServer(handler)
-	kap := NewKAPClient("")
+	kap := NewKAPClient(home)
 	kap.base, kap.token = server.URL, "synthetic"
 	db, err := storage.Open(filepath.Join(t.TempDir(), "automation.db"))
 	if err != nil {
@@ -265,8 +274,7 @@ func TestKeepAliveSendsOnceAndPreservesMode(t *testing.T) {
 			bodyMu.Unlock()
 		}
 	})
-	service, _ := newAutomationTestService(t, handler)
-	service.kap.home = home
+	service, _ := newAutomationTestServiceWithHome(t, handler, home)
 	service.verifyPoll = 20 * time.Millisecond
 	service.verifyWindow = 500 * time.Millisecond
 	now := time.Now().UTC()

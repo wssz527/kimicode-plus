@@ -84,9 +84,9 @@ func keepAliveService(t *testing.T, home string, session map[string]any, prompts
 			}
 		}
 	})
-	service, _ := newAutomationTestService(t, handler)
-	// Point the cache layer at the synthesised home.
-	service.kap.home = home
+	// The synthesised home is injected before the service starts: writing it after
+	// construction races the background event loop and the automation scheduler.
+	service, _ := newAutomationTestServiceWithHome(t, handler, home)
 	service.verifyPoll = 20 * time.Millisecond
 	service.verifyWindow = 500 * time.Millisecond
 	// The session map passed by the caller is the source of truth, so a test can set

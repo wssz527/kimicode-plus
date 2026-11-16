@@ -121,9 +121,17 @@ func NewNativeService(db *sql.DB, kap *KAPClient, cwd string, safe func() bool) 
 	}); err != nil {
 		return nil, err
 	}
+	// automation_intents timestamps are ordered as text (the cooldown, supersede and
+	// restart queries all compare them), so legacy variable-width rows are rewritten.
+	if err := storage.BackfillSortableTimes(context.Background(), db, []storage.TimeColumn{
+		{Table: "automation_intents", Column: "created_at"},
+		{Table: "automation_intents", Column: "updated_at"},
+	}); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	service := &NativeService{db: db, kap: kap, bus: NewEventBus(), cwd: cwd, safe: safe, ctx: ctx, cancel: cancel, cache: map[string]cachedSession{}}
-	if _, err := db.ExecContext(ctx, `UPDATE automation_intents SET state='unknown',result='核心重启后无法确认原请求结果，不会自动重发',updated_at=? WHERE state IN ('pending','acknowledged')`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if _, err := db.ExecContext(ctx, `UPDATE automation_intents SET state='unknown',result='核心重启后无法确认原请求结果，不会自动重发',updated_at=? WHERE state IN ('pending','acknowledged')`, storage.SortableTime(time.Now().UTC())); err != nil {
 		cancel()
 		return nil, err
 	}

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"enhancedkimi/internal/security"
+	"enhancedkimi/internal/storage"
 )
 
 const automationCooldown = 5 * time.Minute
@@ -138,7 +139,7 @@ func (s *NativeService) beginAutomation(ctx context.Context, kind, sessionID, re
 		ContextRevision: revision, State: "pending", CreatedAt: now, UpdatedAt: now,
 	}
 	result, err := s.db.ExecContext(ctx, `INSERT INTO automation_intents(id,kind,host_id,session_id,model_id,context_revision,state,created_at,updated_at,result) VALUES(?,?,?,?,?,?,?,?,?,'')`,
-		intent.ID, intent.Kind, intent.HostID, intent.SessionID, intent.ModelID, intent.ContextRevision, intent.State, intent.CreatedAt.Format(time.RFC3339Nano), intent.UpdatedAt.Format(time.RFC3339Nano))
+		intent.ID, intent.Kind, intent.HostID, intent.SessionID, intent.ModelID, intent.ContextRevision, intent.State, storage.SortableTime(intent.CreatedAt), storage.SortableTime(intent.UpdatedAt))
 	if err != nil {
 		return intent, false, err
 	}
@@ -163,7 +164,7 @@ func (s *NativeService) automationAllowed(ctx context.Context, kind, sessionID, 
 }
 
 func (s *NativeService) updateAutomation(ctx context.Context, id, state, result string, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE automation_intents SET state=?,result=?,updated_at=? WHERE id=?`, state, result, now.Format(time.RFC3339Nano), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE automation_intents SET state=?,result=?,updated_at=? WHERE id=?`, state, result, storage.SortableTime(now), id)
 	return err
 }
 
@@ -187,7 +188,7 @@ func (s *NativeService) finishCompaction(frame NativeFrame) {
 }
 
 func (s *NativeService) expireCompactions(ctx context.Context, now time.Time) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,session_id FROM automation_intents WHERE kind='compaction' AND state='acknowledged' AND updated_at<?`, now.Add(-2*time.Minute).Format(time.RFC3339Nano))
+	rows, err := s.db.QueryContext(ctx, `SELECT id,session_id FROM automation_intents WHERE kind='compaction' AND state='acknowledged' AND updated_at<?`, storage.SortableTime(now.Add(-2*time.Minute)))
 	if err != nil {
 		return err
 	}

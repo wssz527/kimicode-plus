@@ -184,12 +184,8 @@ type parser struct {
 	blocked bool
 	// pendingBlockingCalls counts issued calls of a blocking tool awaiting a result.
 	pendingBlockingCalls int
-	// waitDeliveredSeen records that at least one wait finished, for diagnostics.
-	waitDeliveredSeen bool
-	// LastUserPrompt is the time of the newest turn.prompt written by the user.
+	// lastUserPrompt is the time of the newest turn.prompt written by the user.
 	lastUserPrompt int64
-	// LastTurnPrompt counts user prompts seen, used by retention sampling.
-	userPrompts int
 	// backgroundSubagents holds the subagent IDs spawned with run_in_background that
 	// have not completed yet.
 	backgroundSubagents map[string]bool
@@ -320,11 +316,9 @@ func (p *parser) consume(line []byte) error {
 		// WaitFor tool.call -> tool.result -> task.waitDelivered -> tool.result ->
 		// llm.request. waitDelivered fires when the wait FINISHES and its result is
 		// delivered, so treating it as "blocking started" inverts the meaning.
-		p.waitDeliveredSeen = true
 	case "turn.prompt":
 		if wire.Origin != nil && wire.Origin.Kind == "user" {
 			p.lastUserPrompt = wire.Time
-			p.userPrompts++
 		}
 	}
 	return nil

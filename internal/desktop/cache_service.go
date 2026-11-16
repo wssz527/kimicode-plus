@@ -2,8 +2,8 @@ package desktop
 
 import (
 	"context"
-	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"enhancedkimi/internal/cache"
@@ -167,8 +167,12 @@ func (s *NativeService) cachedTitle(sessionID string) string {
 // old call to keep answering until Monitor becomes a plugin, so this adapter maps
 // the new cache data onto the old shape instead of removing the action.
 //
-// It is a compatibility path only: no new field is added here, and the Monitor
-// plugin will read cache.summary directly.
+// The old surface reads the automation receipt out of `cache.value` (see
+// MonitorSurface.tsx: `asRecord(data?.cache?.value)`), and it always has: before M3
+// the cache field was replaced by `{state, source, note, value: receipt}` whenever a
+// receipt existed. `value` therefore stays reserved for the receipt object, and the
+// new hit-rate numbers travel in sibling keys the old surface ignores. Putting a
+// number in `value` would silently blank the receipt block.
 func (s *NativeService) monitorSummaryCompat(ctx context.Context) map[string]any {
 	now := time.Now().UTC()
 	summary, err := s.cacheSummary(ctx, now)
@@ -176,27 +180,35 @@ func (s *NativeService) monitorSummaryCompat(ctx context.Context) map[string]any
 		// speed keeps its historical shape: state/source/note plus a value when a
 		// real sample exists.
 		"speed": map[string]any{"state": "UNKNOWN", "source": "会话记录 decode 时长", "note": "没有可用的解码时长样本"},
-		"cache": map[string]any{"state": "UNKNOWN", "source": "会话记录 usage", "note": "统计窗口内没有缓存样本"},
+		"cache": map[string]any{"state": "UNKNOWN", "source": "社区经验提醒", "note": "25/29/30 分钟仅为经验阈值，不是官方 TTL"},
 		"quota": map[string]any{"state": "UNKNOWN", "source": "官方 /oauth/usage"},
 		// compatibility notice for the old surface only
 		"compat": map[string]any{"cacheSummary": true, "note": "monitor.summary 仅为过渡兼容，新界面使用 cache.summary"},
 	}
 	if err != nil {
 		result["error"] = err.Error()
-	} else {
-		if summary.Speed.State == cache.Reported && summary.Speed.TokensPerSecond != nil {
-			result["speed"] = map[string]any{"state": "REPORTED", "source": "会话记录 llmServerDecodeMs", "value": *summary.Speed.TokensPerSecond, "samples": summary.Speed.Samples}
-		}
+	}
+	if receipt := automationIntentSummary(ctx, s.db); receipt != nil {
+		state, _ := receipt["state"].(string)
+		result["cache"] = map[string]any{"state": strings.ToUpper(state), "source": "EKD 自动化回执", "note": receipt["note"], "value": receipt}
+	} else if err == nil {
+		// No receipt: the old surface only shows "暂无", so the real numbers can be
+		// reported without taking the reserved `value` slot.
 		switch summary.Today.Reported {
 		case cache.Reported:
-			value := 0.0
+			field := map[string]any{"state": "REPORTED", "source": "会话记录 usage", "readTokens": summary.Today.InputCacheRead, "creationTokens": summary.Today.InputCacheCreation}
 			if summary.Today.HitRate != nil {
-				value = *summary.Today.HitRate
+				field["hitRate"] = *summary.Today.HitRate
 			}
-			result["cache"] = map[string]any{"state": "REPORTED", "source": "会话记录 usage", "value": value, "readTokens": summary.Today.InputCacheRead, "creationTokens": summary.Today.InputCacheCreation}
+			result["cache"] = field
 		case cache.NotReported:
 			// Reported as unknown with the reason, never as 0%.
 			result["cache"] = map[string]any{"state": "UNKNOWN", "source": "会话记录 usage", "note": "供应商未上报缓存数据"}
+		}
+	}
+	if err == nil {
+		if summary.Speed.State == cache.Reported && summary.Speed.TokensPerSecond != nil {
+			result["speed"] = map[string]any{"state": "REPORTED", "source": "会话记录 llmServerDecodeMs", "value": *summary.Speed.TokensPerSecond, "samples": summary.Speed.Samples}
 		}
 		switch summary.Quota.State {
 		case "AVAILABLE":
@@ -206,9 +218,6 @@ func (s *NativeService) monitorSummaryCompat(ctx context.Context) map[string]any
 		default:
 			result["quota"] = map[string]any{"state": "ERROR", "source": summary.Quota.Source, "note": summary.Quota.Note}
 		}
-	}
-	if receipt := automationIntentSummary(ctx, s.db); receipt != nil {
-		result["receipt"] = receipt
 	}
 	return result
 }
@@ -220,5 +229,3 @@ func parseCacheLimit(input map[string]any) int {
 	}
 	return int(raw)
 }
-
-var errCacheDisabled = errors.New("缓存数据层不可用")

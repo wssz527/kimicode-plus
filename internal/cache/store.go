@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
+	"sync"
 	"time"
 
 	"enhancedkimi/internal/storage"
@@ -21,13 +21,27 @@ const (
 )
 
 // Store owns the cache_steps table and the scan positions.
+//
+// Everything below is reached concurrently: the automation tick, the settings page's
+// four parallel cache reads and the keepalive closed loop all call into one Store. The
+// database has its own concurrency contract, so the locks here cover only the Go state
+// and never wrap a query: a lock that spans a query would serialize every reader and,
+// worse, deadlock callers that hold another lock across the same calls.
 type Store struct {
-	db   *sql.DB
+	db *sql.DB
+
+	// mu covers home, files and lastScan.
+	mu   sync.Mutex
 	home string
 	// files keeps one incremental reader per wire.jsonl path.
 	files map[string]*fileState
 	// lastScan guards the scan interval across callers.
 	lastScan time.Time
+
+	// scanMu keeps two concurrent scans from reading the same file offsets and
+	// inserting the same steps twice. It is separate from mu because a scan is long
+	// and mu must stay available to Home/SetHome while it runs.
+	scanMu sync.Mutex
 }
 
 // NewStore migrates the schema and returns a store bound to home.
@@ -71,15 +85,33 @@ func NewStore(db *sql.DB, home string) (*Store, error) {
 	}); err != nil {
 		return nil, err
 	}
+	// cache_steps.time is compared and ordered as text, so any row written with a
+	// variable-width timestamp keeps sorting wrongly until it is rewritten.
+	if err := storage.BackfillSortableTimes(context.Background(), db, []storage.TimeColumn{
+		{Table: "cache_steps", Column: "time"},
+		{Table: "cache_sessions", Column: "created_at"},
+		{Table: "cache_sessions", Column: "updated_at"},
+		{Table: "cache_sessions", Column: "scanned_at"},
+		{Table: "cache_live", Column: "last_user_prompt"},
+		{Table: "cache_live", Column: "updated_at"},
+	}); err != nil {
+		return nil, err
+	}
 	return &Store{db: db, home: home, files: map[string]*fileState{}}, nil
 }
 
 // Home returns the resolved KIMI_CODE_HOME root the store reads from.
-func (s *Store) Home() string { return s.home }
+func (s *Store) Home() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.home
+}
 
 // SetHome repoints the store, dropping cached file offsets: a different home has
 // different inodes and offsets mean nothing across roots.
 func (s *Store) SetHome(home string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if home == s.home {
 		return
 	}
@@ -87,18 +119,47 @@ func (s *Store) SetHome(home string) {
 	s.files = map[string]*fileState{}
 }
 
+// fileStateFor returns the incremental reader for one wire path, creating it when it
+// is new. The returned state is owned by the running scan, which holds scanMu.
+func (s *Store) fileStateFor(path, agent string) *fileState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.files[path]
+	if !ok || state.parser == nil {
+		state = &fileState{parser: newParser(agent)}
+		s.files[path] = state
+	}
+	return state
+}
+
+// beginScan enforces the scan interval and claims the current home. A caller that is
+// told to skip must not read records at all.
+func (s *Store) beginScan(now time.Time, force bool) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !force && !s.lastScan.IsZero() && now.Sub(s.lastScan) < scanInterval {
+		return "", false
+	}
+	s.lastScan = now
+	return s.home, true
+}
+
 // Scan reads new record lines and persists them. A scan that runs sooner than
 // scanInterval after the previous one is skipped, which is what enforces the
 // "not shorter than 5 seconds" rule no matter how often a caller ticks.
 func (s *Store) Scan(ctx context.Context, now time.Time, force bool) (ScanResult, error) {
-	if !force && !s.lastScan.IsZero() && now.Sub(s.lastScan) < scanInterval {
+	home, ok := s.beginScan(now, force)
+	if !ok {
 		return ScanResult{Skipped: true}, nil
 	}
-	s.lastScan = now
-	if s.home == "" {
+	// Two concurrent scans would both read the same offsets and both insert the same
+	// steps; serialize them instead of racing on the shared parsers.
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	if home == "" {
 		return ScanResult{}, nil
 	}
-	sessions, err := discover(s.home)
+	sessions, err := discover(home)
 	if err != nil {
 		return ScanResult{}, err
 	}
@@ -133,14 +194,7 @@ func (s *Store) scanSession(ctx context.Context, session sessionDir, now time.Ti
 	agentCount := 0
 	for _, agent := range session.Agents {
 		path := session.Dir + "/agents/" + agent + "/wire.jsonl"
-		state, ok := s.files[path]
-		if !ok {
-			state = &fileState{parser: newParser(agent)}
-			s.files[path] = state
-		}
-		if state.parser == nil {
-			state.parser = newParser(agent)
-		}
+		state := s.fileStateFor(path, agent)
 		read, restarted, err := readIncremental(path, state)
 		if err != nil {
 			continue
@@ -187,7 +241,7 @@ func (s *Store) insertSteps(ctx context.Context, sessionID string, steps []Step)
 			if step.At.IsZero() {
 				continue
 			}
-			if _, err = statement.ExecContext(ctx, sessionID, step.Agent, step.StepUUID, step.Model, step.At.UTC().Format(time.RFC3339Nano), step.TurnID, step.StepIndex, step.Finish, step.InputOther, step.InputCacheRead, step.InputCacheCreation, step.Output, step.FirstTokenMS, step.DecodeMS); err != nil {
+			if _, err = statement.ExecContext(ctx, sessionID, step.Agent, step.StepUUID, step.Model, storage.SortableTime(step.At), step.TurnID, step.StepIndex, step.Finish, step.InputOther, step.InputCacheRead, step.InputCacheCreation, step.Output, step.FirstTokenMS, step.DecodeMS); err != nil {
 				return err
 			}
 		}
@@ -198,23 +252,23 @@ func (s *Store) insertSteps(ctx context.Context, sessionID string, steps []Step)
 func (s *Store) upsertSession(ctx context.Context, session sessionDir, agents int, now time.Time) error {
 	created, updated := "", ""
 	if session.Meta.CreatedAt > 0 {
-		created = millis(session.Meta.CreatedAt).Format(time.RFC3339Nano)
+		created = storage.SortableTime(millis(session.Meta.CreatedAt))
 	}
 	if session.Meta.UpdatedAt > 0 {
-		updated = millis(session.Meta.UpdatedAt).Format(time.RFC3339Nano)
+		updated = storage.SortableTime(millis(session.Meta.UpdatedAt))
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO cache_sessions(session_id,cwd,title,created_at,updated_at,agent_count,scanned_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET cwd=excluded.cwd,title=excluded.title,created_at=excluded.created_at,updated_at=excluded.updated_at,agent_count=excluded.agent_count,scanned_at=excluded.scanned_at`,
-		session.ID, session.Meta.CWD, session.Meta.Title, created, updated, agents, now.UTC().Format(time.RFC3339Nano))
+		session.ID, session.Meta.CWD, session.Meta.Title, created, updated, agents, storage.SortableTime(now))
 	return err
 }
 
 func (s *Store) upsertLive(ctx context.Context, sessionID string, openBackground int, blocked bool, lastUserPrompt int64, now time.Time) error {
 	prompt := ""
 	if lastUserPrompt > 0 {
-		prompt = millis(lastUserPrompt).Format(time.RFC3339Nano)
+		prompt = storage.SortableTime(millis(lastUserPrompt))
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO cache_live(session_id,open_background,blocked,last_user_prompt,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET open_background=excluded.open_background,blocked=excluded.blocked,last_user_prompt=excluded.last_user_prompt,updated_at=excluded.updated_at`,
-		sessionID, openBackground, boolInt(blocked), prompt, now.UTC().Format(time.RFC3339Nano))
+		sessionID, openBackground, boolInt(blocked), prompt, storage.SortableTime(now))
 	return err
 }
 
@@ -228,7 +282,7 @@ func boolInt(value bool) int {
 // prune drops step rows older than the longest history range so the database
 // cannot grow without bound. 30 days matches cache.history's longest range.
 func (s *Store) prune(ctx context.Context) error {
-	cutoff := time.Now().UTC().Add(-31 * 24 * time.Hour).Format(time.RFC3339Nano)
+	cutoff := storage.SortableTime(time.Now().UTC().Add(-31 * 24 * time.Hour))
 	_, err := s.db.ExecContext(ctx, `DELETE FROM cache_steps WHERE time < ?`, cutoff)
 	return err
 }
@@ -283,7 +337,7 @@ func (s *Store) LastMainStep(ctx context.Context, sessionID string) (Step, bool,
 func (s *Store) StepAfter(ctx context.Context, sessionID string, after time.Time) (Step, bool, error) {
 	step := Step{}
 	var at string
-	err := s.db.QueryRowContext(ctx, `SELECT session_id,agent,step_uuid,model,time,input_other,input_cache_read,input_cache_creation,output,first_token_ms,decode_ms FROM cache_steps WHERE session_id=? AND agent='main' AND time>? ORDER BY time ASC,rowid ASC LIMIT 1`, sessionID, after.UTC().Format(time.RFC3339Nano)).
+	err := s.db.QueryRowContext(ctx, `SELECT session_id,agent,step_uuid,model,time,input_other,input_cache_read,input_cache_creation,output,first_token_ms,decode_ms FROM cache_steps WHERE session_id=? AND agent='main' AND time>? ORDER BY time ASC,rowid ASC LIMIT 1`, sessionID, storage.SortableTime(after)).
 		Scan(&step.SessionID, &step.Agent, &step.StepUUID, &step.Model, &at, &step.InputOther, &step.InputCacheRead, &step.InputCacheCreation, &step.Output, &step.FirstTokenMS, &step.DecodeMS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return step, false, nil
@@ -322,8 +376,6 @@ func parseTime(value string) time.Time {
 	}
 	return at
 }
-
-var _ = fmt.Sprintf
 
 // MainSteps returns every persisted main-agent step for a session in time order.
 // Verification uses it to compare the stored set against the raw record file.

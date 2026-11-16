@@ -2,7 +2,6 @@ package desktop
 
 import (
 	"context"
-	"net/http"
 	"time"
 
 	"enhancedkimi/internal/cache"
@@ -346,20 +345,3 @@ func (s *NativeService) finishKeepAlive(ctx context.Context, intentID, sessionID
 	return nil
 }
 
-// keepAliveSupported reports whether keepalive can work for a session at all. The
-// settings page uses it to explain an unsupported state instead of offering a
-// switch that would silently do nothing.
-func keepAliveSupport(live cache.LiveSignals, running bool) string {
-	switch {
-	case !running:
-		return "既没有未返回的后台子代理，也没有进行中的回合：空闲会话由空闲自动压缩处理，不做保活"
-	case live.Blocked:
-		return "主代理正在阻塞等待中，此状态下保活消息只会排队，无法保活"
-	case live.OpenBackground <= 0:
-		return "当前没有未返回的后台子代理，不满足保活条件"
-	default:
-		return ""
-	}
-}
-
-var _ = http.MethodPost

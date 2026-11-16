@@ -221,3 +221,28 @@ func TestRendererFreezesAddonEntries(t *testing.T) {
 		t.Fatal("renderer.js no longer injects the official settings tab")
 	}
 }
+
+// TestSettingsMountOwnsItsScroll guards the fix for the enhanced settings page being
+// clipped by the official dialog. The official body has a definite height and does not
+// scroll, so the mount has to be clamped to it and scroll its own content; without all
+// three declarations the tail of the page sits outside the dialog where neither the
+// wheel nor scripted scrolling can reach it.
+func TestSettingsMountOwnsItsScroll(t *testing.T) {
+	start := strings.Index(rendererSource, ".ekd-settings-mount{")
+	if start < 0 {
+		t.Fatal("renderer.js lost the settings mount style")
+	}
+	end := strings.Index(rendererSource[start:], "}")
+	if end < 0 {
+		t.Fatal("settings mount style is not terminated")
+	}
+	rule := rendererSource[start : start+end]
+	for _, wanted := range []string{"overflow-y:auto", "max-height:100%", "flex:1 1 auto"} {
+		if !strings.Contains(rule, wanted) {
+			t.Fatalf("settings mount style lost %q: %s", wanted, rule)
+		}
+	}
+	if strings.Contains(rule, "flex:none") {
+		t.Fatalf("settings mount is unconstrained again: %s", rule)
+	}
+}

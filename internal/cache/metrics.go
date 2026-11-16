@@ -3,6 +3,8 @@ package cache
 import (
 	"context"
 	"time"
+
+	"enhancedkimi/internal/storage"
 )
 
 // Reported states answer "did the provider report cache fields at all?". A zero
@@ -201,7 +203,7 @@ func (a *speedAggregate) add(step Step) {
 }
 
 func (s *Store) sinceTotals(ctx context.Context, from time.Time) (rowTotals, speedAggregate, error) {
-	return s.totalsWhere(ctx, `time >= ?`, from.UTC().Format(time.RFC3339Nano))
+	return s.totalsWhere(ctx, `time >= ?`, storage.SortableTime(from))
 }
 
 func (s *Store) totalsWhere(ctx context.Context, clause string, args ...any) (rowTotals, speedAggregate, error) {
@@ -286,7 +288,7 @@ func (s *Store) Summary(ctx context.Context, now time.Time) (Summary, error) {
 }
 
 func (s *Store) modelBreakdown(ctx context.Context, from time.Time) ([]ModelBreakdown, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT model,COUNT(*),COALESCE(SUM(input_cache_read),0),COALESCE(SUM(input_cache_creation),0),COALESCE(SUM(input_other),0),COALESCE(SUM(output),0) FROM cache_steps WHERE time>=? GROUP BY model ORDER BY COUNT(*) DESC`, from.UTC().Format(time.RFC3339Nano))
+	rows, err := s.db.QueryContext(ctx, `SELECT model,COUNT(*),COALESCE(SUM(input_cache_read),0),COALESCE(SUM(input_cache_creation),0),COALESCE(SUM(input_other),0),COALESCE(SUM(output),0) FROM cache_steps WHERE time>=? GROUP BY model ORDER BY COUNT(*) DESC`, storage.SortableTime(from))
 	if err != nil {
 		return nil, err
 	}
@@ -318,7 +320,7 @@ func (s *Store) modelBreakdown(ctx context.Context, from time.Time) ([]ModelBrea
 }
 
 func (s *Store) modelSpeed(ctx context.Context, model string, from time.Time) (Speed, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT output,decode_ms FROM cache_steps WHERE model=? AND time>=? AND output>? AND decode_ms>?`, model, from.UTC().Format(time.RFC3339Nano), minSpeedOutput, minSpeedDecodeMS)
+	rows, err := s.db.QueryContext(ctx, `SELECT output,decode_ms FROM cache_steps WHERE model=? AND time>=? AND output>? AND decode_ms>?`, model, storage.SortableTime(from), minSpeedOutput, minSpeedDecodeMS)
 	if err != nil {
 		return Speed{State: NoSamples}, err
 	}
@@ -464,7 +466,7 @@ func (s *Store) History(ctx context.Context, now time.Time, span string) (Histor
 		}
 		cursor = cursor.Add(step)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT time,input_cache_read,input_cache_creation,input_other,output,decode_ms FROM cache_steps WHERE time>=? ORDER BY time ASC`, from.UTC().Format(time.RFC3339Nano))
+	rows, err := s.db.QueryContext(ctx, `SELECT time,input_cache_read,input_cache_creation,input_other,output,decode_ms FROM cache_steps WHERE time>=? ORDER BY time ASC`, storage.SortableTime(from))
 	if err != nil {
 		return History{}, err
 	}
