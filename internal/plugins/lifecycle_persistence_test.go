@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"enhancedkimi/internal/storage"
 )
@@ -442,5 +443,81 @@ func TestUpgradeFromPreviousSchema(t *testing.T) {
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
 	if _, err := manager.Install(context.Background(), InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatalf("install on an upgraded database: %v", err)
+	}
+}
+
+// A list call must not deadlock: restorable entries need the embedded set and
+// the tombstone rows, and both used to be read while the entries lock was held.
+func TestListReportsUninstalledBundledPluginWithoutDeadlock(t *testing.T) {
+	root := t.TempDir()
+	bundled := map[string]map[string][]byte{
+		"test.sample": {
+			"plugin.json": []byte(testManifest),
+			"renderer.js": []byte("export function activate(){}\n"),
+			"LICENSE":     []byte("MIT\n"),
+		},
+	}
+	manager, err := newManagerAt(t, root, WithBundled(func() (map[string]map[string][]byte, error) { return bundled, nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := manager.ReleaseBundled(ctx, bundled); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = manager.List()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("List deadlocked")
+	}
+
+	live, err := manager.Enable(ctx, "test.sample")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Uninstall(ctx, "test.sample"); err != nil {
+		t.Fatal(err)
+	}
+	// The token is revoked before any file work, so it cannot survive the call.
+	if manager.Verify("test.sample", live.Token) {
+		t.Fatal("uninstall left a valid token")
+	}
+	listed := manager.List()
+	var restorable *Plugin
+	for index := range listed {
+		if listed[index].ID == "test.sample" {
+			restorable = &listed[index]
+		}
+	}
+	if restorable == nil {
+		t.Fatal("an uninstalled bundled plugin disappeared from the list")
+	}
+	if !restorable.Restorable || restorable.State != StateUninstall || restorable.Enabled {
+		t.Fatalf("restorable entry is wrong: %#v", restorable)
+	}
+	if len(restorable.Capabilities) != 0 {
+		t.Fatalf("a tombstone reported capabilities: %#v", restorable.Capabilities)
+	}
+	// Nothing was released automatically.
+	if _, statErr := os.Stat(filepath.Join(root, "plugins", "test.sample")); !os.IsNotExist(statErr) {
+		t.Fatal("listing released the uninstalled plugin's files again")
+	}
+	// And restore is still the explicit path.
+	restored, err := manager.RestoreBundled(ctx, "test.sample", bundled["test.sample"])
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if restored.State != StateDisabled || restored.Enabled {
+		t.Fatalf("restore did not keep the plugin stopped: %#v", restored)
+	}
+	for _, plugin := range manager.List() {
+		if plugin.ID == "test.sample" && plugin.Restorable {
+			t.Fatal("a restored plugin is still listed as restorable")
+		}
 	}
 }

@@ -178,7 +178,16 @@ export function createPluginRuntime(options: RuntimeOptions) {
     if (existing) return existing;
     const scope = new Scope();
     const context = createContext(install.id, install.version, install.granted, install.token, scope);
-    const result = await module.activate(context);
+    let result: Awaited<ReturnType<PluginModule["activate"]>>;
+    try {
+      result = await module.activate(context);
+    } catch (error) {
+      // A plugin that mounts a surface and then throws must not leave that
+      // surface behind: nothing recorded this scope as active, so without this
+      // the nodes, listeners and timers it created would outlive every retry.
+      scope.dispose();
+      throw error;
+    }
     if (result && typeof result === "object" && "dispose" in result && typeof result.dispose === "function") {
       scope.add(() => result.dispose());
     }

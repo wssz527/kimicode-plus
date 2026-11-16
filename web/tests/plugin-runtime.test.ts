@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { actionAllowed, createBridge } from "../src/plugin-runtime/bridge.js";
 import { Scope } from "../src/plugin-runtime/scope.js";
 import { createPluginRuntime } from "../src/plugin-runtime/runtime.js";
+import { pluginHostBridge } from "../src/plugin-runtime/host.js";
 import { entryPath } from "../src/plugin-runtime/loader.js";
 import type { RuntimeRequest } from "../src/plugin-runtime/context.js";
 
@@ -381,4 +382,83 @@ test("storage values come back as the value that was stored, not its JSON text",
   assert.equal(read!.count, 3);
   assert.deepEqual(read!.object, { ok: true });
   assert.equal(read!.missing, undefined);
+});
+
+test("a plugin that mounts and then throws leaves nothing behind", async () => {
+  const host = fakeElement();
+  let polls = 0;
+  const runtime = createPluginRuntime({
+    slots: { sidebar: () => host },
+    request: async path => {
+      if (path === "/plugin-runtime/events.poll") polls += 1;
+      return { value: { events: [], next: 1 } };
+    },
+  });
+  let attempts = 0;
+  const broken = {
+    activate: (context: Parameters<Parameters<typeof runtime.activate>[0]["activate"]>[0]) => {
+      attempts += 1;
+      context.ui.mount("sidebar", () => {});
+      context.events.on("cache", () => {});
+      throw new Error("boom after mount");
+    },
+  };
+  for (let index = 0; index < 3; index += 1) {
+    await assert.rejects(
+      () => runtime.activate(broken, { id: "test.broken", version: "1.0.0", granted: ["ui:sidebar", "metrics:read"], token: "t" }),
+      /boom after mount/,
+    );
+  }
+  // Three failed activations must leave zero containers and zero subscriptions,
+  // not one more of each per retry.
+  assert.equal(host.children.length, 0, "a failed activation left its container behind");
+  assert.equal(polls, 1, `a failed activation left an event subscription behind (${polls} polls)`);
+  assert.equal(attempts, 3);
+  runtime.dispose();
+  // The loop leaves on its next boundary; give it that boundary before asserting.
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(runtime.eventLoops(), 0, "a failed activation left the event loop running");
+});
+
+test("the settings host bridge is absent outside the native host", () => {
+  // A plain browser page has no plugin runtime; the settings panel must render
+  // its explanation rather than throw while reading an undefined bridge.
+  const original = (globalThis as { window?: unknown }).window;
+  delete (globalThis as { window?: unknown }).window;
+  try {
+    assert.equal(pluginHostBridge(), null);
+  } finally {
+    if (original !== undefined) (globalThis as { window?: unknown }).window = original;
+  }
+});
+
+test("the settings bridge resolves to the host's release function", async () => {
+  const mounted: string[] = [];
+  const released: string[] = [];
+  // The native host builds the release as a closure (see mountPluginSettings in
+  // internal/desktop/assets/renderer.js), so the bridge must be typed and used as
+  // a function. Treating it as an object with .dispose() crashed the page.
+  const bridge = {
+    sync: async () => {},
+    list: () => [],
+    mountSettings: async (id: string) => {
+      mounted.push(id);
+      return () => released.push(id);
+    },
+  };
+  const scope = globalThis as { window?: { __ekdPlugins?: typeof bridge } };
+  const original = scope.window;
+  scope.window = { __ekdPlugins: bridge };
+  try {
+    const found = pluginHostBridge();
+    assert.ok(found);
+    const release = await found.mountSettings("test.plugin", {} as HTMLElement);
+    assert.equal(typeof release, "function");
+    release();
+    assert.deepEqual(mounted, ["test.plugin"]);
+    assert.deepEqual(released, ["test.plugin"]);
+  } finally {
+    if (original === undefined) delete scope.window;
+    else scope.window = original;
+  }
 });

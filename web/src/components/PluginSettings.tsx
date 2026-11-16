@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type PluginActivity, type PluginPreview, type PluginRecord } from "../api";
+import { pluginHostBridge } from "../plugin-runtime/host";
 import { Icon } from "./Icon";
 import { ActionButton, Badge, EmptyState, ErrorNotice, Field, InfoNote, Panel, SkeletonRows, StateBadge } from "./ui";
 import { PageError } from "../AppShell";
@@ -56,7 +57,67 @@ const PLAIN_STATE: Record<string, string> = {
   FAULTED: "出错",
   CORRUPT: "文件异常",
   INCOMPATIBLE: "未在此版本验证",
+  UNINSTALLED: "已卸载",
 };
+
+/**
+ * Hosts a plugin's own settings module. The page owns the container and the
+ * lifetime: switching detail, disabling, uninstalling or leaving the panel all
+ * dispose the renderer-side release, which empties the container.
+ *
+ * The bridge exists only inside the native host. In a plain web page there is no
+ * plugin runtime, so the panel explains that instead of rendering nothing.
+ */
+function PluginSettingsPanel({ plugin }: { plugin: PluginRecord }) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const [state, setState] = useState<"loading" | "ready" | "unavailable" | "failed">("loading");
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    const bridge = pluginHostBridge();
+    const element = hostRef.current;
+    if (!bridge || !element) {
+      setState("unavailable");
+      return;
+    }
+    let released = false;
+    let dispose: (() => void) | null = null;
+    setState("loading");
+    setMessage("");
+    bridge
+      .mountSettings(plugin.id, element)
+      .then(release => {
+        if (released) {
+          release();
+          return;
+        }
+        dispose = release;
+        setState("ready");
+      })
+      .catch(error => {
+        if (released) return;
+        setState("failed");
+        setMessage(error instanceof Error ? error.message : String(error));
+      });
+    return () => {
+      released = true;
+      dispose?.();
+    };
+  }, [plugin.id]);
+
+  return (
+    <Panel title="插件设置">
+      {state === "unavailable" ? (
+        <p className="panel-note">插件设置只在 Kimi Code 宿主内可用。当前页面没有运行插件运行时。</p>
+      ) : state === "loading" ? (
+        <SkeletonRows rows={2} cols={1} />
+      ) : state === "failed" ? (
+        <ErrorNotice message={message || "插件设置页加载失败。"} recovery="停用再启用插件后重试；仍然失败时检查插件文件是否为最新版本。" />
+      ) : null}
+      <div className="ekdp-settings-mount" ref={hostRef} hidden={state !== "ready"} />
+    </Panel>
+  );
+}
 
 export interface PluginSettingsProps {
   /** Rendered inside the settings dialog, where the page header is the dialog's. */
@@ -172,6 +233,40 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
   }
 
   const safeMode = Boolean(plugins.data?.safeMode);
+
+  if (current && current.state === "UNINSTALLED") {
+    return (
+      <div className={embedded ? "ekds-plugins" : "page"}>
+        <div className="plugins-detail-head">
+          <ActionButton variant="quiet" icon="arrowRight" onClick={() => setSelected(null)}>
+            返回插件列表
+          </ActionButton>
+          <div className="plugins-detail-title">
+            <h2>{current.name || current.id}</h2>
+            <span className="num">{current.id} · v{current.version}</span>
+          </div>
+          <StateBadge state={current.state} tone={stateTone(current.state)} label={PLAIN_STATE[current.state] ?? stateLabel(current.state)} />
+        </div>
+        {flash ? (
+          <div className="save-flash" role="status">
+            <Icon name="check" size={16} />
+            {flash}
+          </div>
+        ) : null}
+        {action.error ? (
+          <ErrorNotice message={errorMessage(action.error)} recovery={errorRecovery(action.error)} onDismiss={action.clearError} />
+        ) : null}
+        <Panel title="预装副本">
+          <p className="panel-note">
+            这个插件随应用一起提供，已被卸载。恢复会重新释放内置副本；它不会自动回到列表，也不会自动启用。
+          </p>
+          <ActionButton icon="refresh" onClick={() => void restore(current.id)} busy={action.busy}>
+            恢复预装插件
+          </ActionButton>
+        </Panel>
+      </div>
+    );
+  }
 
   if (current) {
     const capabilities = current.capabilities ?? [];
@@ -304,14 +399,12 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
                 </div>
               </div>
             ) : null}
-            <p className="panel-note">卸载会删除插件文件和它的私有存储。预装插件卸载后不会自动恢复，可以用下方的"恢复预装插件"重新安装。</p>
+            <p className="panel-note">卸载会删除插件文件和它的私有存储。预装插件卸载后不会自动恢复，会以"已卸载"留在列表里，可以从那里恢复。</p>
           </Panel>
-          {current.source === "BUNDLED" ? (
-            <Panel title="预装副本">
-              <p className="panel-note">这个插件随应用一起提供。卸载后需要手动恢复，不会在下次启动时自动回到列表。</p>
-              <ActionButton icon="refresh" onClick={() => void restore(current.id)} busy={action.busy}>
-                恢复预装插件
-              </ActionButton>
+          {current.hasSettings && current.enabled ? <PluginSettingsPanel plugin={current} /> : null}
+          {current.hasSettings && !current.enabled ? (
+            <Panel title="插件设置">
+              <p className="panel-note">启用插件后可以在这里打开它的设置页。</p>
             </Panel>
           ) : null}
         </div>
@@ -397,7 +490,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
               </dl>
               {preview.installed ? (
                 <InfoNote tone="warn">
-                  <p>这个插件已经安装过。继续安装会替换它的文件，但保留你当前授予的能力和启用状态。</p>
+                  <p>这个插件已经安装过。继续安装会替换它的文件，并按你下面勾选的能力重新授权；插件会保持停用，需要再手动启用。</p>
                 </InfoNote>
               ) : null}
               {!preview.compatible ? (
@@ -502,7 +595,9 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
                   </span>
                 </span>
                 <StateBadge state={plugin.state} tone={stateTone(plugin.state)} label={PLAIN_STATE[plugin.state] ?? stateLabel(plugin.state)} />
-                <span className="plugin-count num">{(plugin.capabilities ?? []).length} 项能力</span>
+                <span className="plugin-count num">
+                  {plugin.state === "UNINSTALLED" ? "可恢复" : `${(plugin.capabilities ?? []).length} 项能力`}
+                </span>
               </button>
             </li>
           ))}

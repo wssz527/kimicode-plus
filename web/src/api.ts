@@ -388,6 +388,12 @@ export interface PluginRecord {
   updatedAt?: string;
   /** Only present in the enable response: the renderer identity token. */
   token?: string;
+  /**
+   * A bundled plugin the user uninstalled. It is listed only so the page can
+   * offer to restore the embedded copy; it has no files, no capabilities and is
+   * never running.
+   */
+  restorable?: boolean;
 }
 
 /** A validated package, before the user grants anything. Mirrors plugins.PackagePreview. */

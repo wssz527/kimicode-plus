@@ -128,6 +128,11 @@ type Plugin struct {
 	// Forced records that the user enabled a plugin whose host version was not
 	// declared in hostVersions.
 	Forced bool `json:"forced,omitempty"`
+	// Restorable marks a bundled plugin the user uninstalled. It is not
+	// installed, holds no files and is not running; it appears in the list only
+	// so the page can offer to restore the embedded copy. Nothing is released
+	// automatically.
+	Restorable bool `json:"restorable,omitempty"`
 	// Token is only filled in the enable response, for the renderer that is about
 	// to load this plugin. The list never carries it.
 	Token string `json:"token,omitempty"`
@@ -304,16 +309,60 @@ func (m *Manager) load() error {
 
 func (m *Manager) snapshot() []Plugin {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	out := make([]Plugin, 0, len(m.order))
+	installed := make(map[string]bool, len(m.order))
 	for _, id := range m.order {
 		item := m.entries[id]
 		if item == nil {
 			continue
 		}
+		installed[id] = true
 		out = append(out, m.present(item))
 	}
+	m.mu.Unlock()
+	// Restorable entries need the embedded set and the tombstone rows, and both
+	// involve work that takes the same lock (or does DB I/O). They are assembled
+	// after the entries snapshot so a list call cannot deadlock on itself.
+	out = append(out, m.restorable(installed)...)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// restorable reports bundled plugins the user uninstalled. A tombstone is the
+// only record left, so the entry carries no capabilities and no entry point:
+// restoring re-releases the embedded copy and the consent step happens again.
+func (m *Manager) restorable(installed map[string]bool) []Plugin {
+	bundled, err := m.bundledFiles()
+	if err != nil || len(bundled) == 0 {
+		return nil
+	}
+	records, err := loadRecords(context.Background(), m.db)
+	if err != nil {
+		return nil
+	}
+	var out []Plugin
+	for _, item := range records {
+		if !item.tombstone || item.state != StateUninstall {
+			continue
+		}
+		if _, ok := bundled[item.id]; !ok || installed[item.id] {
+			continue
+		}
+		out = append(out, Plugin{
+			ID:           item.id,
+			Name:         item.name,
+			Version:      item.version,
+			Source:       SourceBundled,
+			State:        StateUninstall,
+			Enabled:      false,
+			Capabilities: []string{},
+			Declared:     []string{},
+			Slots:        []string{},
+			HostVersions: []string{},
+			Restorable:   true,
+			UpdatedAt:    m.now().UTC().Format(time.RFC3339),
+		})
+	}
 	return out
 }
 
@@ -647,7 +696,21 @@ func (m *Manager) Uninstall(ctx context.Context, id string) error {
 	}
 	dir := item.dir
 	now := m.now()
+	name, version, source := item.manifest.Name, item.manifest.Version, item.source
+	// Stop first, remove second. A file or row failure below leaves the plugin
+	// installed but stopped, never running with a token that outlives the
+	// uninstall decision the user just made.
+	item.state = StateDisabled
+	item.enabled = false
+	item.forced = false
+	item.errText = ""
+	item.updated = now
+	delete(m.tokens, id)
 	m.mu.Unlock()
+	if err := setState(ctx, m.db, id, StateDisabled, false, "", now); err != nil {
+		return apiError(http.StatusInternalServerError, "PLUGIN_STATE_UNAVAILABLE", "无法保存插件状态，插件仍保持停用")
+	}
+	_ = recordActivity(ctx, m.db, id, ActivityDisable, "卸载前已停用插件并撤销令牌", now)
 
 	if err := os.RemoveAll(dir); err != nil {
 		return apiError(http.StatusInternalServerError, "PLUGIN_UNINSTALL_FAILED", "无法删除插件文件，插件仍保持停用")
@@ -657,9 +720,9 @@ func (m *Manager) Uninstall(ctx context.Context, id string) error {
 		return apiError(http.StatusInternalServerError, "PLUGIN_UNINSTALL_FAILED", "插件文件已删除，但记录未能清理")
 	}
 	_ = saveRecord(ctx, m.db, record{
-		id: id, name: item.manifest.Name, version: item.manifest.Version,
-		manifest: mustJSON(item.manifest), capabilities: []string{}, source: item.source,
-		state: StateUninstall, tombstone: true, installedAt: item.installed, updatedAt: now,
+		id: id, name: name, version: version,
+		manifest: mustJSON(map[string]any{"id": id, "name": name, "version": version}), capabilities: []string{}, source: source,
+		state: StateUninstall, tombstone: true, installedAt: now, updatedAt: now,
 	})
 	m.mu.Lock()
 	delete(m.entries, id)
