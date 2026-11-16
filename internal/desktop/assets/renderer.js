@@ -641,15 +641,17 @@ async function installNativeRenderer(options) {
   };
   document.addEventListener('click', settingsTabClick, true);
   document.addEventListener('scroll', settingsScroll, true);
-  if (options.surface === 'settings' || options.popout) {
+  if (options.surface === 'settings' || options.surface === 'management' || options.popout) {
     document.documentElement.dataset.colorScheme = options.theme || 'dark';
-    document.title = options.surface === 'settings' ? 'KimiCode+ 设置' : 'KimiCode+ 规划聊天';
+    const title = options.surface === 'settings' ? 'KimiCode+ 设置' : options.surface === 'management' ? 'KimiCode+ 管理' : 'KimiCode+ 规划聊天';
+    document.title = title;
     document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:var(--color-bg,#121212);color:var(--color-text,#eee)';
     const element = document.createElement('div');
     element.style.cssText = 'height:100vh;min-height:0';
     document.body.replaceChildren(element);
     const host = makeHost(() => { void transport.request('window.close'); });
-    mount(element, options.surface === 'settings' ? 'settings' : 'planner', host, { initialSource: options.initialSource || 'web' });
+    if (options.surface === 'management') mount(element, 'management', host, { initialPath: options.initialPath });
+    else mount(element, options.surface === 'settings' ? 'settings' : 'planner', host, { initialSource: options.initialSource || 'web' });
     window.__ekdNativeUI = state;
     return { status: 'installed', surface: options.surface || 'planner' };
   }

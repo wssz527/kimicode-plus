@@ -269,31 +269,31 @@
 
 .badge-accent {
   background: var(--accent-soft);
-  border-color: #bfd2f2;
+  border-color: var(--accent-line);
   color: var(--accent-ink);
 }
 
 .badge-success {
   background: var(--success-soft);
-  border-color: #b9dcc9;
+  border-color: var(--success-line);
   color: var(--success);
 }
 
 .badge-warn {
   background: var(--warn-soft);
-  border-color: #e6d3a4;
+  border-color: var(--warn-line);
   color: var(--warn);
 }
 
 .badge-danger {
   background: var(--danger-soft);
-  border-color: #edc3c3;
+  border-color: var(--danger-line);
   color: var(--danger);
 }
 
 .badge-info {
   background: var(--info-soft);
-  border-color: #b9d6df;
+  border-color: var(--info-line);
   color: var(--info);
 }
 
@@ -330,25 +330,25 @@
 .state-success {
   color: var(--success);
   background: var(--success-soft);
-  border-color: #b9dcc9;
+  border-color: var(--success-line);
 }
 
 .state-warn {
   color: var(--warn);
   background: var(--warn-soft);
-  border-color: #e6d3a4;
+  border-color: var(--warn-line);
 }
 
 .state-danger {
   color: var(--danger);
   background: var(--danger-soft);
-  border-color: #edc3c3;
+  border-color: var(--danger-line);
 }
 
 .state-info {
   color: var(--info);
   background: var(--info-soft);
-  border-color: #b9d6df;
+  border-color: var(--info-line);
 }
 
 /* ---------- UNKNOWN token ---------- */
@@ -523,12 +523,12 @@
 
 .notice-error {
   background: var(--danger-soft);
-  border-color: #eec4c4;
+  border-color: var(--danger-line);
   color: var(--danger);
 }
 
 .notice-error .notice-copy p {
-  color: #7f2b32;
+  color: var(--notice-danger-ink);
 }
 
 .notice-error .notice-copy strong {
@@ -537,22 +537,22 @@
 
 .notice-warn {
   background: var(--warn-soft);
-  border-color: #e6d3a4;
+  border-color: var(--warn-line);
   color: var(--warn);
 }
 
 .notice-warn .notice-copy p {
-  color: #6e4a06;
+  color: var(--notice-warn-ink);
 }
 
 .notice-info {
   background: var(--info-soft);
-  border-color: #bfd8e0;
+  border-color: var(--info-line);
   color: var(--info);
 }
 
 .notice-info .notice-copy p {
-  color: #1a4e60;
+  color: var(--notice-info-ink);
 }
 
 /* ---------- empty state ---------- */

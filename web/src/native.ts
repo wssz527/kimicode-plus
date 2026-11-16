@@ -199,6 +199,45 @@ export function commitNumberField(text: string, min: number, max: number): numbe
   return value;
 }
 
+export type ConfigObject = Record<string, unknown>;
+
+export function asConfigObject(value: unknown): ConfigObject | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as ConfigObject) : null;
+}
+
+/** Reads the first present key, so a camelCase GET and a snake_case write both resolve. */
+export function configSection(config: ConfigObject | null, names: string[]): ConfigObject | null {
+  if (!config) return null;
+  for (const name of names) {
+    const found = asConfigObject(config[name]);
+    if (found) return found;
+  }
+  return null;
+}
+
+export function configField(source: ConfigObject | null, names: string[]): unknown {
+  if (!source) return undefined;
+  for (const name of names) {
+    if (source[name] !== undefined) return source[name];
+  }
+  return undefined;
+}
+
+/**
+ * `GET /config` answers with camelCase for these two fields even though the
+ * write used snake_case. Reading only the snake_case key reported "not set"
+ * for values that were set, so both spellings are checked.
+ */
+export function configTimeoutMinutes(config: unknown): string {
+  const value = Number(configField(configSection(asConfigObject(config), ["subagent"]), ["timeout_ms", "timeoutMs"]));
+  return Number.isFinite(value) && value > 0 ? String(Math.round(value / 60000)) : "";
+}
+
+export function configMaxSteps(config: unknown): string {
+  const value = configField(configSection(asConfigObject(config), ["loop_control", "loopControl"]), ["max_steps_per_turn", "maxStepsPerTurn"]);
+  return typeof value === "number" || typeof value === "string" ? String(value) : "";
+}
+
 /** Applies an incoming policy patch onto a base, keeping the fields the server owns. */
 export function mergePolicy(base: CachePolicyDraft, incoming: unknown): CachePolicyDraft {
   const source = (incoming ?? {}) as Partial<CachePolicyDraft>;
@@ -252,6 +291,17 @@ export interface NativeHooks {
   close: () => void;
   popout?: (source?: "local" | "web") => Promise<void>;
   pickSession?: (exclude: string[]) => Promise<string>;
+  openManagement?: (path: ManagementPath) => Promise<void>;
+}
+
+/**
+ * The management window is a separate BrowserWindow, so its routes are a fixed
+ * set. The bridge rejects anything else; this type keeps the surface honest.
+ */
+export const managementPaths = ["/models", "/credentials", "/plugins"] as const;
+export type ManagementPath = typeof managementPaths[number];
+export function isManagementPath(value: string): value is ManagementPath {
+  return (managementPaths as readonly string[]).includes(value);
 }
 export interface NativeTransport {
   request: <T = unknown>(action: string, payload?: Record<string, unknown>) => Promise<T>;
@@ -269,6 +319,7 @@ export interface NativeHost {
   ensureWidth: (width: number) => Promise<void>;
   popout: (source?: "local" | "web") => Promise<void>;
   openSettings: () => Promise<void>;
+  openManagement: (path: ManagementPath) => Promise<void>;
   pickSession: (exclude: string[]) => Promise<string>;
   close: () => void;
 }
@@ -417,6 +468,10 @@ export function createNativeHost(transport: NativeTransport, hooks: NativeHooks,
     ensureWidth: async width => { await transport.request("window.ensureWidth", { width }); },
     popout: hooks.popout ?? (async source => { await transport.request("window.popout", { surface: "planner", initialSource: source ?? "web" }); }),
     openSettings: async () => { await transport.request("window.openSettings"); },
+    openManagement: async path => {
+      if (!isManagementPath(path)) throw new Error("管理窗口只打开模型、凭据和插件页");
+      await transport.request("window.openManagement", { path });
+    },
     pickSession: hooks.pickSession ?? (async exclude => transport.request<string>("host.pickSession", { exclude })),
     close: () => {
       if (disposed) return;

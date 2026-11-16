@@ -44,15 +44,36 @@ async function installNativeBootstrap(options) {
     return body?.value;
   }
   function ownedBrowser(target, mode) { return mode === 'exec' ? state.browserWindow?.webContents : state.views.get(target.id)?.webContents; }
+  // The management window reuses the core.fetch channel, so its routes are a
+  // fixed set: a caller cannot point it at anything the settings sheet does not
+  // offer, and the renderer never receives the core bearer token.
+  const managementPaths = ['/models', '/credentials', '/plugins'];
+  function managementPath(value) {
+    if (typeof value !== 'string' || !managementPaths.includes(value)) throw new Error('管理窗口路径不被允许');
+    return value;
+  }
   async function openWindow(kind, source = {}) {
     const existing = state.windows.get(kind);
-    if (existing && !existing.isDestroyed()) { existing.show(); existing.focus(); return { focused: true }; }
+    if (existing && !existing.isDestroyed()) {
+      existing.show(); existing.focus();
+      if (kind === 'management' && source.path) {
+        // Rebinding gives the window a fresh bridge key bound to the new route;
+        // the old key stops working before the new renderer starts. The theme is
+        // re-read so a rebind cannot fall back to a stale colour scheme.
+        const theme = await wc.executeJavaScript('document.documentElement.dataset.colorScheme||"dark"');
+        await bindRenderer(existing.webContents, 'management', { popout: true, theme, initialPath: managementPath(source.path) });
+      }
+      return { focused: true };
+    }
     const theme = await wc.executeJavaScript('document.documentElement.dataset.colorScheme||"dark"');
     const previous = state.bounds.get(kind);
+    const management = kind === 'management';
     const win = new BrowserWindow({
-      title: 'KimiCode+ 规划',
-      width: previous?.width || 640, height: previous?.height || 840,
-      x: previous?.x, y: previous?.y, minWidth: 400, minHeight: 500,
+      title: management ? 'KimiCode+ 管理' : 'KimiCode+ 规划',
+      width: previous?.width || (management ? 1080 : 640),
+      height: previous?.height || (management ? 760 : 840),
+      x: previous?.x, y: previous?.y,
+      minWidth: management ? 720 : 400, minHeight: management ? 520 : 500,
       show: false, autoHideMenuBar: true, backgroundColor: theme === 'dark' ? '#121212' : '#ffffff',
       webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
     });
@@ -62,7 +83,8 @@ async function installNativeBootstrap(options) {
     win.on('closed', () => { state.channels.delete(contentsId); state.windows.delete(kind); });
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     await win.loadURL('about:blank');
-    await bindRenderer(win.webContents, 'planner', { popout: true, theme, ...source });
+    if (management) await bindRenderer(win.webContents, 'management', { popout: true, theme, initialPath: managementPath(source.path) });
+    else await bindRenderer(win.webContents, 'planner', { popout: true, theme, ...source });
     win.show(); win.focus();
     return { opened: true };
   }
@@ -94,6 +116,7 @@ async function installNativeBootstrap(options) {
       }
       case 'window.openSettings': return wc.executeJavaScript('window.__ekdNativeUI.openSettings()');
       case 'window.popout': return openWindow('planner', { sourceSessionId: payload.sourceSessionId || '', initialSource: payload.initialSource === 'local' ? 'local' : 'web' });
+      case 'window.openManagement': return openWindow('management', { path: managementPath(payload.path) });
       case 'window.close': BrowserWindow.fromWebContents(target)?.close(); return {};
       case 'window.ensureWidth': {
         const win = BrowserWindow.fromWebContents(target);
