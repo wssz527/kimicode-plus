@@ -188,7 +188,7 @@ const SETTINGS_PERMISSIONS = ["core:read", "settings:write", "models:read", "mod
 
 /** The bridge already rejects other paths; this narrows the type for the UI. */
 function managementRoute(value: string | undefined) {
-  return value === "/credentials" || value === "/plugins" ? value : "/models";
+  return value === "/credentials" ? "/credentials" : "/models";
 }
 
 export function mountSurface(element: HTMLElement, surface: SurfaceName, options: SurfaceMountOptions): EnhancementHandle {

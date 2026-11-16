@@ -11,13 +11,18 @@ import (
 // list and as the guard that rejects everything else.
 func TestBootstrapRestrictsManagementRoutes(t *testing.T) {
 	for _, wanted := range []string{
-		"const managementPaths = ['/models', '/credentials', '/plugins'];",
+		"const managementPaths = ['/models', '/credentials'];",
 		"if (typeof value !== 'string' || !managementPaths.includes(value)) throw new Error('管理窗口路径不被允许');",
 		"case 'window.openManagement': return openWindow('management', { path: managementPath(payload.path) });",
 	} {
 		if !strings.Contains(bootstrapSource, wanted) {
 			t.Fatalf("bootstrap.js lost the management route guard: %s", wanted)
 		}
+	}
+	// Plugins are managed inside the settings dialog, so the window must not
+	// expose a plugin route at all.
+	if strings.Contains(bootstrapSource, "'/plugins'") {
+		t.Fatal("bootstrap.js still exposes a plugin route to the management window")
 	}
 	// window.popout and window.openSettings keep their original behaviour.
 	for _, wanted := range []string{

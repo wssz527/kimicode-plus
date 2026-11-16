@@ -46,8 +46,9 @@ async function installNativeBootstrap(options) {
   function ownedBrowser(target, mode) { return mode === 'exec' ? state.browserWindow?.webContents : state.views.get(target.id)?.webContents; }
   // The management window reuses the core.fetch channel, so its routes are a
   // fixed set: a caller cannot point it at anything the settings sheet does not
-  // offer, and the renderer never receives the core bearer token.
-  const managementPaths = ['/models', '/credentials', '/plugins'];
+  // offer, and the renderer never receives the core bearer token. Plugins are
+  // deliberately absent: they are managed inside the settings dialog itself.
+  const managementPaths = ['/models', '/credentials'];
   function managementPath(value) {
     if (typeof value !== 'string' || !managementPaths.includes(value)) throw new Error('管理窗口路径不被允许');
     return value;

@@ -5,13 +5,11 @@ import { Icon } from "./Icon";
 import type { ManagementPath, NativeHost } from "../native";
 import { ModelsPage } from "../pages/ModelsPage";
 import { CredentialsPage } from "../pages/CredentialsPage";
-import { PluginsPage } from "../pages/PluginsPage";
 import "../styles/native-settings-surface.css";
 
 const PAGES: { path: ManagementPath; label: string; hint: string }[] = [
   { path: "/models", label: "模型与供应商", hint: "目录来源、逐字段覆盖与回滚。" },
   { path: "/credentials", label: "凭据库", hint: "密钥只保存在增强程序自己的加密库里。" },
-  { path: "/plugins", label: "插件", hint: "可信 Go 处理组件、启用状态与故障隔离。" },
 ];
 
 /**
@@ -55,6 +53,5 @@ export function ManagementWindow({ host, path }: { host: NativeHost; path: Manag
 
 function CurrentPage({ path }: { path: ManagementPath }) {
   if (path === "/credentials") return <CredentialsPage />;
-  if (path === "/plugins") return <PluginsPage />;
   return <ModelsPage />;
 }

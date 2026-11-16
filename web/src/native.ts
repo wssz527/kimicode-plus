@@ -296,9 +296,10 @@ export interface NativeHooks {
 
 /**
  * The management window is a separate BrowserWindow, so its routes are a fixed
- * set. The bridge rejects anything else; this type keeps the surface honest.
+ * set. Plugins are not here: they are managed inside the settings dialog, which
+ * ships the same PluginSettings component. The bridge rejects anything else.
  */
-export const managementPaths = ["/models", "/credentials", "/plugins"] as const;
+export const managementPaths = ["/models", "/credentials"] as const;
 export type ManagementPath = typeof managementPaths[number];
 export function isManagementPath(value: string): value is ManagementPath {
   return (managementPaths as readonly string[]).includes(value);
@@ -469,7 +470,7 @@ export function createNativeHost(transport: NativeTransport, hooks: NativeHooks,
     popout: hooks.popout ?? (async source => { await transport.request("window.popout", { surface: "planner", initialSource: source ?? "web" }); }),
     openSettings: async () => { await transport.request("window.openSettings"); },
     openManagement: async path => {
-      if (!isManagementPath(path)) throw new Error("管理窗口只打开模型、凭据和插件页");
+      if (!isManagementPath(path)) throw new Error("管理窗口只打开模型与凭据页");
       await transport.request("window.openManagement", { path });
     },
     pickSession: hooks.pickSession ?? (async exclude => transport.request<string>("host.pickSession", { exclude })),

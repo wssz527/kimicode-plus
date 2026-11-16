@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth";
 import { Icon } from "./Icon";
 import { CacheSettings } from "./CacheSettings";
+import { PluginSettings } from "./PluginSettings";
 import { errorText } from "./workbench/pieces";
 import { NativeSettings } from "./NativeSettings";
 import { Badge, ErrorNotice, Spinner } from "./ui";
@@ -17,7 +18,7 @@ const SECTIONS = [
 ] as const;
 type SectionId = typeof SECTIONS[number]["id"];
 
-const MANAGEMENT_PATHS = ["/models", "/credentials", "/plugins"] as const;
+const MANAGEMENT_PATHS = ["/models", "/credentials"] as const;
 type ManagementPath = typeof MANAGEMENT_PATHS[number];
 
 /**
@@ -89,7 +90,7 @@ export function SettingsWindow({ host }: { host: NativeHost }) {
       <div className="ekds-body">
         {openId === "cache" ? <CacheSettings host={host} /> : null}
         {openId === "native" ? <NativeSettings /> : null}
-        {openId === "plugins" ? <PluginsSection host={host} /> : null}
+        {openId === "plugins" ? <PluginsSection /> : null}
         {openId === "addons" ? <AddonsSection host={host} /> : null}
         {openId === "diagnostics" ? <DiagnosticsSection host={host} /> : null}
       </div>
@@ -97,23 +98,10 @@ export function SettingsWindow({ host }: { host: NativeHost }) {
   </div>;
 }
 
-function PluginsSection({ host }: { host: NativeHost }) {
+function PluginsSection() {
   return <>
-    <p className="ekds-note">插件在独立管理窗口里安装、启用和查看故障记录。这里只保留入口，避免在设置弹层里再放一套导航。</p>
-    <div className="ekds-group">
-      <button type="button" className="ekds-row ekds-row-button" onClick={() => void host.openManagement("/plugins")}>
-        <span className="ekds-row-label"><strong>插件管理</strong><small>可信 Go 处理组件、启用状态与最近失败</small></span>
-        <span className="ekds-row-tail">
-          <span className="ekds-row-aside">独立窗口</span>
-          <Icon name="arrowUpRight" size={15} className="ekds-chevron" />
-        </span>
-      </button>
-    </div>
-    <dl className="ekds-facts">
-      <div><dt>Monitor 来源</dt><dd>bfjnbvf/kimi-code-monitor · MIT</dd></div>
-      <div><dt>固定版本</dt><dd><code>1d529f0b424a708971cfac097238df444f3b5beb</code></dd></div>
-      <div><dt>更新策略</dt><dd>锁定当前提交，不自动跟随浮动分支</dd></div>
-    </dl>
+    <p className="ekds-note">插件按清单申请的能力取用核心功能，停用后不影响核心与其他模块。</p>
+    <PluginSettings embedded />
   </>;
 }
 

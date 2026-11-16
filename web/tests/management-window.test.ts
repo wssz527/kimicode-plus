@@ -11,10 +11,10 @@ import {
   readAddonFeatures,
 } from "../src/native.js";
 
-test("management paths are exactly the three pages the window can render", () => {
-  assert.deepEqual([...managementPaths], ["/models", "/credentials", "/plugins"]);
+test("management paths are exactly the two routes the window can render", () => {
+  assert.deepEqual([...managementPaths], ["/models", "/credentials"]);
   for (const path of managementPaths) assert.equal(isManagementPath(path), true, path);
-  for (const path of ["/", "/settings", "/models/", "/models/../credentials", "models", "/native-settings", "/plugins?x=1", ""]) {
+  for (const path of ["/", "/settings", "/models/", "/models/../credentials", "models", "/native-settings", "/plugins", "/plugins?x=1", ""]) {
     assert.equal(isManagementPath(path), false, path);
   }
 });
@@ -32,7 +32,9 @@ test("openManagement sends only a whitelisted path and refuses the rest", async 
   );
   await host.openManagement("/credentials");
   assert.deepEqual(calls, [{ action: "window.openManagement", payload: { path: "/credentials" } }]);
-  await assert.rejects(() => host.openManagement("/settings" as never), /管理窗口只打开/);
+  for (const rejected of ["/settings", "/plugins"]) {
+    await assert.rejects(() => host.openManagement(rejected as never), /管理窗口只打开/);
+  }
   assert.equal(calls.length, 1, "a rejected path must not reach the bridge");
   host.close();
 });
