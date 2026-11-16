@@ -2,636 +2,720 @@ package plugins
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"enhancedkimi/internal/credentials"
 	"enhancedkimi/internal/httpx"
-	"enhancedkimi/internal/storage"
+	"enhancedkimi/internal/redact"
 )
 
 const APIPrefix = "/enhance/v1"
 
-// activationWaitLimit bounds how long a duplicate enable waits for the running
-// activation, so a stuck simulated plugin cannot pin an HTTP handler forever.
-const activationWaitLimit = 30 * time.Second
-
 const (
-	StateDisabled = "DISABLED"
-	StateEnabling = "ENABLING"
-	StateEnabled  = "ENABLED"
-	StateFaulted  = "FAULTED"
-	StateBlocked  = "BLOCKED"
+	StateDisabled  = "DISABLED"
+	StateEnabled   = "ENABLED"
+	StateFaulted   = "FAULTED"
+	StateBlocked   = "BLOCKED"
+	StateIncompat  = "INCOMPATIBLE"
+	StateCorrupt   = "CORRUPT"
+	StateUninstall = "UNINSTALLED"
 )
 
 const (
-	ActionEnable  = "ENABLE"
-	ActionDisable = "DISABLE"
-	ActionFault   = "FAULT"
+	SourceBundled = "BUNDLED"
+	SourceLocal   = "LOCAL"
 )
 
-var migrations = []string{
-	`CREATE TABLE plugin_states (
-		id TEXT PRIMARY KEY,
-		enabled INTEGER NOT NULL DEFAULT 0,
-		state TEXT NOT NULL DEFAULT 'DISABLED',
-		faults INTEGER NOT NULL DEFAULT 0,
-		error TEXT NOT NULL DEFAULT '',
-		resources INTEGER NOT NULL DEFAULT 0,
-		updated_at TEXT NOT NULL
-	)`,
+// rendererTokenLimit bounds the in-memory identity tokens. One token exists per
+// enabled plugin per running core; a leak here would be an unbounded growth bug
+// rather than a security event.
+const rendererTokenLimit = 256
+
+// Options wires the manager to the App it belongs to. Everything that a plugin
+// can reach is held on the instance: there is no package-level vault, core or
+// data directory, so two Apps in one process cannot see each other's state.
+type Options struct {
+	DataDir     string
+	HostVersion string
+	Core        Core
+	Vault       *credentials.Vault
+	Now         func() time.Time
+	// Bundled supplies the embedded plugin set for restore and release. The core
+	// injects it so this package never imports the plugin bundle.
+	Bundled func() (map[string]map[string][]byte, error)
 }
 
-type Descriptor struct {
+// Option mutates Options during construction.
+type Option func(*Options)
+
+func WithDataDir(dir string) Option         { return func(o *Options) { o.DataDir = dir } }
+func WithHostVersion(v string) Option       { return func(o *Options) { o.HostVersion = v } }
+func WithCore(core Core) Option             { return func(o *Options) { o.Core = core } }
+func WithVault(v *credentials.Vault) Option { return func(o *Options) { o.Vault = v } }
+
+func WithBundled(load func() (map[string]map[string][]byte, error)) Option {
+	return func(o *Options) { o.Bundled = load }
+}
+
+// Core is the narrow slice of the App the plugin host needs. nativeService
+// implements it; declaring it here keeps the desktop package out of this
+// package's imports and makes the manager testable with a fake.
+type Core interface {
+	Action(ctx context.Context, action string, payload json.RawMessage) (any, error)
+	Events() EventSource
+}
+
+// EventSource is desktop.EventBus reduced to the one method the plugin host
+// calls. The adapter in package server bridges the concrete event type.
+type EventSource interface {
+	Poll(ctx context.Context, after int64, scopes []string, wait time.Duration) (EventPage, error)
+}
+
+type Event struct {
+	Sequence int64  `json:"sequence"`
+	Scope    string `json:"scope"`
+	Value    any    `json:"value"`
+}
+
+type EventPage struct {
+	Events []Event `json:"events"`
+	Next   int64   `json:"next"`
+	Reset  bool    `json:"reset,omitempty"`
+}
+
+// Plugin is one row of the plugin page. It carries only what the UI renders;
+// capabilities are reported as granted names so an ungranted permission is not
+// displayed as if it were in force.
+type Plugin struct {
 	ID           string   `json:"id"`
 	Name         string   `json:"name"`
 	Version      string   `json:"version"`
-	Kind         string   `json:"kind"`
-	Description  string   `json:"description"`
-	HostRange    string   `json:"hostRange"`
+	Description  string   `json:"description,omitempty"`
+	Author       string   `json:"author,omitempty"`
+	License      string   `json:"license,omitempty"`
+	Source       string   `json:"source"`
+	State        string   `json:"state"`
+	Enabled      bool     `json:"enabled"`
+	Error        string   `json:"error,omitempty"`
 	Capabilities []string `json:"capabilities"`
-	Builtin      bool     `json:"builtin"`
-	Sandbox      string   `json:"sandbox"`
+	Declared     []string `json:"declaredCapabilities"`
+	Slots        []string `json:"slots"`
+	HostVersions []string `json:"hostVersions"`
+	Compatible   bool     `json:"compatible"`
+	HasSettings  bool     `json:"hasSettings"`
+	// Entry is the manifest entry, which the renderer needs to load the module.
+	Entry       Entry  `json:"entry"`
+	Upstream    string `json:"upstream,omitempty"`
+	InstalledAt string `json:"installedAt,omitempty"`
+	UpdatedAt   string `json:"updatedAt,omitempty"`
+	// Desired is the user's enabled intent, which survives a restart. Enabled is
+	// true only while this process has granted the plugin a live token; a plugin
+	// can be desired and not yet live before a renderer adopts it.
+	Desired bool `json:"desired"`
+	// Forced records that the user enabled a plugin whose host version was not
+	// declared in hostVersions.
+	Forced bool `json:"forced,omitempty"`
+	// Token is only filled in the enable response, for the renderer that is about
+	// to load this plugin. The list never carries it.
+	Token string `json:"token,omitempty"`
 }
 
-type Plugin struct {
-	Descriptor
-	State      string `json:"state"`
-	Enabled    bool   `json:"enabled"`
-	Faults     int    `json:"faults"`
-	Error      string `json:"error,omitempty"`
-	Resources  int    `json:"resources"`
-	UpdatedAt  string `json:"updatedAt"`
-	SafeMode   bool   `json:"safeMode"`
-	Controlled string `json:"controlled"`
-}
-
-type Scope struct {
-	mu     sync.Mutex
-	own    []resource
-	closed bool
-}
-
-type resource struct {
-	name    string
-	cleanup func() error
-}
-
-func (s *Scope) Own(name string, cleanup func() error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		runCleanup(name, cleanup)
-		return
-	}
-	s.own = append(s.own, resource{name: name, cleanup: cleanup})
-	s.mu.Unlock()
-}
-
-// Dispose releases every registered resource in reverse order. Each disposer is
-// isolated so one panic or error can never skip the remaining cleanup.
-func (s *Scope) Dispose() []string {
-	s.mu.Lock()
-	resources := s.own
-	s.own = nil
-	s.closed = true
-	s.mu.Unlock()
-	var failures []string
-	for i := len(resources) - 1; i >= 0; i-- {
-		if message, ok := runCleanup(resources[i].name, resources[i].cleanup); !ok {
-			failures = append(failures, message)
-		}
-	}
-	return failures
-}
-
-func runCleanup(name string, cleanup func() error) (message string, ok bool) {
-	if cleanup == nil {
-		return "", true
-	}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			message = fmt.Sprintf("%s: disposer panic isolated: %v", name, recovered)
-			ok = false
-		}
-	}()
-	if err := cleanup(); err != nil {
-		return name + ": " + err.Error(), false
-	}
-	return "", true
-}
-
-func (s *Scope) Count() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.own)
-}
-
-type Activation func(scope *Scope) error
-
-type definition struct {
-	descriptor Descriptor
-	activate   Activation
-	selfCheck  func() error
-}
-
-// activation links one running attempt to the scope it created. A stale
-// activation must never publish state for a newer attempt.
-type activation struct {
-	scope *Scope
-	token uint64
-	done  chan struct{}
-}
-
-type runtimeState struct {
+// entry is a live install: the parsed manifest, the granted capabilities and
+// where its files are. The manifest is re-read from disk on every start, so an
+// edited file is caught instead of being trusted from the database.
+type entry struct {
+	manifest  Manifest
+	grants    Grants
+	declared  []string
+	source    string
+	dir       string
 	state     string
-	active    *activation
-	faults    int
-	err       string
-	updatedAt time.Time
+	errText   string
+	enabled   bool
+	forced    bool
+	updated   time.Time
+	installed time.Time
 }
 
 type Manager struct {
 	db      *sql.DB
 	safe    func() bool
+	dataDir string
+	host    string
+	core    Core
+	vault   *credentials.Vault
+	bundled func() (map[string]map[string][]byte, error)
+	now     func() time.Time
+
 	mu      sync.Mutex
-	defs    map[string]*definition
+	entries map[string]*entry
 	order   []string
-	runtime map[string]*runtimeState
+	tokens  map[string]string
+	client  *http.Client
 	closed  bool
-	token   uint64
 }
 
-func New(db *sql.DB, safe func() bool) (*Manager, error) {
+// New builds the plugin host. A missing data directory is not fatal: the manager
+// then serves an empty list and refuses installs, which keeps a headless test or
+// a degraded start usable instead of failing the whole core.
+func New(db *sql.DB, safe func() bool, options ...Option) (*Manager, error) {
 	if db == nil {
 		return nil, errors.New("plugins requires a database")
 	}
 	if safe == nil {
 		safe = func() bool { return false }
 	}
-	if err := storage.Migrate(db, "plugins", migrations); err != nil {
-		return nil, fmt.Errorf("plugins migrations: %w", err)
+	opts := Options{}
+	for _, option := range options {
+		option(&opts)
+	}
+	if opts.Now == nil {
+		opts.Now = func() time.Time { return time.Now().UTC() }
+	}
+	if err := migrate(db); err != nil {
+		return nil, err
 	}
 	manager := &Manager{
 		db:      db,
 		safe:    safe,
-		defs:    make(map[string]*definition),
-		runtime: make(map[string]*runtimeState),
+		dataDir: opts.DataDir,
+		host:    opts.HostVersion,
+		core:    opts.Core,
+		vault:   opts.Vault,
+		bundled: opts.Bundled,
+		now:     opts.Now,
+		entries: make(map[string]*entry),
+		tokens:  make(map[string]string),
 	}
-	manager.registerBuiltins()
 	if err := manager.load(); err != nil {
 		return nil, err
 	}
 	return manager, nil
 }
 
-func (m *Manager) registerBuiltins() {
-	m.add(definition{
-		descriptor: Descriptor{
-			ID: "kct", Name: "KCT 指令转接（模拟）", Version: "1.0.0", Kind: "BRIDGE_HELPER",
-			Description: "内置模拟插件：在没有真实通道时展示指令转接的生命周期与资源记账。",
-			HostRange:   "1.x", Capabilities: []string{"ROUTE_INSTRUCTIONS"}, Builtin: true,
-			Sandbox: "IN_PROCESS_SIMULATION",
-		},
-		activate: func(scope *Scope) error {
-			return simulateActivation(scope)
-		},
-	})
-	m.add(definition{
-		descriptor: Descriptor{
-			ID: "monitor", Name: "运行监视（模拟）", Version: "1.0.0", Kind: "OBSERVER",
-			Description: "内置模拟插件：只记录内存中的模拟计数，不读取官方进程、配置或会话。",
-			HostRange:   "1.x", Capabilities: []string{"HEALTH_SUMMARY"}, Builtin: true,
-			Sandbox: "IN_PROCESS_SIMULATION",
-		},
-		activate: func(scope *Scope) error {
-			return simulateActivation(scope)
-		},
-	})
-	m.add(definition{
-		descriptor: Descriptor{
-			ID: "fault-demo", Name: "故障示例（测试）", Version: "1.0.0", Kind: "FAULT_INJECTOR",
-			Description: "唯一会抛出错误的测试插件；用于验证禁用隔离与状态持久化，不影响其他插件。",
-			HostRange:   "1.x", Capabilities: []string{"INJECT_FAULT"}, Builtin: true,
-			Sandbox: "IN_PROCESS_SIMULATION",
-		},
-		activate: func(scope *Scope) error {
-			return simulateActivation(scope)
-		},
-		selfCheck: func() error {
-			return errors.New("模拟故障：插件自检按设计失败")
-		},
-	})
+// UseCore and UseVault attach the App instances after construction, because the
+// core builds plugins before the native service and the vault exist. Passing
+// them here keeps a single instance per App instead of a package global.
+func (m *Manager) UseCore(core Core) {
+	m.mu.Lock()
+	m.core = core
+	m.mu.Unlock()
 }
 
-func simulateActivation(scope *Scope) error {
-	if scope == nil {
-		return errors.New("missing activation scope")
-	}
-	scope.Own("connection", func() error { return nil })
-	scope.Own("timer", func() error { return nil })
-	scope.Own("listener", func() error { return nil })
-	return nil
+func (m *Manager) UseVault(vault *credentials.Vault) {
+	m.mu.Lock()
+	m.vault = vault
+	m.mu.Unlock()
 }
 
-func (m *Manager) add(def definition) {
-	if _, exists := m.defs[def.descriptor.ID]; exists {
-		return
+func (m *Manager) SetHostVersion(version string) {
+	m.mu.Lock()
+	m.host = version
+	m.mu.Unlock()
+}
+
+// DataDir reports the plugin root this manager owns. The renderer needs it to
+// build asset URLs, and two managers in one process must report different roots.
+func (m *Manager) DataDir() string { return m.dataDir }
+
+func (m *Manager) bundledFiles() (map[string]map[string][]byte, error) {
+	m.mu.Lock()
+	load := m.bundled
+	m.mu.Unlock()
+	if load == nil {
+		return nil, nil
 	}
-	m.defs[def.descriptor.ID] = &def
-	m.order = append(m.order, def.descriptor.ID)
+	return load()
+}
+
+func (m *Manager) pluginsDir() string {
+	if m.dataDir == "" {
+		return ""
+	}
+	return filepath.Join(m.dataDir, "plugins")
 }
 
 func (m *Manager) load() error {
+	ctx := context.Background()
+	records, err := loadRecords(ctx, m.db)
+	if err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	rows, err := m.db.Query(`SELECT id,enabled,state,faults,error,updated_at FROM plugin_states`)
-	if err != nil {
-		return fmt.Errorf("load plugin states: %w", err)
-	}
-	defer rows.Close()
-	type persisted struct {
-		id      string
-		enabled bool
-		state   string
-		faults  int
-		errText string
-	}
-	var saved []persisted
-	for rows.Next() {
-		var row persisted
-		var enabled int
-		if err := rows.Scan(&row.id, &enabled, &row.state, &row.faults, &row.errText, new(string)); err != nil {
-			return fmt.Errorf("scan plugin state: %w", err)
-		}
-		row.enabled = enabled == 1
-		saved = append(saved, row)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate plugin states: %w", err)
-	}
-	for _, row := range saved {
-		if _, ok := m.defs[row.id]; !ok {
+	for _, item := range records {
+		if item.tombstone {
 			continue
 		}
-		state := &runtimeState{state: StateDisabled, faults: row.faults, err: row.errText, updatedAt: time.Now().UTC()}
-		if row.enabled || row.state == StateEnabled || row.state == StateEnabling {
-			state.state = StateBlocked
-			state.err = "上次运行结束前插件仍处于启用状态；模拟插件不会在读取持久状态时自动启动，请显式启用。"
-		} else if row.state == StateFaulted {
-			state.state = StateFaulted
+		var manifest Manifest
+		if err := json.Unmarshal(item.manifest, &manifest); err != nil {
+			manifest = Manifest{ID: item.id, Name: item.name, Version: item.version}
 		}
-		m.runtime[row.id] = state
-	}
-	return nil
-}
-
-func (m *Manager) persistLocked(id string, state *runtimeState) error {
-	enabled := 0
-	if state.state == StateEnabled {
-		enabled = 1
-	}
-	resources := 0
-	if state.active != nil && state.active.scope != nil {
-		resources = state.active.scope.Count()
-	}
-	updated := state.updatedAt.UTC().Format(time.RFC3339Nano)
-	_, err := m.db.Exec(`INSERT INTO plugin_states(id,enabled,state,faults,error,resources,updated_at) VALUES(?,?,?,?,?,?,?)
-		ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled,state=excluded.state,faults=excluded.faults,error=excluded.error,resources=excluded.resources,updated_at=excluded.updated_at`,
-		id, enabled, state.state, state.faults, state.err, resources, updated)
-	if err != nil {
-		return fmt.Errorf("persist plugin state: %w", err)
-	}
-	return nil
-}
-
-func (m *Manager) state(id string) *runtimeState {
-	state, ok := m.runtime[id]
-	if !ok {
-		state = &runtimeState{state: StateDisabled, updatedAt: time.Now().UTC()}
-		m.runtime[id] = state
-	}
-	return state
-}
-
-// takeScopeLocked detaches the current activation and returns its scope. The
-// caller disposes it outside the lock. Detaching alone invalidates the matching
-// in-flight activation, because a stale attempt only publishes when its token is
-// still the current one.
-func (m *Manager) takeScopeLocked(state *runtimeState) *Scope {
-	if state.active == nil {
-		return nil
-	}
-	scope := state.active.scope
-	state.active = nil
-	return scope
-}
-
-func (m *Manager) List() []Plugin {
-	m.EnforceSafeMode()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	safe := m.safe()
-	out := make([]Plugin, 0, len(m.order))
-	for _, id := range m.order {
-		def := m.defs[id]
-		state := m.state(id)
-		plugin := Plugin{
-			Descriptor: def.descriptor,
-			State:      state.state,
-			Enabled:    state.state == StateEnabled,
-			Faults:     state.faults,
-			Error:      state.err,
-			Resources:  0,
-			UpdatedAt:  state.updatedAt.UTC().Format(time.RFC3339Nano),
-			SafeMode:   safe,
-			Controlled: "SIMULATED_ONLY",
+		grants, grantErr := ParseCapabilities(item.capabilities)
+		if grantErr != nil {
+			grants = Grants{fixed: make(map[string]bool)}
 		}
-		if def.descriptor.Sandbox == "TRUSTED_GO" {
-			plugin.Controlled = "PORTABLE_GO_ONLY"
+		// The persisted record is the user's intent, not a claim that the plugin is
+		// running. `desired` is that intent and survives shutdown, while `state`
+		// records why the plugin is not running (blocked, incompatible, corrupt).
+		// Restoring from `state` alone would lose the enable decision, because a
+		// clean shutdown writes DISABLED for every plugin it stopped. Only the
+		// running/stopped pair follows `desired`: a recorded reason to stay down
+		// still wins over a desire to run.
+		state := item.state
+		if state == "" {
+			state = StateDisabled
 		}
-		if state.active != nil && state.active.scope != nil {
-			plugin.Resources = state.active.scope.Count()
-		}
-		if safe && (plugin.State == StateDisabled || plugin.State == StateBlocked) {
-			plugin.State = StateBlocked
-			if plugin.Error == "" {
-				plugin.Error = "安全模式已阻止插件启动。"
+		if state == StateEnabled || state == StateDisabled {
+			if item.desired {
+				state = StateEnabled
+			} else {
+				state = StateDisabled
 			}
 		}
-		out = append(out, plugin)
+		m.entries[item.id] = &entry{
+			manifest: manifest, grants: grants, declared: manifest.CapabilityNames(),
+			source: item.source, dir: filepath.Join(m.pluginsDir(), manifest.DataDirName()),
+			state: state, errText: item.err, enabled: item.desired,
+			// Force-enabling an incompatible plugin is not a separate column: it is
+			// exactly a desired plugin the host version does not cover, so the flag
+			// is re-derived instead of drifting from what was stored.
+			forced:    item.desired && !m.compatible(manifest),
+			installed: item.installedAt, updated: item.updatedAt,
+		}
+		m.order = append(m.order, item.id)
+	}
+	sort.Strings(m.order)
+	return nil
+}
+
+func (m *Manager) snapshot() []Plugin {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Plugin, 0, len(m.order))
+	for _, id := range m.order {
+		item := m.entries[id]
+		if item == nil {
+			continue
+		}
+		out = append(out, m.present(item))
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
-// EnforceSafeMode is reversible: it stops plugins and releases their resources
-// while safe mode is on, but leaves the manager usable once safe mode is off.
+func (m *Manager) present(item *entry) Plugin {
+	plugin := Plugin{
+		ID:           item.manifest.ID,
+		Name:         item.manifest.Name,
+		Version:      item.manifest.Version,
+		Description:  item.manifest.Description,
+		Author:       item.manifest.Author,
+		License:      item.manifest.License,
+		Source:       item.source,
+		State:        item.state,
+		Enabled:      item.state == StateEnabled,
+		Desired:      item.enabled,
+		Forced:       item.forced,
+		Error:        item.errText,
+		Capabilities: item.grants.Names(),
+		Declared:     append([]string(nil), item.declared...),
+		Slots:        grantedSlots(item.grants),
+		HostVersions: append([]string(nil), item.manifest.HostVersions...),
+		Compatible:   m.compatible(item.manifest),
+		HasSettings:  item.manifest.Entry.Settings != "",
+		Entry:        item.manifest.Entry,
+		Upstream:     upstreamLabel(item.manifest),
+		UpdatedAt:    item.updated.String(),
+	}
+	if !item.installed.IsZero() {
+		plugin.InstalledAt = item.installed.String()
+	}
+	return plugin
+}
+
+func upstreamLabel(manifest Manifest) string {
+	if manifest.Upstream == nil {
+		return ""
+	}
+	parts := []string{}
+	if manifest.Upstream.Repo != "" {
+		parts = append(parts, manifest.Upstream.Repo)
+	}
+	if manifest.Upstream.Commit != "" {
+		parts = append(parts, manifest.Upstream.Commit)
+	}
+	if manifest.Upstream.License != "" {
+		parts = append(parts, manifest.Upstream.License)
+	}
+	return strings.Join(parts, " · ")
+}
+
+func grantedSlots(grants Grants) []string {
+	slots := []string{}
+	for _, slot := range []string{"sidebar", "settings", "thinking", "message"} {
+		if grants.AllowsSlot(slot) {
+			slots = append(slots, slot)
+		}
+	}
+	return slots
+}
+
+// compatible reports the version gate. An unknown host version (a build without
+// one, or a test) does not block a plugin: the gate protects users from
+// unverified hosts, and refusing everything would make the feature unusable in a
+// developer build. A known version that is not declared is a real mismatch.
+func (m *Manager) compatible(manifest Manifest) bool {
+	host := strings.TrimSpace(m.host)
+	if host == "" {
+		return true
+	}
+	return manifest.HostVersionSupported(host)
+}
+
+// List returns every install in a stable order.
+func (m *Manager) List() []Plugin { return m.snapshot() }
+
+// Get returns one install.
+func (m *Manager) Get(id string) (Plugin, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	item, ok := m.entries[id]
+	if !ok {
+		return Plugin{}, false
+	}
+	return m.present(item), true
+}
+
+// GrantsFor returns the granted capabilities of an enabled plugin. The zero
+// Grants denies everything, so a missing or disabled plugin cannot act.
+func (m *Manager) GrantsFor(id string) (Grants, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	item, ok := m.entries[id]
+	if !ok || item.state != StateEnabled {
+		return Grants{}, false
+	}
+	return item.grants, true
+}
+
+// TokenOwner resolves the plugin a token belongs to. The dedicated action route
+// uses it so a plugin cannot even name another plugin: its identity comes from
+// the token, not from the URL.
+func (m *Manager) TokenOwner(token string) (string, bool) {
+	if token == "" {
+		return "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, current := range m.tokens {
+		if subtleEqual(current, token) {
+			return id, true
+		}
+	}
+	return "", false
+}
+
+// Token issues the renderer identity token for an enabled plugin. The token is
+// generated per enable, kept in memory only, and never written to the database or
+// an activity row; it dies with the manager.
+func (m *Manager) Token(id string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	item, ok := m.entries[id]
+	if !ok {
+		return "", apiError(http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件未安装")
+	}
+	if item.state != StateEnabled {
+		return "", apiError(http.StatusConflict, "PLUGIN_DISABLED", "插件未启用")
+	}
+	if token, ok := m.tokens[id]; ok {
+		return token, nil
+	}
+	if len(m.tokens) >= rendererTokenLimit {
+		return "", apiError(http.StatusTooManyRequests, "PLUGIN_TOKEN_LIMIT", "同时启用的插件过多")
+	}
+	token, err := newToken()
+	if err != nil {
+		return "", apiError(http.StatusInternalServerError, "PLUGIN_TOKEN", "无法生成插件身份令牌")
+	}
+	m.tokens[id] = token
+	return token, nil
+}
+
+// Verify reports whether a renderer-supplied token belongs to the plugin it
+// claims. A token from another plugin, another App or an earlier enable fails,
+// which is what makes the identity per-instance rather than global.
+func (m *Manager) Verify(id, token string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, ok := m.tokens[id]
+	if !ok || token == "" || current == "" {
+		return false
+	}
+	return subtleEqual(current, token)
+}
+
+func subtleEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var diff byte
+	for i := 0; i < len(a); i++ {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
+}
+
+func newToken() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+func (m *Manager) enabled(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	item, ok := m.entries[id]
+	return ok && item.state == StateEnabled
+}
+
+// Enable turns a plugin on after re-checking the version gate, the safe mode and
+// the files on disk. Every refusal leaves a reason the page can show.
+// Enable turns a plugin on. A host version outside hostVersions is refused unless
+// force is set, which the page only sends after the user confirms the warning.
+func (m *Manager) Enable(ctx context.Context, id string) (Plugin, error) {
+	return m.enable(ctx, id, false)
+}
+
+// ForceEnable is the explicit override for a plugin the current host version did
+// not declare. It is deliberately a separate call so the default path can never
+// be reached by accident.
+func (m *Manager) ForceEnable(ctx context.Context, id string) (Plugin, error) {
+	return m.enable(ctx, id, true)
+}
+
+func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, error) {
+	m.mu.Lock()
+	item, ok := m.entries[id]
+	if !ok {
+		m.mu.Unlock()
+		return Plugin{}, apiError(http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件未安装")
+	}
+	if m.closed {
+		m.mu.Unlock()
+		return Plugin{}, apiError(http.StatusConflict, "MANAGER_CLOSED", "插件管理器已关闭")
+	}
+	if item.state == StateEnabled {
+		m.mu.Unlock()
+		return m.present(item), nil
+	}
+	safe := m.safe()
+	manifest := item.manifest
+	dir := item.dir
+	m.mu.Unlock()
+
+	now := m.now()
+	if safe {
+		m.fail(ctx, id, StateBlocked, "安全模式已阻止插件启动。", ActivitySafeMode, now)
+		return m.Get2(id), apiError(http.StatusConflict, "SAFE_MODE", "安全模式已阻止插件启动")
+	}
+	if !m.compatible(manifest) && !force {
+		message := fmt.Sprintf("未在此宿主版本（%s）验证，已拒绝启用。确认风险后可强制启用。", m.host)
+		m.fail(ctx, id, StateIncompat, message, ActivityVersion, now)
+		return m.Get2(id), apiError(http.StatusConflict, "PLUGIN_INCOMPATIBLE", message)
+	}
+	if err := manifest.ValidateFiles(dir); err != nil {
+		message := redact.Text(err.Error())
+		m.fail(ctx, id, StateCorrupt, message, ActivityCorrupt, now)
+		return m.Get2(id), apiError(http.StatusConflict, "PLUGIN_FILES_INVALID", message)
+	}
+
+	m.mu.Lock()
+	item = m.entries[id]
+	if item == nil || m.closed {
+		m.mu.Unlock()
+		return Plugin{}, apiError(http.StatusConflict, "MANAGER_CLOSED", "插件管理器已关闭")
+	}
+	item.state = StateEnabled
+	item.errText = ""
+	item.enabled = true
+	item.forced = force && !m.compatible(manifest)
+	item.updated = now
+	token, tokenErr := m.issueTokenLocked(id)
+	plugin := m.present(item)
+	m.mu.Unlock()
+
+	if tokenErr != nil {
+		m.fail(ctx, id, StateFaulted, "无法生成插件身份令牌。", ActivityError, now)
+		return m.Get2(id), apiError(http.StatusInternalServerError, "PLUGIN_TOKEN", "无法生成插件身份令牌")
+	}
+	if err := setState(ctx, m.db, id, StateEnabled, true, "", now); err != nil {
+		m.mu.Lock()
+		item.state = StateDisabled
+		item.enabled = false
+		delete(m.tokens, id)
+		m.mu.Unlock()
+		return m.Get2(id), apiError(http.StatusInternalServerError, "PLUGIN_STATE_UNAVAILABLE", "无法保存插件状态")
+	}
+	_ = recordActivity(ctx, m.db, id, ActivityEnable, "插件已启用", now)
+	plugin.Token = token
+	return plugin, nil
+}
+
+func (m *Manager) issueTokenLocked(id string) (string, error) {
+	if token, ok := m.tokens[id]; ok {
+		return token, nil
+	}
+	token, err := newToken()
+	if err != nil {
+		return "", err
+	}
+	m.tokens[id] = token
+	return token, nil
+}
+
+// Get2 is Get without the comma-ok, for the paths that just refused an action
+// and want to report the resulting state.
+func (m *Manager) Get2(id string) Plugin {
+	plugin, _ := m.Get(id)
+	return plugin
+}
+
+func (m *Manager) fail(ctx context.Context, id, state, message, kind string, now time.Time) {
+	m.mu.Lock()
+	item := m.entries[id]
+	if item != nil {
+		item.state = state
+		item.enabled = false
+		item.errText = message
+		item.updated = now
+	}
+	delete(m.tokens, id)
+	m.mu.Unlock()
+	_ = setState(ctx, m.db, id, state, false, message, now)
+	_ = recordActivity(ctx, m.db, id, kind, message, now)
+}
+
+// Disable stops a plugin and revokes its renderer token in the same step, so a
+// renderer that keeps polling cannot act after the user turned it off.
+func (m *Manager) Disable(ctx context.Context, id string) error {
+	m.mu.Lock()
+	item, ok := m.entries[id]
+	if !ok {
+		m.mu.Unlock()
+		return apiError(http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件未安装")
+	}
+	item.state = StateDisabled
+	item.enabled = false
+	item.forced = false
+	item.errText = ""
+	item.updated = m.now()
+	delete(m.tokens, id)
+	m.mu.Unlock()
+	if err := setState(ctx, m.db, id, StateDisabled, false, "", m.now()); err != nil {
+		return apiError(http.StatusInternalServerError, "PLUGIN_STATE_UNAVAILABLE", "无法保存插件状态")
+	}
+	_ = recordActivity(ctx, m.db, id, ActivityDisable, "插件已停用", m.now())
+	return nil
+}
+
+// Uninstall removes the files, the private storage and the token, and leaves a
+// tombstone so the bundled copy is not released again. The tombstone is what
+// makes "uninstall" a decision rather than a temporary deletion.
+func (m *Manager) Uninstall(ctx context.Context, id string) error {
+	m.mu.Lock()
+	item, ok := m.entries[id]
+	if !ok {
+		m.mu.Unlock()
+		return apiError(http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件未安装")
+	}
+	dir := item.dir
+	now := m.now()
+	m.mu.Unlock()
+
+	if err := os.RemoveAll(dir); err != nil {
+		return apiError(http.StatusInternalServerError, "PLUGIN_UNINSTALL_FAILED", "无法删除插件文件，插件仍保持停用")
+	}
+	_ = storageClear(ctx, m.db, id)
+	if err := deleteRecord(ctx, m.db, id); err != nil {
+		return apiError(http.StatusInternalServerError, "PLUGIN_UNINSTALL_FAILED", "插件文件已删除，但记录未能清理")
+	}
+	_ = saveRecord(ctx, m.db, record{
+		id: id, name: item.manifest.Name, version: item.manifest.Version,
+		manifest: mustJSON(item.manifest), capabilities: []string{}, source: item.source,
+		state: StateUninstall, tombstone: true, installedAt: item.installed, updatedAt: now,
+	})
+	m.mu.Lock()
+	delete(m.entries, id)
+	delete(m.tokens, id)
+	m.order = removeString(m.order, id)
+	m.mu.Unlock()
+	_ = recordActivity(ctx, m.db, id, ActivityUninstall, "插件已卸载；卸载后不会自动恢复预装副本", now)
+	return nil
+}
+
+func mustJSON(value any) []byte {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return []byte("{}")
+	}
+	return data
+}
+
+func removeString(list []string, value string) []string {
+	out := make([]string, 0, len(list))
+	for _, item := range list {
+		if item != value {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// EnforceSafeMode stops every plugin when safe mode is on. It is reversible: the
+// installs stay, only the running state and tokens are dropped.
 func (m *Manager) EnforceSafeMode() {
 	if !m.safe() {
 		return
 	}
+	ctx := context.Background()
 	m.mu.Lock()
-	var active []*Scope
-	for id := range m.defs {
-		state := m.state(id)
-		if scope := m.takeScopeLocked(state); scope != nil {
-			active = append(active, scope)
+	changed := []string{}
+	for id, item := range m.entries {
+		if item.state == StateEnabled {
+			item.state = StateBlocked
+			item.errText = "安全模式已阻止插件运行。"
+			item.enabled = false
+			item.updated = m.now()
+			changed = append(changed, id)
 		}
-		if state.state == StateEnabled || state.state == StateEnabling {
-			state.state = StateBlocked
-			state.err = "安全模式已阻止插件运行；资源已释放。"
-			state.updatedAt = time.Now().UTC()
-			_ = m.persistLocked(id, state)
-		}
+		delete(m.tokens, id)
 	}
 	m.mu.Unlock()
-	for _, scope := range active {
-		scope.Dispose()
+	for _, id := range changed {
+		_ = setState(ctx, m.db, id, StateBlocked, false, "安全模式已阻止插件运行。", m.now())
+		_ = recordActivity(ctx, m.db, id, ActivitySafeMode, "安全模式已阻止插件运行。", m.now())
 	}
 }
 
-func (m *Manager) Enable(id string) (Plugin, error) {
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return Plugin{}, apiError(409, "MANAGER_CLOSED", "插件管理器已关闭")
-	}
-	def, ok := m.defs[id]
-	if !ok {
-		m.mu.Unlock()
-		return Plugin{}, apiError(404, "PLUGIN_NOT_FOUND", "内置插件不存在；不支持安装任意插件")
-	}
-	state := m.state(id)
-	if m.safe() {
-		state.state = StateBlocked
-		state.err = "安全模式已阻止插件启动。"
-		state.updatedAt = time.Now().UTC()
-		err := m.persistLocked(id, state)
-		m.mu.Unlock()
-		if err != nil {
-			return Plugin{}, apiError(500, "PLUGIN_STATE_UNAVAILABLE", "无法保存插件状态")
-		}
-		return m.snapshot(id), apiError(409, "SAFE_MODE", "安全模式已阻止插件启动")
-	}
-	if state.state == StateEnabled && state.active != nil {
-		m.mu.Unlock()
-		return m.snapshot(id), nil
-	}
-	if state.state == StateEnabling && state.active != nil {
-		// A concurrent enable joins the running activation instead of creating a
-		// competing scope. It never restarts after a cancellation.
-		token := state.active.token
-		done := state.active.done
-		m.mu.Unlock()
-		select {
-		case <-done:
-		case <-time.After(activationWaitLimit):
-			return m.snapshot(id), apiError(409, "PLUGIN_ENABLING", "插件启动超时，状态保持 ENABLING")
-		}
-		m.mu.Lock()
-		state = m.state(id)
-		enabled := state.state == StateEnabled && state.active != nil && state.active.token == token
-		finalState := state.state
-		m.mu.Unlock()
-		if enabled {
-			return m.snapshot(id), nil
-		}
-		if finalState == StateFaulted {
-			return m.snapshot(id), apiError(502, "PLUGIN_ACTIVATION_FAILED", "插件启动失败，已回滚其资源；其他插件不受影响")
-		}
-		return m.snapshot(id), apiError(409, "PLUGIN_ACTIVATION_CANCELLED", "插件启动已被取消，资源已释放")
-	}
-
-	m.token++
-	token := m.token
-	scope := &Scope{}
-	state.state = StateEnabling
-	state.err = ""
-	state.updatedAt = time.Now().UTC()
-	state.active = &activation{scope: scope, token: token, done: make(chan struct{})}
-	done := state.active.done
-	m.mu.Unlock()
-	defer close(done)
-
-	err := runActivation(def.activate, scope)
-	if err != nil {
-		failures := scope.Dispose()
-		m.mu.Lock()
-		state = m.state(id)
-		if m.closed || state.active == nil || state.active.token != token {
-			// Disable, safe mode or close cancelled this attempt while it was
-			// running and a newer attempt may already own the state. Its late
-			// failure must not fault or clear that newer activation.
-			m.mu.Unlock()
-			return Plugin{}, apiError(409, "PLUGIN_ACTIVATION_CANCELLED", "插件启动已被取消，资源已释放")
-		}
-		state.active = nil
-		state.state = StateFaulted
-		state.faults++
-		state.err = sanitize(err.Error())
-		state.updatedAt = time.Now().UTC()
-		if len(failures) > 0 {
-			state.err = sanitize(state.err + "；清理失败：" + strings.Join(failures, "；"))
-		}
-		persistErr := m.persistLocked(id, state)
-		m.mu.Unlock()
-		if persistErr != nil {
-			return Plugin{}, apiError(500, "PLUGIN_STATE_UNAVAILABLE", "插件启动失败且状态未能保存")
-		}
-		return m.snapshot(id), apiError(502, "PLUGIN_ACTIVATION_FAILED", "插件启动失败，已回滚其资源；其他插件不受影响")
-	}
-
-	m.mu.Lock()
-	state = m.state(id)
-	if m.closed || state.active == nil || state.active.token != token {
-		// Disable, close or safe mode cancelled this attempt while it was running.
-		m.mu.Unlock()
-		scope.Dispose()
-		return m.snapshot(id), apiError(409, "PLUGIN_ACTIVATION_CANCELLED", "插件启动已被取消，资源已释放")
-	}
-	state.state = StateEnabled
-	state.err = ""
-	state.updatedAt = time.Now().UTC()
-	persistErr := m.persistLocked(id, state)
-	m.mu.Unlock()
-	if persistErr != nil {
-		m.Disable(id)
-		return Plugin{}, apiError(500, "PLUGIN_STATE_UNAVAILABLE", "无法保存插件状态，已回滚启动")
-	}
-	return m.snapshot(id), nil
-}
-
-func runActivation(activate Activation, scope *Scope) (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("plugin panic isolated: %v", recovered)
-		}
-	}()
-	return activate(scope)
-}
-
-func (m *Manager) Disable(id string) error {
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return apiError(409, "MANAGER_CLOSED", "插件管理器已关闭")
-	}
-	if _, ok := m.defs[id]; !ok {
-		m.mu.Unlock()
-		return apiError(404, "PLUGIN_NOT_FOUND", "内置插件不存在")
-	}
-	state := m.state(id)
-	scope := m.takeScopeLocked(state)
-	state.state = StateDisabled
-	state.updatedAt = time.Now().UTC()
-	persistErr := m.persistLocked(id, state)
-	m.mu.Unlock()
-
-	var failures []string
-	if scope != nil {
-		failures = scope.Dispose()
-	}
-	if len(failures) > 0 && persistErr == nil {
-		m.mu.Lock()
-		state = m.state(id)
-		if state.state == StateDisabled {
-			state.err = sanitize("资源清理部分失败：" + strings.Join(failures, "；"))
-			persistErr = m.persistLocked(id, state)
-		}
-		m.mu.Unlock()
-	}
-	if persistErr != nil {
-		return apiError(500, "PLUGIN_STATE_UNAVAILABLE", "无法保存插件状态")
-	}
-	return nil
-}
-
-func (m *Manager) Fault(id string) (Plugin, error) {
-	m.mu.Lock()
-	def, ok := m.defs[id]
-	if !ok {
-		m.mu.Unlock()
-		return Plugin{}, apiError(404, "PLUGIN_NOT_FOUND", "内置插件不存在")
-	}
-	if m.safe() {
-		m.mu.Unlock()
-		return m.snapshot(id), apiError(409, "SAFE_MODE", "安全模式已阻止插件运行")
-	}
-	state := m.state(id)
-	if state.state != StateEnabled || state.active == nil {
-		m.mu.Unlock()
-		return m.snapshot(id), apiError(409, "PLUGIN_NOT_ENABLED", "只有已启用的插件才能触发故障")
-	}
-	token := state.active.token
-	selfCheck := def.selfCheck
-	m.mu.Unlock()
-
-	var err error
-	if selfCheck != nil {
-		err = runSelfCheck(selfCheck)
-	}
-	if err == nil {
-		return m.snapshot(id), nil
-	}
-
-	m.mu.Lock()
-	state = m.state(id)
-	if state.active == nil || state.active.token != token {
-		// The attempt was cancelled while the self-check was running.
-		m.mu.Unlock()
-		return m.snapshot(id), apiError(409, "PLUGIN_ACTIVATION_CANCELLED", "插件已在自检期间被停用")
-	}
-	scope := m.takeScopeLocked(state)
-	state.state = StateFaulted
-	state.faults++
-	state.err = sanitize(err.Error())
-	state.updatedAt = time.Now().UTC()
-	persistErr := m.persistLocked(id, state)
-	m.mu.Unlock()
-
-	var failures []string
-	if scope != nil {
-		failures = scope.Dispose()
-	}
-	if len(failures) > 0 {
-		m.mu.Lock()
-		state = m.state(id)
-		if state.state == StateFaulted {
-			state.err = sanitize(state.err + "；清理失败：" + strings.Join(failures, "；"))
-			persistErr = m.persistLocked(id, state)
-		}
-		m.mu.Unlock()
-	}
-	if persistErr != nil {
-		return Plugin{}, apiError(500, "PLUGIN_STATE_UNAVAILABLE", "插件故障状态未能保存")
-	}
-	return m.snapshot(id), apiError(502, "PLUGIN_FAULTED", "插件自检失败，已隔离并释放其资源；其他插件不受影响")
-}
-
-func runSelfCheck(check func() error) (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("plugin panic isolated: %v", recovered)
-		}
-	}()
-	return check()
-}
-
-func (m *Manager) snapshot(id string) Plugin {
-	for _, plugin := range m.List() {
-		if plugin.ID == id {
-			return plugin
-		}
-	}
-	return Plugin{}
-}
-
+// Close drops every token and stops the host. A call after Close is refused so a
+// shut-down App cannot be driven through a stale reference.
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	if m.closed {
@@ -639,41 +723,62 @@ func (m *Manager) Close() error {
 		return nil
 	}
 	m.closed = true
-	type pending struct {
-		id    string
-		scope *Scope
-	}
-	var active []pending
-	for id := range m.defs {
-		state := m.state(id)
-		if scope := m.takeScopeLocked(state); scope != nil {
-			active = append(active, pending{id: id, scope: scope})
+	// Shutdown releases live resources but preserves the user's enable intent, so
+	// the next renderer can adopt the plugin without the user re-enabling it.
+	for id, item := range m.entries {
+		if item.state == StateEnabled {
+			item.state = StateDisabled
 		}
-		if state.state == StateEnabled || state.state == StateEnabling {
-			state.state = StateDisabled
-		}
-		state.updatedAt = time.Now().UTC()
+		_ = id
 	}
+	m.tokens = make(map[string]string)
 	m.mu.Unlock()
-
-	var cleanupErrors []string
-	for _, item := range active {
-		if failures := item.scope.Dispose(); len(failures) > 0 {
-			cleanupErrors = append(cleanupErrors, failures...)
+	ctx := context.Background()
+	var failures []string
+	for id, item := range m.entries {
+		// desired stays true: it records what the user asked for, not what this
+		// process managed to keep running.
+		if err := setState(ctx, m.db, id, item.state, item.enabled, item.errText, m.now()); err != nil {
+			failures = append(failures, err.Error())
 		}
 	}
-
-	m.mu.Lock()
-	for id := range m.defs {
-		if err := m.persistLocked(id, m.state(id)); err != nil {
-			cleanupErrors = append(cleanupErrors, err.Error())
-		}
-	}
-	m.mu.Unlock()
-	if len(cleanupErrors) > 0 {
-		return errors.New("plugin cleanup incomplete: " + strings.Join(cleanupErrors, "; "))
+	if len(failures) > 0 {
+		return errors.New("plugin shutdown incomplete: " + strings.Join(failures, "; "))
 	}
 	return nil
+}
+
+func (m *Manager) closedError() error {
+	return apiError(http.StatusConflict, "MANAGER_CLOSED", "插件管理器已关闭")
+}
+
+// Health is the summary the core health endpoint shows.
+func (m *Manager) Health(ctx context.Context) map[string]any {
+	plugins := m.snapshot()
+	enabled, faulted := 0, 0
+	errs := []string{}
+	for _, plugin := range plugins {
+		if plugin.Enabled {
+			enabled++
+		}
+		switch plugin.State {
+		case StateFaulted, StateCorrupt, StateIncompat, StateBlocked:
+			faulted++
+			if plugin.Error != "" {
+				errs = append(errs, plugin.ID+": "+plugin.Error)
+			}
+		}
+	}
+	return map[string]any{
+		"status":      "OK",
+		"safeMode":    m.safe(),
+		"total":       len(plugins),
+		"enabled":     enabled,
+		"faulted":     faulted,
+		"hostVersion": m.host,
+		"mode":        "LOCAL_TRUSTED_RENDERER",
+		"errors":      errs,
+	}
 }
 
 func (m *Manager) Register(mux *http.ServeMux) {
@@ -682,16 +787,37 @@ func (m *Manager) Register(mux *http.ServeMux) {
 	}
 	mux.HandleFunc("GET "+APIPrefix+"/plugins", m.handleList)
 	mux.HandleFunc("GET "+APIPrefix+"/plugins/health", m.handleHealth)
-	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}", m.handleAction)
+	mux.HandleFunc("POST "+APIPrefix+"/plugins/preview", m.handlePreview)
+	mux.HandleFunc("POST "+APIPrefix+"/plugins/install", m.handleInstall)
+	// Bundled plugins can be restored after the user uninstalled them, and an
+	// unverified host version can be overridden with an explicit confirmation.
+	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}/restore", m.handleRestore)
+	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}/force-enable", m.handleForceEnable)
+	// The plugin runtime calls this route with its token in the body. The host
+	// bridge only forwards a fixed header allowlist, so a token header would not
+	// reach the core; identifying the plugin by its token is also the stronger
+	// design, because the URL cannot name a plugin at all.
+	mux.HandleFunc("POST "+APIPrefix+"/plugin-runtime/{action}", m.handleRuntime)
+	mux.HandleFunc("GET "+APIPrefix+"/plugins/{id}", m.handleGet)
+	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}/enable", m.handleEnable)
+	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}/disable", m.handleDisable)
+	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}/uninstall", m.handleUninstall)
+	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}/action/{action}", m.handleAction)
+	mux.HandleFunc("GET "+APIPrefix+"/plugins/{id}/activity", m.handleActivity)
+	// The runtime asks for its token when it adopts a plugin enabled before this
+	// renderer existed, and loads the module from the plugin's own directory.
+	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}/token", m.handleToken)
+	mux.HandleFunc("GET "+APIPrefix+"/plugins/{id}/assets/{file...}", m.handleAssets)
 }
 
 func (m *Manager) handleList(w http.ResponseWriter, _ *http.Request) {
-	plugins := m.List()
+	plugins := m.snapshot()
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"items":    plugins,
-		"total":    len(plugins),
-		"safeMode": m.safe(),
-		"notice":   "全部为内置可信模拟插件，在进程内运行；不执行任意 JavaScript，不启动 Node，也没有真实插件进程。这是 Mock，不是操作系统沙箱。",
+		"items":       plugins,
+		"total":       len(plugins),
+		"safeMode":    m.safe(),
+		"hostVersion": m.host,
+		"apiVersion":  APIVersion,
 	})
 }
 
@@ -699,102 +825,244 @@ func (m *Manager) handleHealth(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, m.Health(r.Context()))
 }
 
-func (m *Manager) handleAction(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSpace(r.PathValue("id"))
+// handleRuntime is the endpoint the renderer plugin runtime uses. The body
+// carries the identity token and the params; the token decides which plugin is
+// acting, so neither the URL nor the params can impersonate another plugin.
+func (m *Manager) handleRuntime(w http.ResponseWriter, r *http.Request) {
+	action := strings.TrimSpace(r.PathValue("action"))
+	if action == "" {
+		httpx.Fail(w, http.StatusBadRequest, "PLUGIN_ACTION_REQUIRED", "缺少插件动作名")
+		return
+	}
 	var body struct {
-		Action string `json:"action"`
+		Token  string          `json:"token"`
+		Params json.RawMessage `json:"params,omitempty"`
 	}
 	if !httpx.Decode(w, r, &body) {
 		return
 	}
-	action := strings.ToUpper(strings.TrimSpace(body.Action))
-	switch action {
-	case ActionEnable:
-		plugin, err := m.Enable(id)
-		if err != nil {
-			fail(w, err, plugin)
-			return
-		}
-		httpx.JSON(w, http.StatusOK, plugin)
-	case ActionDisable:
-		if err := m.Disable(id); err != nil {
-			fail(w, err, Plugin{})
-			return
-		}
-		httpx.JSON(w, http.StatusOK, m.snapshot(id))
-	case ActionFault:
-		plugin, err := m.Fault(id)
-		if err != nil {
-			fail(w, err, plugin)
-			return
-		}
-		httpx.JSON(w, http.StatusOK, plugin)
-	case "":
-		httpx.Fail(w, http.StatusBadRequest, "ACTION_REQUIRED", "action 必须是 ENABLE、DISABLE 或 FAULT")
-	default:
-		httpx.Fail(w, http.StatusBadRequest, "ACTION_INVALID", "action 必须是 ENABLE、DISABLE 或 FAULT")
-	}
-}
-
-type APIError struct {
-	Status  int
-	Code    string
-	Message string
-}
-
-func (e *APIError) Error() string { return e.Code + ": " + e.Message }
-
-func apiError(status int, code, message string) *APIError {
-	return &APIError{Status: status, Code: code, Message: message}
-}
-
-func fail(w http.ResponseWriter, err error, plugin Plugin) {
-	var apiErr *APIError
-	if errors.As(err, &apiErr) {
-		if plugin.ID != "" {
-			httpx.JSON(w, apiErr.Status, map[string]any{"error": httpx.Error{Code: apiErr.Code, Message: apiErr.Message}, "plugin": plugin})
-			return
-		}
-		httpx.Fail(w, apiErr.Status, apiErr.Code, apiErr.Message)
+	id, ok := m.TokenOwner(body.Token)
+	if !ok {
+		httpx.Fail(w, http.StatusUnauthorized, "PLUGIN_IDENTITY_REJECTED", "插件身份令牌无效")
 		return
 	}
-	httpx.Fail(w, http.StatusInternalServerError, "INTERNAL_ERROR", "内部错误")
+	params := body.Params
+	if len(params) == 0 {
+		params = json.RawMessage("{}")
+	}
+	value, err := m.runAction(r.Context(), id, action, params, nil)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"value": value})
 }
 
-func sanitize(text string) string {
-	text = strings.TrimSpace(text)
-	if len(text) > 300 {
-		return text[:300] + "…"
+func (m *Manager) handlePreview(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Root string `json:"root"`
 	}
-	return text
+	if !httpx.Decode(w, r, &body) {
+		return
+	}
+	preview, err := m.Preview(r.Context(), body.Root)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, preview)
 }
 
-func (m *Manager) Health(ctx context.Context) map[string]any {
-	m.EnforceSafeMode()
-	plugins := m.List()
-	enabled, faulted, resources := 0, 0, 0
-	var errs []string
-	for _, plugin := range plugins {
-		if plugin.Enabled {
-			enabled++
-		}
-		if plugin.State == StateFaulted {
-			faulted++
-			if plugin.Error != "" {
-				errs = append(errs, plugin.ID+": "+plugin.Error)
-			}
-		}
-		resources += plugin.Resources
+func (m *Manager) handleRestore(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	bundled, err := m.bundledFiles()
+	if err != nil {
+		httpx.Fail(w, http.StatusInternalServerError, "PLUGIN_RESTORE_FAILED", "无法读取预装插件")
+		return
 	}
-	return map[string]any{
-		"status":    "OK",
-		"safeMode":  m.safe(),
-		"total":     len(plugins),
-		"enabled":   enabled,
-		"faulted":   faulted,
-		"resources": resources,
-		"errors":    errs,
-		"processes": 0,
-		"mode":      "SIMULATED_IN_PROCESS",
+	files, ok := bundled[id]
+	if !ok {
+		httpx.Fail(w, http.StatusNotFound, "PLUGIN_NOT_BUNDLED", "没有这个预装插件")
+		return
 	}
+	plugin, err := m.RestoreBundled(r.Context(), id, files)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, plugin)
 }
+
+func (m *Manager) handleForceEnable(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	var body struct {
+		Confirm bool `json:"confirm"`
+	}
+	if !httpx.Decode(w, r, &body) {
+		return
+	}
+	if !body.Confirm {
+		httpx.Fail(w, http.StatusBadRequest, "PLUGIN_FORCE_CONFIRM_REQUIRED", "强制启用前需要明确确认风险")
+		return
+	}
+	plugin, err := m.ForceEnable(r.Context(), id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, plugin)
+}
+
+func (m *Manager) handleInstall(w http.ResponseWriter, r *http.Request) {
+	var request InstallRequest
+	if !httpx.Decode(w, r, &request) {
+		return
+	}
+	plugin, err := m.Install(r.Context(), request)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, plugin)
+}
+
+func (m *Manager) handleGet(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	plugin, ok := m.Get(id)
+	if !ok {
+		httpx.Fail(w, http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件未安装")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, plugin)
+}
+
+func (m *Manager) handleEnable(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	plugin, err := m.Enable(r.Context(), id)
+	if err != nil {
+		plugin = m.Get2(id)
+		fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, plugin)
+}
+
+func (m *Manager) handleDisable(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if err := m.Disable(r.Context(), id); err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, m.Get2(id))
+}
+
+func (m *Manager) handleUninstall(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if err := m.Uninstall(r.Context(), id); err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"id": id, "uninstalled": true})
+}
+
+func (m *Manager) handleActivity(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if _, ok := m.Get(id); !ok {
+		httpx.Fail(w, http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件未安装")
+		return
+	}
+	offset, limit := httpx.Page(r)
+	if limit > 200 {
+		limit = 200
+	}
+	before := int64(0)
+	if _, err := fmt.Sscanf(r.URL.Query().Get("before"), "%d", &before); err != nil {
+		before = 0
+	}
+	items, err := loadActivity(r.Context(), m.db, id, before, offset+limit)
+	if err != nil {
+		httpx.Fail(w, http.StatusInternalServerError, "PLUGIN_ACTIVITY_UNAVAILABLE", "无法读取插件活动记录")
+		return
+	}
+	if offset < len(items) {
+		items = items[offset:]
+	} else {
+		items = []Activity{}
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"items": items, "total": len(items), "before": before})
+}
+
+// handleToken re-issues the identity token to this renderer. It is the same token
+// the enable response returned, so a plugin that was already enabled when the
+// window opened can still adopt it. Safe mode and a disabled plugin refuse.
+func (m *Manager) handleToken(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	token, err := m.Token(id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"id": id, "token": token})
+}
+
+// handleAssets returns a plugin's own module source as JSON. The renderer runs
+// under the official `app://renderer` origin, so it cannot fetch a plugin file by
+// URL: the source travels through the same authenticated core channel as every
+// other plugin call and is imported from a blob URL there.
+func (m *Manager) handleAssets(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	file := strings.TrimSpace(r.PathValue("file"))
+	m.mu.Lock()
+	item, ok := m.entries[id]
+	enabled := ok && item.state == StateEnabled
+	var dir string
+	var manifest Manifest
+	if ok {
+		dir = item.dir
+		manifest = item.manifest
+	}
+	m.mu.Unlock()
+	if !ok {
+		httpx.Fail(w, http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件未安装")
+		return
+	}
+	if !enabled {
+		httpx.Fail(w, http.StatusConflict, "PLUGIN_DISABLED", "插件未启用")
+		return
+	}
+	if file == "" {
+		httpx.Fail(w, http.StatusNotFound, "PLUGIN_ASSET_MISSING", "没有指定文件")
+		return
+	}
+	cleaned := path.Clean(file)
+	// Only the files the manifest names can be served. An enabled plugin must not
+	// be able to read arbitrary files it happens to ship next to its entry point,
+	// and nothing outside the plugin directory is reachable at all.
+	allowed := manifest.Entry.Renderer == cleaned || (manifest.Entry.Settings != "" && manifest.Entry.Settings == cleaned)
+	if !allowed || strings.HasPrefix(cleaned, "..") || path.IsAbs(cleaned) {
+		httpx.Fail(w, http.StatusNotFound, "PLUGIN_ASSET_MISSING", "文件不存在")
+		return
+	}
+	target := filepath.Join(dir, filepath.FromSlash(cleaned))
+	if !strings.HasPrefix(target, dir+string(os.PathSeparator)) {
+		httpx.Fail(w, http.StatusNotFound, "PLUGIN_ASSET_MISSING", "文件不存在")
+		return
+	}
+	info, err := os.Stat(target)
+	if err != nil || !info.Mode().IsRegular() {
+		httpx.Fail(w, http.StatusNotFound, "PLUGIN_ASSET_MISSING", "文件不存在")
+		return
+	}
+	if info.Size() > assetLimit {
+		httpx.Fail(w, http.StatusRequestEntityTooLarge, "PLUGIN_ASSET_LIMIT", "插件文件过大")
+		return
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		httpx.Fail(w, http.StatusInternalServerError, "PLUGIN_ASSET_UNAVAILABLE", "无法读取插件文件")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"path": cleaned, "source": string(data)})
+}
+
+const assetLimit = 8 << 20

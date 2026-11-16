@@ -92,3 +92,27 @@ func TestPairingRejectsInvalidAndUnknownPermissions(t *testing.T) {
 		}
 	}
 }
+
+// The plugin runtime posts to /enhance/v1/plugin-runtime/{action}, a path that
+// does not start with "plugins". An unmatched path is classified as core
+// traffic, which a plugin-scoped pairing does not hold, so every plugin action
+// used to fail with PERMISSION_DENIED before the plugin manager ever saw it.
+func TestPluginRuntimeRoutesCountAsPluginTraffic(t *testing.T) {
+	cases := map[string]string{
+		"/enhance/v1/plugins":                            "plugins:read",
+		"/enhance/v1/plugins/kimicode-plus.example-hello": "plugins:read",
+		"/enhance/v1/plugins/x/enable":                    "plugins:write",
+		"/enhance/v1/plugin-runtime/storage.set":          "plugins:write",
+		"/enhance/v1/plugin-runtime/events.poll":          "plugins:write",
+	}
+	for path, expected := range cases {
+		method := http.MethodGet
+		if strings.HasSuffix(expected, ":write") {
+			method = http.MethodPost
+		}
+		r := httptest.NewRequest(method, path, nil)
+		if actual := permission(r); actual != expected {
+			t.Errorf("%s %s: got %s, want %s", method, path, actual, expected)
+		}
+	}
+}

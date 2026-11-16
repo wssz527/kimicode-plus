@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,7 +28,7 @@ func TestModulesShareOneMuxAndStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bridge: %v", err)
 	}
-	manager, err := plugins.New(db, safe)
+	manager, err := plugins.New(db, safe, plugins.WithDataDir(t.TempDir()))
 	if err != nil {
 		t.Fatalf("plugins: %v", err)
 	}
@@ -91,8 +92,28 @@ func TestModulesShareOneMuxAndStorage(t *testing.T) {
 		t.Fatalf("unexpected delivery: %#v", record)
 	}
 
+	// The plugin module still mounts into the same mux and shares the same
+	// database. The old assertion enabled a simulated builtin; the new contract is
+	// a real local install, so the same intent is checked by installing a package
+	// and driving its lifecycle through HTTP.
+	root := t.TempDir()
+	if err = os.WriteFile(filepath.Join(root, "plugin.json"), []byte(`{"id":"bridge.sample","name":"Bridge","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":["ui:sidebar"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(root, "renderer.js"), []byte("export function activate(){}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(root, "LICENSE"), []byte("MIT\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	install := httptest.NewRecorder()
+	// The user confirmed the manifest's own capability list after the preview.
+	mux.ServeHTTP(install, httptest.NewRequest(http.MethodPost, "/enhance/v1/plugins/install", strings.NewReader(`{"root":"`+root+`","capabilities":["ui:sidebar"]}`)))
+	if install.Code != http.StatusCreated {
+		t.Fatalf("install => %d %s", install.Code, install.Body.String())
+	}
 	enable := httptest.NewRecorder()
-	mux.ServeHTTP(enable, httptest.NewRequest(http.MethodPost, "/enhance/v1/plugins/kct", strings.NewReader(`{"action":"ENABLE"}`)))
+	mux.ServeHTTP(enable, httptest.NewRequest(http.MethodPost, "/enhance/v1/plugins/bridge.sample/enable", nil))
 	if enable.Code != http.StatusOK {
 		t.Fatalf("enable => %d %s", enable.Code, enable.Body.String())
 	}
@@ -103,7 +124,7 @@ func TestModulesShareOneMuxAndStorage(t *testing.T) {
 	if err := json.Unmarshal(health.Body.Bytes(), &healthBody); err != nil {
 		t.Fatalf("decode health: %v", err)
 	}
-	if healthBody["resources"] != float64(3) || healthBody["processes"] != float64(0) {
+	if healthBody["enabled"] != float64(1) || healthBody["total"] != float64(1) {
 		t.Fatalf("unexpected plugin health: %#v", healthBody)
 	}
 }

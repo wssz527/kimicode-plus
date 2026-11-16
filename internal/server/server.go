@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"enhancedkimi/internal/security"
 	"enhancedkimi/internal/usage"
 	"enhancedkimi/internal/webassets"
+	bundledPlugins "enhancedkimi/plugins"
 )
 
 const Version = "0.2.0"
@@ -45,18 +47,19 @@ type NativeOptions struct {
 }
 
 type App struct {
-	Handler     http.Handler
-	Settings    *config.Store
-	modules     []Module
-	pluginClose func() error
-	pluginSafe  func()
-	adapter     *desktop.Mock
-	native      *desktop.NativeService
-	started     time.Time
-	gateway     *gateway.Gateway
-	planner     *chat.PlannerService
-	gatewayErr  string
-	gatewayBase string
+	Handler       http.Handler
+	Settings      *config.Store
+	modules       []Module
+	pluginClose   func() error
+	pluginSafe    func()
+	pluginManager *plugins.Manager
+	adapter       *desktop.Mock
+	native        *desktop.NativeService
+	started       time.Time
+	gateway       *gateway.Gateway
+	planner       *chat.PlannerService
+	gatewayErr    string
+	gatewayBase   string
 }
 
 // New builds the core without the local gateway. A build that wants /v1 uses
@@ -139,12 +142,26 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 		return e
 	})
 	add("plugins", func() error {
-		s, e := plugins.New(db, cfg.Safe)
+		// The data directory is known before construction; the vault and the native
+		// service are not, because they are built further down. They are attached by
+		// instance method on this same manager, so an App never reaches a
+		// package-level vault or core.
+		//
+		// The host version is deliberately not passed here: hostVersions refers to
+		// the Kimi Code client version (1.3.x), which is discovered when the
+		// enhancer attaches, not to this core's own 0.2.0. An unknown host version
+		// leaves the version gate open rather than inventing a compatibility claim.
+		s, e := plugins.New(db, cfg.Safe, plugins.WithDataDir(native.DataDir), plugins.WithBundled(bundledPlugins.BundledPlugins))
 		if e == nil {
 			s.Register(mux)
-			s.RegisterPortable(mux, ledger)
+			app.pluginManager = s
 			app.pluginClose = s.Close
 			app.pluginSafe = s.EnforceSafeMode
+			if bundled, bundleErr := bundledPlugins.BundledPlugins(); bundleErr == nil {
+				if releaseErr := s.ReleaseBundled(context.Background(), bundled); releaseErr != nil {
+					log.Printf("bundled plugin release incomplete: %v", releaseErr)
+				}
+			}
 		}
 		return e
 	})
@@ -156,6 +173,10 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 		providerClient = provider.New(db, vault)
 		providerClient.Register(mux)
 		credentialStatus = "ENCRYPTED_VAULT_MANUAL_UNLOCK"
+		if app.pluginManager != nil {
+			// The plugin host gets this App's vault, not a second locked one.
+			app.pluginManager.UseVault(vault)
+		}
 		closePlugins := app.pluginClose
 		app.pluginClose = func() error {
 			vault.Lock()
@@ -209,6 +230,9 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 		} else {
 			nativeService.Register(mux)
 			app.native = nativeService
+			if app.pluginManager != nil {
+				app.pluginManager.UseCore(pluginCore{service: nativeService})
+			}
 			if chatReady && app.gateway != nil {
 				planner, plannerErr := chat.NewPlanner(db, app.gateway, native.CWD, nativeService.Events())
 				if plannerErr != nil {

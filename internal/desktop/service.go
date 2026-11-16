@@ -236,6 +236,22 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.bus.Poll(ctx, int64(after), scopes, time.Duration(wait)*time.Millisecond), nil
 	case "session.view":
 		return s.sessionView(ctx, stringInput(input, "id"))
+	case "sessions.list":
+		// A plugin-visible list that carries only session metadata. bootstrap also
+		// returns models, planner threads and recovery settings, which a plugin with
+		// sessions:read must not receive.
+		sessions, err := s.kap.Sessions(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"items": sessions, "total": len(sessions)}, nil
+	case "sessions.view":
+		return s.sessionView(ctx, stringInput(input, "id"))
+	case "sessions.create":
+		return s.createSession(ctx, input)
+	case "sessions.send":
+		_, err := s.sendPrompt(ctx, input)
+		return map[string]any{"sessionId": stringInput(input, "id")}, err
 	case "session.watch":
 		id := stringInput(input, "id")
 		_, err := s.sessionView(ctx, id)

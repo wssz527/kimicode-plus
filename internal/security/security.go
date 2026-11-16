@@ -74,7 +74,12 @@ func permission(r *http.Request) string {
 		category = "tasks"
 	case strings.HasPrefix(p, "chat"):
 		category = "chat"
-	case strings.HasPrefix(p, "plugins"):
+	case strings.HasPrefix(p, "plugins"), strings.HasPrefix(p, "plugin-runtime"):
+		// Plugin runtime calls carry a plugin identity token in the body and are
+		// authorized again in the plugin manager. They still arrive over the core
+		// API, so the core guard must classify them as plugin traffic; leaving them
+		// unmatched maps them to core:write, which a plugin-scoped pairing does not
+		// hold, and every plugin action fails with PERMISSION_DENIED.
 		category = "plugins"
 	case strings.HasPrefix(p, "credentials"):
 		category = "credentials"

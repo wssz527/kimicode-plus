@@ -75,10 +75,23 @@ Text redaction does not modify or certify attachment bytes. Preview warns that s
 
 ## Adapter, plugins and chat
 
-`GET/PUT /adapter` controls independent Mock availability only. `GET /plugins`, `POST /plugins/{id} {action:ENABLE|DISABLE|FAULT}` manage fixed trusted capabilities and isolated cleanup. Production kct/monitor descriptors identify TRUSTED_GO / PORTABLE_GO_ONLY; resource counters remain simulated lifecycle accounting, not OS metrics. No external plugin code or plugin-host process.
+`GET/PUT /adapter` controls independent Mock availability only.
 
-- `POST /plugins/kct/render {goal,context,constraints}` requires enabled kct; returns redacted instruction text/findings and `sent:false`. This is a Go portable implementation, not original KCT execution.
-- `POST /plugins/monitor/import {events}` requires enabled monitor and usage modules; forces source=monitor and ingests through the canonical ledger. No official process observation.
+## Plugins
+
+Plugins are local trusted packages (manifest + ES module) hosted by the core. `GET /plugins` lists installs with state, granted capabilities, slots and the compatibility verdict; `GET /plugins/health` summarizes them; `GET /plugins/{id}` reads one.
+
+`POST /plugins/install {root, capabilities?}` installs from a local folder or zip. The package is validated in a temporary directory and only then moved into `<dataDir>/plugins/<id>`; an existing install is replaced atomically and kept on failure. A zip is limited to 64 entries, 4 MiB per file and 16 MiB total, and entries with absolute paths, parent traversal or symlinks are refused. `capabilities` narrows the manifest declaration: a capability the manifest did not declare cannot be granted. A freshly installed plugin stays disabled.
+
+`POST /plugins/{id}/enable` returns the plugin state plus a per-renderer identity token. `POST /plugins/{id}/disable` stops the plugin and revokes that token in the same step. `POST /plugins/{id}/uninstall` deletes files and private storage and leaves a tombstone, so a bundled plugin the user removed is never released again automatically. `GET /plugins/{id}/activity` returns the redacted activity log.
+
+Plugin actions run at `POST /plugin-runtime/{action}` with body `{token, params}`. The token alone decides which plugin is acting, so neither the URL nor the params can address another plugin; an invalid or revoked token answers `401 PLUGIN_IDENTITY_REJECTED`. Each action is authorized by the capability table before any work happens, and an action absent from that table is refused rather than forwarded, answering `403 PLUGIN_CAPABILITY_DENIED`.
+
+Capabilities: `metrics:read`, `sessions:read`, `sessions:send`, `config:read`, `config:write`, `ui:sidebar`, `ui:settings`, `ui:thinking`, `ui:message`, `storage`, `net:<host>` and `credentials:<name>`. A `net:*.example.com` grant covers one label of subdomain and never the bare domain. Network requests are proxied by Go with only http/https, no embedded URL credentials, no redirect following, an 8 MiB response cap and `Set-Cookie` stripped. A credential is resolved by the core and injected into the outbound header; the plaintext never reaches the renderer, an activity row or an error message, and a locked vault is reported as such instead of yielding an empty value.
+
+`GET /plugins/{id}/assets/{file}` serves an enabled plugin's own files for `import()`, restricted to that plugin's directory. `POST /plugins/{id}/token` re-issues the same identity token to a renderer that adopted an already-enabled plugin. Safe mode refuses install and enable, stops running plugins and revokes their tokens. A plugin whose manifest files fail validation is marked `CORRUPT` with its files kept in place, and a host version outside `hostVersions` marks it `INCOMPATIBLE`; neither case deletes user files.
+
+The core owns no plugin-host process and no simulated plugin. Monitor and KCT are, by contract, ordinary plugins that use these interfaces; the core has no private channel or hardcoded mount for either.
 
 `GET/POST /chat/sources` manages HTTPS URL entries, Kimi default. Opening a site remains URL_ONLY. `POST /chat/threads {title,sourceId,providerId,model,projectId}` creates a PROVIDER lightweight thread when providerId is given; legacy calls without providerId create explicitly MOCK threads. `GET /chat/threads`, `GET /chat/threads/{id}` read durable history.
 

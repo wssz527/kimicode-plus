@@ -115,18 +115,16 @@ Mock 只有三条合成会话，`owner` 固定为 `official-host`，`kind` 为 `
 
 ## 插件
 
-只有三个内置定义，硬编码在 `registerBuiltins` 中，没有安装、更新、签名或任意脚本入口：`kct`（指令转接模拟）、`monitor`（运行监视模拟）、`fault-demo`（唯一会失败的测试插件）。
+插件不在本文件描述的桥接层里，而是核心的本地插件宿主：包结构、清单、能力、运行时接口、生命周期与 HTTP 接口见 [PLUGINS.md](PLUGINS.md)。这里只记录与桥接相关的约束。
 
-- 启停幂等：重复 `ENABLE` 不重复申请资源；`DISABLE` 逆序释放并允许重复调用。
-- 资源作用域：每个插件激活时 `scope.Own` 登记连接/定时器/监听器；失败或禁用时逐个释放，单个 disposer 抛错不阻断其余清理，错误写入 `error` 字段。
-- 故障隔离：只有 `fault-demo` 的自检会失败，`FAULT` 会释放该插件资源并置 `FAULTED`，其他插件保持 `ENABLED`。激活与自检都在 `recover` 保护下，panic 转为 `FAULTED`。
-- 安全模式：注入的 `safe func() bool` 为真时，`List`/`Health`/`Enable` 都会先强制停止已运行插件并释放资源，新启用返回 `409 SAFE_MODE`。
-- 持久与重启：状态、故障计数、错误写入 `plugin_states`。启动时**不自动激活**任何插件；上次遗留 `ENABLED` 的记录显示为 `BLOCKED` 并说明需显式启用。默认 `resources = 0`、`processes = 0`。
-- **单次激活归属**：每次激活持有递增 token。`DISABLE`、`Close`、`EnforceSafeMode` 只摘除当前 activation；激活结束时若 token 已被替换，结果被丢弃并立即释放新资源，不会把状态重新写回 `ENABLED`。成功与失败两条路径都执行同一归属检查：被取消的激活迟到返回错误时只返回 `PLUGIN_ACTIVATION_CANCELLED`，既不会把新一轮已成功的插件改成 `FAULTED`，也不会累加 `faults` 或清除新 activation；只有仍拥有该次激活时，失败才会记录为 `FAULTED`。
-- **并发 `ENABLE` 合并**：第二次 `ENABLE` 不会另建 scope，而是等待同一次激活完成，因此资源只申请一次。等待上限 30 秒，超时返回 `PLUGIN_ENABLING`，状态仍为 `ENABLING`。
-- **清理隔离**：`Scope.Dispose` 逆序执行每个 disposer，单独 `recover` panic 与捕获 error，任何一项失败都不影响剩余清理；失败项写入 `error` 字段。
-- **安全模式可逆**：`EnforceSafeMode` 在安全模式开启时停用插件并释放资源，关闭后可以直接重新 `Enable`。`Close` 是终止操作：标记 closed、释放全部资源，之后 `Enable` 返回 `MANAGER_CLOSED`。
-- 声明：全部为进程内模拟，不执行任意 JavaScript、不启动 Node、没有真实插件进程。**这是 Mock，不是操作系统沙箱**；`GET /plugins` 的 `notice` 明确写出这一点。
+- **没有内置模拟插件**：不存在 `kct`、`monitor`、`fault-demo` 这类进程内模拟定义，也没有 `registerBuiltins`、`FAULT` 动作或"模拟资源计数"。插件列表只反映真实安装。
+- **插件不是桥接适配器**：插件通过 `/enhance/v1/plugin-runtime/{action}` 取用核心能力，与 Outbox、任务投递、原生适配器互不影响。桥接降级时插件照常工作。
+- **进程内运行**：插件是运行在宿主渲染进程里的 ES module，核心不启动 Node 服务，也没有插件宿主子进程。
+- **安全模式**：`safe func() bool` 为真时拒绝安装与启用，并停止已运行插件、撤销其身份令牌；关闭后可以重新启用。插件页同时显示该状态。
+- **`Close` 是终止操作**：撤销全部令牌，之后安装、启用、动作调用都返回 `MANAGER_CLOSED`。
+- **不修改官方包体**：插件只读取本机数据目录，不写入 Kimi Code 官方存储，不回写官方凭据。
+
+Monitor 与 KCT 是后续阶段的适配插件，本阶段不实现；它们将来只能经上述接口接入，核心不为其保留私有通道或硬编码挂载。
 
 ## 与 `docs/API_CONTRACT.md` 的精确偏差
 

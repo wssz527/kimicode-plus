@@ -25,6 +25,7 @@
     "src/lib/format.ts",
     "src/lib/modelsdev.ts",
     "src/lib/usage.ts",
+    "src/plugin-runtime",
     "../adapters"
   ]
 }

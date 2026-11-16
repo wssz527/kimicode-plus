@@ -3,6 +3,7 @@ import base64
 import copy
 import hashlib
 import json
+from pathlib import Path
 
 
 def task_for(session, task_id='acceptance-loop'):
@@ -77,16 +78,100 @@ def verify_bridge(core, results):
     return {'task': empty, 'id': record['id'], 'thirdId': third['id']}
 
 
-def verify_plugins(core, results):
-    assert core.request('/plugins/monitor', {'action': 'ENABLE'})['state'] == 'ENABLED'
-    assert core.request('/plugins/monitor', {'action': 'ENABLE'})['resources'] == 3
-    core.request('/plugins/fault-demo', {'action': 'ENABLE'})
-    core.request('/plugins/fault-demo', {'action': 'FAULT'}, expected=502)
-    plugins = {v['id']: v for v in core.request('/plugins')['items']}
-    assert plugins['monitor']['state'] == 'ENABLED' and plugins['monitor']['resources'] == 3
-    assert plugins['fault-demo']['state'] == 'FAULTED' and plugins['fault-demo']['resources'] == 0
-    assert core.request('/plugins/health')['processes'] == 0
-    results.append('simulated plugin repeat-enable, isolated fault and zero Node/plugin-host processes')
+def make_local_plugin(folder, plugin_id, name='Local acceptance plugin', capabilities=None, corrupt=False):
+    """Write a real plugin package on disk for the local-install flow.
+
+    The acceptance run installs this through the public endpoint, so the whole
+    zip/folder validation path is exercised instead of a hardcoded builtin.
+    """
+    root = Path(folder) / ('acceptance-plugin-' + plugin_id.replace('.', '-'))
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        'id': plugin_id, 'name': name, 'version': '1.0.0', 'apiVersion': 1,
+        'description': 'Acceptance fixture installed from a local folder.',
+        'hostVersions': ['1.*'],
+        'entry': {'renderer': 'renderer.js'},
+        'capabilities': capabilities if capabilities is not None else ['ui:sidebar', 'storage'],
+    }
+    (root / 'plugin.json').write_text(json.dumps(manifest), encoding='utf-8')
+    (root / 'renderer.js').write_text('export function activate(ctx) { ctx.log("info", "acceptance"); }\n', encoding='utf-8')
+    (root / 'LICENSE').write_text('MIT\n', encoding='utf-8')
+    if corrupt:
+        (root / 'renderer.js').unlink()
+    return str(root)
+
+
+def verify_plugins(core, results, folder):
+    bundled = 'kimicode-plus.example-hello'
+    items = {v['id']: v for v in core.request('/plugins')['items']}
+    assert bundled in items, items
+    assert items[bundled]['source'] == 'BUNDLED' and items[bundled]['enabled'] is False
+    results.append('bundled plugin is released on first run and starts disabled')
+
+    enabled = core.request('/plugins/' + bundled + '/enable', {})
+    assert enabled['state'] == 'ENABLED' and enabled['token']
+    token = enabled['token']
+    assert core.request('/plugins/' + bundled + '/action/runtime.info', {}, headers={'X-Plugin-Token': token})['value']['id'] == bundled
+    core.request('/plugins/' + bundled + '/action/config.save', {'params': {'patch': {'x': 1}}}, headers={'X-Plugin-Token': token}, expected=403)
+    core.request('/plugins/' + bundled + '/action/runtime.info', {}, expected=401)
+    results.append('plugin identity token gates actions and an ungranted capability is refused')
+
+    activity = core.request('/plugins/' + bundled + '/activity')['items']
+    assert any(v['kind'] == 'ENABLE' for v in activity), activity
+    results.append('system-initiated plugin actions land in the activity log')
+
+    local = 'acceptance.local'
+    root = make_local_plugin(folder, local)
+    # Installing requires a consent decision, so the flow is preview (no write),
+    # then install with the confirmed list. A missing list is a refusal, not a
+    # silent grant of everything the manifest asked for.
+    preview = core.request('/plugins/preview', {'root': root})
+    assert preview['id'] == local and preview['capabilities'] == ['storage', 'ui:sidebar'], preview
+    core.request('/plugins/install', {'root': root}, expected=400)
+    installed = core.request('/plugins/install', {'root': root, 'capabilities': preview['capabilities']}, expected=201)
+    assert installed['id'] == local and installed['source'] == 'LOCAL'
+    assert installed['capabilities'] == ['storage', 'ui:sidebar'], installed
+    core.request('/plugins/' + local + '/enable', {})
+    core.request('/plugins/' + local + '/disable', {})
+    core.request('/plugins/' + local + '/uninstall', {})
+    assert local not in {v['id'] for v in core.request('/plugins')['items']}
+    results.append('preview, explicit capability consent, install, enable, disable and uninstall complete')
+
+    # A narrower grant is accepted and stored as given.
+    narrow_root = make_local_plugin(folder, 'acceptance.narrow', capabilities=['ui:sidebar', 'storage'])
+    narrow_preview = core.request('/plugins/preview', {'root': narrow_root})
+    assert narrow_preview['capabilities'] == ['storage', 'ui:sidebar'], narrow_preview
+    narrow = core.request('/plugins/install', {'root': narrow_root, 'capabilities': ['ui:sidebar']}, expected=201)
+    assert narrow['capabilities'] == ['ui:sidebar'], narrow
+    # The capability the user did not confirm is not usable even though the
+    # manifest declares it: enabling issues a token, but storage is still denied.
+    narrow_token = core.request('/plugins/' + narrow['id'] + '/enable', {})['token']
+    core.request('/plugins/' + narrow['id'] + '/action/storage.set', {'key': 'k', 'value': 1}, headers={'X-Plugin-Token': narrow_token}, expected=403)
+    core.request('/plugins/' + narrow['id'] + '/disable', {})
+    core.request('/plugins/' + narrow['id'] + '/uninstall', {})
+    results.append('a grant narrower than the manifest is stored exactly as confirmed')
+
+    broken = make_local_plugin(folder, 'acceptance.broken', corrupt=True)
+    core.request('/plugins/preview', {'root': broken}, expected=400)
+    results.append('a package missing its declared entry file is refused before install')
+
+    escaped = make_local_plugin(folder, 'acceptance.escape', capabilities=['root:everything'])
+    core.request('/plugins/preview', {'root': escaped}, expected=400)
+    results.append('an unknown capability is refused at install time')
+
+    # Leave the bundled plugin running: the safe-mode step below asserts that
+    # turning safe mode on actually stops it, which requires it to be live.
+    return {'bundled': bundled, 'token': token}
+
+
+def verify_plugin_safe_mode(core, results, bundled, token):
+    items = {v['id']: v for v in core.request('/plugins')['items']}
+    assert items[bundled]['enabled'] is False and items[bundled]['state'] == 'BLOCKED', items[bundled]
+    core.request('/plugins/' + bundled + '/enable', {}, expected=409)
+    # The token issued before safe mode was switched on must no longer identify
+    # the plugin. A 401 here is the proof that revocation is not cosmetic.
+    core.request('/plugin-runtime/runtime.info', {'token': token}, expected=401)
+    results.append('safe mode stops the running plugin, refuses activation and revokes its token')
 
 
 def verify_registry_usage(core, results):

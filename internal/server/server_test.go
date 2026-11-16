@@ -25,7 +25,9 @@ func TestRealLoopbackCoreLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	guard := security.New(listener.Addr().String())
-	app, err := New(db, guard, false)
+	// A real plugin root so the bundled plugin is released and the safe-mode
+	// check runs against an install that actually exists.
+	app, err := NewWithNative(db, guard, false, "", NativeOptions{DataDir: t.TempDir()})
 	if err != nil {
 		listener.Close()
 		t.Fatal(err)
@@ -103,9 +105,9 @@ func TestRealLoopbackCoreLifecycle(t *testing.T) {
 	if code != 409 {
 		t.Fatal("settings CAS not enforced")
 	}
-	code, _ = request("POST", "/plugins/monitor", map[string]any{"action": "ENABLE"}, guard.PairingToken())
+	code, b = request("POST", "/plugins/kimicode-plus.example-hello/enable", nil, guard.PairingToken())
 	if code != 409 {
-		t.Fatal("safe mode permitted plugin activation")
+		t.Fatalf("safe mode permitted plugin activation: %d %s", code, b)
 	}
 	_, b = request("GET", "/settings", nil, guard.PairingToken())
 	json.Unmarshal(b, &settings)
@@ -114,7 +116,7 @@ func TestRealLoopbackCoreLifecycle(t *testing.T) {
 	if code != 200 {
 		t.Fatal(string(b))
 	}
-	code, b = request("POST", "/plugins/monitor", map[string]any{"action": "ENABLE"}, guard.PairingToken())
+	code, b = request("POST", "/plugins/kimicode-plus.example-hello/enable", nil, guard.PairingToken())
 	if code != 200 {
 		t.Fatalf("leaving safe mode did not restore plugin activation: %d %s", code, b)
 	}
