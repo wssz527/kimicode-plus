@@ -1,18 +1,24 @@
 import { createRoot } from "react-dom/client";
+import { useMemo, type ReactNode } from "react";
 import { App } from "./App";
 import { connectHostTransport, type CoreTransport } from "./api";
-import { installHost, type HostConnection } from "./host";
+import { installHost, releaseHost, type HostConnection } from "./host";
 import { useEmbeddedNavigation } from "./routes";
 import { normalizeColorScheme, rewriteAssetURLs } from "./lib/embed";
 import { Workbench } from "./components/Workbench";
-import { installDemoHost, createCoreTransport, createNativeHost, type DemoHost, type NativeHost } from "./native";
+import { createCoreTransport, createEventChannel, createNativeHost, HostScopeContext, type DemoHost, type NativeHost, type HostScopeValue } from "./native";
 import { AuthProvider } from "./auth";
 import { MonitorSurface, PlannerSurface, SettingsWindow } from "./components/Surfaces";
 import { SessionGrid } from "./components/SessionGrid";
 import "./styles/surfaces.css";
 
-export { createCoreTransport, createNativeHost };
+export { createCoreTransport, createEventChannel, createNativeHost };
 import "./styles/workbench.css";
+
+function HostScopeProvider({ host, children }: { host: NativeHost | null; children: ReactNode }) {
+  const value = useMemo<HostScopeValue>(() => ({ host }), [host]);
+  return <HostScopeContext.Provider value={value}>{children}</HostScopeContext.Provider>;
+}
 
 export interface MountOptions extends HostConnection {
   core: CoreTransport;
@@ -36,6 +42,47 @@ export interface EnhancementHandle {
 
 const mounts = new WeakMap<HTMLElement, EnhancementHandle>();
 
+/**
+ * The core transport behind `api.ts` is process-wide, so two mounts share it.
+ * Reference counting keeps the last unmount from detaching a transport that a
+ * still-open mount depends on.
+ */
+let transportMounts = 0;
+
+function acquireTransport(transport: CoreTransport, permissions: string[]): () => void {
+  transportMounts += 1;
+  connectHostTransport(transport, permissions);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    transportMounts -= 1;
+    if (transportMounts <= 0) {
+      transportMounts = 0;
+      connectHostTransport(null);
+    }
+  };
+}
+
+// Embedded navigation is also process-wide. Reset it only when the last
+// enhancement mount goes away, so one panel closing keeps the others routed.
+let navigationMounts = 0;
+
+function acquireNavigation(): () => void {
+  navigationMounts += 1;
+  useEmbeddedNavigation("/");
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    navigationMounts -= 1;
+    if (navigationMounts <= 0) {
+      navigationMounts = 0;
+      useEmbeddedNavigation(null);
+    }
+  };
+}
+
 export function mountEnhancement(element: HTMLElement, options: MountOptions): EnhancementHandle {
   const embed = options.embed === true;
   mounts.get(element)?.unmount();
@@ -53,12 +100,16 @@ export function mountEnhancement(element: HTMLElement, options: MountOptions): E
   const priorEmbeddedAttr = element.getAttribute("data-ekd-embedded");
   if (embed) element.dataset.ekdEmbedded = "true";
   shadow.append(styles, container);
-  installHost(options);
-  installDemoHost(options.demoHost ?? null);
-  useEmbeddedNavigation("/");
-  connectHostTransport(options.core, options.permissions);
+  const hostConnection: HostConnection = options;
+  installHost(hostConnection);
+  const releaseNavigation = acquireNavigation();
+  const releaseTransport = acquireTransport(options.core, options.permissions);
   const root = createRoot(container);
-  root.render(<App embed={embed} />);
+  root.render(
+    <HostScopeProvider host={options.demoHost ?? null}>
+      <App embed={embed} />
+    </HostScopeProvider>,
+  );
   let mounted = true;
   const handle: EnhancementHandle = {
     updateContext: (context: HostConnection["context"]) => {
@@ -79,9 +130,9 @@ export function mountEnhancement(element: HTMLElement, options: MountOptions): E
           if (priorEmbeddedAttr === null) delete element.dataset.ekdEmbedded;
           else element.dataset.ekdEmbedded = priorEmbeddedAttr;
         }
-        connectHostTransport(null);
-        useEmbeddedNavigation(null);
-        installHost(null);
+        releaseTransport();
+        releaseNavigation();
+        releaseHost(hostConnection);
       }
     },
   };
@@ -102,7 +153,7 @@ export function mountWorkbench(element: HTMLElement, options: { host: DemoHost; 
   observer.observe(element.ownerDocument.documentElement, { attributes: true, attributeFilter: ["data-color-scheme"] });
   shadow.append(styles, container);
   const root = createRoot(container);
-  root.render(<Workbench host={options.host} />);
+  root.render(<HostScopeProvider host={options.host}><Workbench host={options.host} /></HostScopeProvider>);
   const handle: EnhancementHandle = {
     updateContext: () => {},
     unmount: () => { observer.disconnect(); root.unmount(); container.remove(); styles.remove(); mounts.delete(element); },
@@ -123,6 +174,8 @@ export interface SurfaceMountOptions {
   onNativeRestore?: () => void;
 }
 
+const SETTINGS_PERMISSIONS = ["core:read", "settings:write", "models:read", "models:write", "usage:read", "usage:write", "plugins:read", "plugins:write", "credentials:read", "credentials:write"];
+
 export function mountSurface(element: HTMLElement, surface: SurfaceName, options: SurfaceMountOptions): EnhancementHandle {
   mounts.get(element)?.unmount();
   const shadow = element.shadowRoot ?? element.attachShadow({ mode: "open" });
@@ -135,13 +188,13 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
   const observer = new MutationObserver(syncTheme);
   observer.observe(element.ownerDocument.documentElement, { attributes: true, attributeFilter: ["data-color-scheme"] });
   shadow.append(styles, container);
-  installDemoHost(options.host);
-  if (surface === "settings") connectHostTransport(createCoreTransport(options.host), ["core:read", "settings:write", "models:read", "models:write", "usage:read", "usage:write", "plugins:read", "plugins:write", "credentials:read", "credentials:write"]);
+  const releaseTransport = surface === "settings" ? acquireTransport(createCoreTransport(options.host), SETTINGS_PERMISSIONS) : null;
   const root = createRoot(container);
-  if (surface === "planner") root.render(<PlannerSurface host={options.host} initialSource={options.initialSource} />);
-  else if (surface === "sessions") root.render(<SessionGrid host={options.host} initialExtraIds={options.initialExtraIds ?? []} onNativeRestore={options.onNativeRestore ?? (() => options.host.close())} />);
-  else if (surface === "settings") root.render(<AuthProvider><SettingsWindow host={options.host} /></AuthProvider>);
-  else root.render(<MonitorSurface host={options.host} />);
+  const wrap = (children: React.ReactNode) => <HostScopeProvider host={options.host}>{children}</HostScopeProvider>;
+  if (surface === "planner") root.render(wrap(<PlannerSurface host={options.host} initialSource={options.initialSource} />));
+  else if (surface === "sessions") root.render(wrap(<SessionGrid host={options.host} initialExtraIds={options.initialExtraIds ?? []} onNativeRestore={options.onNativeRestore ?? (() => options.host.close())} />));
+  else if (surface === "settings") root.render(wrap(<AuthProvider><SettingsWindow host={options.host} /></AuthProvider>));
+  else root.render(wrap(<MonitorSurface host={options.host} />));
   let mounted = true;
   const handle: EnhancementHandle = {
     updateContext: () => {},
@@ -153,8 +206,7 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
       container.remove();
       styles.remove();
       if (mounts.get(element) === handle) mounts.delete(element);
-      if (surface === "settings") connectHostTransport(null);
-      installDemoHost(null);
+      releaseTransport?.();
     },
   };
   mounts.set(element, handle);

@@ -24,15 +24,18 @@ test("native host routes events only to their session and stops polling on close
     },
   }, { activeSession: () => "b", close: () => { closed = true; } });
   let aCalls = 0;
-  let bValue = null;
+  let bValue: unknown = null;
   host.subscribe("session:a", () => { aCalls += 1; });
   host.subscribe("session:b", value => { bValue = value; host.close(); });
-  await new Promise(resolve => setTimeout(resolve, 20));
+  // An empty page keeps the loop gentle, so wait for the delivery instead of a
+  // fixed delay that depends on the idle guard.
+  const deadline = Date.now() + 2000;
+  while (!closed && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(aCalls, 0);
   assert.deepEqual(bValue, { ok: true });
   assert.equal(closed, true);
   const settled = polls;
-  await new Promise(resolve => setTimeout(resolve, 10));
+  await new Promise(resolve => setTimeout(resolve, 100));
   assert.equal(polls, settled);
 });
 

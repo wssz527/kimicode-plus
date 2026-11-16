@@ -54,26 +54,6 @@ export function PlannerPane({ host, boot, hidden }: { host: DemoHost; boot: Demo
     return () => { alive = false; unsubscribe(); };
   }, [activeId, host]);
   useEffect(() => {
-    if (!activeId || thread?.status !== "running") return;
-    let alive = true;
-    let pending = false;
-    const refresh = async () => {
-      if (pending) return;
-      pending = true;
-      try {
-        const next = await host.request<PlannerThread>("planner.get", { id: activeId });
-        if (alive) receive(next);
-      } catch (cause) {
-        if (alive) setError(errorText(cause));
-      } finally {
-        pending = false;
-      }
-    };
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 250);
-    return () => { alive = false; window.clearInterval(timer); };
-  }, [activeId, host, thread?.status]);
-  useEffect(() => {
     listRef.current?.parentElement?.scrollTo({ top: listRef.current.parentElement.scrollHeight });
   }, [thread?.messages, thread?.status]);
   useEffect(() => {

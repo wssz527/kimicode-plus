@@ -22,6 +22,14 @@ export function installHost(value: HostConnection | null) {
   context = value?.context ?? null;
   for (const listener of listeners) listener();
 }
+/**
+ * Clears the connection only when it is still the one this mount installed.
+ * A panel that unmounts later must not detach a surface that mounted since.
+ */
+export function releaseHost(expected: HostConnection | null) {
+  if (expected === null || connection !== expected) return;
+  installHost(null);
+}
 export function setHandoffContext(value: HostContext) {
   context = value;
   for (const listener of listeners) listener();

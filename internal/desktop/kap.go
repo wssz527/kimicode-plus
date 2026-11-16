@@ -82,9 +82,22 @@ type nativeEnvelope struct {
 type NativeError struct {
 	Code    string
 	Message string
+	Status  int
 }
 
 func (e *NativeError) Error() string { return e.Message }
+
+// kapTransportError keeps the user-facing message while preserving the cause so
+// the retry policy can tell a refused connection from a mid-flight break.
+type kapTransportError struct {
+	message string
+	cause   error
+	// sent records whether the request may have reached the server.
+	sent bool
+}
+
+func (e *kapTransportError) Error() string { return e.message }
+func (e *kapTransportError) Unwrap() error { return e.cause }
 
 type KAPClient struct {
 	home   string
@@ -96,10 +109,34 @@ type KAPClient struct {
 	watched map[string]bool
 	writeMu sync.Mutex
 	socket  *websocket.Conn
+
+	// resolved marks base/token as read from the official instance record, so
+	// only a disk-derived endpoint is invalidated. Endpoints injected directly
+	// (tests, diagnostics) are owned by the caller.
+	resolved   bool
+	backoffMin time.Duration
+	backoffMax time.Duration
 }
 
 func NewKAPClient(home string) *KAPClient {
-	return &KAPClient{home: filepath.Clean(home), watched: map[string]bool{}, client: &http.Client{Transport: &http.Transport{Proxy: nil}}}
+	return &KAPClient{
+		home: filepath.Clean(home), watched: map[string]bool{}, client: &http.Client{Transport: &http.Transport{Proxy: nil}},
+		backoffMin: 500 * time.Millisecond, backoffMax: 30 * time.Second,
+	}
+}
+
+// invalidate forgets the resolved endpoint so the next call re-reads the
+// instance record and token. The official client writes a new port and token on
+// every launch, so a cached pair only stays valid for the process that wrote it.
+// An endpoint injected by the caller is not disk state and must survive.
+func (k *KAPClient) invalidate() {
+	k.mu.Lock()
+	if k.resolved {
+		k.base = ""
+		k.token = ""
+		k.resolved = false
+	}
+	k.mu.Unlock()
 }
 
 func (k *KAPClient) resolve() error {
@@ -156,6 +193,7 @@ func (k *KAPClient) resolve() error {
 	}
 	k.base = "http://" + net.JoinHostPort(host, strconv.Itoa(instances[0].Port))
 	k.token = token
+	k.resolved = true
 	return nil
 }
 
@@ -169,20 +207,58 @@ func (k *KAPClient) endpoint() (string, string, error) {
 }
 
 func (k *KAPClient) Request(ctx context.Context, method, path string, body any) (json.RawMessage, error) {
+	if !strings.HasPrefix(path, "/") || strings.Contains(path, "..") {
+		return nil, errors.New("官方接口路径无效")
+	}
+	var payload []byte
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		payload = encoded
+	}
+	raw, err := k.send(ctx, method, path, payload)
+	if err == nil {
+		return raw, nil
+	}
+	if !retryableRequest(ctx, method, err) {
+		return nil, err
+	}
+	k.invalidate()
+	return k.send(ctx, method, path, payload)
+}
+
+// retryableRequest allows exactly one re-resolve-and-retry. A rejected token or
+// a connection that never opened cannot have executed anything, so resending is
+// side-effect free. Anything that may have reached the server is retried only
+// for idempotent methods: a truncated response must not duplicate a prompt.
+func retryableRequest(ctx context.Context, method string, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var native *NativeError
+	if errors.As(err, &native) {
+		return native.Status == http.StatusUnauthorized
+	}
+	var transport *kapTransportError
+	if !errors.As(err, &transport) {
+		return false
+	}
+	if !transport.sent {
+		return true
+	}
+	return method == http.MethodGet || method == http.MethodHead
+}
+
+func (k *KAPClient) send(ctx context.Context, method, path string, payload []byte) (json.RawMessage, error) {
 	base, token, err := k.endpoint()
 	if err != nil {
 		return nil, err
 	}
-	if !strings.HasPrefix(path, "/") || strings.Contains(path, "..") {
-		return nil, errors.New("官方接口路径无效")
-	}
 	var reader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		reader = bytes.NewReader(data)
+	if payload != nil {
+		reader = bytes.NewReader(payload)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
@@ -192,35 +268,45 @@ func (k *KAPClient) Request(ctx context.Context, method, path string, body any) 
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
-	if body != nil {
+	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	response, err := k.client.Do(req)
 	if err != nil {
-		return nil, errors.New("无法连接官方会话服务")
+		return nil, &kapTransportError{message: "无法连接官方会话服务", cause: err, sent: !unsentFailure(err)}
 	}
 	defer response.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(response.Body, 8<<20))
 	if err != nil {
-		return nil, err
+		return nil, &kapTransportError{message: "官方会话服务在响应中断开", cause: err, sent: true}
+	}
+	if response.StatusCode == http.StatusUnauthorized {
+		return nil, &NativeError{Code: "NATIVE_UNAUTHORIZED", Message: "官方会话服务拒绝了当前访问凭据，请重新打开客户端", Status: response.StatusCode}
 	}
 	var envelope nativeEnvelope
 	if len(data) > 0 && json.Unmarshal(data, &envelope) == nil && (envelope.Code != 0 || envelope.Message != "" || envelope.Data != nil) {
 		if envelope.Code != 0 {
-			return nil, &NativeError{Code: "NATIVE_ERROR", Message: "官方接口返回：" + envelope.Message}
+			return nil, &NativeError{Code: "NATIVE_ERROR", Message: "官方接口返回：" + envelope.Message, Status: response.StatusCode}
 		}
 		if response.StatusCode >= 400 {
-			return nil, &NativeError{Code: "NATIVE_HTTP", Message: "官方接口返回 HTTP " + strconv.Itoa(response.StatusCode)}
+			return nil, &NativeError{Code: "NATIVE_HTTP", Message: "官方接口返回 HTTP " + strconv.Itoa(response.StatusCode), Status: response.StatusCode}
 		}
 		return envelope.Data, nil
 	}
 	if response.StatusCode >= 400 {
-		return nil, &NativeError{Code: "NATIVE_HTTP", Message: "官方接口返回 HTTP " + strconv.Itoa(response.StatusCode)}
+		return nil, &NativeError{Code: "NATIVE_HTTP", Message: "官方接口返回 HTTP " + strconv.Itoa(response.StatusCode), Status: response.StatusCode}
 	}
 	if len(data) == 0 {
 		return json.RawMessage("null"), nil
 	}
 	return json.RawMessage(data), nil
+}
+
+// unsentFailure reports connection failures raised while dialing, where the
+// request never reached the server.
+func unsentFailure(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
 }
 
 func decodeNative[T any](raw json.RawMessage, label string) (T, error) {

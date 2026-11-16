@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { getDemoHost } from "../native";
+import { useHost } from "../native";
 import { Icon } from "./Icon";
 import { Badge, ErrorNotice, Spinner } from "./ui";
 import "../styles/workbench.css";
@@ -266,7 +266,7 @@ function ModelSelect({
 }
 
 export function NativeSettings({ embedded = false }: { embedded?: boolean }) {
-  const host = getDemoHost();
+  const host = useHost();
   const [config, setConfig] = useState<Dic | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
