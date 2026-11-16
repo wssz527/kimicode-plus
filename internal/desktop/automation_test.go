@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -242,49 +243,71 @@ func TestCompactionRestartDoesNotReplayAcknowledged(t *testing.T) {
 	}
 }
 
+// TestKeepAliveSendsOnceAndPreservesMode keeps the original guarantees of the
+// pre-M2 keepalive (send once, never change plan/tower mode, respect approvals)
+// while satisfying the D8 preconditions: a running session with an open background
+// subagent and a quiet main agent.
 func TestKeepAliveSendsOnceAndPreservesMode(t *testing.T) {
+	home := t.TempDir()
+	keepAliveFixture{home: home, mainAge: 40 * time.Minute, background: true}.write(t, "synthetic/model")
 	var prompts atomic.Int32
-	var bodies []map[string]any
+	var bodyMu sync.Mutex
+	bodies := []map[string]any{}
 	session := nativeTestSession("s1", 0, nil)
 	session["busy"] = true
 	session["main_turn_active"] = true
-	handler := automationTestSessionHandler(t, session, []NativeTurn{}, nil, nil, func(path string, body map[string]any) {
+	handler := &syncHandler{session: session}
+	handler.inner = automationTestSessionHandler(t, session, []NativeTurn{}, nil, nil, func(path string, body map[string]any) {
 		if path == "/api/v1/sessions/s1/prompts" {
 			prompts.Add(1)
+			bodyMu.Lock()
 			bodies = append(bodies, body)
+			bodyMu.Unlock()
 		}
 	})
 	service, _ := newAutomationTestService(t, handler)
+	service.kap.home = home
+	service.verifyPoll = 20 * time.Millisecond
+	service.verifyWindow = 500 * time.Millisecond
 	now := time.Now().UTC()
-	mapped, _ := mapNativeSession(json.RawMessage(`{"id":"s1","updated_at":"2026-11-16T00:00:00Z","busy":true,"main_turn_active":true}`))
-	cache := automationTestCache(mapped, now)
-	service.cache["s1"] = cache
+	mapped, _ := mapNativeSession(json.RawMessage(`{"id":"s1","updated_at":"2026-11-16T00:00:00Z","busy":true,"main_turn_active":true,"pending_interaction":"none"}`))
+	service.cache["s1"] = automationTestCache(mapped, now)
 	settings := defaultAutomationSettings()
 	settings.KeepAlive.Enabled = true
 	settings.KeepAlive.Minutes = 5
 	if err := service.storeAutomationSettings(context.Background(), settings); err != nil {
 		t.Fatal(err)
 	}
+	// The session's own activity is recent, so only the main agent's request time can
+	// justify a keepalive.
+	service.mu.Lock()
+	recent := service.cache["s1"]
+	recent.lastActivity = now
+	service.cache["s1"] = recent
+	service.mu.Unlock()
+
 	if err := service.automationTick(context.Background(), now); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.automationTick(context.Background(), now.Add(time.Minute)); err != nil {
-		t.Fatal(err)
-	}
+	// Wait for the asynchronous closed-loop verifier to settle the intent.
+	waitForKeepAliveState(t, service, keepAliveInvalid)
 	if prompts.Load() != 1 || len(bodies) != 1 {
 		t.Fatalf("keepalive calls = %d", prompts.Load())
 	}
-	if _, exists := bodies[0]["plan_mode"]; exists {
+	bodyMu.Lock()
+	first := bodies[0]
+	bodyMu.Unlock()
+	if _, exists := first["plan_mode"]; exists {
 		t.Fatal("keepalive changed plan mode")
 	}
-	if _, exists := bodies[0]["tower_mode"]; exists {
+	if _, exists := first["tower_mode"]; exists {
 		t.Fatal("keepalive changed tower mode")
 	}
-	updated := service.cache["s1"]
-	updated.session.PendingInteraction = "approval"
-	updated.lastActivity = now.Add(-time.Hour)
-	service.cache["s1"] = updated
-	if err := service.automationTick(context.Background(), now.Add(2*time.Hour)); err != nil {
+	// A pending approval must block the next candidate even after the cooldown. The
+	// official session is the source of truth here: automationTick re-reads it, so the
+	// approval has to be visible in the synthetic provider too.
+	handler.setPending("approval")
+	if err := service.automationTick(context.Background(), now.Add(30*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if prompts.Load() != 1 {
@@ -518,4 +541,26 @@ func TestNativeRecoveryUsesOfficialQuotaAndRemovesWaiter(t *testing.T) {
 	if err = service.db.QueryRow(`SELECT state FROM automation_intents WHERE id='recovery:session:s1'`).Scan(&state); err != nil || state != "completed" {
 		t.Fatalf("recovery receipt = %s %v", state, err)
 	}
+}
+
+// syncHandler lets a test change the synthetic official session between ticks, so the
+// service's re-read sees the same state a real client would report.
+type syncHandler struct {
+	mu      sync.Mutex
+	inner   http.Handler
+	session map[string]any
+}
+
+func (h *syncHandler) setPending(value string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.session["pending_interaction"] = value
+}
+
+func (h *syncHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	pending := h.session["pending_interaction"]
+	h.mu.Unlock()
+	_ = pending
+	h.inner.ServeHTTP(w, r)
 }

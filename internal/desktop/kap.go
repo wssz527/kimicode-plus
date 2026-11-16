@@ -118,6 +118,10 @@ type KAPClient struct {
 	backoffMax time.Duration
 }
 
+// Home reports the KIMI_CODE_HOME this client reads instance records from. The
+// cache layer roots its session scan at the same directory.
+func (k *KAPClient) Home() string { return k.home }
+
 func NewKAPClient(home string) *KAPClient {
 	return &KAPClient{
 		home: filepath.Clean(home), watched: map[string]bool{}, client: &http.Client{Transport: &http.Transport{Proxy: nil}},

@@ -40,6 +40,179 @@ export interface SessionView {
   approvals: { id: string; title: string; detail?: string; options?: { label: string; value: string }[] }[];
   goal?: { status?: string; [key: string]: unknown };
 }
+/** Cache metrics mirrored from internal/cache. Every numeric cache field can be
+ * absent by design: a missing rate means "the provider never reported cache
+ * fields", which is not the same as a zero hit rate (plan D4 / M2 section 3). */
+export interface CacheTotals {
+  steps: number;
+  inputOther: number;
+  inputCacheRead: number;
+  inputCacheCreation: number;
+  output: number;
+  hitRate: number | null;
+  reported: string;
+}
+
+export interface CacheSpeed {
+  state: string;
+  tokensPerSecond?: number;
+  samples: number;
+  note?: string;
+}
+
+export interface CacheQuota {
+  state: string;
+  source: string;
+  note?: string;
+  value?: unknown;
+}
+
+export interface CacheModelRow extends CacheTotals {
+  model: string;
+  speed: CacheSpeed;
+  note?: string;
+}
+
+export interface CacheSummary {
+  generatedAt: string;
+  hour: CacheTotals;
+  today: CacheTotals;
+  models: CacheModelRow[];
+  speed: CacheSpeed;
+  quota: CacheQuota;
+  reportingNote?: string;
+}
+
+export interface CacheSessionRow {
+  sessionId: string;
+  title: string;
+  cwd: string;
+  model: string;
+  lastRequestAt: string | null;
+  idleMinutes: number | null;
+  recent: CacheTotals;
+  contextTokens: number;
+  openBackground: number;
+  blocked: boolean;
+  reported: string;
+  note?: string;
+}
+
+export interface CacheHistoryPoint {
+  bucket: string;
+  totals: CacheTotals;
+  speed: CacheSpeed;
+}
+
+export interface CacheHistory {
+  range: string;
+  unit: string;
+  points: CacheHistoryPoint[];
+  totals: CacheTotals;
+}
+
+export interface CacheRetentionBucket {
+  label: string;
+  minMs: number;
+  maxMs: number;
+  samples: number;
+  hitRate: number | null;
+  reported: string;
+}
+
+export interface CacheRetention {
+  idleBuckets: CacheRetentionBucket[];
+  note: string;
+}
+
+export interface CacheReceipt {
+  kind: string;
+  sessionId: string;
+  sessionTitle?: string;
+  state: string;
+  note: string;
+  at: string;
+}
+
+export interface CachePolicySettings {
+  keepAlive: { enabled: boolean; minutes: number };
+  compaction: { enabled: boolean; idleMinutes: number; contextThreshold: number };
+  recovery: { enabled: boolean; intervalSeconds: number; entries: { id: string; title: string; status: string; nextAt?: string; note?: string }[] };
+}
+
+/** A provider that never reported cache fields must never render as 0%. */
+export const CACHE_NOT_REPORTED = "NOT_REPORTED";
+
+/** Renders a hit rate. `null` means "no number is honest here". */
+export function hitRateLabel(totals: Pick<CacheTotals, "hitRate" | "reported"> | null | undefined): string {
+  if (!totals) return "--";
+  if (totals.reported === CACHE_NOT_REPORTED) return "未上报";
+  if (totals.hitRate === null || totals.hitRate === undefined || !Number.isFinite(totals.hitRate)) return "--";
+  return `${(totals.hitRate * 100).toFixed(1)}%`;
+}
+
+/**
+ * "距上次请求 N 分钟". The value comes from the main agent's own last model
+ * request, so subagent activity never resets it (plan D8).
+ */
+export function idleLabel(minutes: number | null | undefined): string {
+  if (minutes === null || minutes === undefined || !Number.isFinite(minutes)) return "尚无请求记录";
+  if (minutes < 1) return "不到 1 分钟";
+  if (minutes < 60) return `${Math.round(minutes)} 分钟`;
+  const hours = minutes / 60;
+  return hours < 48 ? `${hours.toFixed(1)} 小时` : `${Math.round(hours / 24)} 天`;
+}
+
+export function tokenLabel(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value) || value < 0) return "--";
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return String(value);
+}
+
+export function speedLabel(speed: Pick<CacheSpeed, "tokensPerSecond"> | null | undefined): string {
+  if (!speed || speed.tokensPerSecond === undefined || !Number.isFinite(speed.tokensPerSecond)) return "--";
+  return `${speed.tokensPerSecond.toFixed(1)} tok/s`;
+}
+
+/**
+ * Decides whether a background policy event may replace the form. An event that
+ * arrives while the user has an unsaved edit in flight must not overwrite the draft
+ * (plan M2 section 5: "后台 automation 事件不得覆盖正在编辑的草稿").
+ */
+export function shouldApplyPolicyEvent(state: { writing: boolean; editing: boolean }): boolean {
+  return !state.writing && !state.editing;
+}
+
+export interface CachePolicyDraft {
+  keepAlive: { enabled: boolean; minutes: number };
+  compaction: { enabled: boolean; idleMinutes: number; contextThreshold: number };
+  recovery: { enabled: boolean; intervalSeconds: number; entries: NonNullable<CachePolicySettings["recovery"]["entries"]> };
+}
+
+/** A number field commits only on blur, and only when the value is in range. */
+export function commitNumberField(text: string, min: number, max: number): number | null {
+  const trimmed = text.trim();
+  if (!/^-?\d+$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  if (!Number.isInteger(value) || value < min || value > max) return null;
+  return value;
+}
+
+/** Applies an incoming policy patch onto a base, keeping the fields the server owns. */
+export function mergePolicy(base: CachePolicyDraft, incoming: unknown): CachePolicyDraft {
+  const source = (incoming ?? {}) as Partial<CachePolicyDraft>;
+  return {
+    keepAlive: { ...base.keepAlive, ...(source.keepAlive ?? {}) },
+    compaction: { ...base.compaction, ...(source.compaction ?? {}) },
+    recovery: {
+      ...base.recovery,
+      ...(source.recovery ?? {}),
+      entries: source.recovery?.entries ?? base.recovery.entries,
+    },
+  };
+}
+
 export interface RecoveryState {
   enabled: boolean;
   intervalSeconds: number;

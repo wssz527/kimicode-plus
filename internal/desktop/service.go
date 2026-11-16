@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"enhancedkimi/internal/cache"
 	"enhancedkimi/internal/httpx"
 	"enhancedkimi/internal/storage"
 )
@@ -51,8 +52,17 @@ type NativeService struct {
 	mu           sync.Mutex
 	automationMu sync.Mutex
 	featureMu    sync.Mutex
+	cacheMu      sync.Mutex
 	wg           sync.WaitGroup
 	cache        map[string]cachedSession
+	// store is the session-record metrics layer. It is created lazily because the
+	// official records directory may not exist yet.
+	store    *cache.Store
+	cacheErr error
+	// verifyWindow / verifyPoll override the keepalive closed-loop timings. Tests
+	// shorten them; production leaves them zero so the defaults apply.
+	verifyWindow time.Duration
+	verifyPoll   time.Duration
 	planner      PlannerActions
 	attach       AttachConfig
 }
@@ -268,8 +278,21 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.enableAttach(ctx, input)
 	case "attach.disable":
 		return s.disableAttach()
+	case "cache.summary":
+		return s.cacheSummary(ctx, time.Now().UTC())
+	case "cache.sessions":
+		return s.cacheSessions(ctx, time.Now().UTC(), parseCacheLimit(input))
+	case "cache.history":
+		return s.cacheHistory(ctx, time.Now().UTC(), stringInput(input, "range"))
+	case "cache.retention":
+		return s.cacheRetention(ctx, time.Now().UTC())
+	case "cache.receipts":
+		return s.cacheReceipts(ctx, parseCacheLimit(input))
 	case "monitor.summary":
-		return s.monitorSummary(ctx), nil
+		// Transitional compatibility for the built-in Monitor surface. Plan D10
+		// keeps the persistent indicator out of the core, but this existing call
+		// must not regress before Monitor becomes a plugin.
+		return s.monitorSummaryCompat(ctx), nil
 	case "automation.get":
 		return s.automationSettings(ctx)
 	case "automation.set":
@@ -740,23 +763,4 @@ func (s *NativeService) handoff(ctx context.Context, input map[string]any) (map[
 		return nil, err
 	}
 	return map[string]any{"sessionId": id}, nil
-}
-
-func (s *NativeService) monitorSummary(ctx context.Context) map[string]any {
-	usage, err := s.kap.Request(ctx, http.MethodGet, "/oauth/usage", nil)
-	result := map[string]any{
-		"speed": map[string]any{"state": "UNKNOWN", "source": "EKD 用量账本", "note": "没有完整 token 与耗时样本时不补零"},
-		"cache": map[string]any{"state": "UNKNOWN", "source": "社区经验提醒", "note": "25/29/30 分钟仅为经验阈值，不是官方 TTL"},
-		"quota": map[string]any{"state": "UNKNOWN", "source": "官方 /oauth/usage"},
-	}
-	if receipt := automationIntentSummary(ctx, s.db); receipt != nil {
-		state, _ := receipt["state"].(string)
-		result["cache"] = map[string]any{"state": strings.ToUpper(state), "source": "EKD 自动化回执", "note": receipt["note"], "value": receipt}
-	}
-	if err == nil {
-		result["quota"] = managedUsageMonitor(usage)
-	} else {
-		result["quota"] = map[string]any{"state": "ERROR", "source": "官方 /oauth/usage", "note": err.Error()}
-	}
-	return result
 }

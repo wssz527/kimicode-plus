@@ -109,8 +109,22 @@ func goalBlocksAutomation(raw json.RawMessage) bool {
 	return false
 }
 
+// goalAutomationBlocked reports whether a goal's budget forbids automation.
+//
+// An unread goal counts as blocking. That is the safe answer for recovery, which
+// must not resume a spent budget: "cannot confirm the budget" has to mean "do not
+// spend". Idle automation does not share that trade-off and uses goalBlocksIdle
+// instead, because a cache entry created by the KAP session list has goalKnown=false
+// until something fetches the goal, and treating that as blocked silently disabled
+// keepalive and compaction for every such session with no receipt explaining why.
 func goalAutomationBlocked(snapshot automationSnapshot) bool {
 	return !snapshot.goalKnown || goalBlocksAutomation(snapshot.goal)
+}
+
+// goalBlocksIdle is the goal test for keepalive and compaction: only a goal that was
+// actually read and is stopped or over budget forbids the action.
+func goalBlocksIdle(snapshot automationSnapshot) bool {
+	return snapshot.goalKnown && goalBlocksAutomation(snapshot.goal)
 }
 
 func pendingNativeInteraction(snapshot automationSnapshot) bool {
@@ -226,51 +240,13 @@ func (s *NativeService) refreshAutomationSnapshot(ctx context.Context, id string
 	return snapshotFromCache(loaded), true, nil
 }
 
-func (s *NativeService) runKeepAlive(ctx context.Context, settings AutomationSettings, id string, now time.Time) {
-	snapshot, ok := s.automationSnapshot(id)
-	if !ok || !snapshot.session.Busy && !snapshot.session.MainTurnActive || pendingNativeInteraction(snapshot) || now.Sub(snapshot.lastActivity) < time.Duration(settings.KeepAlive.Minutes)*time.Minute {
-		return
-	}
-	snapshot, ok, err := s.refreshAutomationSnapshot(ctx, id, now)
-	if err != nil || !ok || !snapshot.session.Busy && !snapshot.session.MainTurnActive || pendingNativeInteraction(snapshot) || goalAutomationBlocked(snapshot) || now.Sub(snapshot.lastActivity) < time.Duration(settings.KeepAlive.Minutes)*time.Minute {
-		return
-	}
-	allowed, err := s.automationAllowed(ctx, "keepalive", id, contextRevision(snapshot), now)
-	if err != nil || !allowed {
-		return
-	}
-	intent, _, err := s.beginAutomation(ctx, "keepalive", id, contextRevision(snapshot), now)
-	if err != nil {
-		return
-	}
-	latest, ok := s.automationSnapshot(id)
-	if !ok || latest.revision != snapshot.revision || !latest.session.Busy && !latest.session.MainTurnActive || pendingNativeInteraction(latest) || goalAutomationBlocked(latest) {
-		_ = s.updateAutomation(ctx, intent.ID, "cancelled", "发送前出现新活动或审批，候选已失效", now)
-		return
-	}
-	if err = s.kap.Watch(id); err != nil {
-		_ = s.updateAutomation(ctx, intent.ID, "failed", "无法订阅保活回执："+err.Error(), now)
-		return
-	}
-	_, err = s.sendPrompt(ctx, map[string]any{"id": id, "text": "继续", "mode": "inherit"})
-	if err != nil {
-		note := "保活消息未被官方接收：" + err.Error()
-		_ = s.updateAutomation(ctx, intent.ID, "failed", note, now)
-		s.publishAutomationReceipt("keepalive", id, "failed", note)
-		return
-	}
-	note := "最小保活消息已被官方接收；原任务结果仍以会话事件为准"
-	_ = s.updateAutomation(ctx, intent.ID, "completed", note, now)
-	s.publishAutomationReceipt("keepalive", id, "completed", note)
-}
-
 func (s *NativeService) runCompaction(ctx context.Context, settings AutomationSettings, id string, now time.Time) {
 	snapshot, ok := s.automationSnapshot(id)
-	if !ok || snapshot.session.Busy || snapshot.session.MainTurnActive || pendingNativeInteraction(snapshot) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
+	if !ok || compactionBlocked(snapshot, s.openBackground(ctx, id)) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
 		return
 	}
 	snapshot, ok, err := s.refreshAutomationSnapshot(ctx, id, now)
-	if err != nil || !ok || snapshot.session.Busy || snapshot.session.MainTurnActive || pendingNativeInteraction(snapshot) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
+	if err != nil || !ok || compactionBlocked(snapshot, s.openBackground(ctx, id)) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
 		return
 	}
 	usage := snapshot.session.Usage
@@ -304,6 +280,31 @@ func (s *NativeService) runCompaction(ctx context.Context, settings AutomationSe
 	}
 	_ = s.updateAutomation(ctx, intent.ID, "acknowledged", "官方已接受压缩请求，等待完成事件", now)
 	s.publishAutomationReceipt("compaction", id, "acknowledged", "ACK 不是完成，正在等待官方事件")
+}
+
+// compactionBlocked applies the same D8 definition of "running" that keepalive uses.
+// A session whose main agent finished its turn while a background subagent still runs
+// reports busy=false, so checking only the official flags would let idle compaction
+// compact a session that is in fact still working.
+func compactionBlocked(snapshot automationSnapshot, openBackground int) bool {
+	if snapshot.session.Busy || snapshot.session.MainTurnActive || pendingNativeInteraction(snapshot) {
+		return true
+	}
+	return openBackground > 0
+}
+
+// openBackground reads the recorded open-background count, returning 0 when the cache
+// layer is unavailable so a missing signal cannot block automation outright.
+func (s *NativeService) openBackground(ctx context.Context, id string) int {
+	store, err := s.cacheStore()
+	if err != nil {
+		return 0
+	}
+	live, err := store.Live(ctx, id)
+	if err != nil {
+		return 0
+	}
+	return live.OpenBackground
 }
 
 func (s *NativeService) syncAutomationSessions(ctx context.Context, now time.Time) error {
@@ -359,14 +360,24 @@ func (s *NativeService) automationTick(ctx context.Context, now time.Time) error
 	}
 	var syncErr error
 	if settings.KeepAlive.Enabled || settings.Compaction.Enabled || settings.Recovery.Enabled {
-		syncErr = s.syncAutomationSessions(ctx, now)
+		// Refresh the session-record metrics first: keepalive's clock and its
+		// background-subagent condition both come from cache_steps/cache_live, so they
+		// must be current before any policy decision this tick. Creating the store here
+		// also means the scheduler works without waiting for the settings page to read
+		// cache.summary once.
+		if _, scanErr := s.cacheScan(ctx, now, false); scanErr != nil {
+			syncErr = scanErr
+		}
+		if syncErr == nil {
+			syncErr = s.syncAutomationSessions(ctx, now)
+		}
 	}
 	if err = s.expireCompactions(ctx, now); err != nil {
 		return err
 	}
 	for _, id := range s.automationSessionIDs() {
 		if settings.KeepAlive.Enabled {
-			s.runKeepAlive(ctx, settings, id, now)
+			s.runKeepAliveOnce(ctx, settings, id, now)
 		}
 		if settings.Compaction.Enabled {
 			s.runCompaction(ctx, settings, id, now)

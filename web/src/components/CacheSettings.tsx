@@ -1,116 +1,399 @@
-import { useEffect, useId, useState } from "react";
-import type { NativeHost } from "../native";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import type {
+  CacheHistory,
+  CachePolicySettings,
+  CacheReceipt,
+  CacheRetention,
+  CacheSessionRow,
+  CacheSummary,
+  NativeHost,
+} from "../native";
+import {
+  commitNumberField,
+  CACHE_NOT_REPORTED as NOT_REPORTED,
+  hitRateLabel,
+  idleLabel,
+  mergePolicy,
+  shouldApplyPolicyEvent,
+  speedLabel as formatSpeed,
+  tokenLabel,
+} from "../native";
 import { ErrorNotice, Spinner, Toggle } from "./ui";
 import { errorText } from "./workbench/pieces";
+import "../styles/cache-settings.css";
 
-interface AutomationSettings {
-  keepAlive: { enabled: boolean; minutes: number };
-  compaction: { enabled: boolean; idleMinutes: number; contextThreshold: number };
-  recovery: { enabled: boolean; intervalSeconds: number; entries: { id: string; title: string; status: string; nextAt?: string; note?: string }[] };
-}
-
-const DEFAULTS: AutomationSettings = {
+const DEFAULTS: CachePolicySettings = {
   keepAlive: { enabled: false, minutes: 25 },
   compaction: { enabled: false, idleMinutes: 25, contextThreshold: 60 },
   recovery: { enabled: false, intervalSeconds: 60, entries: [] },
 };
 
 const RECOVERY_STATUS: Record<string, string> = {
-	WATCHING: "已监听",
-	WAITING: "等待额度恢复",
-	PAUSED: "等待会话可操作",
-	BLOCKED: "已被预算或权限阻止",
-	ERROR: "检查失败",
-	UNKNOWN: "结果未知",
+  WATCHING: "已监听",
+  WAITING: "等待额度恢复",
+  PAUSED: "等待会话可操作",
+  BLOCKED: "已被预算或权限阻止",
+  ERROR: "检查失败",
+  UNKNOWN: "结果未知",
 };
 
-function NumberField({ label, value, min, max, unit, hideLabel = false, onChange }: {
+/**
+ * Receipt states separate "the official client accepted the request" from "the
+ * official client finished it". Plan M2 section 5 requires the distinction.
+ */
+const RECEIPT_STATE: Record<string, { label: string; tone: "ok" | "pending" | "bad" | "muted" }> = {
+  verified: { label: "保活成功", tone: "ok" },
+  completed: { label: "官方已完成", tone: "ok" },
+  acknowledged: { label: "官方已接收，等待完成", tone: "pending" },
+  invalid: { label: "保活无效", tone: "bad" },
+  failed: { label: "发送失败", tone: "bad" },
+  cancelled: { label: "已取消", tone: "muted" },
+  skipped: { label: "未发送", tone: "muted" },
+  unknown: { label: "结果未知", tone: "muted" },
+};
+
+const KIND_LABEL: Record<string, string> = { keepalive: "保活", compaction: "压缩", recovery: "额度恢复" };
+
+function NumberField({ label, value, min, max, unit, hideLabel = false, onCommit, onEditingChange }: {
   label: string;
   value: number;
   min: number;
   max: number;
   unit: string;
   hideLabel?: boolean;
-  onChange: (value: number) => void;
+  onCommit: (value: number | null) => void;
+  onEditingChange?: (editing: boolean) => void;
 }) {
   const id = useId();
-  return <span className="ekds-field-inline">
-    <label htmlFor={id} className={hideLabel ? "ekds-sr" : undefined}>{label}</label>
-    <input id={id} className="ekds-num" type="number" min={min} max={max} value={value} onChange={event => onChange(Number(event.target.value))} />
-    <span>{unit}</span>
+  // The draft is local: a background automation event must never overwrite what the
+  // user is typing. Only blur commits, and only when the value is valid.
+  const [text, setText] = useState(String(value));
+  const focused = useRef(false);
+  useEffect(() => {
+    if (!focused.current) setText(String(value));
+  }, [value]);
+  const parsed = commitNumberField(text, min, max);
+  const valid = parsed !== null;
+  return <span className="eks-field">
+    <label htmlFor={id} className={hideLabel ? "eks-sr" : undefined}>{label}</label>
+    <input
+      id={id}
+      className={`eks-num${valid ? "" : " is-invalid"}`}
+      type="number"
+      inputMode="numeric"
+      min={min}
+      max={max}
+      aria-invalid={valid ? undefined : true}
+      value={text}
+      onFocus={() => { focused.current = true; onEditingChange?.(true); }}
+      onChange={event => setText(event.target.value)}
+      onBlur={() => {
+        focused.current = false;
+        onEditingChange?.(false);
+        if (parsed !== null) onCommit(parsed);
+        else setText(String(value));
+      }}
+    />
+    <span className="eks-unit">{unit}</span>
   </span>;
 }
 
+function Group({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
+  return <section className="eks-group-section">
+    <h3 className="eks-group-title">{title}</h3>
+    {hint ? <p className="eks-group-hint">{hint}</p> : null}
+    <div className="eks-group">{children}</div>
+  </section>;
+}
+
 export function CacheSettings({ host }: { host: NativeHost }) {
-  const [saved, setSaved] = useState<AutomationSettings | null>(null);
-  const [draft, setDraft] = useState<AutomationSettings>(DEFAULTS);
-  const [busy, setBusy] = useState(false);
+  const [summary, setSummary] = useState<CacheSummary | null>(null);
+  const [sessions, setSessions] = useState<CacheSessionRow[]>([]);
+  const [retention, setRetention] = useState<CacheRetention | null>(null);
+  const [receipts, setReceipts] = useState<CacheReceipt[]>([]);
+  const [history, setHistory] = useState<CacheHistory | null>(null);
+  const [range, setRange] = useState<"24h" | "7d" | "30d">("24h");
+  const [policy, setPolicy] = useState<CachePolicySettings>(DEFAULTS);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [loading, setLoading] = useState(true);
+  // While a policy write is in flight, incoming automation events are ignored so the
+  // user's switches are not bounced back to the previous value. `editing` does the
+  // same for a number field that currently holds focus.
+  const writing = useRef(false);
+  const editing = useRef(false);
+
+  const loadReadings = useCallback(async () => {
+    const [nextSummary, nextSessions, nextRetention, nextReceipts] = await Promise.all([
+      host.request<CacheSummary>("cache.summary"),
+      host.request<CacheSessionRow[]>("cache.sessions", { limit: 20 }),
+      host.request<CacheRetention>("cache.retention"),
+      host.request<CacheReceipt[]>("cache.receipts", { limit: 20 }),
+    ]);
+    setSummary(nextSummary);
+    setSessions(Array.isArray(nextSessions) ? nextSessions : []);
+    setRetention(nextRetention);
+    setReceipts(Array.isArray(nextReceipts) ? nextReceipts : []);
+  }, [host]);
+
   useEffect(() => {
     let alive = true;
-    host.request<AutomationSettings>("automation.get").then(value => {
-      if (!alive) return;
-      setSaved(value); setDraft(value);
-    }).catch(cause => { if (alive) setError(errorText(cause)); });
+    (async () => {
+      try {
+        await loadReadings();
+        const nextPolicy = await host.request<CachePolicySettings>("automation.get");
+        if (alive) setPolicy({ ...DEFAULTS, ...nextPolicy });
+      } catch (cause) {
+        if (alive) setError(errorText(cause));
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
     return () => { alive = false; };
-  }, [host]);
-  useEffect(() => host.subscribe<AutomationSettings>("automation", event => {
-    if (event && typeof event === "object" && "keepAlive" in event) { setSaved(event); setDraft(event); }
+  }, [host, loadReadings]);
+
+  useEffect(() => {
+    let alive = true;
+    host.request<CacheHistory>("cache.history", { range })
+      .then(value => { if (alive) setHistory(value); })
+      .catch(() => { if (alive) setHistory(null); });
+    return () => { alive = false; };
+  }, [host, range]);
+
+  useEffect(() => host.subscribe<CachePolicySettings>("automation", event => {
+    // A background event refreshes the persisted policy, but never while the user has
+    // an edit or write in flight.
+    if (!shouldApplyPolicyEvent({ writing: writing.current, editing: editing.current })) return;
+    if (event && typeof event === "object" && "keepAlive" in event) setPolicy(mergePolicy(DEFAULTS, event));
   }), [host]);
 
-  async function save() {
-    setBusy(true); setError(""); setNotice("");
+  const savePolicy = useCallback(async (next: CachePolicySettings, successNote: string) => {
+    writing.current = true;
+    setError("");
+    setNotice("");
     try {
-      await host.request<AutomationSettings>("automation.set", draft as unknown as Record<string, unknown>);
-      const confirmed = await host.request<AutomationSettings>("automation.get");
-      setSaved(confirmed); setDraft(confirmed); setNotice("设置已保存并读回。启用的项目将在后台运行，结果可在 Monitor 中查看。");
-    } catch (cause) { setError(errorText(cause)); }
-    finally { setBusy(false); }
+      const confirmed = await host.request<CachePolicySettings>("automation.set", next as unknown as Record<string, unknown>);
+      setPolicy({ ...DEFAULTS, ...confirmed });
+      setNotice(successNote);
+    } catch (cause) {
+      setError(errorText(cause));
+      // Re-read the authoritative value so the UI does not keep showing a lie.
+      try {
+        setPolicy({ ...DEFAULTS, ...(await host.request<CachePolicySettings>("automation.get")) });
+      } catch { /* the error notice already explains the state */ }
+    } finally {
+      writing.current = false;
+    }
+  }, [host]);
+
+  if (loading && !summary && !error) {
+    return <div className="eks-loading"><Spinner size={15} />正在读取缓存与额度数据</div>;
   }
-  const dirty = saved !== null && JSON.stringify(saved) !== JSON.stringify(draft);
-  if (!saved && !error) return <div className="ekds-loading"><Spinner size={15} />正在读取缓存与额度设置</div>;
-  return <>
-    {error ? <ErrorNotice title="缓存设置不可用" message={error} recovery="修正后重新保存；未保存的编辑仍保留。" /> : null}
-    <div className="ekds-group">
-      <div className="ekds-row">
-        <span className="ekds-row-label"><strong>缓存保活</strong><small>长任务超过设定时间没有响应时，发送一条继续消息，可能消耗额度。等待审批或有新活动时不会发送。</small></span>
-        <Toggle label="启用缓存保活" checked={draft.keepAlive.enabled} onChange={value => setDraft({ ...draft, keepAlive: { ...draft.keepAlive, enabled: value } })} />
+
+  const keepAliveOff = !policy.keepAlive.enabled;
+  const compactionOff = !policy.compaction.enabled;
+  const recoveryOff = !policy.recovery.enabled;
+
+  return <div className="eks">
+    {error ? <ErrorNotice title="缓存与额度暂时不可用" message={error} recovery="可以继续使用官方客户端；修正后重新打开本页。" /> : null}
+
+    <Group title="概览" hint="数字来自本机会话记录，只读，不改动官方文件。">
+      <div className="eks-metrics">
+        <div className="eks-metric">
+          <span className="eks-metric-label">今日命中率</span>
+          <strong className="eks-metric-value">{hitRateLabel(summary?.today)}</strong>
+          {summary?.today?.reported === NOT_REPORTED
+            ? <small className="eks-metric-note">供应商未上报缓存数据</small>
+            : <small className="eks-metric-note">读取 {tokenLabel(summary?.today?.inputCacheRead ?? 0)} · 创建 {tokenLabel(summary?.today?.inputCacheCreation ?? 0)} · 未命中 {tokenLabel(summary?.today?.inputOther ?? 0)}</small>}
+        </div>
+        <div className="eks-metric">
+          <span className="eks-metric-label">近 1 小时命中率</span>
+          <strong className="eks-metric-value">{hitRateLabel(summary?.hour)}</strong>
+          <small className="eks-metric-note">{summary?.hour?.reported === NOT_REPORTED ? "供应商未上报缓存数据" : `${summary?.hour?.steps ?? 0} 步`}</small>
+        </div>
+        <div className="eks-metric">
+          <span className="eks-metric-label">平均生成速度</span>
+          <strong className="eks-metric-value">{formatSpeed(summary?.speed)}</strong>
+          <small className="eks-metric-note">按服务端解码时长计算</small>
+        </div>
+        <div className="eks-metric">
+          <span className="eks-metric-label">额度</span>
+          <strong className="eks-metric-value">{summary?.quota?.state === "AVAILABLE" ? "可用" : summary?.quota?.state === "EXHAUSTED" ? "已用尽" : "未知"}</strong>
+          <small className="eks-metric-note">{summary?.quota?.note ?? summary?.quota?.source ?? "官方未返回额度"}</small>
+        </div>
       </div>
-      <div className="ekds-row">
-        <span className="ekds-row-label"><strong>未回传阈值</strong><small>只有明确开启后才调度。</small></span>
-        <NumberField label="未回传阈值" hideLabel value={draft.keepAlive.minutes} min={5} max={120} unit="分钟" onChange={value => setDraft({ ...draft, keepAlive: { ...draft.keepAlive, minutes: value } })} />
+      {summary?.reportingNote ? <p className="eks-inline-note">{summary.reportingNote}</p> : null}
+      {summary?.models?.length ? <div className="eks-models">
+        {summary.models.slice(0, 6).map(model => <div key={model.model} className="eks-model-row">
+          <span className="eks-model-name" title={model.model}>{model.model === "UNKNOWN" ? "未关联到模型" : model.model}</span>
+          <span className="eks-model-rate">{hitRateLabel(model)}</span>
+          <span className="eks-model-speed">{formatSpeed(model.speed)}</span>
+        </div>)}
+      </div> : null}
+    </Group>
+
+    <Group title="会话" hint="“距上次请求”只统计主代理自己的模型请求，子代理活动不会重置它。">
+      {sessions.length === 0
+        ? <p className="eks-empty">还没有可读取的会话缓存记录。使用官方客户端发起一次对话后返回本页。</p>
+        : <div className="eks-table" role="table" aria-label="活跃会话缓存状态">
+          <div className="eks-table-head" role="row">
+            <span role="columnheader">会话</span>
+            <span role="columnheader">命中率</span>
+            <span role="columnheader">距上次请求</span>
+            <span role="columnheader">状态</span>
+          </div>
+          {sessions.map(row => <div key={row.sessionId} className="eks-table-row" role="row">
+            <span role="cell" className="eks-cell-main">
+              <strong>{row.title || "未命名会话"}</strong>
+              <small title={row.model}>{row.model === "UNKNOWN" ? "模型未关联" : row.model}</small>
+            </span>
+            <span role="cell" className="eks-cell-rate">{hitRateLabel(row.recent)}</span>
+            <span role="cell" className="eks-cell-idle">{idleLabel(row.idleMinutes)}</span>
+            <span role="cell" className="eks-cell-state">
+              {row.blocked
+                ? <span className="eks-chip is-warn">阻塞等待中</span>
+                : row.openBackground > 0
+                  ? <span className="eks-chip is-active">{row.openBackground} 个后台子代理</span>
+                  : <span className="eks-chip">空闲</span>}
+            </span>
+          </div>)}
+        </div>}
+    </Group>
+
+    <Group title="策略" hint="三项分别授权，默认关闭。同一会话不会同时保活和压缩：运行中只可能保活，空闲时只可能压缩。">
+      <div className="eks-row">
+        <span className="eks-row-label">
+          <strong>后台等待保活</strong>
+          <small>只在主会话等待后台子代理、且主代理自己超过设定时间没有发出模型请求时触发。每次保活消耗一次请求额度，并在主会话里留下一条消息。</small>
+        </span>
+        <Toggle
+          label="启用后台等待保活"
+          checked={policy.keepAlive.enabled}
+          onChange={value => void savePolicy({ ...policy, keepAlive: { ...policy.keepAlive, enabled: value } }, value ? "后台等待保活已开启。" : "后台等待保活已关闭。")}
+        />
       </div>
-      <div className="ekds-row">
-        <span className="ekds-row-label"><strong>空闲自动压缩</strong><small>会话结束并空闲后，在上下文占用超过阈值时请求压缩。界面会记录是否完成，结果不明确时不会自动重试。</small></span>
-        <Toggle label="启用空闲自动压缩" checked={draft.compaction.enabled} onChange={value => setDraft({ ...draft, compaction: { ...draft.compaction, enabled: value } })} />
+      {!keepAliveOff ? <>
+        <div className="eks-row is-sub">
+          <span className="eks-row-label"><strong>主代理静默阈值</strong><small>主代理距上一次模型请求达到这个时长才保活。5–60 分钟。</small></span>
+          <NumberField label="主代理静默阈值" hideLabel value={policy.keepAlive.minutes} min={5} max={60} unit="分钟"
+            onEditingChange={value => { editing.current = value; }} onCommit={value => { if (value !== null) void savePolicy(mergePolicy(policy, { keepAlive: { ...policy.keepAlive, minutes: value } }), "保活阈值已保存。"); }} />
+        </div>
+        <div className="eks-row is-sub is-stacked">
+          <span className="eks-row-label">
+            <strong>可参考的实测保留情况</strong>
+            <small>{retention?.note ?? "正在读取观测结果。"}</small>
+          </span>
+          {retention?.idleBuckets?.length ? <div className="eks-retention">
+            {retention.idleBuckets.map(bucket => <div key={bucket.label} className="eks-retention-row">
+              <span className="eks-retention-label">{bucket.label}</span>
+              <span className="eks-retention-bar" aria-hidden="true">
+                <span className="eks-retention-fill" style={{ width: bucket.hitRate === null ? "0%" : `${Math.max(2, Math.min(100, bucket.hitRate * 100))}%` }} />
+              </span>
+              <span className="eks-retention-value">
+                {bucket.reported === NOT_REPORTED ? "未上报" : bucket.hitRate === null ? "无样本" : `${(bucket.hitRate * 100).toFixed(0)}%（${bucket.samples} 次）`}
+              </span>
+            </div>)}
+          </div> : null}
+          <p className="eks-inline-note">真实的缓存保留时长没有公开值，这里只显示观测结果，不换算成倒计时。</p>
+        </div>
+        <p className="eks-row is-sub is-note">阻塞式等待无法保活：主代理停在阻塞调用里时，消息只会排队到等待结束，此时缓存已经过期。这种情况会记录为“未发送”并说明原因。</p>
+      </> : null}
+
+      <div className="eks-row">
+        <span className="eks-row-label">
+          <strong>空闲自动压缩</strong>
+          <small>会话空闲达到设定时长且上下文超过阈值时请求官方压缩。这是空闲会话的替代方案，不会用来保活。</small>
+        </span>
+        <Toggle
+          label="启用空闲自动压缩"
+          checked={policy.compaction.enabled}
+          onChange={value => void savePolicy({ ...policy, compaction: { ...policy.compaction, enabled: value } }, value ? "空闲自动压缩已开启。" : "空闲自动压缩已关闭。")}
+        />
       </div>
-      <div className="ekds-row">
-        <span className="ekds-row-label"><strong>压缩条件</strong><small>空闲时间与上下文阈值同时满足才提交。</small></span>
-        <span className="ekds-row-controls">
-          <NumberField label="空闲" value={draft.compaction.idleMinutes} min={5} max={1440} unit="分钟" onChange={value => setDraft({ ...draft, compaction: { ...draft.compaction, idleMinutes: value } })} />
-          <NumberField label="上下文超过" value={draft.compaction.contextThreshold} min={1} max={100} unit="%" onChange={value => setDraft({ ...draft, compaction: { ...draft.compaction, contextThreshold: value } })} />
+      {!compactionOff ? <div className="eks-row is-sub">
+        <span className="eks-row-label"><strong>压缩条件</strong><small>空闲时长与上下文阈值同时满足才提交。</small></span>
+        <span className="eks-controls">
+          <NumberField label="空闲" value={policy.compaction.idleMinutes} min={5} max={1440} unit="分钟"
+            onEditingChange={value => { editing.current = value; }} onCommit={value => { if (value !== null) void savePolicy(mergePolicy(policy, { compaction: { ...policy.compaction, idleMinutes: value } }), "空闲阈值已保存。"); }} />
+          <NumberField label="上下文超过" value={policy.compaction.contextThreshold} min={1} max={100} unit="%"
+            onEditingChange={value => { editing.current = value; }} onCommit={value => { if (value !== null) void savePolicy(mergePolicy(policy, { compaction: { ...policy.compaction, contextThreshold: value } }), "上下文阈值已保存。"); }} />
+        </span>
+      </div> : null}
+
+      <div className="eks-row">
+        <span className="eks-row-label">
+          <strong>额度恢复自动继续</strong>
+          <small>等待官方额度恢复后继续；自定义服务使用受控重试。遵守目标预算和当前权限。</small>
+        </span>
+        <Toggle
+          label="启用额度恢复自动继续"
+          checked={policy.recovery.enabled}
+          onChange={value => void savePolicy({ ...policy, recovery: { ...policy.recovery, enabled: value } }, value ? "额度恢复已开启。" : "额度恢复已关闭。")}
+        />
+      </div>
+      {!recoveryOff ? <div className="eks-row is-sub">
+        <span className="eks-row-label"><strong>检测间隔</strong><small>等待恢复的会话按此间隔重试。</small></span>
+        <NumberField label="检测间隔" hideLabel value={policy.recovery.intervalSeconds} min={15} max={3600} unit="秒"
+          onEditingChange={value => { editing.current = value; }} onCommit={value => { if (value !== null) void savePolicy(mergePolicy(policy, { recovery: { ...policy.recovery, intervalSeconds: value } }), "检测间隔已保存。"); }} />
+      </div> : null}
+    </Group>
+
+    {policy.recovery.entries.length ? <Group title="等待额度恢复的会话">
+      {policy.recovery.entries.map(entry => <div key={entry.id} className="eks-row is-sub">
+        <span className="eks-row-label"><strong>{entry.title}</strong><small>{entry.note}</small></span>
+        <span className="eks-chip">{RECOVERY_STATUS[entry.status] ?? "未知状态"}</span>
+      </div>)}
+    </Group> : null}
+
+    <Group title="实际用量" hint="按小时或按天聚合的 token 与速度记录。">
+      <div className="eks-row">
+        <span className="eks-row-label"><strong>统计区间</strong></span>
+        <span className="eks-segmented" role="group" aria-label="历史区间">
+          {(["24h", "7d", "30d"] as const).map(item => <button
+            key={item}
+            type="button"
+            className={`eks-segment${range === item ? " is-on" : ""}`}
+            aria-pressed={range === item}
+            onClick={() => setRange(item)}
+          >{item}</button>)}
         </span>
       </div>
-      <div className="ekds-row">
-        <span className="ekds-row-label"><strong>额度恢复自动继续</strong><small>等待官方额度恢复后继续；自定义服务使用受控重试。遵守目标预算和当前权限。</small></span>
-        <Toggle label="启用额度恢复自动继续" checked={draft.recovery.enabled} onChange={value => setDraft({ ...draft, recovery: { ...draft.recovery, enabled: value } })} />
-      </div>
-      <div className="ekds-row">
-        <span className="ekds-row-label"><strong>检测间隔</strong><small>等待恢复的会话按此间隔重试。</small></span>
-        <NumberField label="检测间隔" hideLabel value={draft.recovery.intervalSeconds} min={15} max={3600} unit="秒" onChange={value => setDraft({ ...draft, recovery: { ...draft.recovery, intervalSeconds: value } })} />
-      </div>
-      {draft.recovery.entries.length ? <div className="ekds-list">{draft.recovery.entries.map(entry => <div key={entry.id}>
-        <strong>{entry.title}</strong>
-        <span>{RECOVERY_STATUS[entry.status] ?? "未知状态"}</span>
-        <small>{entry.note}</small>
-      </div>)}</div> : <p className="ekds-empty">当前没有等待额度恢复的会话。</p>}
-    </div>
-    <div className="ekds-savebar">
-      <span>{dirty ? "有未保存更改" : notice || "设置已与持久化状态同步"}</span>
-      <button type="button" className="wb-btn" disabled={busy || !dirty} onClick={() => { if (saved) setDraft(saved); setNotice("已撤销未保存修改。"); }}>撤销修改</button>
-      <button type="button" className="wb-btn" disabled={busy} onClick={() => { setDraft(DEFAULTS); setNotice("默认值尚未保存，请检查后确认。"); }}>恢复默认</button>
-      <button type="button" className="wb-btn is-primary" disabled={busy || !dirty} onClick={() => void save()}>{busy ? <Spinner size={12} /> : null}保存本类设置</button>
-    </div>
-  </>;
+      {history?.points?.length
+        ? <div className="eks-spark" aria-label={`${history.range} 输入 token 分布`}>
+          {history.points.map(point => {
+            const peak = Math.max(...history.points.map(candidate => candidate.totals.inputOther + candidate.totals.inputCacheRead + candidate.totals.inputCacheCreation));
+            const total = point.totals.inputOther + point.totals.inputCacheRead + point.totals.inputCacheCreation;
+            const height = peak > 0 ? Math.max(2, Math.round((total / peak) * 100)) : 0;
+            return <span key={point.bucket} className="eks-spark-bar" style={{ height: `${height}%` }}
+              title={`${point.bucket}：命中 ${tokenLabel(point.totals.inputCacheRead)} · 未命中 ${tokenLabel(point.totals.inputOther)}`} />;
+          })}
+        </div>
+        : <p className="eks-empty">这个区间还没有记录。</p>}
+      {history?.totals ? <div className="eks-totals">
+        <span>区间命中率 <strong>{hitRateLabel(history.totals)}</strong></span>
+        <span>读取 <strong>{tokenLabel(history.totals.inputCacheRead)}</strong></span>
+        <span>创建 <strong>{tokenLabel(history.totals.inputCacheCreation)}</strong></span>
+        <span>未命中 <strong>{tokenLabel(history.totals.inputOther)}</strong></span>
+        <span>输出 <strong>{tokenLabel(history.totals.output)}</strong></span>
+      </div> : null}
+    </Group>
+
+    <Group title="最近执行记录" hint="“官方已接收”不等于“官方已完成”；保活是否成功以下一步 input_cache_read 为准。">
+      {receipts.length === 0
+        ? <p className="eks-empty">还没有执行记录。策略开启后，每次保活、压缩和恢复都会记录在这里。</p>
+        : <div className="eks-receipts">
+          {receipts.map((receipt, index) => {
+            const meta = RECEIPT_STATE[receipt.state] ?? { label: receipt.state || "未知", tone: "muted" as const };
+            return <div key={`${receipt.kind}-${receipt.sessionId}-${receipt.at}-${index}`} className="eks-receipt">
+              <span className={`eks-chip is-${meta.tone}`}>{meta.label}</span>
+              <span className="eks-receipt-kind">{KIND_LABEL[receipt.kind] ?? receipt.kind}</span>
+              <span className="eks-receipt-session">{receipt.sessionTitle || receipt.sessionId.slice(0, 12)}</span>
+              <span className="eks-receipt-note">{receipt.note}</span>
+            </div>;
+          })}
+        </div>}
+    </Group>
+
+    {notice ? <p className="eks-notice" role="status">{notice}</p> : null}
+  </div>;
 }

@@ -2,6 +2,55 @@
 
 改动保存在当前 Git 工作树，未新建发布提交或上传文件。独立数据位于相邻 `../work/` 的隔离目录，不修改官方程序包或开发主实例。
 
+## 缓存与额度（M2，2026-11-16）
+
+数据来自本机 `~/.kimi-code/sessions` 的只读解析，全部验证未改动官方文件、未调用付费模型。
+
+| 范围 | 结果 | 证据 |
+|---|---|---|
+| 增量读取 | 追加、截断、同路径替换（inode 变化）、半行不解析且下轮补全、5 秒扫描下限均通过 | `internal/cache/cache_test.go` |
+| 超长行 | 官方记录存在单行约 360KB。早期实现只吃掉首个读缓冲，21.8MB/263 步的会话入库仅 14 步；修复后入库 257 步。回归测试 `TestReadsPastOneBuffer` | `internal/cache/cache_test.go` |
+| 模型关联 | `usageScope=turn` 才参与配对，按 usage 四字段完全相等匹配；配对失败记 UNKNOWN；usage 为空的 error/interrupted 不入库 | `TestModelPairingAndUnknown` |
+| 速度字段 | 解码时长取 `llmServerDecodeMs`，用 `firstToken>stream` 的样本断言不是 `stream-firstToken` | `TestSpeedUsesServerDecode` |
+| 未上报判定 | read/creation 双零记 NOT_REPORTED 且不显示 0%；有非零 read 的真实低命中（3%）给数字 | `TestNotReportedVersusLowHitRate` |
+| 命中率与保留时长 | 命中率公式、retention 按空闲时长分桶均通过 | `TestHitRateFormula`、`TestRetentionBuckets` |
+| 保活时钟 | "距上次请求"只跟主代理，子代理更新的步骤不刷新 | `TestSessionsIgnoreSubagentActivity` |
+| 保活策略 | 子代理活跃时仍触发、审批阻断、空闲不触发、无后台子代理不触发、阈值以下不触发、阻塞等待记 skipped | `internal/desktop/cache_keepalive_test.go` |
+| 保活闭环判定 | cacheRead>0 判成功；双零判 unknown（不伪造）；有上报但命中 0 判无效；窗口内被后续保活接手时记 invalid 而不是冒领对方步骤 | `TestJudgeKeepAliveVerdicts`、`TestSupersededKeepAliveDoesNotClaimTheNewerStep`、`TestSupersedeQueryScopesToSession` |
+| 真实会话手算 | 3 个会话与手算一致（含 931657/0.990900 的重合） | 见下方实测记录 |
+| 前端 | typecheck 通过、81 项测试全绿、build 成功 | `web/` |
+| 真实二进制端到端 | 隔离宿主上 `cache.summary`/`sessions`/`history`/`retention`/`receipts` 返回真实值；`monitor.summary` 兼容层正常；阈值 5–60 校验生效；设置写入读回一致 | 隔离宿主运行日志 |
+| 保活自动闭环 | 隔离宿主上由调度器自动触发，两次连续保活分别落 `invalid` 与 `verified`，回执在页面上按时间排列可见 | 见下方"保活闭环实测" |
+| 页面截图 | 深浅两种配色均渲染正确：四张指标卡并排、会话表格三列、策略开关、留存条、实际用量柱状图、最近执行记录三种回执状态 | `work/ab/shots/cache-light.png`、`cache-dark.png` |
+
+### 保活闭环实测（隔离宿主，合成上游）
+
+前提状态：主代理已派发 `run_in_background: true` 的后台子代理并结束回合，官方报 `busy=true / main_turn_active=false`，`cache_live.open_background=1`，主代理上一次模型请求在 30 分钟前。
+
+观察到的完整序列：
+
+| 时刻 | 事件 |
+| --- | --- |
+| 13:18:07.295 | 调度器自动发送保活 #1，意图转 `acknowledged` |
+| 13:18:07 – 13:23:07 | 该会话没有产生任何主代理步骤 |
+| 13:23:07.295 | 冷却结束，保活 #2 发出 |
+| 13:23:07.359 | 主代理产生新步骤，`input_cache_read=1100` |
+| 13:23:07.505 | 保活 #1 落 `invalid`："本次保活窗口内没有产生自己的模型请求，后续保活已接手核对，本次保活无效" |
+| 13:23:22.370 | 保活 #2 落 `verified`："主代理下一步命中缓存，input_cache_read 大于 0，保活成功" |
+
+首轮实现里保活 #1 会把保活 #2 引起的步骤算成自己的成果、写成 `verified`。本轮修复后两者归属分明，变异测试（删掉该分支）会复现原始的 `verified/1100` 错判。
+
+限制：本次合成上游在保活请求上返回 `cached_tokens=1100`，所以 `verified` 证明的是"闭环能把下一步的 `input_cache_read` 正确归属到对应的保活"，**不证明**保活真的延长了官方缓存的存活时间。后者需要同会话有/无保活的中断对比，本轮未做。
+
+### 隔离宿主 A/B 实测（D8 发现阶段）
+
+环境：`../work/ekd-native-acceptance` 隔离宿主（官方 2.6.0，独立 `KIMI_CODE_HOME` 与独立 Electron profile），合成 OpenAI 兼容上游记录每次请求并上报 `cached_tokens`。provider `base_url` 经官方 `/config` 热改并在结束后还原。未接管日常实例、未安装真实 LaunchAgent、未调用付费模型。
+
+- **状态 A（后台等待）可保活**：首条消息产生请求 → 回合结束 `busy=false` → 保活消息 HTTP 200 → 上游记录到携带保活标记的新请求（4 次请求中 2 次命中标记）。
+- **状态 B（阻塞等待）不可保活**：合成上游返回真实 `Bash` 工具调用执行 `sleep 75`，阻塞窗口内发送保活消息被接收，但阻塞期间与工具结束后均**没有**新增请求，保活标记未出现在任何请求里。实现因此记 `skipped` 并说明原因。
+
+方法论修正：最初通过改写 `config.toml` 指向合成上游，上游收到 0 个请求——宿主只在启动时读配置。必须用官方 `/config` 热改才能验证。
+
 ## 当前原生聚合验收（2026-11-16）
 
 | 范围 | 当前结果 | 证据与限制 |
