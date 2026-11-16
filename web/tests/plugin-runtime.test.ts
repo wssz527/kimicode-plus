@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { actionAllowed, createBridge } from "../src/plugin-runtime/bridge.js";
 import { Scope } from "../src/plugin-runtime/scope.js";
-import { createPluginRuntime } from "../src/plugin-runtime/runtime.js";
+import { createPluginRuntime, defaultTheme } from "../src/plugin-runtime/runtime.js";
 import { pluginHostBridge } from "../src/plugin-runtime/host.js";
 import { entryPath } from "../src/plugin-runtime/loader.js";
 import type { RuntimeRequest } from "../src/plugin-runtime/context.js";
@@ -528,4 +528,24 @@ test("a mount failure inside an activation is tagged with its own phase", async 
   // the same error again would count one broken render as two faults.
   assert.deepEqual(codes, ["PLUGIN_MOUNT_FAILED"]);
   runtime.dispose();
+});
+
+test("defaultTheme follows explicit schemes and the system media query", () => {
+  const names = ["document", "getComputedStyle", "matchMedia"];
+  const saved = new Map(names.map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  let light = false;
+  try {
+    for (const [configured, systemLight, expected] of [["light", false, "light"], ["dark", true, "dark"], ["system", true, "light"], ["system", false, "dark"]] as const) {
+      Object.defineProperty(globalThis, "document", { configurable: true, value: { documentElement: { dataset: { colorScheme: configured } } } });
+      Object.defineProperty(globalThis, "getComputedStyle", { configurable: true, value: () => ({ getPropertyValue: () => "" }) });
+      Object.defineProperty(globalThis, "matchMedia", { configurable: true, value: (query: string) => ({ matches: query === "(prefers-color-scheme: light)" ? light : !light }) });
+      light = systemLight;
+      assert.equal(defaultTheme().scheme, expected);
+    }
+  } finally {
+    for (const [name, descriptor] of saved) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete (globalThis as Record<string, unknown>)[name];
+    }
+  }
 });

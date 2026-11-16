@@ -13,7 +13,7 @@ export function PluginsPage() {
         title="插件"
         description="本地受信插件运行在当前界面里，按清单申请的能力取用核心功能。核心关闭全部插件后仍完整可用。"
       />
-      <PluginSettings />
+      <PluginSettings embedded />
     </div>
   );
 }

@@ -414,7 +414,8 @@ function createEventPump(reportFailure: (id: string, error: unknown, code: strin
 
 export function defaultTheme(): PluginTheme {
   const doc = typeof document === "undefined" ? null : document.documentElement;
-  const scheme = doc?.dataset.colorScheme === "light" ? "light" : "dark";
+  const configured = doc?.dataset.colorScheme;
+  const scheme = configured === "light" || (configured !== "dark" && globalThis.matchMedia?.("(prefers-color-scheme: light)").matches) ? "light" : "dark";
   const style = doc ? getComputedStyle(doc) : null;
   const tokens: Record<string, string> = {};
   for (const name of ["--color-bg", "--color-text", "--color-text-secondary", "--color-line", "--color-hover", "--blue", "--font-ui"]) {
