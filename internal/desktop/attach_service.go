@@ -34,7 +34,11 @@ func (s *NativeService) attachConfig() AttachConfig {
 func (s *NativeService) attachStatus(ctx context.Context) map[string]any {
 	config := s.attachConfig()
 	host := map[string]any{"running": false, "reason": "未配置 Kimi Code 数据目录，无法发现宿主"}
-	if config.KimiHome != "" {
+	if !hostPlatformSupported {
+		// Discovery itself depends on the macOS process tools, so an unsupported
+		// platform reports the support boundary instead of pretending a probe ran.
+		host = map[string]any{"running": false, "reason": ErrUnsupportedPlatform.Error()}
+	} else if config.KimiHome != "" {
 		if discovered, err := DiscoverHost(ctx, config.Profile); err == nil {
 			host = discovered
 		} else {
@@ -47,10 +51,15 @@ func (s *NativeService) attachStatus(ctx context.Context) map[string]any {
 		payload["last"] = state
 	}
 	// The agent cannot be offered when the core does not know its own binary or
-	// the pairing details a launchd run needs.
-	payload["available"] = config.Executable != "" && config.CoreURL != "" && len(config.PairingToken) >= 32
+	// the pairing details a launchd run needs. It is also never offered on a
+	// platform whose host runtime has not been verified: the LaunchAgent it would
+	// install could only fail, or take over a host nothing knows how to address.
+	payload["available"] = hostPlatformSupported && config.Executable != "" && config.CoreURL != "" && len(config.PairingToken) >= 32
 	if !payload["available"].(bool) {
 		payload["unavailableReason"] = "后台接入需要在带核心地址和配对凭据的增强核心中启用"
+		if !hostPlatformSupported {
+			payload["unavailableReason"] = ErrUnsupportedPlatform.Error()
+		}
 	}
 	return payload
 }
@@ -59,6 +68,9 @@ func (s *NativeService) attachStatus(ctx context.Context) map[string]any {
 // The daily-instance consent is a separate flag so choosing "auto attach" never
 // silently implies taking over the client the user is working in.
 func (s *NativeService) enableAttach(ctx context.Context, input map[string]any) (map[string]any, error) {
+	if !hostPlatformSupported {
+		return nil, ErrUnsupportedPlatform
+	}
 	config := s.attachConfig()
 	if config.Executable == "" || config.CoreURL == "" || len(config.PairingToken) < AttachTokenMinLength {
 		return nil, errors.New("后台接入需要核心地址和配对凭据，请从完整的增强核心中启用")

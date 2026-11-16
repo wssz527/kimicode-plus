@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
@@ -70,6 +69,9 @@ func IsDebugInstance(command string) bool {
 // launched with that --user-data-dir, which is how isolated verification runs
 // address their own host.
 func FindMainPID(ctx context.Context, profile string) (int, error) {
+	if !hostPlatformSupported {
+		return 0, ErrUnsupportedPlatform
+	}
 	if profile != "" && !filepath.IsAbs(profile) {
 		return 0, errors.New("隔离宿主的 profile 必须是绝对路径")
 	}
@@ -165,10 +167,19 @@ func CommandLine(ctx context.Context, pid int) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
+// ErrUnsupportedPlatform names the support boundary of the host integration.
+// Only the macOS host path has been verified end to end; the other targets are
+// compile-only, so they must refuse instead of signalling a process or claiming
+// a successful attach.
+var ErrUnsupportedPlatform = errors.New("增强宿主接入目前只支持 macOS 宿主；本平台仅保证编译通过，不会向任何进程发送信号")
+
 // VerifyLiveProcess confirms the running process still executes the verified
-// binary. lsof reports the mapped text image inodes, so a replaced application
-// bundle is caught even when the on-disk path is unchanged.
+// binary. The platform-specific runtime image check catches a replaced
+// application bundle even when the on-disk path is unchanged.
 func VerifyLiveProcess(ctx context.Context, info ProcessInfo) error {
+	if !hostPlatformSupported {
+		return ErrUnsupportedPlatform
+	}
 	current, err := ProcessIdentity(ctx, info.PID)
 	if err != nil {
 		return err
@@ -179,23 +190,7 @@ func VerifyLiveProcess(ctx context.Context, info ProcessInfo) error {
 	if current.UID != os.Getuid() {
 		return errors.New("宿主进程不属于当前用户，拒绝接入")
 	}
-	output, err := exec.CommandContext(ctx, "/usr/sbin/lsof", "-nP", "-a", "-p", strconv.Itoa(info.PID), "-d", "txt", "-Fin").Output()
-	if err != nil {
-		return errors.New("无法读取宿主进程的内存映像，拒绝接入")
-	}
-	st, err := os.Stat(info.Executable)
-	if err != nil {
-		return errors.New("宿主可执行文件不可读，拒绝接入")
-	}
-	sys, ok := st.Sys().(*syscall.Stat_t)
-	if !ok {
-		return errors.New("无法读取宿主可执行文件标识，拒绝接入")
-	}
-	want := fmt.Sprintf("i%d\nn%s\n", sys.Ino, info.Executable)
-	if !strings.Contains(string(output), want) {
-		return errors.New("正在运行的宿主与已校验的应用不一致，拒绝接入")
-	}
-	return nil
+	return verifyRuntimeImage(ctx, info)
 }
 
 type HostContract struct {
@@ -322,10 +317,13 @@ func Attach(ctx context.Context, pid int) (*CDP, error) {
 	if pid <= 0 {
 		return nil, errors.New("宿主 PID 无效")
 	}
+	if !hostPlatformSupported {
+		return nil, ErrUnsupportedPlatform
+	}
 	if inspectorOpen(ctx) {
 		return nil, errors.New("9229 调试端口已被占用，拒绝附着未知进程")
 	}
-	if err := syscall.Kill(pid, syscall.SIGUSR1); err != nil {
+	if err := activateInspector(pid); err != nil {
 		return nil, err
 	}
 	var endpoint string
