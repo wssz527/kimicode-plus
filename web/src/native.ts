@@ -44,6 +44,24 @@ export interface RecoveryState {
   intervalSeconds: number;
   entries: { id: string; kind: string; title: string; status: string; nextAt?: string; note?: string }[];
 }
+/** Optional addons frozen out of the core product; both default to false. */
+export interface AddonFeatures {
+  planner: boolean;
+  multiSession: boolean;
+}
+export const addonFeatureKeys = ["planner", "multiSession"] as const;
+export type AddonFeatureKey = typeof addonFeatureKeys[number];
+export function normalizeAddonFeatures(value: unknown): AddonFeatures {
+  const source = (value ?? {}) as Partial<Record<AddonFeatureKey, unknown>>;
+  return { planner: source.planner === true, multiSession: source.multiSession === true };
+}
+export async function readAddonFeatures(host: Pick<NativeHost, "request">): Promise<AddonFeatures> {
+  return normalizeAddonFeatures(await host.request<AddonFeatures>("features.get"));
+}
+export async function writeAddonFeatures(host: Pick<NativeHost, "request">, next: AddonFeatures): Promise<AddonFeatures> {
+  const target = normalizeAddonFeatures(next);
+  return normalizeAddonFeatures(await host.request<AddonFeatures>("features.set", { planner: target.planner, multiSession: target.multiSession }));
+}
 export interface DemoBootstrap {
   cwd: string;
   models: { id: string; name: string }[];
@@ -51,6 +69,7 @@ export interface DemoBootstrap {
   threads: PlannerThread[];
   sessions: NativeSession[];
   recovery: RecoveryState;
+  features?: AddonFeatures;
 }
 export interface NativeHooks {
   onActiveSession?: (listener: (id: string) => void) => () => void;

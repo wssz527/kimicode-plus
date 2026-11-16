@@ -25,6 +25,7 @@ async function installNativeRenderer(options) {
   const state = {
     module,
     request: transport.request,
+    features: { planner: false, multiSession: false },
     handles: new Set(),
     entries: [],
     observer: null,
@@ -132,6 +133,7 @@ async function installNativeRenderer(options) {
     void transport.request('host.browserBounds', { visible: false }).catch(() => {});
   }
   async function openPlanner(source = 'web') {
+    if (!state.features.planner) throw new Error('规划是附加功能，请先在 KimiCode+ 设置中开启');
     if (state.plannerHandle) {
       window.dispatchEvent(new CustomEvent('ekd:planner-source', { detail: source }));
       state.panel?.showPanel();
@@ -169,6 +171,7 @@ async function installNativeRenderer(options) {
     restoreSidebar();
   }
   async function mountSessions(extraIds) {
+    if (!state.features.multiSession) throw new Error('多屏会话是附加功能，请先在 KimiCode+ 设置中开启');
     closeSessions();
     const chat = document.querySelector('.chat');
     const composer = document.querySelector('.composer');
@@ -432,19 +435,56 @@ async function installNativeRenderer(options) {
     state.entries.push(button);
     return button;
   }
+  function addonEntryPlan() {
+    const plan = [];
+    if (state.features.planner) plan.push({ action: 'planner', label: '规划' });
+    if (state.features.multiSession) plan.push({ action: 'split', label: '添加同屏会话' });
+    return plan;
+  }
+  function removeEntry(action) {
+    for (const element of state.entries) {
+      if (element.dataset?.ekdEntry === action) element.remove();
+    }
+    state.entries = state.entries.filter(element => element.isConnected);
+    if (action === 'planner') {
+      state.plannerTab?.parentElement?.remove();
+      state.plannerTab = null;
+    }
+  }
+  function applyFeatures(next, initial) {
+    const previous = state.features;
+    state.features = { planner: next?.planner === true, multiSession: next?.multiSession === true };
+    if (!state.features.planner) {
+      if (state.plannerHandle) closePlanner();
+      removeEntry('planner');
+    }
+    if (!state.features.multiSession) {
+      if (state.sessionContainer) closeSessions();
+      removeEntry('split');
+    }
+    if (!initial && (previous.planner !== state.features.planner || previous.multiSession !== state.features.multiSession)) ensure();
+  }
+  async function refreshFeatures() {
+    try {
+      applyFeatures(await transport.request('features.get'), true);
+    } catch {
+      applyFeatures(null, true);
+    }
+  }
   function syncNativeEntries() {
     state.entries = state.entries.filter(element => element.isConnected);
-    const sideChat = [...document.querySelectorAll('button.sit-link, .pt-body .pl button.ui-menu-item')].find(button => button.querySelector('.sit-name')?.textContent.trim() === '侧边聊天' || [...button.childNodes].some(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim() === '侧边聊天'));
+    const addonEntries = addonEntryPlan();
+    const sideChat = addonEntries.length ? [...document.querySelectorAll('button.sit-link, .pt-body .pl button.ui-menu-item')].find(button => button.querySelector('.sit-name')?.textContent.trim() === '侧边聊天' || [...button.childNodes].some(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim() === '侧边聊天')) : null;
     if (sideChat) {
       let anchor = sideChat;
-      for (const [action, text] of [['planner', '规划'], ['split', '添加同屏会话']]) {
+      for (const { action, label } of addonEntries) {
         let entry = state.entries.find(button => button.dataset.ekdEntry === action);
-        if (!entry?.isConnected) entry = makeEntry(text, action, anchor, sideChat);
+        if (!entry?.isConnected) entry = makeEntry(label, action, anchor, sideChat);
         anchor = entry;
       }
     }
     const tabs = document.querySelector('.ptb-tabs');
-    if (tabs && !state.plannerTab?.isConnected) {
+    if (tabs && state.features.planner && !state.plannerTab?.isConnected) {
       const wrapper = document.createElement('div'); wrapper.className = 'ptb-tab'; wrapper.dataset.ekdPlannerTab = '';
       const button = document.createElement('button'); button.type = 'button'; button.className = 'ptb-tab-main'; button.textContent = 'KimiCode+ 规划'; button.setAttribute('aria-selected', 'false');
       button.addEventListener('click', () => void openPlanner('web'));
@@ -461,18 +501,6 @@ async function installNativeRenderer(options) {
         footer.before(element); state.monitorHost = element;
         const host = makeHost(() => { unmountHandle(state.monitorHandle); state.monitorHandle = null; element.remove(); });
         state.monitorHandle = mount(element, 'monitor', host); state.entries.push(element);
-      }
-      const settingsTemplate = document.querySelector('.sidebar-actions .btn-new-chat');
-      if (settingsTemplate && !state.entries.some(element => element.dataset.ekdEntry === 'settings' && element.isConnected)) {
-        const button = settingsTemplate.cloneNode(true);
-        button.type = 'button';
-        button.classList.add('ekd-native-entry');
-        button.dataset.ekdEntry = 'settings';
-        setEntryLabel(button, 'KimiCode+ 设置');
-        const nativeIcon = footer.querySelector('.side-footer-settings svg');
-        if (nativeIcon) button.querySelector('svg')?.replaceWith(nativeIcon.cloneNode(true));
-        button.addEventListener('click', () => void openSettings().catch(error => { button.title = error?.message || String(error); }));
-        footer.before(button); state.entries.push(button);
       }
     }
     syncSettingsTab();
@@ -501,6 +529,7 @@ async function installNativeRenderer(options) {
     state.removed = true;
     state.observer?.disconnect();
     state.unsubscribeSession?.();
+    state.unsubscribeFeatures?.();
     document.removeEventListener('click', nativeTabClick, true);
     document.removeEventListener('click', settingsTabClick, true);
     document.removeEventListener('scroll', settingsScroll, true);
@@ -546,6 +575,8 @@ async function installNativeRenderer(options) {
   }
   document.addEventListener('click', nativeTabClick, true);
   window.__ekdNativeUI = state;
+  await refreshFeatures();
+  state.unsubscribeFeatures = makeHost(() => {}).subscribe('features', value => applyFeatures(value, false));
   let previousSession = activeSession();
   const sessionStore = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia._s.get('kimi.sessions');
   state.unsubscribeSession = sessionStore?.$subscribe(() => {
