@@ -403,12 +403,3 @@ func (s *NativeService) runAutomation() {
 		}
 	}
 }
-
-func automationIntentSummary(ctx context.Context, db *sql.DB) map[string]any {
-	var kind, state, result, updated string
-	err := db.QueryRowContext(ctx, `SELECT kind,state,result,updated_at FROM automation_intents WHERE kind IN ('keepalive','compaction') ORDER BY updated_at DESC,rowid DESC LIMIT 1`).Scan(&kind, &state, &result, &updated)
-	if err != nil {
-		return nil
-	}
-	return map[string]any{"kind": kind, "state": state, "note": result, "at": updated}
-}

@@ -329,6 +329,41 @@ test("deactivating one plugin leaves the other plugin's event subscription worki
   }
 });
 
+test("the last plugin stops the shared loop and a later activation restarts one loop", async () => {
+  let polls = 0;
+  const runtime = createPluginRuntime({
+    slots: {},
+    request: async path => {
+      if (path === "/plugin-runtime/events.poll") {
+        polls += 1;
+        await new Promise(resolve => setTimeout(resolve, 50));
+        return { value: { events: [], next: polls } };
+      }
+      return { value: {} };
+    },
+  });
+  const waitForLoop = async (expected: number) => {
+    const start = Date.now();
+    while (runtime.eventLoops() !== expected) {
+      if (Date.now() - start > 1500) throw new Error(`event loop did not become ${expected}`);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  };
+  const install = { id: "plugin.one", version: "1.0.0", granted: ["metrics:read"], token: "t" };
+  try {
+    await runtime.activate({ activate: context => { context.events.on("cache", () => {}); } }, install);
+    await waitForLoop(1);
+    runtime.deactivate("plugin.one");
+    await waitForLoop(0);
+    await runtime.activate({ activate: context => { context.events.on("cache", () => {}); } }, install);
+    await waitForLoop(1);
+    assert.ok(polls >= 2, "reactivation did not resume polling");
+  } finally {
+    runtime.dispose();
+  }
+  assert.equal(runtime.eventLoops(), 0);
+});
+
 test("a throwing listener only removes its own subscription", async () => {
   let healthy = 0;
   const runtime = createPluginRuntime({
@@ -408,16 +443,17 @@ test("a plugin that mounts and then throws leaves nothing behind", async () => {
       () => runtime.activate(broken, { id: "test.broken", version: "1.0.0", granted: ["ui:sidebar", "metrics:read"], token: "t" }),
       /boom after mount/,
     );
+    // Finish only the poll that was already issued for this failed activation.
+    // With no remaining subscribers, the next attempt must start a fresh loop.
+    const deadline = Date.now() + 250;
+    while (runtime.eventLoops() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(runtime.eventLoops(), 0, "a failed activation left the event loop running");
+    assert.equal(polls, index + 1, "a failed activation left an event subscription behind");
   }
-  // Three failed activations must leave zero containers and zero subscriptions,
-  // not one more of each per retry.
   assert.equal(host.children.length, 0, "a failed activation left its container behind");
-  assert.equal(polls, 1, `a failed activation left an event subscription behind (${polls} polls)`);
   assert.equal(attempts, 3);
   runtime.dispose();
-  // The loop leaves on its next boundary; give it that boundary before asserting.
-  await new Promise(resolve => setTimeout(resolve, 100));
-  assert.equal(runtime.eventLoops(), 0, "a failed activation left the event loop running");
+  assert.equal(runtime.eventLoops(), 0, "dispose left the event loop running");
 });
 
 test("the settings host bridge is absent outside the native host", () => {
