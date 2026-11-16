@@ -39,9 +39,10 @@ interface MonitorModule {
   createRefresher(options: Record<string, unknown>): {
     trigger(): void;
     refresh(): void;
+    resume(): void;
     start(): void;
     dispose(): void;
-    status(): { disposed: boolean; generation: number; scheduled: boolean };
+    status(): { disposed: boolean; generation: number; scheduled: boolean; deferred: boolean };
   };
 }
 
@@ -467,4 +468,229 @@ test("a failed load reports the error and still schedules the fallback", async (
   await Promise.resolve();
   assert.equal(loads, 2);
   refresher.dispose();
+});
+
+test("a trigger inside the window waits only the remainder", async () => {
+  const clock = fakeClock();
+  let loads = 0;
+  const refresher = createRefresher({
+    load: async () => {
+      loads += 1;
+      return { n: loads };
+    },
+    apply: () => {},
+    minGap: 10_000,
+    fallback: 60_000,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  refresher.start();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(loads, 1);
+  clock.advance(3_000);
+  refresher.trigger();
+  // The coalescing window is measured from the last start, so this read is due at
+  // 10s, not 13s: re-scheduling the whole gap would drift further on every event.
+  assert.equal(clock.pending(), 1);
+  clock.advance(6_999);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(loads, 1, "not due before the window closes");
+  clock.advance(1);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(loads, 2);
+  refresher.dispose();
+});
+
+test("a timer that expires while hidden parks until the surface is visible", async () => {
+  const clock = fakeClock();
+  let visible = true;
+  let loads = 0;
+  const refresher = createRefresher({
+    load: async () => {
+      loads += 1;
+      return { n: loads };
+    },
+    apply: () => {},
+    isVisible: () => visible,
+    minGap: 10_000,
+    fallback: 60_000,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  refresher.start();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(loads, 1);
+  visible = false;
+  clock.advance(60_000);
+  await Promise.resolve();
+  await Promise.resolve();
+  // A hidden sidebar does not read the core: the due work is parked instead of run
+  // and no repeating timer keeps firing in the background.
+  assert.equal(loads, 1);
+  assert.equal(refresher.status().deferred, true);
+  assert.equal(clock.pending(), 0);
+  visible = true;
+  refresher.resume();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(loads, 2);
+  assert.equal(refresher.status().deferred, false);
+  refresher.dispose();
+});
+
+test("regaining visibility without due work does not read the core", async () => {
+  const clock = fakeClock();
+  let visible = true;
+  let loads = 0;
+  const refresher = createRefresher({
+    load: async () => {
+      loads += 1;
+      return { n: loads };
+    },
+    apply: () => {},
+    isVisible: () => visible,
+    minGap: 10_000,
+    fallback: 60_000,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  refresher.start();
+  await Promise.resolve();
+  await Promise.resolve();
+  visible = false;
+  clock.advance(1_000);
+  visible = true;
+  refresher.resume();
+  await Promise.resolve();
+  await Promise.resolve();
+  // Focus alone is not a reason to poll: the fallback window has not elapsed.
+  assert.equal(loads, 1);
+  assert.equal(refresher.status().deferred, false);
+  refresher.dispose();
+});
+
+test("resume on a hidden surface stays parked", async () => {
+  const clock = fakeClock();
+  let loads = 0;
+  const refresher = createRefresher({
+    load: async () => {
+      loads += 1;
+      return { n: loads };
+    },
+    apply: () => {},
+    isVisible: () => false,
+    minGap: 10_000,
+    fallback: 60_000,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  refresher.start();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(loads, 1);
+  refresher.resume();
+  await Promise.resolve();
+  await Promise.resolve();
+  // A resume from a still hidden surface is not a reason to read the core.
+  assert.equal(loads, 1);
+  refresher.dispose();
+});
+
+test("dispose drops a parked read", async () => {
+  const clock = fakeClock();
+  let visible = false;
+  let loads = 0;
+  const refresher = createRefresher({
+    load: async () => {
+      loads += 1;
+      return { n: loads };
+    },
+    apply: () => {},
+    isVisible: () => visible,
+    minGap: 10_000,
+    fallback: 60_000,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  refresher.start();
+  await Promise.resolve();
+  await Promise.resolve();
+  clock.advance(60_000);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(refresher.status().deferred, true);
+  assert.equal(loads, 1);
+  refresher.dispose();
+  assert.equal(refresher.status().deferred, false);
+  visible = true;
+  refresher.resume();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(loads, 1, "a disposed refresher never reads again");
+  assert.equal(clock.pending(), 0);
+});
+
+/* ---------- 侧栏与设置页的分工 ---------- */
+
+test("the trend window follows the sidebar range instead of a fixed label", () => {
+  const trend = /function trendModules\(\)[\s\S]*?\n  \}/.exec(rendererSource)?.[0] ?? "";
+  assert.ok(trend, "trendModules is found in the shipped file");
+  assert.match(trend, /RANGE_LABEL\[state\.range\]/);
+  assert.match(trend, /state\.history\.range === state\.range/);
+  // The tag used to hard-code "近 24 小时" while the bars could show another window.
+  assert.doesNotMatch(rendererSource, /"近 24 小时"/);
+  // A point is one aggregated bucket, not a single request.
+  assert.match(trend, /聚合命中率/);
+  assert.doesNotMatch(trend, /一次真实上报/);
+});
+
+test("a sidebar range switch is temporary and never rewrites the default", () => {
+  const showRange = /function showRange\(range\)[\s\S]*?\n  \}/.exec(rendererSource)?.[0] ?? "";
+  assert.ok(showRange, "showRange is found in the shipped file");
+  assert.match(showRange, /state\.range = range/);
+  assert.match(showRange, /refresher\.trigger\(\)/);
+  assert.doesNotMatch(showRange, /storage\.set|persist\(/);
+  // The history request and both range selectors read the sidebar's own value.
+  assert.match(rendererSource, /cache\.history", \{ range: state\.range \}/);
+  assert.match(rendererSource, /setAttribute\("aria-pressed", String\(state\.range === item\)\)/);
+});
+
+test("a settings write that fails leaves the published value untouched", () => {
+  const persist = /async function persist\(next\)[\s\S]*?\n  \}/.exec(rendererSource)?.[0] ?? "";
+  assert.ok(persist, "persist is found in the shipped file");
+  // The commit of state.settings comes after the awaited write, so a rejected write
+  // cannot publish a value that would be gone after a restart.
+  const writeAt = persist.indexOf("await ctx.storage.set");
+  const commitAt = persist.indexOf("state.settings = candidate");
+  const publishAt = persist.indexOf("hub.publish(candidate)");
+  assert.ok(writeAt >= 0 && commitAt > writeAt, "settings commit after the successful write");
+  assert.ok(publishAt > commitAt, "the hub only hears about a saved value");
+  assert.match(persist, /settingsError/);
+});
+
+test("the settings page also writes before it commits", () => {
+  const save = /async function save\(patch, message\)[\s\S]*?\n  \}/.exec(settingsSource)?.[0] ?? "";
+  assert.ok(save, "save is found in the shipped settings file");
+  const writeAt = save.indexOf("await ctx.storage.set");
+  const commitAt = save.indexOf("settings = candidate");
+  assert.ok(writeAt >= 0 && commitAt > writeAt, "settings commit after the successful write");
+  assert.match(save, /仍在使用上次保存的设置/);
+});
+
+test("the settings page brings its own scoped styles", () => {
+  // The panel is injected into the host page, which has no rules for these class
+  // names; without its own stylesheet it rendered as unstyled text.
+  assert.match(settingsSource, /createElement\("style"\)/);
+  assert.match(settingsSource, /\.ekdp-mon-/);
+  const cleanup = /return \(\) => \{[\s\S]*?\};/.exec(settingsSource)?.[0] ?? "";
+  assert.match(cleanup, /style\.remove\(\)/, "the injected style is removed with the panel");
 });

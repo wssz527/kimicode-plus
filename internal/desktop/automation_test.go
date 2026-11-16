@@ -572,3 +572,72 @@ func (h *syncHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = pending
 	h.inner.ServeHTTP(w, r)
 }
+
+
+// TestAutomationIntentsLegacyTimestampsAreBackfilled covers the table the reviewer
+// asked about: its cooldown, supersede and expire queries all compare timestamps as
+// text, so a legacy variable-width row must not survive a restart.
+func TestAutomationIntentsLegacyTimestampsAreBackfilled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "intents.db")
+	db, err := storage.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewNativeService(db, NewKAPClient(""), t.TempDir(), func() bool { return false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.Close()
+	db.Close()
+
+	// Reopen and write a legacy row by hand, then construct a service again.
+	db, err = storage.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	whole := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
+	frac := whole.Add(359 * time.Millisecond)
+	for index, at := range []time.Time{whole, frac} {
+		if _, err = db.Exec(`INSERT INTO automation_intents(id,kind,host_id,session_id,model_id,context_revision,state,created_at,updated_at,result) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			"legacy-"+string(rune('a'+index)), "keepalive", "native", "s1", "", "r1", "verified", at.UTC().Format(time.RFC3339Nano), at.UTC().Format(time.RFC3339Nano), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var first string
+	if err = db.QueryRow(`SELECT id FROM automation_intents ORDER BY created_at ASC LIMIT 1`).Scan(&first); err != nil {
+		t.Fatal(err)
+	}
+	if first != "legacy-b" {
+		t.Fatalf("precondition: legacy order already correct (%s); the fixture no longer reproduces the bug", first)
+	}
+
+	reopened, err := NewNativeService(db, NewKAPClient(""), t.TempDir(), func() bool { return false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err = db.QueryRow(`SELECT id FROM automation_intents ORDER BY created_at ASC LIMIT 1`).Scan(&first); err != nil {
+		t.Fatal(err)
+	}
+	if first != "legacy-a" {
+		t.Fatalf("after backfill the oldest intent is %s, want legacy-a", first)
+	}
+	rows, err := db.Query(`SELECT length(created_at),length(updated_at) FROM automation_intents`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var created, updated int
+		if err = rows.Scan(&created, &updated); err != nil {
+			t.Fatal(err)
+		}
+		if created != len(storage.SortableLayout) || updated != len(storage.SortableLayout) {
+			t.Fatalf("widths = %d/%d, want %d", created, updated, len(storage.SortableLayout))
+		}
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -263,12 +263,16 @@ export function createRefresher(options) {
   const now = options.now ?? (() => Date.now());
   const setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
   const clearTimer = options.clearTimer ?? (handle => clearTimeout(handle));
+  const isVisible = options.isVisible ?? (() => true);
 
   let disposed = false;
   let generation = 0;
   let lastStart = -Infinity;
   let timer = null;
   let inFlight = false;
+  // A timer that expired while the surface was hidden. It is not re-armed in a
+  // hot loop: `resume()` runs the work once the surface is visible again.
+  let deferred = false;
 
   function clear() {
     if (timer !== null) {
@@ -282,6 +286,13 @@ export function createRefresher(options) {
     if (disposed) return;
     timer = setTimer(() => {
       timer = null;
+      if (!isVisible()) {
+        // Hidden surfaces do not read the core. Remember that work is due and let
+        // `resume()` pick it up on the next visibility change.
+        deferred = true;
+        return;
+      }
+      deferred = false;
       void run();
     }, Math.max(0, ms));
   }
@@ -317,10 +328,23 @@ export function createRefresher(options) {
       if (disposed) return;
       const gap = now() - lastStart;
       if (gap < minGap) {
-        schedule(gap);
+        // Wait out the remainder of the coalescing window, not the whole window
+        // again: scheduling `gap` would push the read further away on every event.
+        schedule(minGap - gap);
         return;
       }
       void run();
+    },
+    /**
+     * Called when the surface becomes visible again. A run that came due while
+     * hidden starts now; otherwise only a read older than the fallback is forced,
+     * so regaining focus does not poll the core.
+     */
+    resume() {
+      if (disposed || !isVisible()) return;
+      if (!deferred && now() - lastStart < fallback) return;
+      deferred = false;
+      void run(true);
     },
     /** A user-requested read. It queues behind nothing and supersedes the answer
      * of a request that started earlier. */
@@ -334,10 +358,11 @@ export function createRefresher(options) {
     },
     dispose() {
       disposed = true;
+      deferred = false;
       clear();
     },
     status() {
-      return { disposed, generation, scheduled: timer !== null };
+      return { disposed, generation, scheduled: timer !== null, deferred };
     },
   };
 }
@@ -436,6 +461,12 @@ const STYLE = String.raw`
 .ksb-detail-toggle { width: auto; height: 22px; padding: 2px 6px; gap: 5px; color: var(--mon-muted); font-size: 10px; }
 .ksb-refresh-icon { display: inline-flex; }
 .ekd-mon.is-busy .ksb-refresh-icon { animation: ksb-spin 900ms linear infinite; }
+
+.ksb-notice {
+  margin-top: 6px; padding: 4px 7px; border-radius: 8px;
+  background: color-mix(in srgb, var(--mon-warn) 12%, transparent);
+  color: var(--mon-warn); font-size: 10px; line-height: 1.45;
+}
 
 .ksb-banner {
   margin-top: 6px; padding: 5px 7px; border: 1px dashed var(--mon-danger); border-radius: 8px;
@@ -559,6 +590,7 @@ const STYLE = String.raw`
 .ekd-mon.is-mini .ksb-diag,
 .ekd-mon.is-mini .ksb-banner,
 .ekd-mon.is-mini .ksb-pet { display: none; }
+.ekd-mon.is-mini .ksb-mini-stats { margin-top: 5px; }
 .ekd-mon:not(.is-mini) .ksb-mini-stats { display: none; }
 
 @container (max-width: 190px) {
@@ -638,12 +670,17 @@ export async function activate(ctx) {
   if (typeof document === "undefined") return;
   const hub = settingsHub(ctx);
   const state = {
+    // `settings` is the persisted configuration; `range` is what the sidebar is
+    // currently showing. A temporary switch only moves `range`, so the configured
+    // default survives until the settings page changes it.
     settings: DEFAULT_SETTINGS,
+    range: DEFAULT_SETTINGS.range,
     summary: null,
     history: null,
     sessions: [],
     receipts: [],
     errors: [],
+    settingsError: "",
     loadedAt: null,
     busy: false,
     detail: false,
@@ -657,15 +694,35 @@ export async function activate(ctx) {
   } catch {
     state.settings = normalizeSettings(null);
   }
+  state.range = state.settings.range;
 
+  /**
+   * Persists one settings change. The in-memory settings only move after the write
+   * succeeded: a failed write must leave the sidebar showing the last saved value
+   * instead of a state that will disappear on the next restart.
+   */
   async function persist(next) {
-    state.settings = mergeSettings(state.settings, next);
+    const candidate = mergeSettings(state.settings, next);
     try {
-      await ctx.storage.set(STORAGE_KEY, state.settings);
+      await ctx.storage.set(STORAGE_KEY, candidate);
     } catch (error) {
+      state.settingsError = `设置未能保存：${error?.message || error}`;
       ctx.log("warn", `Monitor 设置未能保存：${error?.message || error}`);
+      render();
+      return;
     }
-    hub.publish(state.settings);
+    state.settings = candidate;
+    state.settingsError = "";
+    hub.publish(candidate);
+    render();
+  }
+
+  /** A sidebar range switch is a view change, not a configuration change. */
+  function showRange(range) {
+    if (!RANGES.includes(range) || range === state.range) return;
+    state.range = range;
+    render();
+    refresher.trigger();
   }
 
   const refreshNow = () => {
@@ -678,7 +735,7 @@ export async function activate(ctx) {
       ["summary", ctx.core.request("cache.summary")],
       ["sessions", ctx.core.request("cache.sessions", { limit: 20 })],
       ["receipts", ctx.core.request("cache.receipts", { limit: 3 })],
-      ["history", ctx.core.request("cache.history", { range: state.settings.range })],
+      ["history", ctx.core.request("cache.history", { range: state.range })],
     ];
     const settled = await Promise.allSettled(tasks.map(([, promise]) => promise));
     const result = { errors: [] };
@@ -713,14 +770,25 @@ export async function activate(ctx) {
     fail,
     minGap: 10_000,
     fallback: 60_000,
-    // 侧栏不可见时不发请求；读可见性不算监听器。
-    setTimer: (fn, ms) => window.setTimeout(() => {
-      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-      fn();
-    }, ms),
+    // The sidebar stays mounted in a background window, and an invisible surface
+    // has no reason to read the core. A due timer parks instead of being dropped,
+    // and the visibility listener below picks it up again.
+    isVisible: () => document.visibilityState !== "hidden",
+    setTimer: (fn, ms) => window.setTimeout(fn, ms),
     clearTimer: handle => window.clearTimeout(handle),
   });
   ctx.onDispose(() => refresher.dispose());
+
+  // Regaining visibility is the one moment a parked read must run: without it a
+  // timer that expired in a background window left the sidebar stale until the
+  // next event or the fallback interval. Listening is scoped to this plugin and
+  // removed with the mount.
+  const onVisibility = () => {
+    if (document.visibilityState === "hidden") return;
+    refresher.resume();
+  };
+  document.addEventListener("visibilitychange", onVisibility);
+  ctx.onDispose(() => document.removeEventListener("visibilitychange", onVisibility));
 
   const unsubscribeCache = ctx.events.on("cache", () => refresher.trigger());
   ctx.onDispose(() => unsubscribeCache.dispose());
@@ -728,10 +796,18 @@ export async function activate(ctx) {
   ctx.onDispose(() => unsubscribeAutomation.dispose());
 
   function onSettings(next) {
-    const previousRange = state.settings.range;
+    const previous = state.settings;
     state.settings = normalizeSettings(next);
+    state.settingsError = "";
+    // A changed *default* window retargets the sidebar. A change to another field
+    // leaves a temporary switch alone, so editing the pet toggle does not silently
+    // undo the window the user is looking at.
+    const defaultChanged = state.settings.range !== previous.range;
+    if (defaultChanged) {
+      state.range = state.settings.range;
+      refresher.trigger();
+    }
     render();
-    if (state.settings.range !== previousRange) refresher.trigger();
   }
   hub.listeners.add(onSettings);
   ctx.onDispose(() => hub.listeners.delete(onSettings));
@@ -794,8 +870,9 @@ export async function activate(ctx) {
   }
 
   function bodyBlocks() {
-    if (state.settings.mini) return [miniBlock()];
+    if (state.settings.mini) return [miniBlock(), settingsNotice()].filter(Boolean);
     const blocks = [];
+    if (state.settingsError) blocks.push(settingsNotice());
     if (state.errors.length) blocks.push(errorBanner());
     // One grid for every module, so the two columns share a rhythm instead of each
     // section sizing its own. The cards are ordinary sections inside it, not a
@@ -831,6 +908,17 @@ export async function activate(ctx) {
     quotaItem.append(quotaValue);
     row.append(quotaItem);
     return row;
+  }
+
+  /**
+   * A settings write that failed leaves the persisted value untouched, so the
+   * toggle snaps back to what is actually saved. This line explains why.
+   */
+  function settingsNotice() {
+    if (!state.settingsError) return null;
+    const notice = node("p", "ksb-notice", state.settingsError);
+    notice.setAttribute("role", "alert");
+    return notice;
   }
 
   function errorBanner() {
@@ -906,10 +994,13 @@ export async function activate(ctx) {
   }
 
   function trendModules() {
-    const model = trendModel(state.history);
+    // The trend always describes the window the sidebar is showing, so its label
+    // and accessible name follow the current range instead of a fixed "24 hours".
+    const label = RANGE_LABEL[state.range];
+    const model = trendModel(state.history && state.history.range === state.range ? state.history : null);
     const module = node("div", "ksb-module ksb-span-2 ksb-trend");
     const head = node("div", "ksb-section-head");
-    head.append(node("span", "ksb-quota-label", "命中率趋势"), node("span", "ksb-tag is-plain", "近 24 小时"));
+    head.append(node("span", "ksb-quota-label", "命中率趋势"), node("span", "ksb-tag is-plain", `近 ${label}`));
     module.append(head);
     if (!model.drawable) {
       module.append(node("p", "ksb-footnote", model.samples === 0 ? "还没有可绘制命中率的样本，供应商未上报时不会画线。" : "命中率样本不足两个，暂不连线以免误导。"));
@@ -920,7 +1011,7 @@ export async function activate(ctx) {
     svg.setAttribute("viewBox", "0 0 100 30");
     svg.setAttribute("preserveAspectRatio", "none");
     svg.setAttribute("role", "img");
-    svg.setAttribute("aria-label", "近 24 小时命中率趋势");
+    svg.setAttribute("aria-label", `近 ${label}命中率趋势`);
     const base = document.createElementNS("http://www.w3.org/2000/svg", "line");
     base.setAttribute("class", "ksb-spark-base");
     base.setAttribute("x1", "0");
@@ -944,7 +1035,11 @@ export async function activate(ctx) {
       svg.append(dot);
     }
     module.append(svg);
-    module.append(node("p", "ksb-footnote", "每个点是一次真实上报；断开的区间表示该小时供应商未上报。"));
+    // Points are one bucket each: cache.history aggregates per hour for 24h and per
+    // day for 7d/30d, so calling a point "one request" would describe the data
+    // wrongly. A gap is a bucket with no reported hit rate.
+    const unit = model.unit === "day" ? "天" : "小时";
+    module.append(node("p", "ksb-footnote", `每个点是该${unit}的聚合命中率；断开的区间表示该${unit}供应商未上报。`));
     return [module];
   }
 
@@ -1037,14 +1132,16 @@ export async function activate(ctx) {
       const button = node("button", "", item);
       button.type = "button";
       button.dataset.focus = `range-${item}`;
-      button.setAttribute("aria-pressed", String(state.settings.range === item));
-      button.title = `按${RANGE_LABEL[item]}统计`;
-      button.addEventListener("click", () => void persist({ range: item }));
+      button.setAttribute("aria-pressed", String(state.range === item));
+      // A sidebar switch is temporary by design: it changes what is shown now and
+      // never rewrites the configured default from the settings page.
+      button.title = state.range === item ? `正在按${RANGE_LABEL[item]}统计` : `临时改为按${RANGE_LABEL[item]}统计`;
+      button.addEventListener("click", () => showRange(item));
       rangeSwitch.append(button);
     }
     head.append(rangeSwitch);
     wrap.append(head);
-    const current = state.history && state.history.range === state.settings.range ? state.history : null;
+    const current = state.history && state.history.range === state.range ? state.history : null;
     const model = historyModel(current);
     if (model.empty) {
       wrap.append(node("p", "ksb-footnote", current ? "这个区间还没有用量记录。" : "正在读取历史用量。"));
@@ -1052,7 +1149,7 @@ export async function activate(ctx) {
     }
     const bars = node("div", "ksb-bars");
     bars.setAttribute("role", "img");
-    bars.setAttribute("aria-label", `${RANGE_LABEL[state.settings.range]}输入 token 分布，区间命中率 ${model.hitRate}`);
+    bars.setAttribute("aria-label", `${RANGE_LABEL[state.range]}输入 token 分布，区间命中率 ${model.hitRate}`);
     for (const bar of model.bars) {
       const cell = node("span", "ksb-bar");
       cell.title = `${bar.bucket}：${bar.empty ? "无样本" : `${tokenText(bar.total)} 输入 · 命中 ${bar.hitRate}`}`;
@@ -1137,6 +1234,7 @@ export async function activate(ctx) {
     return () => {
       disposed = true;
       refresher.dispose();
+      document.removeEventListener("visibilitychange", onVisibility);
       hub.listeners.delete(onSettings);
       unsubscribeCache.dispose();
       unsubscribeAutomation.dispose();
