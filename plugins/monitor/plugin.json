@@ -1,0 +1,17 @@
+{
+  "id": "kimicode-plus.monitor",
+  "name": "Monitor",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "description": "缓存与额度侧边栏：2x2 指标、趋势柱图、等待中的后台子代理、迷你模式。数据全部来自本机缓存指标接口。",
+  "author": "KimiCode+",
+  "license": "MIT",
+  "hostVersions": ["1.*"],
+  "entry": { "renderer": "renderer.js", "settings": "settings.js" },
+  "capabilities": ["metrics:read", "ui:sidebar", "ui:settings", "storage"],
+  "upstream": {
+    "repo": "bfjnbvf/kimi-code-monitor",
+    "commit": "1d529f0b424a708971cfac097238df444f3b5beb",
+    "license": "MIT"
+  }
+}
