@@ -26,7 +26,6 @@ func TestParseMainPIDRequiresIsolatedProfile(t *testing.T) {
 		t.Fatal("multiple main processes must be refused")
 	}
 }
-
 func TestHostContractIsExplicit(t *testing.T) {
 	identity := HostIdentity{Type: "browser", AppVersion: "1.3.5", Electron: "45.1.0"}
 	if _, err := identity.Contract(); err != nil {

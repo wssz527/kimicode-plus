@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth";
 import { Icon } from "./Icon";
 import { CacheSettings } from "./CacheSettings";
+import { errorText } from "./workbench/pieces";
 import { NativeSettings } from "./NativeSettings";
 import type { NativeHost } from "../native";
 import { BrowserPage } from "../pages/BrowserPage";
@@ -15,6 +16,7 @@ import "../styles/native-settings-surface.css";
 
 const SECTIONS = [
   { id: "overview", label: "概览", hint: "核心与增强状态" },
+  { id: "attach", label: "接入与自动恢复", hint: "宿主发现与后台接入" },
   { id: "planning", label: "规划与交接", hint: "来源、预设与跨会话交接" },
   { id: "browser", label: "浏览器权限与数据", hint: "网站操作权限与导入记录" },
   { id: "native", label: "原生会话配置", hint: "工具、子代理模型与权限规则" },
@@ -73,6 +75,7 @@ export function SettingsWindow({ host }: { host: NativeHost }) {
       </header>
       <div className="ekds-body">
         {openId === "overview" ? <OverviewSection /> : null}
+        {openId === "attach" ? <AttachSection host={host} /> : null}
         {openId === "planning" ? <PlanningSection host={host} /> : null}
         {openId === "browser" ? <div className="ekds-embed"><BrowserPage /></div> : null}
         {openId === "native" ? <div className="ekds-embed"><NativeSettings embedded /></div> : null}
@@ -107,6 +110,121 @@ function OverviewSection() {
         </div>)}
     </div>
     <p className="ekds-note">增强操作在主界面，这里只管理配置与运行状态。</p>
+  </>;
+}
+
+type AttachStatus = {
+  host: {
+    running?: boolean;
+    reason?: string;
+    pid?: number;
+    isolated?: boolean;
+    dailyInstance?: boolean;
+    debugInstance?: boolean;
+    fuse?: string;
+    inspectorBusy?: boolean;
+    consentRequired?: boolean;
+  };
+  agent: { enabled: boolean; path?: string; error?: string };
+  last?: { status?: string; error?: string; consentRequired?: boolean; hostPid?: number; appVersion?: string; daily?: boolean };
+  available: boolean;
+  unavailableReason?: string;
+};
+
+const FUSE_TEXT: Record<string, string> = {
+  ready: "允许临时调试端点",
+  "signal-disabled": "已禁用调试信号，无法接入",
+  "unknown-layout": "无法识别该版本的调试开关",
+};
+
+function AttachSection({ host }: { host: NativeHost }) {
+  const [status, setStatus] = useState<AttachStatus | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [consent, setConsent] = useState(false);
+
+  const reload = useCallback(async () => {
+    try {
+      setStatus(await host.request<AttachStatus>("attach.status"));
+    } catch (cause) {
+      setError(errorText(cause));
+    }
+  }, [host]);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  async function toggle(next: boolean) {
+    setBusy(true);
+    setError("");
+    try {
+      await host.request(next ? "attach.enable" : "attach.disable", next ? { allowDailyInstance: consent } : {});
+      await reload();
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!status) {
+    return <p className="ekds-note">{error || "正在读取宿主接入状态…"}</p>;
+  }
+  const running = status.host.running === true;
+  const daily = status.host.dailyInstance === true;
+  return <>
+    <p className="ekds-note">增强层只在客户端运行期间接入。开启下面的后台接入后，客户端重启或刷新会由系统在文件变化时触发一次接入，不轮询进程。</p>
+    <div className="ekds-group">
+      <div className="ekds-row">
+        <span className="ekds-row-label">
+          <strong>Kimi Code</strong>
+          <small>{running ? (daily ? "正在使用日常客户端" : "正在运行的隔离宿主") : status.host.reason || "未检测到正在运行的客户端"}</small>
+        </span>
+        <span className={`ekds-state is-${running ? "ready" : "unknown"}`}>{running ? "运行中" : "未运行"}</span>
+      </div>
+      {running ? <dl className="ekds-facts is-inset">
+        <div><dt>进程号</dt><dd className="num">{status.host.pid ?? "—"}</dd></div>
+        <div><dt>调试开关</dt><dd>{FUSE_TEXT[status.host.fuse ?? ""] ?? "未知"}</dd></div>
+        <div><dt>临时调试端口</dt><dd>{status.host.inspectorBusy ? "已被占用，本次不会接入" : "空闲"}</dd></div>
+        {status.host.debugInstance ? <div><dt>启动参数</dt><dd>带调试参数的实例，不会自动接入</dd></div> : null}
+      </dl> : null}
+      <div className="ekds-row">
+        <span className="ekds-row-label">
+          <strong>重启后自动恢复</strong>
+          <small>{status.available ? "由系统在客户端文件变化时触发，安装后默认只在当前用户生效。" : status.unavailableReason}</small>
+        </span>
+        <button
+          type="button"
+          className="ekds-btn"
+          role="switch"
+          aria-checked={status.agent.enabled}
+          disabled={busy || !status.available}
+          onClick={() => void toggle(!status.agent.enabled)}
+        >
+          {busy ? "处理中…" : status.agent.enabled ? "已开启" : "已关闭"}
+        </button>
+      </div>
+      {daily && !status.agent.enabled ? <div className="ekds-row">
+        <span className="ekds-row-label">
+          <strong>接入日常客户端</strong>
+          <small>当前检测到的是你正在使用的客户端。接入会改变它的界面，需要你明确同意。</small>
+        </span>
+        <label className="ekds-check">
+          <input type="checkbox" checked={consent} onChange={event => setConsent(event.target.checked)} />
+          我知道会改变当前界面
+        </label>
+      </div> : null}
+      {status.agent.error ? <div className="ekds-row"><span className="ekds-row-label"><strong>后台接入状态</strong><small>{status.agent.error}</small></span></div> : null}
+      {status.last ? <div className="ekds-row">
+        <span className="ekds-row-label">
+          <strong>上次接入</strong>
+          <small>{status.last.error || `已接入进程 ${status.last.hostPid ?? "—"}（客户端 ${status.last.appVersion ?? "未知版本"}）`}</small>
+        </span>
+        <span className={`ekds-state is-${status.last.status === "installed" ? "ready" : "faulted"}`}>{status.last.status === "installed" ? "成功" : "未接入"}</span>
+      </div> : null}
+    </div>
+    {error ? <p className="ekds-note is-error">{error}</p> : null}
   </>;
 }
 

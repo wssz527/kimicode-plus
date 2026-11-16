@@ -271,6 +271,34 @@
   box-shadow: var(--ekds-ring);
 }
 
+/* ---------- 显式同意行 ---------- */
+
+.ekds-check {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  color: var(--ekds-text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ekds-check input {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--ekds-accent);
+  cursor: pointer;
+}
+
+.ekds-check input:focus-visible {
+  outline: none;
+  box-shadow: var(--ekds-ring);
+}
+
+.ekds-note.is-error {
+  color: var(--red, #ff8a8c);
+}
+
 /* ---------- 开关（原生 checkbox 视觉隐藏，保留键盘焦点） ---------- */
 
 .ekds .toggle { padding: 0; align-items: center; }

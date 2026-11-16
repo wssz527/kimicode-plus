@@ -19,9 +19,16 @@ var bootstrapSource string
 var rendererSource string
 
 type AttachOptions struct {
+	// Profile narrows discovery to one isolated instance launched with this
+	// --user-data-dir. An empty profile accepts the single running instance, which
+	// is how a client started from the Dock is addressed.
 	Profile      string
 	CoreURL      string
 	PairingToken string
+	// AllowDailyInstance is the user's explicit consent to attach to the client
+	// they actually use. Without it, an instance with no isolated profile is
+	// discovered but reported as需要授权 instead of being attached to.
+	AllowDailyInstance bool
 }
 
 type AttachResult struct {
@@ -32,7 +39,14 @@ type AttachResult struct {
 	Electron    string `json:"electron"`
 	HostPID     int    `json:"hostPid"`
 	DOMRevision int    `json:"domRevision"`
+	// Daily is true when the attached instance is the user's normal client rather
+	// than a disposable isolated host.
+	Daily bool `json:"daily"`
 }
+
+// ErrConsentRequired is returned when the only running client is the user's daily
+// instance and no explicit consent was given.
+var ErrConsentRequired = errors.New("检测到日常客户端正在运行；接入会改变它的界面，需要你显式授权后才会继续")
 
 func missingNativeCapability(capabilities map[string]bool) string {
 	for _, capability := range []string{"ptShell", "ptBody", "sideColumn", "sideFooter"} {
@@ -43,14 +57,52 @@ func missingNativeCapability(capabilities map[string]bool) string {
 	return ""
 }
 
+// resolveHost finds the instance to attach to and completes every identity check
+// that can run before a signal is sent. The command line is returned separately:
+// it is discovery input, not part of the identity that must stay identical.
+func resolveHost(ctx context.Context, options AttachOptions) (ProcessInfo, string, error) {
+	pid, err := FindMainPID(ctx, options.Profile)
+	if err != nil {
+		return ProcessInfo{}, "", err
+	}
+	info, err := ProcessIdentity(ctx, pid)
+	if err != nil {
+		return ProcessInfo{}, "", err
+	}
+	if info.Executable != KimiExecutable {
+		return ProcessInfo{}, "", errors.New("目标进程不是 Kimi Code 主进程")
+	}
+	command, err := CommandLine(ctx, pid)
+	if err != nil {
+		return ProcessInfo{}, "", err
+	}
+	// A debug or test instance is never taken over automatically: its inspector
+	// may be opened by whoever launched it, and the port check cannot tell them
+	// apart.
+	if IsDebugInstance(command) && options.Profile == "" {
+		return ProcessInfo{}, "", errors.New("检测到调试或测试实例，增强不会自动接入")
+	}
+	if options.Profile == "" && !options.AllowDailyInstance {
+		return ProcessInfo{}, "", ErrConsentRequired
+	}
+	if err = CheckInspectorFuse(KimiFramework); err != nil {
+		return ProcessInfo{}, "", err
+	}
+	if err = VerifyLiveProcess(ctx, info); err != nil {
+		return ProcessInfo{}, "", err
+	}
+	return info, command, nil
+}
+
 func AttachNative(ctx context.Context, options AttachOptions) (*AttachResult, error) {
 	if options.CoreURL == "" || len(options.PairingToken) < 32 {
 		return nil, errors.New("缺少增强核心地址或配对凭据")
 	}
-	pid, err := FindMainPID(ctx, options.Profile)
+	info, _, err := resolveHost(ctx, options)
 	if err != nil {
 		return nil, err
 	}
+	pid := info.PID
 	attachCtx, cancel := context.WithTimeout(ctx, 75*time.Second)
 	defer cancel()
 	cdp, err := Attach(attachCtx, pid)
@@ -59,7 +111,7 @@ func AttachNative(ctx context.Context, options AttachOptions) (*AttachResult, er
 	}
 	succeeded := false
 	defer func() {
-		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer closeCancel()
 		if !succeeded {
 			_, _ = cdp.Evaluate(closeCtx, `(async()=>{if(globalThis.__ekdNative?.cleanup){await globalThis.__ekdNative.cleanup();return true;}return false;})()`)
@@ -137,6 +189,41 @@ func AttachNative(ctx context.Context, options AttachOptions) (*AttachResult, er
 	}
 	result.HostPID = pid
 	result.DOMRevision = contract.DOMRevision
+	result.Daily = options.Profile == ""
 	succeeded = true
 	return &result, nil
+}
+
+// DiscoverHost reports the running instance without attaching to it, so the
+// settings surface can show the current state and offer the consent prompt.
+func DiscoverHost(ctx context.Context, profile string) (map[string]any, error) {
+	pid, err := FindMainPID(ctx, profile)
+	if err != nil {
+		return map[string]any{"running": false, "reason": err.Error()}, nil
+	}
+	if _, err = ProcessIdentity(ctx, pid); err != nil {
+		return map[string]any{"running": false, "reason": err.Error()}, nil
+	}
+	command, _ := CommandLine(ctx, pid)
+	debug := IsDebugInstance(command)
+	fuse := "ready"
+	if err := CheckInspectorFuse(KimiFramework); err != nil {
+		if errors.Is(err, ErrInspectorDisabled) {
+			fuse = "signal-disabled"
+		} else {
+			fuse = "unknown-layout"
+		}
+	}
+	inspectorBusy := inspectorOpen(ctx)
+	return map[string]any{
+		"running":         true,
+		"pid":             pid,
+		"profile":         profile,
+		"isolated":        profile != "",
+		"debugInstance":   debug,
+		"dailyInstance":   profile == "",
+		"fuse":            fuse,
+		"inspectorBusy":   inspectorBusy,
+		"consentRequired": profile == "",
+	}, nil
 }
