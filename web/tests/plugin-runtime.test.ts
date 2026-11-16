@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { actionAllowed, createBridge } from "../src/plugin-runtime/bridge.js";
 import { Scope } from "../src/plugin-runtime/scope.js";
 import { createPluginRuntime, defaultTheme } from "../src/plugin-runtime/runtime.js";
-import { pluginHostBridge } from "../src/plugin-runtime/host.js";
+import { pluginHostBridge, syncPluginHost } from "../src/plugin-runtime/host.js";
 import { entryPath } from "../src/plugin-runtime/loader.js";
 import type { RuntimeRequest } from "../src/plugin-runtime/context.js";
 
@@ -457,6 +457,30 @@ test("the settings bridge resolves to the host's release function", async () => 
     release();
     assert.deepEqual(mounted, ["test.plugin"]);
     assert.deepEqual(released, ["test.plugin"]);
+  } finally {
+    if (original === undefined) delete scope.window;
+    else scope.window = original;
+  }
+});
+
+test("settings actions await sidebar synchronization and retain a refresh failure", async () => {
+  const scope = globalThis as { window?: { __ekdPlugins?: { sync: () => Promise<void> } } };
+  const original = scope.window;
+  let finish = () => {};
+  scope.window = {
+    __ekdPlugins: {
+      sync: () => new Promise<void>(resolve => { finish = resolve; }),
+    },
+  };
+  try {
+    let settled = false;
+    const pending = syncPluginHost().then(result => { settled = true; return result; });
+    await Promise.resolve();
+    assert.equal(settled, false, "a sidebar refresh was treated as complete before its Promise resolved");
+    finish();
+    assert.equal(await pending, null);
+    scope.window = { __ekdPlugins: { sync: async () => { throw new Error("host unavailable"); } } };
+    assert.equal(await syncPluginHost(), "host unavailable");
   } finally {
     if (original === undefined) delete scope.window;
     else scope.window = original;

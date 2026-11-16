@@ -27,3 +27,12 @@ export function pluginHostBridge(): PluginHostBridge | null {
   if (typeof window === "undefined") return null;
   return window.__ekdPlugins ?? null;
 }
+
+export async function syncPluginHost(): Promise<string | null> {
+  try {
+    await pluginHostBridge()?.sync();
+    return null;
+  } catch (cause) {
+    return cause instanceof Error ? cause.message : String(cause);
+  }
+}

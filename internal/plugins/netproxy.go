@@ -21,7 +21,6 @@ const (
 	proxyResponseLimit = 8 << 20
 	proxyRequestLimit  = 1 << 20
 	proxyTimeout       = 30 * time.Second
-	proxyRedirectLimit = 3
 )
 
 var proxyHeaderPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
@@ -198,9 +197,7 @@ func (m *Manager) proxy(ctx context.Context, id string, grants Grants, vault *cr
 			result.RedirectTo = target.String()
 		}
 	}
-	if action != "net.probe" {
-		_ = recordActivity(ctx, m.db, id, ActivityNetwork, method+" "+parsed.Hostname()+" → "+itoa(response.StatusCode), m.now())
-	}
+	_ = recordActivity(ctx, m.db, id, ActivityNetwork, method+" "+parsed.Hostname()+" → "+itoa(response.StatusCode), m.now())
 	return result, nil
 }
 

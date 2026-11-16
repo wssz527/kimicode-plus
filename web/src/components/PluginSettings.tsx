@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type PluginActivity, type PluginPreview, type PluginRecord } from "../api";
-import { pluginHostBridge } from "../plugin-runtime/host";
+import { pluginHostBridge, syncPluginHost } from "../plugin-runtime/host";
 import { Icon } from "./Icon";
 import { ActionButton, Badge, EmptyState, ErrorNotice, Field, InfoNote, Panel, SkeletonRows, StateBadge } from "./ui";
 import { PageError } from "../AppShell";
@@ -181,6 +181,8 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
   const [previewBusy, setPreviewBusy] = useState(false);
   const [confirmForce, setConfirmForce] = useState(false);
   const action = useAction<PluginRecord | { id: string; uninstalled: boolean }>();
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!flash) return;
@@ -196,10 +198,21 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
     { enabled: Boolean(selected) },
   );
 
+  async function syncHost() {
+    setSyncing(true);
+    setSyncError(null);
+    try {
+      setSyncError(await syncPluginHost());
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   async function run(id: string, kind: "enable" | "disable" | "uninstall") {
     if (kind === "uninstall") {
       const done = await action.run(() => api.plugins.uninstall(id));
       if (done) {
+        await syncHost();
         setSelected(null);
         setFlash("插件已卸载。卸载后的预装插件不会自动恢复。");
         plugins.reload();
@@ -208,6 +221,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
     }
     const result = await action.run(() => (kind === "enable" ? api.plugins.enable(id) : api.plugins.disable(id)));
     if (result && "state" in result) {
+      await syncHost();
       setFlash(`「${result.name || result.id}」现在${PLAIN_STATE[result.state] ?? stateLabel(result.state)}。`);
       plugins.reload();
       activity.reload();
@@ -261,6 +275,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
   async function forceEnable(id: string) {
     const result = await action.run(() => api.plugins.forceEnable(id));
     if (result && "state" in result) {
+      await syncHost();
       setConfirmForce(false);
       setFlash(`「${result.name || result.id}」已强制启用。它未在当前宿主版本验证。`);
       plugins.reload();
@@ -271,6 +286,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
   async function restore(id: string) {
     const result = await action.run(() => api.plugins.restore(id));
     if (result && "state" in result) {
+      await syncHost();
       setFlash(`预装插件「${result.name || result.id}」已恢复，保持停用。`);
       plugins.reload();
       activity.reload();
@@ -278,6 +294,18 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
   }
 
   const safeMode = Boolean(plugins.data?.safeMode);
+  const syncNotice = syncError ? (
+    <div className="inline-actions">
+      <ErrorNotice
+        title="侧栏尚未同步"
+        message={syncError}
+        recovery="核心已保存这次变更。重试只刷新插件界面，不会重复写入。"
+      />
+      <ActionButton icon="refresh" onClick={() => void syncHost()} busy={syncing}>
+        重新同步侧栏
+      </ActionButton>
+    </div>
+  ) : null;
 
   if (current && current.state === "UNINSTALLED") {
     return (
@@ -298,6 +326,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
             {flash}
           </div>
         ) : null}
+        {syncNotice}
         {action.error ? (
           <ErrorNotice message={errorMessage(action.error)} recovery={errorRecovery(action.error)} onDismiss={action.clearError} />
         ) : null}
@@ -305,7 +334,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
           <p className="panel-note">
             这个插件随应用一起提供，已被卸载。恢复会重新释放内置副本；它不会自动回到列表，也不会自动启用。
           </p>
-          <ActionButton icon="refresh" onClick={() => void restore(current.id)} busy={action.busy}>
+          <ActionButton icon="refresh" onClick={() => void restore(current.id)} busy={action.busy || syncing}>
             恢复预装插件
           </ActionButton>
         </Panel>
@@ -335,6 +364,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
             {flash}
           </div>
         ) : null}
+        {syncNotice}
         {action.error ? (
           <ErrorNotice message={errorMessage(action.error)} recovery={errorRecovery(action.error)} onDismiss={action.clearError} />
         ) : null}
@@ -401,7 +431,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
           <Panel title="操作">
             <div className="plugins-detail-actions">
               {current.enabled ? (
-                <ActionButton icon="power" onClick={() => void run(current.id, "disable")} busy={action.busy}>
+                <ActionButton icon="power" onClick={() => void run(current.id, "disable")} busy={action.busy || syncing}>
                   停用插件
                 </ActionButton>
               ) : (
@@ -409,18 +439,18 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
                   variant="primary"
                   icon="power"
                   onClick={() => void run(current.id, "enable")}
-                  busy={action.busy}
+                  busy={action.busy || syncing}
                   disabled={safeMode}
                 >
                   启用插件
                 </ActionButton>
               )}
               {!current.enabled && !current.compatible ? (
-                <ActionButton icon="alert" onClick={() => setConfirmForce(true)} busy={action.busy} disabled={safeMode}>
+                <ActionButton icon="alert" onClick={() => setConfirmForce(true)} busy={action.busy || syncing} disabled={safeMode}>
                   强制启用
                 </ActionButton>
               ) : null}
-              <ActionButton variant="danger" icon="trash" onClick={() => void run(current.id, "uninstall")} busy={action.busy}>
+              <ActionButton variant="danger" icon="trash" onClick={() => void run(current.id, "uninstall")} busy={action.busy || syncing}>
                 卸载
               </ActionButton>
             </div>
@@ -435,7 +465,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
                   强制启用「{current.name || current.id}」意味着让一个没有在当前宿主版本验证过的插件运行。它可能读到你的会话内容。确认继续？
                 </p>
                 <div className="inline-actions">
-                  <ActionButton variant="danger" icon="check" onClick={() => void forceEnable(current.id)} busy={action.busy}>
+                  <ActionButton variant="danger" icon="check" onClick={() => void forceEnable(current.id)} busy={action.busy || syncing}>
                     确认强制启用
                   </ActionButton>
                   <ActionButton variant="quiet" onClick={() => setConfirmForce(false)}>
@@ -501,6 +531,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
         </div>
       ) : null}
 
+      {syncNotice}
       {safeMode ? (
         <InfoNote tone="warn">
           <p>安全模式已开启。所有插件都已停用，安装与启用都会被拒绝。关闭安全模式后可以重新启用。</p>
@@ -598,7 +629,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
           <div className="inline-actions">
             {preview ? (
               <>
-                <ActionButton variant="primary" icon="check" onClick={() => void install()} busy={action.busy}>
+                <ActionButton variant="primary" icon="check" onClick={() => void install()} busy={action.busy || syncing}>
                   授予 {granted.length} 项能力并安装
                 </ActionButton>
                 <ActionButton variant="quiet" onClick={() => setPreview(null)}>

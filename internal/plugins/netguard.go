@@ -57,14 +57,8 @@ func isBlockedAddress(ip net.IP) bool {
 	return false
 }
 
-// literalAddress reports whether a grant host is itself an IP literal. A user
-// who wrote `net:127.0.0.1` explicitly approved that address, so it is exempt
-// from the private-address rule; a name that merely resolves there is not.
-func literalAddress(host string) bool {
-	_, ok := canonicalIP(host)
-	return ok
-}
-
+// A user who wrote `net:127.0.0.1` explicitly approved that address, so it is
+// exempt from the private-address rule; a name that merely resolves there is not.
 // resolveApprovedAddr resolves an authorized host and returns the single address
 // the dialer must use. Every answer is checked: a name that resolves to mixed
 // public and private addresses is refused rather than "first one wins", because
