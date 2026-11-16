@@ -1,0 +1,198 @@
+:root,
+.ekd-root {
+  --paper: #f4f6f9;
+  --surface: #fbfcfd;
+  --surface-raised: #ffffff;
+  --surface-sunken: #edf1f6;
+  --ink: #142238;
+  --ink-strong: #0c1829;
+  --ink-muted: #4d5d73;
+  --ink-faint: #5b6b80;
+  --line: #d9e0e9;
+  --line-strong: #bcc8d6;
+  --accent: #1c5fd0;
+  --accent-hover: #174ea8;
+  --accent-ink: #0e3d8c;
+  --accent-soft: #e6eefb;
+  --success: #17694a;
+  --success-soft: #e3f1e9;
+  --warn: #8a5a00;
+  --warn-soft: #fbf0d8;
+  --danger: #a92a33;
+  --danger-soft: #fbe7e7;
+  --info: #1d5e74;
+  --info-soft: #e2f0f4;
+  --focus: #1c5fd0;
+  --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.05), 0 8px 24px -12px rgba(0, 0, 0, 0.14);
+  --radius-sm: 5px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --font-sans: "Noto Sans SC Subset", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: "JetBrains Mono Metrics", "SFMono-Regular", "Cascadia Mono", "Menlo", monospace;
+  --sidebar: 224px;
+  --content-max: 1480px;
+  color-scheme: light;
+}
+
+@font-face {
+  font-family: "Noto Sans SC Subset";
+  src: url("/fonts/NotoSansSC-subset.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "JetBrains Mono Metrics";
+  src: url("/fonts/JetBrainsMono-metrics.woff2") format("woff2");
+  font-weight: 100 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: 340px;
+  background:
+    radial-gradient(1200px 320px at 18% -10%, rgba(28, 95, 208, 0.07), transparent 70%),
+    linear-gradient(180deg, rgba(219, 228, 241, 0.55), transparent);
+  pointer-events: none;
+  z-index: -1;
+}
+
+::selection {
+  background: #cfe0fb;
+  color: var(--ink-strong);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+h1,
+h2,
+h3,
+h4,
+p,
+ul,
+ol,
+dl,
+dd,
+figure {
+  margin: 0;
+}
+
+ul,
+ol {
+  padding: 0;
+  list-style: none;
+}
+
+a {
+  color: var(--accent-ink);
+  text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  text-underline-offset: 3px;
+}
+
+a:hover {
+  text-decoration-color: var(--accent);
+}
+
+code,
+kbd,
+samp,
+pre,
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 0;
+}
+
+::placeholder {
+  color: var(--ink-faint);
+  opacity: 1;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #99a8bb;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.skip-link {
+  position: absolute;
+  left: 12px;
+  top: -48px;
+  z-index: 40;
+  padding: 8px 14px;
+  background: var(--ink-strong);
+  color: #fff;
+  border-radius: var(--radius-sm);
+  transition: top 140ms ease-out;
+}
+
+.skip-link:focus {
+  top: 12px;
+}

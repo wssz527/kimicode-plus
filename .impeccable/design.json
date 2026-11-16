@@ -1,0 +1,664 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-10T15:02:48Z",
+  "title": "Design System: Enhanced Kimi Desktop",
+  "extensions": {
+    "colorMeta": {
+      "paper": {
+        "role": "neutral",
+        "displayName": "冷白纸 Paper",
+        "canonical": "#f4f6f9",
+        "tonalRamp": [
+          "#0a0b0c",
+          "#262628",
+          "#414245",
+          "#5c5e60",
+          "#797a7d",
+          "#9d9ea1",
+          "#c2c4c7",
+          "#e6e8ea"
+        ]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "面板纸 Panel",
+        "canonical": "#fbfcfd",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#262627",
+          "#424243",
+          "#5d5e5e",
+          "#797a7b",
+          "#9d9e9f",
+          "#c3c4c5",
+          "#e7e8e8"
+        ]
+      },
+      "surface-raised": {
+        "role": "neutral",
+        "displayName": "抬升白 Raised",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#262626",
+          "#424242",
+          "#5d5d5d",
+          "#7a7a7a",
+          "#9e9e9e",
+          "#c4c4c4",
+          "#e8e8e8"
+        ]
+      },
+      "surface-sunken": {
+        "role": "neutral",
+        "displayName": "下沉灰 Sunken",
+        "canonical": "#edf1f6",
+        "tonalRamp": [
+          "#0a0b0d",
+          "#252729",
+          "#3f4347",
+          "#5b5e62",
+          "#777b7f",
+          "#9b9fa3",
+          "#c1c4c9",
+          "#e5e8ec"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "深海蓝 Ink",
+        "canonical": "#142238",
+        "tonalRamp": [
+          "#050b16",
+          "#1f2733",
+          "#33435b",
+          "#4e5e78",
+          "#6a7b96",
+          "#8da0bc",
+          "#b3c5e3",
+          "#dbe9fe"
+        ]
+      },
+      "ink-strong": {
+        "role": "neutral",
+        "displayName": "深海蓝深 Ink Strong",
+        "canonical": "#0c1829",
+        "tonalRamp": [
+          "#060b14",
+          "#202731",
+          "#354357",
+          "#505f73",
+          "#6c7b91",
+          "#90a0b7",
+          "#b5c6dd",
+          "#dde9fa"
+        ],
+        "note": "标题与强调文字。"
+      },
+      "ink-muted": {
+        "role": "neutral",
+        "displayName": "次要墨 Muted",
+        "canonical": "#4d5d73",
+        "tonalRamp": [
+          "#060b15",
+          "#1f2731",
+          "#344358",
+          "#4f5f75",
+          "#6b7c93",
+          "#8ea0b8",
+          "#b3c6df",
+          "#dce9fb"
+        ]
+      },
+      "ink-faint": {
+        "role": "neutral",
+        "displayName": "弱化墨 Faint",
+        "canonical": "#5b6b80",
+        "tonalRamp": [
+          "#060b14",
+          "#202731",
+          "#354357",
+          "#4f5f73",
+          "#6b7c91",
+          "#8fa0b7",
+          "#b4c6dd",
+          "#dce9fa"
+        ]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "细线 Rule",
+        "canonical": "#d9e0e9",
+        "tonalRamp": [
+          "#090b0f",
+          "#24272a",
+          "#3d434a",
+          "#585e66",
+          "#757b83",
+          "#989fa7",
+          "#bec5ce",
+          "#e3e8ef"
+        ]
+      },
+      "line-strong": {
+        "role": "neutral",
+        "displayName": "强线 Strong Rule",
+        "canonical": "#bcc8d6",
+        "tonalRamp": [
+          "#070c11",
+          "#22272d",
+          "#39434f",
+          "#545f6b",
+          "#717c88",
+          "#94a0ad",
+          "#bac5d3",
+          "#e0e9f3"
+        ]
+      },
+      "accent": {
+        "role": "primary",
+        "displayName": "操作蓝 Action Blue",
+        "canonical": "#1c5fd0",
+        "tonalRamp": [
+          "#000135",
+          "#042257",
+          "#003995",
+          "#2158b6",
+          "#3f77d7",
+          "#629cff",
+          "#86c3ff",
+          "#b5e9ff"
+        ]
+      },
+      "accent-hover": {
+        "role": "primary",
+        "displayName": "操作蓝加深",
+        "canonical": "#174ea8",
+        "tonalRamp": [
+          "#00052e",
+          "#0a244f",
+          "#003a93",
+          "#2259b4",
+          "#3f77d5",
+          "#639dfe",
+          "#87c4ff",
+          "#bee9ff"
+        ]
+      },
+      "accent-ink": {
+        "role": "primary",
+        "displayName": "链接蓝 Link Ink",
+        "canonical": "#0e3d8c",
+        "tonalRamp": [
+          "#00062b",
+          "#0e254c",
+          "#0d3c8b",
+          "#2b5aac",
+          "#4778cd",
+          "#6a9df5",
+          "#8fc4ff",
+          "#c2e9ff"
+        ]
+      },
+      "accent-soft": {
+        "role": "primary",
+        "displayName": "雾蓝 Accent Wash",
+        "canonical": "#e6eefb",
+        "tonalRamp": [
+          "#090b10",
+          "#23272c",
+          "#3c434d",
+          "#575e69",
+          "#747b86",
+          "#979fab",
+          "#bdc5d1",
+          "#e3e8f1"
+        ]
+      },
+      "success": {
+        "role": "tertiary",
+        "displayName": "确认绿 Confirmed Green",
+        "canonical": "#17694a",
+        "tonalRamp": [
+          "#001105",
+          "#092e1f",
+          "#005134",
+          "#1d6d4e",
+          "#408b6a",
+          "#65b18e",
+          "#8bd7b3",
+          "#c2f6db"
+        ]
+      },
+      "success-soft": {
+        "role": "tertiary",
+        "displayName": "确认绿底",
+        "canonical": "#e3f1e9",
+        "tonalRamp": [
+          "#080c0a",
+          "#222825",
+          "#3a463f",
+          "#55615a",
+          "#717e77",
+          "#95a29b",
+          "#bac8c0",
+          "#e1ebe5"
+        ]
+      },
+      "warn": {
+        "role": "tertiary",
+        "displayName": "未知琥珀 Unknown Amber",
+        "canonical": "#8a5a00",
+        "tonalRamp": [
+          "#190500",
+          "#382100",
+          "#643600",
+          "#815200",
+          "#a06f24",
+          "#c7934c",
+          "#efb972",
+          "#ffe1b0"
+        ]
+      },
+      "warn-soft": {
+        "role": "tertiary",
+        "displayName": "未知琥珀底",
+        "canonical": "#fbf0d8",
+        "tonalRamp": [
+          "#0f0b04",
+          "#2a261c",
+          "#4a412e",
+          "#665d48",
+          "#837964",
+          "#a89d87",
+          "#cec3ac",
+          "#efe7d7"
+        ]
+      },
+      "danger": {
+        "role": "tertiary",
+        "displayName": "阻断红 Blocked Red",
+        "canonical": "#a92a33",
+        "tonalRamp": [
+          "#260000",
+          "#490d11",
+          "#830016",
+          "#a52931",
+          "#c74a4d",
+          "#f17070",
+          "#ff9694",
+          "#ffcac5"
+        ]
+      },
+      "danger-soft": {
+        "role": "tertiary",
+        "displayName": "阻断红底",
+        "canonical": "#fbe7e7",
+        "tonalRamp": [
+          "#100909",
+          "#2c2424",
+          "#4d3e3e",
+          "#6a5959",
+          "#877575",
+          "#ac9999",
+          "#d2bfbf",
+          "#f2e4e4"
+        ]
+      },
+      "info": {
+        "role": "tertiary",
+        "displayName": "信息青 Info Teal",
+        "canonical": "#1d5e74",
+        "tonalRamp": [
+          "#000e18",
+          "#0d2a35",
+          "#004a5f",
+          "#27667c",
+          "#46849b",
+          "#6aa8c1",
+          "#90cfe8",
+          "#c4f0ff"
+        ]
+      },
+      "info-soft": {
+        "role": "tertiary",
+        "displayName": "信息青底",
+        "canonical": "#e2f0f4",
+        "tonalRamp": [
+          "#070c0e",
+          "#222829",
+          "#394548",
+          "#546063",
+          "#707d80",
+          "#94a1a5",
+          "#b9c7cb",
+          "#e0eaed"
+        ]
+      },
+      "sidebar-deep": {
+        "role": "neutral",
+        "displayName": "装订边深蓝",
+        "canonical": "#101f36",
+        "tonalRamp": [
+          "#050b16",
+          "#1e2734",
+          "#32435d",
+          "#4d5f7a",
+          "#697b98",
+          "#8ca0bd",
+          "#b1c6e4",
+          "#dae9ff"
+        ]
+      },
+      "sidebar-base": {
+        "role": "neutral",
+        "displayName": "侧栏基底深蓝",
+        "canonical": "#0d1a2c",
+        "tonalRamp": [
+          "#060b14",
+          "#202731",
+          "#354358",
+          "#4f5f74",
+          "#6b7c92",
+          "#8fa0b8",
+          "#b4c6df",
+          "#dce9fb"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "页面标题",
+        "purpose": "每页唯一的主标题，使用 clamp 在 1.45–1.8rem 之间随视口缩放。"
+      },
+      "headline": {
+        "displayName": "来源页标题",
+        "purpose": "来源详情与对话头部的 17px 标题；粗体来自 h2 默认字重。"
+      },
+      "title": {
+        "displayName": "面板标题",
+        "purpose": "面板头与抽屉小标题，13px/600。"
+      },
+      "body": {
+        "displayName": "正文",
+        "purpose": "默认正文 14px/1.6；说明段落限 65–75ch。"
+      },
+      "label": {
+        "displayName": "标签",
+        "purpose": "表头、字段标签、状态徽标，11px 下限。"
+      },
+      "metric": {
+        "displayName": "读数",
+        "purpose": "总览与用量读数条数值，≤640px 降为 22px。"
+      },
+      "measure": {
+        "displayName": "等宽度量",
+        "purpose": "ID、哈希、Token 计数、时间与代码块，tabular-nums。"
+      }
+    },
+    "shadows": [
+      {
+        "name": "overlay",
+        "value": "0 1px 2px rgba(0, 0, 0, 0.05), 0 8px 24px -12px rgba(0, 0, 0, 0.14)",
+        "purpose": "配对屏外框；全站唯一的大面积浮层投影。"
+      },
+      {
+        "name": "drawer",
+        "value": "-8px 0 30px -18px rgba(0, 0, 0, 0.32)",
+        "purpose": "右侧抽屉左缘投影，随 220ms 进入动画出现。"
+      },
+      {
+        "name": "knob",
+        "value": "0 1px 2px rgba(0, 0, 0, 0.28)",
+        "purpose": "开关白旋钮的微影。"
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-standard",
+        "value": "cubic-bezier(0.22, 0.61, 0.36, 1)",
+        "purpose": "页面进入、抽屉推入与开关旋钮位移共用曲线。"
+      },
+      {
+        "name": "transition-fast",
+        "value": "130ms ease-out",
+        "purpose": "按钮背景、描边与文字颜色的状态过渡。"
+      },
+      {
+        "name": "transition-nav",
+        "value": "140ms ease-out",
+        "purpose": "侧栏导航项的背景、颜色与描边过渡。"
+      },
+      {
+        "name": "transition-toggle",
+        "value": "150ms ease-out",
+        "purpose": "开关轨道底色过渡；旋钮位移改用 ease-standard。"
+      },
+      {
+        "name": "page-enter",
+        "value": "320ms cubic-bezier(0.22, 0.61, 0.36, 1)",
+        "purpose": "页面进入：仅 6px 竖直位移，不改透明度，避免后台标签恢复时出现空白帧。"
+      },
+      {
+        "name": "drawer-in",
+        "value": "220ms cubic-bezier(0.22, 0.61, 0.36, 1)",
+        "purpose": "抽屉从右推入 18px 并淡入。"
+      },
+      {
+        "name": "backdrop-fade",
+        "value": "150ms ease-out",
+        "purpose": "抽屉遮罩淡入。"
+      },
+      {
+        "name": "spin",
+        "value": "720ms linear",
+        "purpose": "加载 spinner；prefers-reduced-motion 下放慢到 1600ms。"
+      },
+      {
+        "name": "shimmer",
+        "value": "1.4s linear",
+        "purpose": "骨架屏扫光；reduced motion 下停止。"
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "layout-collapse",
+        "value": "1180px",
+        "purpose": "六个双栏页面收为单栏，右侧块转为 auto-fit 网格。"
+      },
+      {
+        "name": "sidebar-narrow",
+        "value": "1100px",
+        "purpose": "侧栏 224px → 196px，主区留白 30px → 22px。"
+      },
+      {
+        "name": "stack",
+        "value": "900px",
+        "purpose": "读数条降列，聊天、导入、预览、交接来源改单列。"
+      },
+      {
+        "name": "sidebar-top",
+        "value": "820px",
+        "purpose": "侧栏变顶部区域，桌面导航换成横向胶囊导航，顶栏 48px。"
+      },
+      {
+        "name": "page-head-stack",
+        "value": "720px",
+        "purpose": "页头改纵向排列，面板内边距 13px。"
+      },
+      {
+        "name": "single-column",
+        "value": "640px",
+        "purpose": "方向卡片与筛选表单单列，抽屉全宽。"
+      },
+      {
+        "name": "pairing-narrow",
+        "value": "560px",
+        "purpose": "配对屏隐藏左侧账本列。"
+      }
+    ],
+    "knownGaps": [
+      {
+        "area": "form controls",
+        "detail": ".input、.select、.textarea 在 components.css 中没有基础规则；实际只有 .input-sm、.input-code、.input-with-icon .input 与 .composer .textarea 的局部调整。",
+        "evidence": "web/src/styles/components.css、web/src/styles/pages.css:284、web/src/styles/pages.css:1891"
+      },
+      {
+        "area": "layout utility",
+        "detail": ".form-grid 被 3 个页面引用，但四个样式表中没有对应规则。",
+        "evidence": "web/src/pages/ChatPage.tsx:501、web/src/pages/HandoffPage.tsx:488、web/src/pages/ModelsPage.tsx:611"
+      },
+      {
+        "area": "tokens",
+        "detail": "--radius-pill 未在 :root 声明，胶囊形状依赖 var(--radius-pill, 999px) 的回退值。",
+        "evidence": "web/src/styles/base.css:1、web/src/styles/components.css:261"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "推进流程的唯一主操作：创建交接、保存设置、导入模型。蓝底白字，hover 加深，active 下沉 0.5px。",
+      "html": "<button class=\"ds-btn ds-btn-primary\" type=\"button\">创建交接</button>",
+      "css": ".ds-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:36px;padding:0 13px;border-radius:5px;border:1px solid var(--line-strong,#bcc8d6);background:var(--surface-raised,#ffffff);color:var(--ink,#142238);font-family:var(--font-sans, \"Noto Sans SC Subset\", \"PingFang SC\", \"Hiragino Sans GB\", \"Microsoft YaHei\", sans-serif);font-size:13px;font-weight:500;line-height:1.2;white-space:nowrap;cursor:pointer;text-decoration:none;transition:background 130ms ease-out,border-color 130ms ease-out,color 130ms ease-out}.ds-btn:hover{background:var(--surface-sunken,#edf1f6);border-color:#a9b7c8}.ds-btn:focus-visible{outline:2px solid var(--focus,#1c5fd0);outline-offset:2px}.ds-btn:disabled{cursor:not-allowed;opacity:.55}.ds-btn-primary{background:var(--accent,#1c5fd0);border-color:var(--accent,#1c5fd0);color:#fff}.ds-btn-primary:hover{background:var(--accent-hover,#174ea8);border-color:var(--accent-hover,#174ea8)}.ds-btn-primary:active{transform:translateY(.5px)}"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "常规动作的默认按钮：白底、强线描边、深墨文字。hover 转为下沉灰并把描边压深一档。",
+      "html": "<button class=\"ds-btn\" type=\"button\">刷新读数</button>",
+      "css": ".ds-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:36px;padding:0 13px;border-radius:5px;border:1px solid var(--line-strong,#bcc8d6);background:var(--surface-raised,#ffffff);color:var(--ink,#142238);font-family:var(--font-sans, \"Noto Sans SC Subset\", \"PingFang SC\", \"Hiragino Sans GB\", \"Microsoft YaHei\", sans-serif);font-size:13px;font-weight:500;line-height:1.2;white-space:nowrap;cursor:pointer;text-decoration:none;transition:background 130ms ease-out,border-color 130ms ease-out,color 130ms ease-out}.ds-btn:hover{background:var(--surface-sunken,#edf1f6);border-color:#a9b7c8}.ds-btn:focus-visible{outline:2px solid var(--focus,#1c5fd0);outline-offset:2px}.ds-btn:disabled{cursor:not-allowed;opacity:.55}.ds-btn:active{transform:translateY(.5px)}"
+    },
+    {
+      "name": "Icon Button",
+      "kind": "button",
+      "refersTo": null,
+      "description": "30×30 的透明图标按钮，用于关闭提示、移除附件、打开设置。静止无底色，hover 才出现下沉灰与深墨图标。",
+      "html": "<button class=\"ds-icon-btn\" type=\"button\" aria-label=\"关闭提示\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M6 6l12 12M18 6L6 18\"/></svg></button>",
+      "css": ".ds-icon-btn{display:inline-grid;place-items:center;width:30px;height:30px;padding:0;border-radius:5px;border:1px solid transparent;background:transparent;color:var(--ink-faint,#5b6b80);cursor:pointer;flex:none}.ds-icon-btn:hover{background:var(--surface-sunken,#edf1f6);color:var(--ink,#142238)}.ds-icon-btn:focus-visible{outline:2px solid var(--focus,#1c5fd0);outline-offset:1px}"
+    },
+    {
+      "name": "Field",
+      "kind": "input",
+      "refersTo": null,
+      "description": "标签、控件、提示三行式字段。共享层没有 .input 基础皮肤，控件外观在此保留浏览器默认值——反映当前实现的真实状态，不作为推荐样式。",
+      "html": "<div class=\"ds-field\"><label class=\"ds-field-label\" for=\"ds-field-name\">显示名称<span class=\"ds-req\" aria-hidden=\"true\"> *</span></label><input class=\"ds-field-control\" id=\"ds-field-name\" value=\"本地 Mock 供应商\"><p class=\"ds-field-hint\">每个字段独立保存值、来源与抓取时间。</p><p class=\"ds-field-error\">名称不能为空。</p></div>",
+      "css": ".ds-field{display:grid;gap:5px;min-width:0;font-family:var(--font-sans, \"Noto Sans SC Subset\", \"PingFang SC\", \"Hiragino Sans GB\", \"Microsoft YaHei\", sans-serif);font-size:14px;line-height:1.6;color:var(--ink,#142238)}.ds-field-label{font-size:12px;font-weight:500;color:var(--ink-muted,#4d5d73);letter-spacing:.02em}.ds-req{color:var(--danger,#a92a33)}.ds-field-control{font:inherit;color:inherit}.ds-field-hint{font-size:11.5px;line-height:1.6;color:var(--ink-faint,#5b6b80);margin:0;overflow-wrap:anywhere}.ds-field-error{font-size:11.5px;color:var(--danger,#a92a33);margin:0}.ds-field-control:focus-visible{outline:2px solid var(--focus,#1c5fd0);outline-offset:2px}"
+    },
+    {
+      "name": "State Badge",
+      "kind": "chip",
+      "refersTo": "state-badge",
+      "description": "胶囊状态徽标：实心圆点表示已知/成功，45° 菱形表示未知/待核对。warn 档固定用菱形。 静态展示组件：源码未定义 hover，此处只补齐全局焦点环，供其被键盘聚焦时使用。",
+      "html": "<span class=\"ds-state ds-state-success\"><span class=\"ds-state-mark\" aria-hidden=\"true\"></span>已送达</span> <span class=\"ds-state ds-state-warn\"><span class=\"ds-state-mark ds-state-mark-diamond\" aria-hidden=\"true\"></span>尚未提交</span>",
+      "css": ".ds-state{display:inline-flex;align-items:center;gap:6px;font-family:var(--font-sans, \"Noto Sans SC Subset\", \"PingFang SC\", \"Hiragino Sans GB\", \"Microsoft YaHei\", sans-serif);font-size:11.5px;font-weight:500;letter-spacing:.015em;padding:1px 8px 1px 7px;border-radius:999px;border:1px solid var(--line,#d9e0e9);background:var(--surface-raised,#ffffff);color:var(--ink-muted,#4d5d73);white-space:nowrap}.ds-state-mark{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}.ds-state-mark-diamond{border-radius:1px;transform:rotate(45deg)}.ds-state-success{color:var(--success,#17694a);background:var(--success-soft,#e3f1e9);border-color:#b9dcc9}.ds-state-warn{color:var(--warn,#8a5a00);background:var(--warn-soft,#fbf0d8);border-color:#e6d3a4}.ds-state:focus-visible{outline:2px solid var(--focus,#1c5fd0);outline-offset:2px}"
+    },
+    {
+      "name": "UNKNOWN Token",
+      "kind": "chip",
+      "refersTo": "unknown-tag",
+      "description": "未知值的专属 token：琥珀虚线边框、米色底、等宽 11px。不是徽标变体，不能换用普通 badge。 静态展示组件：源码未定义 hover，此处只补齐全局焦点环，供其被键盘聚焦时使用。",
+      "html": "<span class=\"ds-unknown\" title=\"核心未提供该值或明确标记为未知\">UNKNOWN</span>",
+      "css": ".ds-unknown{display:inline-flex;align-items:center;padding:0 5px;border:1px dashed #c7a868;border-radius:3px;background:#fdf8ec;color:var(--warn,#8a5a00);font-size:11px;font-family:var(--font-mono, \"JetBrains Mono Metrics\", \"SFMono-Regular\", \"Cascadia Mono\", \"Menlo\", monospace);font-variant-numeric:tabular-nums;letter-spacing:.04em;line-height:1.7;white-space:nowrap}.ds-unknown:focus-visible{outline:2px solid var(--focus,#1c5fd0);outline-offset:2px}"
+    },
+    {
+      "name": "Panel",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "标准容器：10px 圆角、1px 细线描边、面板纸底，无阴影。头部 12×16px 且高 46px，主体 16px。 静态展示组件：源码未定义 hover，此处只补齐全局焦点环，供其被键盘聚焦时使用。",
+      "html": "<section class=\"ds-panel\"><div class=\"ds-panel-head\"><h2 class=\"ds-panel-title\">最近交接</h2><span class=\"ds-panel-aside\">共 1 条</span></div><div class=\"ds-panel-body\"><p class=\"ds-panel-copy\">任务状态来自持久 Outbox。DELIVERED 表示 Mock 宿主确认；UNKNOWN 表示无法确认，只能核对。</p></div></section>",
+      "css": ".ds-panel{background:var(--surface,#fbfcfd);border:1px solid var(--line,#d9e0e9);border-radius:10px;min-width:0;font-family:var(--font-sans, \"Noto Sans SC Subset\", \"PingFang SC\", \"Hiragino Sans GB\", \"Microsoft YaHei\", sans-serif);color:var(--ink,#142238);font-size:14px;line-height:1.6}.ds-panel-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 16px;border-bottom:1px solid var(--line,#d9e0e9);min-height:46px}.ds-panel-title{font-size:13px;font-weight:600;letter-spacing:.015em;color:var(--ink-strong,#0c1829);margin:0}.ds-panel-aside{font-size:11.5px;color:var(--ink-faint,#5b6b80)}.ds-panel-body{padding:16px}.ds-panel-copy{margin:0;font-size:13px;color:var(--ink-muted,#4d5d73)}@media (max-width:720px){.ds-panel-body{padding:13px}}.ds-panel:focus-visible{outline:2px solid var(--focus,#1c5fd0);outline-offset:2px}"
+    },
+    {
+      "name": "Data Table",
+      "kind": "custom",
+      "refersTo": null,
+      "description": "记录行的主载体：下沉灰表头、11px 字距标签、12.5px 数据行、9×14px 单元格，hover 为 40% 雾蓝。容器负责横向滚动。 静态展示组件：源码未定义 hover，此处只补齐全局焦点环，供其被键盘聚焦时使用。",
+      "html": "<div class=\"ds-table-scroll\"><table class=\"ds-data-table\"><caption>当前页事件 · 第 1–2 条 / 共 6 条</caption><thead><tr><th>模型</th><th>输入 Token</th><th>来源</th></tr></thead><tbody><tr><td><span class=\"ds-cell-strong\">kimi-k2</span><span class=\"ds-cell-sub\">mock-provider</span></td><td class=\"ds-num-cell\">12,480</td><td class=\"ds-cell-muted\">core summary</td></tr><tr><td><span class=\"ds-cell-strong\">kimi-k1.5</span><span class=\"ds-cell-sub\">mock-provider</span></td><td class=\"ds-num-cell\">3,206</td><td class=\"ds-cell-muted\">core summary</td></tr></tbody></table></div>",
+      "css": ".ds-table-scroll{overflow-x:auto;min-width:0;font-family:var(--font-sans, \"Noto Sans SC Subset\", \"PingFang SC\", \"Hiragino Sans GB\", \"Microsoft YaHei\", sans-serif)}.ds-data-table{width:100%;border-collapse:collapse;font-size:12.5px;color:var(--ink,#142238)}.ds-data-table caption{text-align:left;padding:9px 14px;font-size:11.5px;color:var(--ink-faint,#5b6b80);border-bottom:1px solid var(--line,#d9e0e9);background:var(--surface,#fbfcfd)}.ds-data-table th{text-align:left;font-weight:500;font-size:11px;letter-spacing:.05em;color:var(--ink-faint,#5b6b80);text-transform:uppercase;padding:8px 14px;border-bottom:1px solid var(--line-strong,#bcc8d6);background:var(--surface-sunken,#edf1f6);white-space:nowrap}.ds-data-table td{padding:9px 14px;border-bottom:1px solid var(--line,#d9e0e9);vertical-align:top;color:var(--ink,#142238)}.ds-data-table tbody tr:last-child td{border-bottom:0}.ds-data-table tbody tr{transition:background 130ms ease-out}.ds-data-table tbody tr:hover{background:color-mix(in srgb,var(--accent-soft,#e6eefb) 40%,transparent)}.ds-num-cell{font-family:var(--font-mono, \"JetBrains Mono Metrics\", \"SFMono-Regular\", \"Cascadia Mono\", \"Menlo\", monospace);font-variant-numeric:tabular-nums;font-size:12px;white-space:nowrap}.ds-cell-muted{color:var(--ink-faint,#5b6b80)}.ds-cell-strong{display:block;font-weight:500;color:var(--ink-strong,#0c1829);font-size:12.5px}.ds-cell-sub{display:block;font-size:11px;color:var(--ink-faint,#5b6b80);margin-top:1px}.ds-table-scroll:focus-visible{outline:2px solid var(--focus,#1c5fd0);outline-offset:2px}"
+    },
+    {
+      "name": "Reading Strip",
+      "kind": "custom",
+      "refersTo": null,
+      "description": "总览与用量页的读数条：每个单元只有标签、26px 读数与一行说明。未知值改用琥珀 UNKNOWN token，部分和前缀 ≥。 静态展示组件：源码未定义 hover，此处只补齐全局焦点环，供其被键盘聚焦时使用。",
+      "html": "<div class=\"ds-readings\"><div class=\"ds-reading\"><span class=\"ds-reading-label\">模块就绪</span><span class=\"ds-reading-value\">5/5</span><span class=\"ds-reading-note\">核心注册的模块</span></div><div class=\"ds-reading\"><span class=\"ds-reading-label\">Outbox 记录</span><span class=\"ds-reading-value\">1</span><span class=\"ds-reading-note\">1 已送达 · 0 未知</span></div><div class=\"ds-reading ds-reading-warn\"><span class=\"ds-reading-label\">网关余额</span><span class=\"ds-reading-value ds-reading-unknown\">UNKNOWN</span><span class=\"ds-reading-note\">无已知观测值</span></div></div>",
+      "css": ".ds-readings{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border:1px solid var(--line,#d9e0e9);border-radius:10px;background:var(--surface,#fbfcfd);font-family:var(--font-sans, \"Noto Sans SC Subset\", \"PingFang SC\", \"Hiragino Sans GB\", \"Microsoft YaHei\", sans-serif)}.ds-reading{padding:13px 16px 14px;border-right:1px solid var(--line,#d9e0e9);display:grid;gap:0;min-width:0}.ds-reading:last-child{border-right:0}.ds-reading-label{font-size:11px;letter-spacing:.045em;color:var(--ink-faint,#5b6b80)}.ds-reading-value{font-size:26px;line-height:1.25;letter-spacing:-.03em;color:var(--ink-strong,#0c1829);font-weight:500;font-variant-numeric:tabular-nums;font-family:var(--font-mono, \"JetBrains Mono Metrics\", \"SFMono-Regular\", \"Cascadia Mono\", \"Menlo\", monospace)}.ds-reading-note{font-size:11.5px;color:var(--ink-faint,#5b6b80);line-height:1.5}.ds-reading-warn .ds-reading-value{color:var(--warn,#8a5a00)}.ds-reading-unknown{display:inline-flex;align-items:center;align-self:start;margin:3px 0;padding:0 5px;border:1px dashed #c7a868;border-radius:3px;background:#fdf8ec;color:var(--warn,#8a5a00);font-family:var(--font-mono, \"JetBrains Mono Metrics\", \"SFMono-Regular\", \"Cascadia Mono\", \"Menlo\", monospace);font-size:11px;letter-spacing:.04em;line-height:1.7}@media (max-width:900px){.ds-readings{grid-template-columns:repeat(2,minmax(0,1fr))}.ds-reading:nth-child(2n){border-right:0}.ds-reading:nth-child(-n+2){border-bottom:1px solid var(--line,#d9e0e9)}}@media (max-width:640px){.ds-reading-value{font-size:22px}}.ds-readings:focus-visible{outline:2px solid var(--focus,#1c5fd0);outline-offset:2px}"
+    },
+    {
+      "name": "Sidebar Navigation",
+      "kind": "nav",
+      "refersTo": "nav-item-active",
+      "description": "深海蓝渐变侧栏中的导航项：17px 线性图标 + 13.5px 标签，选中为 19% 半透明蓝底、亮描边与纯白文字，焦点环换成亮蓝。",
+      "html": "<nav class=\"ds-rail\" aria-label=\"工作台导航\"><ul class=\"ds-nav\"><li><a class=\"ds-nav-link ds-is-active\" href=\"#\" aria-current=\"page\"><svg width=\"17\" height=\"17\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3.5\" y=\"3.5\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"13.5\" y=\"3.5\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"3.5\" y=\"13.5\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"13.5\" y=\"13.5\" width=\"7\" height=\"7\" rx=\"1\"/></svg>总览</a></li><li><a class=\"ds-nav-link\" href=\"#\"><svg width=\"17\" height=\"17\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M12 3.5 20 8l-8 4.5L4 8l8-4.5Z\"/><path d=\"M4 8v8l8 4.5 8-4.5V8\"/><path d=\"M12 12.5V20\"/></svg>供应商与模型</a></li><li><a class=\"ds-nav-link\" href=\"#\"><svg width=\"17\" height=\"17\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 20V4\"/><path d=\"M4 20h16\"/><rect x=\"7\" y=\"12\" width=\"3\" height=\"5\"/><rect x=\"12\" y=\"8\" width=\"3\" height=\"9\"/><rect x=\"17\" y=\"5\" width=\"3\" height=\"12\"/></svg>用量</a></li></ul></nav>",
+      "css": ".ds-rail{width:224px;max-width:100%;padding:16px;box-sizing:border-box;background:linear-gradient(180deg,#101f36 0%,#0d1a2c 62%,#0b1728 100%);border-radius:10px;font-family:var(--font-sans, \"Noto Sans SC Subset\", \"PingFang SC\", \"Hiragino Sans GB\", \"Microsoft YaHei\", sans-serif)}.ds-nav ul{display:grid;gap:2px;margin:0;padding:0;list-style:none}.ds-nav-link{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:7px;color:#b6c7dc;text-decoration:none;font-size:13.5px;border:1px solid transparent;transition:background 140ms ease-out,color 140ms ease-out,border-color 140ms ease-out}.ds-nav-link svg{color:#7e93ad;flex:none}.ds-nav-link:hover{background:rgba(255,255,255,.055);color:#edf4fd}.ds-nav-link:hover svg{color:#a9c4e4}.ds-nav-link:focus-visible{outline:2px solid #8fbaff;outline-offset:2px}.ds-nav-link.ds-is-active{background:rgba(70,128,220,.19);border-color:rgba(126,172,240,.3);color:#fff;font-weight:500}.ds-nav-link.ds-is-active svg{color:#8fbaff}"
+    }
+  ],
+  "narrative": {
+    "northStar": "实验室记录本（The Lab Notebook）",
+    "overview": "这不是营销页，而是一张长期摊开的工作台：冷白与淡蓝灰的纸面、深海蓝的墨，蓝色只出现在真正要执行的动作上。界面的第一原则是可追踪——每条数值带来源，每次交接留下前后证据，UNKNOWN 与 Mock 从不伪装成已确认。视觉密度参考机房的记录墙与词典的阅读纪律：信息行紧凑，组与组之间留出真正的空白，不靠卡片堆叠制造层次。\n\n深色侧栏是这台工作台的装订边，承载核心状态与导航；主区始终是浅色纸面，因为用户会在白天的桌面上连续数小时阅读表格。整个系统不用插画、不用渐变文字、不用彩色左侧竖条，也不给卡片加硬阴影。页面顶部有一层极淡的蓝灰径向光晕（`body::before`，高 340px），只负责把纸面与侧栏的冷色接起来，不承载信息。\n\n动效只有三种：页面进入 320ms 的 6px 竖直位移（不改透明度，后台标签切回时不会先出现空白帧）、抽屉 220ms 从右推入并伴随 150ms 遮罩淡入、状态变化的 130–150ms 颜色过渡。`prefers-reduced-motion` 下页面位移与按钮、开关过渡全部关闭，spinner 放慢到 1600ms，骨架屏停止闪光。",
+    "keyCharacteristics": [
+      "冷白纸面 + 深海蓝侧栏，蓝色仅用于主操作与选中态",
+      "表格、信息行、带来源标签的数值，而不是卡片网格",
+      "状态用形状区分：实心点=确定，菱形=未知",
+      "全部中文界面，数字与 ID 使用等宽字体",
+      "224px 固定侧栏；窄屏折叠为横向滚动的胶囊导航"
+    ],
+    "rules": [
+      {
+        "name": "The UNKNOWN Rule",
+        "body": "未知不是空字符串，也不是 0。它必须显示为带虚线边框的琥珀色 token，或显式的 \"UNKNOWN\" 文案。",
+        "section": "colors"
+      },
+      {
+        "name": "The One Accent Rule",
+        "body": "蓝色只标记可执行的动作与当前选中项。标题、图标、分隔线都不染色。",
+        "section": "colors"
+      },
+      {
+        "name": "The Evidence Color Rule",
+        "body": "状态色只由状态本身决定，不由位置或强调级别决定；红色不用于\"重要\"，绿色不用于\"推荐\"。",
+        "section": "colors"
+      },
+      {
+        "name": "The 11px Floor Rule",
+        "body": "功能性文字不低于 11px。表头、时间戳、元数据都遵守；本系统没有装饰性小字。",
+        "section": "typography"
+      },
+      {
+        "name": "The Tabular Rule",
+        "body": "任何需要对齐、比较或复制的数字都用 .num / .num-cell：等宽字体加 font-variant-numeric: tabular-nums，不靠手动空格对齐。",
+        "section": "typography"
+      },
+      {
+        "name": "The Border-Once Rule",
+        "body": "每个容器只声明一种边界：要么 1px 描边，要么投影，不叠加\"幽灵卡片\"。",
+        "section": "elevation"
+      },
+      {
+        "name": "The No-Panel-Shadow Rule",
+        "body": "面板、表格、读数条与卡片一律不带阴影；抬升感由明度差与 1px 描边完成。",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do 用信息行和表格承载数据，保持 9–14px 的紧凑单元格内边距。",
+      "Do 给每个数值标注来源与时间；缺失时显示虚线琥珀色 UNKNOWN。",
+      "Do 用实心圆点/菱形区分已知与未知状态。",
+      "Do 保持 4.5:1 以上的正文与占位符对比度（已验证：正文 14.7:1、次要 6.2:1、弱化 5.0:1、主按钮白字 5.8:1）。",
+      "Do 在窄屏让表格自身滚动、导航横向滚动，页面主体不横向溢出。",
+      "Do 让动效只承担状态说明：130–150ms 的颜色过渡、6px 的页面进入位移，并在 prefers-reduced-motion 下关闭。"
+    ],
+    "donts": [
+      "Don't 使用渐变文字、彩色左侧竖条、零偏移彩色光晕或硬偏移阴影。",
+      "Don't 把卡片网格当作页面主结构；面板内最多再嵌一层子区块。",
+      "Don't 用 emoji 或 Unicode 符号代替图标；图标统一为 stroke-width=\"1.6\" 的线性 SVG 描边（无单位，随图标尺寸缩放）。",
+      "Don't 用 0 或空字符串表示未知，也不用\"大概\"\"可能\"掩盖未取得的数据。",
+      "Don't 把 Mock 适配器、官网入口或合成夹具描述成已验证的真实集成。",
+      "Don't 假设 .input / .select / .textarea 已有共享皮肤：当前没有基础规则，新增表单前先补齐共享层，而不是在页面里另造一套控件外观。"
+    ]
+  }
+}

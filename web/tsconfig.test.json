@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": [
+      "node"
+    ],
+    "outDir": ".test-build",
+    "rootDir": "..",
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
+  },
+  "include": [
+    "tests",
+    "src/lib/contract.ts",
+    "src/lib/format.ts",
+    "src/lib/modelsdev.ts",
+    "src/lib/usage.ts",
+    "../adapters"
+  ]
+}

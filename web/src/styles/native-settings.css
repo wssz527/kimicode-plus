@@ -1,0 +1,210 @@
+/* ---------- 原生设置：结构化编辑器 ---------- */
+
+.ns-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-height: 30px;
+  padding: 3px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+}
+
+.ns-tags:focus-within {
+  outline: 2px solid var(--focus);
+  outline-offset: 0;
+  border-color: var(--accent);
+}
+
+.ns-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 3px 1px 7px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.ns-tag button {
+  display: inline-grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.72;
+}
+
+.ns-tag button:hover {
+  opacity: 1;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.ns-tag-input {
+  flex: 1 1 110px;
+  min-width: 88px;
+  padding: 1px 2px;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--ink);
+}
+
+.ns-tag-input:focus-visible {
+  outline: none;
+  border: 0;
+}
+
+.ns-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ns-pool-list,
+.ns-rule-list {
+  display: grid;
+}
+
+.ns-pool-row,
+.ns-rule-row {
+  display: grid;
+  gap: 6px;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.ns-pool-row:last-child,
+.ns-rule-row:last-child {
+  border-bottom: 0;
+}
+
+.ns-pool-row {
+  grid-template-columns: 56px minmax(0, 1fr) minmax(0, 1fr) 24px;
+  grid-template-areas: "default model desc remove";
+}
+
+.ns-rule-row {
+  grid-template-columns: 92px minmax(0, 1.2fr) 100px minmax(0, 1fr) 24px;
+  grid-template-areas: "decision pattern scope reason remove";
+}
+
+.ns-head-cell {
+  font-size: 11px;
+  color: var(--ink-faint);
+  letter-spacing: 0.02em;
+}
+
+.ns-pool-headrow,
+.ns-rule-headrow {
+  display: grid;
+  gap: 6px;
+  padding: 0 0 5px;
+  border-bottom: 1px solid var(--line);
+}
+
+.ns-pool-headrow {
+  grid-template-columns: 56px minmax(0, 1fr) minmax(0, 1fr) 24px;
+}
+
+.ns-rule-headrow {
+  grid-template-columns: 92px minmax(0, 1.2fr) 100px minmax(0, 1fr) 24px;
+}
+
+.ns-default {
+  grid-area: default;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ns-default input {
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+.ns-pool-model {
+  grid-area: model;
+}
+
+.ns-pool-desc {
+  grid-area: desc;
+}
+
+.ns-rule-decision {
+  grid-area: decision;
+}
+
+.ns-rule-pattern {
+  grid-area: pattern;
+}
+
+.ns-rule-scope {
+  grid-area: scope;
+}
+
+.ns-rule-reason {
+  grid-area: reason;
+}
+
+.ns-row-remove {
+  grid-area: remove;
+  justify-self: end;
+}
+
+.ns-empty-line {
+  padding: 10px 0;
+  font-size: 11.5px;
+  color: var(--ink-muted);
+}
+
+.ns-rule-row > .ns-issue {
+  grid-column: 1 / -1;
+}
+
+.ns-issue {
+  padding: 6px 9px;
+  border-radius: var(--radius-sm);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+@container (max-width: 560px) {
+  .ns-pool-headrow,
+  .ns-rule-headrow {
+    display: none;
+  }
+
+  .ns-pool-row {
+    grid-template-columns: 56px minmax(0, 1fr) 24px;
+    grid-template-areas:
+      "default model remove"
+      "desc desc desc";
+  }
+
+  .ns-rule-row {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 24px;
+    grid-template-areas:
+      "decision scope remove"
+      "pattern pattern pattern"
+      "reason reason reason";
+  }
+}

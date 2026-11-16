@@ -1,0 +1,90 @@
+{
+  "ids": [
+    {
+      "value": "my.gateway",
+      "valid": true
+    },
+    {
+      "value": "Upper",
+      "valid": false
+    },
+    {
+      "value": "_first",
+      "valid": false
+    },
+    {
+      "value": ".first",
+      "valid": false
+    },
+    {
+      "value": "1first",
+      "valid": true
+    },
+    {
+      "value": "with space",
+      "valid": false
+    },
+    {
+      "value": " padded ",
+      "valid": false
+    },
+    {
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": true
+    },
+    {
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false
+    },
+    {
+      "value": "",
+      "valid": false
+    }
+  ],
+  "urls": [
+    {
+      "value": "http://127.0.0.1:11434/v1",
+      "valid": true
+    },
+    {
+      "value": "http://[::1]:11434/v1",
+      "valid": true
+    },
+    {
+      "value": "http://localhost:8000/api",
+      "valid": true
+    },
+    {
+      "value": "https://example.com/v1",
+      "valid": true
+    },
+    {
+      "value": "http://example.com/v1",
+      "valid": false
+    },
+    {
+      "value": "https://example.com/?x=1",
+      "valid": false
+    },
+    {
+      "value": "https://example.com/#x",
+      "valid": false
+    },
+    {
+      "value": "https://user:example@example.com/v1",
+      "valid": false
+    },
+    {
+      "value": "https://example.com:0/v1",
+      "valid": false
+    },
+    {
+      "value": "file:///tmp/x",
+      "valid": false
+    },
+    {
+      "value": "http://127.1:8000/v1",
+      "valid": false
+    }
+  ]
+}

@@ -1,0 +1,326 @@
+package server
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log"
+	"net/http"
+	"path"
+	"strings"
+	"time"
+
+	"enhancedkimi/internal/bridge"
+	"enhancedkimi/internal/chat"
+	"enhancedkimi/internal/config"
+	"enhancedkimi/internal/credentials"
+	"enhancedkimi/internal/desktop"
+	"enhancedkimi/internal/future"
+	"enhancedkimi/internal/gateway"
+	"enhancedkimi/internal/httpx"
+	"enhancedkimi/internal/plugins"
+	"enhancedkimi/internal/provider"
+	"enhancedkimi/internal/registry"
+	"enhancedkimi/internal/security"
+	"enhancedkimi/internal/usage"
+	"enhancedkimi/internal/webassets"
+)
+
+const Version = "0.2.0"
+
+type Module struct {
+	ID      string `json:"id"`
+	State   string `json:"state"`
+	Message string `json:"message,omitempty"`
+}
+type NativeOptions struct {
+	Home string
+	CWD  string
+}
+
+type App struct {
+	Handler     http.Handler
+	Settings    *config.Store
+	modules     []Module
+	pluginClose func() error
+	pluginSafe  func()
+	adapter     *desktop.Mock
+	native      *desktop.NativeService
+	started     time.Time
+	gateway     *gateway.Gateway
+	planner     *chat.PlannerService
+	gatewayErr  string
+	gatewayBase string
+}
+
+// New builds the core without the local gateway. A build that wants /v1 uses
+// NewWithGateway; the split keeps existing callers unchanged and makes serving
+// /v1 an explicit decision.
+func New(db *sql.DB, guard *security.Guard, forceSafe bool) (*App, error) {
+	return NewWithGateway(db, guard, forceSafe, "")
+}
+
+// NewWithGateway builds the core and, when gatewayToken is non-empty, mounts
+// the local OpenAI-compatible gateway. An empty token leaves /v1 unmounted
+// rather than serving it open.
+func NewWithGateway(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayToken string) (*App, error) {
+	return NewWithNative(db, guard, forceSafe, gatewayToken, NativeOptions{})
+}
+
+func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayToken string, native NativeOptions) (*App, error) {
+	cfg, err := config.New(db)
+	if err != nil {
+		return nil, err
+	}
+	if forceSafe && !cfg.Safe() {
+		v, e := cfg.Get()
+		if e != nil {
+			return nil, e
+		}
+		v.SafeMode = true
+		if e = cfg.Put(v); e != nil {
+			return nil, e
+		}
+	}
+	settings, err := cfg.Get()
+	if err != nil {
+		return nil, err
+	}
+	app := &App{Settings: cfg, started: time.Now(), adapter: desktop.NewMock()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /enhance/v1/pair", guard.Pair)
+	app.adapter.Register(mux)
+	add := func(id string, init func() error) {
+		if !settings.Modules[id] {
+			app.modules = append(app.modules, Module{id, "DISABLED", "重启后应用模块设置"})
+			return
+		}
+		if err := init(); err != nil {
+			app.modules = append(app.modules, Module{id, "FAULTED", "初始化失败，其余模块仍可使用"})
+			log.Printf("module %s initialization failed", id)
+		} else {
+			app.modules = append(app.modules, Module{id, "READY", ""})
+		}
+	}
+	add("registry", func() error {
+		s, e := registry.New(db)
+		if e == nil {
+			s.Register(mux)
+		}
+		return e
+	})
+	var ledger *usage.Service
+	add("usage", func() error {
+		s, e := usage.New(db)
+		if e == nil {
+			s.Register(mux)
+			ledger = s
+		}
+		return e
+	})
+	add("bridge", func() error {
+		s, e := bridge.New(db, app.adapter, cfg.Safe)
+		if e == nil {
+			s.UseDispatchGate(func(fn func() error) error {
+				err := cfg.Dispatch(fn)
+				if errors.Is(err, config.ErrSafeMode) {
+					return desktop.ErrSafeMode
+				}
+				return err
+			})
+			s.Register(mux)
+		}
+		return e
+	})
+	add("plugins", func() error {
+		s, e := plugins.New(db, cfg.Safe)
+		if e == nil {
+			s.Register(mux)
+			s.RegisterPortable(mux, ledger)
+			app.pluginClose = s.Close
+			app.pluginSafe = s.EnforceSafeMode
+		}
+		return e
+	})
+	var providerClient *provider.Client
+	credentialStatus := "UNAVAILABLE"
+	vault, vaultErr := credentials.NewVault(db)
+	if vaultErr == nil {
+		vault.Register(mux)
+		providerClient = provider.New(db, vault)
+		providerClient.Register(mux)
+		credentialStatus = "ENCRYPTED_VAULT_MANUAL_UNLOCK"
+		closePlugins := app.pluginClose
+		app.pluginClose = func() error {
+			vault.Lock()
+			if closePlugins != nil {
+				return closePlugins()
+			}
+			return nil
+		}
+		browser, e := future.NewBrowserStore(db, vault.BrowserStore(), cfg.Dispatch)
+		if e == nil {
+			browser.Register(mux)
+			app.modules = append(app.modules, Module{"browser-store", "READY", "隔离加密会话库，原生浏览器未连接"})
+		}
+	}
+	workspace, workspaceErr := future.NewWorkspace(db, cfg.Safe, cfg.Dispatch)
+	if workspaceErr == nil {
+		workspace.Register(mux)
+		app.modules = append(app.modules, Module{"workspace", "READY", "本地会话引用与策略，原生执行未连接"})
+	}
+	if providerClient != nil && gatewayToken != "" {
+		gw := gateway.New(providerClient, ledger, cfg.Dispatch, gatewayToken)
+		gw.Register(mux)
+		mux.HandleFunc("GET /enhance/v1/gateway", func(w http.ResponseWriter, r *http.Request) {
+			httpx.JSON(w, 200, map[string]any{"enabled": true, "baseUrl": app.gatewayBase, "tokenMasked": gateway.MaskToken(gatewayToken), "tokenAvailable": true, "streaming": true, "reasoningContent": true, "toolCalls": true, "multiAccount": false, "writesUserConfig": false})
+		})
+		mux.HandleFunc("GET /enhance/v1/gateway/preview", func(w http.ResponseWriter, r *http.Request) {
+			httpx.JSON(w, 200, gw.PreviewConfig(app.gatewayBase))
+		})
+		app.gateway = gw
+		app.modules = append(app.modules, Module{"gateway", "READY", "本机 OpenAI 兼容网关，单账号穿透"})
+	} else {
+		// No token means /v1 is not mounted at all. It is not a faulted module,
+		// so it must not appear as a degraded core capability.
+		app.gatewayErr = "未提供本地网关令牌"
+	}
+	chats, err := chat.New(db)
+	chatReady := err == nil
+	if chatReady {
+		if providerClient != nil {
+			chats.UseProvider(providerClient, ledger, cfg.Dispatch)
+		}
+		chats.Register(mux)
+		app.modules = append(app.modules, Module{"chat", "READY", ""})
+	} else {
+		app.modules = append(app.modules, Module{"chat", "FAULTED", "聊天初始化失败，其余模块仍可使用"})
+	}
+	if native.Home != "" {
+		nativeService, nativeErr := newNativeIntegration(db, native, cfg.Safe)
+		if nativeErr != nil {
+			app.modules = append(app.modules, Module{"native-host", "FAULTED", "原生服务初始化失败，其余模块仍可使用"})
+		} else {
+			nativeService.Register(mux)
+			app.native = nativeService
+			if chatReady && app.gateway != nil {
+				planner, plannerErr := chat.NewPlanner(db, app.gateway, native.CWD, nativeService.Events())
+				if plannerErr != nil {
+					app.modules = append(app.modules, Module{"planner", "FAULTED", "规划持久化初始化失败，其余模块仍可使用"})
+				} else {
+					nativeService.UsePlanner(planner)
+					app.planner = planner
+					app.modules = append(app.modules, Module{"planner", "READY", "持久化流式规划、工作区工具与逐次审批"})
+				}
+			}
+			app.modules = append(app.modules, Module{"native-host", "READY", "官方会话适配与版本化 RPC 动作层"})
+		}
+	}
+	compactionStatus := "POLICY_ONLY_NATIVE_UNCONNECTED"
+	if app.native != nil {
+		compactionStatus = "NATIVE_SCHEDULER_WITH_RECEIPTS"
+	}
+	mux.HandleFunc("GET /enhance/v1/health", func(w http.ResponseWriter, r *http.Request) {
+		httpx.JSON(w, 200, map[string]any{"status": "OK", "version": Version, "safeMode": cfg.Safe(), "modules": app.modules, "uptimeMs": time.Since(app.started).Milliseconds(), "adapter": app.adapter.Status(r.Context()), "compaction": compactionStatus, "credentials": credentialStatus})
+	})
+	mux.HandleFunc("GET /enhance/v1/settings", func(w http.ResponseWriter, r *http.Request) {
+		v, e := cfg.Get()
+		if e != nil {
+			httpx.Fail(w, 500, "STORAGE_ERROR", "无法读取设置")
+			return
+		}
+		httpx.JSON(w, 200, v)
+	})
+	mux.HandleFunc("PUT /enhance/v1/settings", func(w http.ResponseWriter, r *http.Request) {
+		var update config.Update
+		if !httpx.Decode(w, r, &update) {
+			return
+		}
+		v, inputErr := update.Value()
+		if inputErr != nil {
+			httpx.Fail(w, 422, "INVALID_SETTINGS", "所有设置必须明确填写，未知值不能替代开关或版本号")
+			return
+		}
+		if chatReady {
+			var n int
+			if e := db.QueryRow(`SELECT count(*) FROM chat_sources WHERE id=?`, v.DefaultChatSource).Scan(&n); e != nil || n == 0 {
+				httpx.Fail(w, 422, "INVALID_SOURCE", "默认聊天来源不存在")
+				return
+			}
+		} else {
+			current, e := cfg.Get()
+			if e != nil || current.DefaultChatSource != v.DefaultChatSource {
+				httpx.Fail(w, 409, "SOURCE_UNAVAILABLE", "聊天模块不可用，恢复后再更换默认来源")
+				return
+			}
+		}
+		if e := cfg.Put(v); e != nil {
+			if errors.Is(e, config.ErrConflict) {
+				httpx.Fail(w, 409, "CONFIG_CONFLICT", "设置已变化，请刷新后再保存")
+			} else {
+				httpx.Fail(w, 422, "INVALID_SETTINGS", "设置无效，请检查模块和空闲分钟数")
+			}
+			return
+		}
+		if cfg.Safe() && app.pluginSafe != nil {
+			app.pluginSafe()
+		}
+		v, e := cfg.Get()
+		if e != nil {
+			httpx.Fail(w, 500, "STORAGE_ERROR", "设置已保存，但暂时无法读回")
+			return
+		}
+		httpx.JSON(w, 200, v)
+	})
+	for _, method := range []string{"GET", "POST", "PUT", "PATCH", "DELETE"} {
+		mux.HandleFunc(method+" /enhance/", func(w http.ResponseWriter, r *http.Request) {
+			httpx.Fail(w, 404, "NOT_FOUND", "接口不存在或模块未启用")
+		})
+	}
+	assets := webassets.FS()
+	files := http.FileServer(http.FS(assets))
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
+		if p == "." || p == "" {
+			p = "index.html"
+		}
+		if _, e := fs.Stat(assets, p); e != nil {
+			if path.Ext(p) != "" {
+				http.NotFound(w, r)
+				return
+			}
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/"
+			files.ServeHTTP(w, r2)
+			return
+		}
+		files.ServeHTTP(w, r)
+	})
+	app.Handler = recoverer(guard.Wrap(mux))
+	return app, nil
+}
+func (a *App) Close() error {
+	if a.planner != nil {
+		a.planner.Close()
+	}
+	if a.native != nil {
+		a.native.Close()
+	}
+	if a.pluginClose != nil {
+		return a.pluginClose()
+	}
+	return nil
+}
+func recoverer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if recover() != nil {
+				log.Printf("request isolated id=%s", security.Random()[:12])
+				httpx.Fail(w, 500, "INTERNAL_ERROR", "操作失败，核心服务仍在运行")
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+func (a *App) String() string { return fmt.Sprintf("Enhanced Kimi Desktop %s", Version) }

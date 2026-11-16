@@ -1,0 +1,30 @@
+{
+  "name": "enhanced-kimi-workbench",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test:build": "tsc -p tsconfig.test.json",
+    "test": "npm run test:build && node --test .test-build/web/tests/*.test.js",
+    "clean": "rm -rf dist .test-build node_modules/.cache/test-build",
+    "build:host": "vite build --config vite.host.config.ts"
+  },
+  "dependencies": {
+    "react": "19.2.9",
+    "react-dom": "19.2.9",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.7",
+    "@vitejs/plugin-react": "5.2.0",
+    "typescript": "5.9.3",
+    "vite": "7.3.8"
+  }
+}

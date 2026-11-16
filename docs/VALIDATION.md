@@ -1,0 +1,122 @@
+# 功能与验证记录
+
+改动保存在当前 Git 工作树，未新建发布提交或上传文件。独立数据位于相邻 `../work/` 的隔离目录，不修改官方程序包或开发主实例。
+
+## 当前原生聚合验收（2026-11-16）
+
+| 范围 | 当前结果 | 证据与限制 |
+|---|---|---|
+| 正式宿主连接 | 隔离 Kimi Code 1.3.5 / Electron 45.1.0 的版本、DOM revision 1、RPC 来源与核心读取检查通过 | 主实例未操作；当前返修脚本为 `../work/ekd-final-integration/verify-review-fixes.mjs`，旧 `verify-native-ui/flow.mjs` 仅保留早期记录 |
+| 核心与界面恢复 | 核心重启、旧连接清理、入口去重、空会话挂载和官方单会话恢复已验证；Vue 重建后原生子节点不漏出；原生浏览器已打开时重连仍恢复侧栏 | `verify-review-fixes.mjs`；最终构建的 `final-native-smoke.mjs` 在工具模板数量为 0 时验证 Monitor/设置入口、默认网页规划和 11 项设置，`final-native-smoke-result.json`；`final-native-settings.png`、`final-native-sidebar.png` 已读回 |
+| 原生界面 | 深浅色、760px 设置窄窗、900px 三窗格、双/三窗格输入区无重叠通过；统一规划入口默认网页 | `review-fixes-result.json`、`review-multi-dark.png`、`review-multi-light.png`、`review-multi-narrow.png`；无常驻工作台/选择器/空闲状态带 |
+| 本地规划 | 合成供应商下真实流式、停止、write 审批、多选与编辑交接通过 | `verify-planner-flow.mjs`、`review-planner-flow-dark.png`；批准前未写文件，批准后读回，Code 真实接收文本，未暗改默认模型 |
+| 多会话 | 同一入口从两窗格追加到三窗格，侧栏切换主窗格、已显示会话交换、草稿保留；并行更新、独立停止、模型/模式与 Read 审批通过 | `verify-review-fixes.mjs`、`verify-multi-session.mjs`、`review-multi-session-dark.png`；权限规则在 finally 恢复 |
+| 附件与消息 | 点加号、附件条目、权限选择、真实 KAP 文件发送、消息时间及引用回复通过 | `verify-attachment-flow.mjs`、`review-attachment-result.json`；文件对话框返回值使用确定性替身，未实际 GUI 点选系统文件窗口，后续 KAP 发送和消息读回为真实调用 |
+| 网页到 Code | 合成网页真实 WebContents 选区提取、编辑预览、已有会话交接与回复通过 | `verify-web-flow.mjs`、`review-web-flow-view.png`；可见性、弹层遮挡与坐标核对通过，不证明网站内自动聊天 |
+| 设置聚合 | 单层 11 项列表嵌入官方设置，旧多层导航移除；标签顺序、原生标签恢复、缓存撤销/默认/保存读回通过 | `verify-review-fixes.mjs`；`verify-settings-flow.mjs` 验证布局、网站权限保存后恢复和真实模型目录；`review-settings-list-dark.png`、`review-settings-models-dark.png`、`review-settings-narrow-light.png` |
+| 恢复面板与 Monitor | 手动监听、检查、撤销和官方单会话恢复通过；Monitor 默认约 233px，详情折叠，无样本显示未知 | `verify-recovery-flow.mjs`、`review-sidebar-dark.png`；自动化测试期间暂关并恢复原值，不把隔离配置的 recovery.enabled=true 说成默认值 |
+| 自动化执行 | 五秒调度、保活、compact ACK/完成、额度窗口、Goal 阻断、撤销及重启 UNKNOWN 均有合成 KAP 回归 | `internal/desktop/automation_test.go`；产品三项默认关闭，未启用真实账号自动动作 |
+| 前端静态检查 | TypeScript 类型检查、61 项测试及完整 build 通过 | `web/` 当前源码和 `scripts/build.sh`；含按官方会话切换时不重复窗格的回归 |
+| Go 与二进制 | 生产包测试、desktop/chat race、vet 通过；二进制 21/21 验收通过 | `go test ./cmd/... ./internal/...`、`go test -race ./internal/desktop ./internal/chat`、`python3 scripts/acceptance.py --binary ./dist/enhanced-kimi` |
+
+本轮没有调用真实付费模型、真实网站账号或真实浏览器 Cookie。自动化三项产品默认关闭；实机恢复脚本暂关自动化并在结束后恢复隔离环境原值，不能把合成调度测试说成真实账号自动化验收。规划、多会话、设置和恢复面板的主视图截图已读回，网页子视图截图也已读回；主 WebContents 截图不包含子 WebContentsView，当前录屏权限未取得完整窗口合成截图，不能据此声称具有完整窗口视觉证据。
+
+UI 机械检查最初报告两项：Markdown 引用块左边线是语义样式而非装饰卡片，保留；Monitor 进度条的宽度动画已移除。机械检查不能替代上述实机操作与截图检查。
+
+## 0.2.0 历史基线
+
+以下记录保留早期独立核心、模型、用量和设置挂载的历史结果。其中的“未完成”只描述当时基线；与当前原生状态的关系以 `NATIVE_INTEGRATION.md` 为准。
+
+## 审查项处理
+
+| 项目 | 本轮处理 | 证据 |
+|---|---|---|
+| F01/F02/F04/F05/F06/F07/F08 | 继承审查已关闭的配置、附件、派发、用量、目录及证据修复，不重复重写 | 原生产回归和二进制场景继续通过；旧审查包保留在 work/ |
+| F03：模型抽屉乱序 | 请求代次绑定当前模型，关闭/卸载使旧响应失效；实体与 revision 一起固定 | web/tests/async-target.test.ts，第一个生产处理函数回归 |
+| F03：公共导入错目标 | 预览绑定来源/目标，请求代次与当前选择复核；改选清空预览，保存核对目标 | 同文件第二个回归；实际公共导入及页面读回 |
+| F09：宿主体验 | 设置区嵌入、子页返回、主题变量、上下文回调与可装配 ES 模块已实现 | 隔离 Kimi Code 1.3.4 的真实设置页挂载、核心读取、标签还原、关闭重开与重复注入；正式 IPC/常驻产品接入仍未完成，最新 embed 版尚无可用系统截图 |
+| 本轮发现的主题覆盖 | 深色主题选择器覆盖内层 ekd-root，修正提示文字颜色和标题选择器 | 最终 Go 内嵌页面深浅模式实际查看 |
+
+F03 回归通过 TypeScript AST 抽取生产处理函数并执行受控异步请求，不等同于 React DOM 或跨浏览器端到端测试。前端原直方图测试使用过期固定日期，改为当天 UTC 夹具；生产用量计算未改变。
+
+## 实际功能增量
+
+- AES-256-GCM 加密凭据库，口令派生、锁定、secretRef；无明文读取 API。
+- Go 供应商模型目录及四种轻量聊天协议，稳定请求意图、12 条上下文、持久请求状态与用量；UNKNOWN 不自动重发。
+- 本地会话引用、Worktree、布局/Reviewer 偏好、分层压缩条件评估。
+- 用户导出 JSON 的站点/全部范围、Cookie 目标冲突、加密隔离保存及独立网站权限。
+- 可信 Go 指令整理和 Monitor 兼容用量导入，无独立 Node 服务。
+- 真实可操作的二级页面及可装配宿主界面模块；隔离 Kimi Code 设置页的运行时入口已验证，正式 IPC 与常驻产品接入尚未完成。
+
+- 用户显式路径的只读凭据导入、Unix 秒 expires_at 预览、供应商账号 revision/启停/优先级与默认停用边界。
+- 轻量聊天 UNKNOWN 的显式核对解除；INFLIGHT 不可解除，审计不改写、不自动重发。
+- 独立本机令牌保护的 OpenAI/Kimi 网关，支持流式/非流式、reasoning_content、Kimi 扩展字段、工具调用回环、用量与账号归因。官方 Kimi CLI 2.4.1 已在隔离 Home 中通过合成上游完成文本和真实 Read 工具回合。
+
+## 2026-11-13 增量复验
+
+- Go：`go vet ./internal/... ./cmd/...` 与 `go test ./internal/... ./cmd/... -count=1` 覆盖全部生产包；网关含真实二进制、工具分片、流完整性、上游错误和整流 dispatch 锁回归。
+- 前端：TypeScript 类型检查通过，57/57 测试通过；最终 `scripts/build.sh` 的普通 Vite、host 模块、Go 内嵌构建与依赖通知均成功。
+- 最终二进制：`python3 scripts/acceptance.py --binary ./dist/enhanced-kimi` 21/21 通过。真实 CLI 与原生设置页复验均使用该最终 `dist/enhanced-kimi`，不是只验证临时构建。
+- 真实 CLI：`../work/ekd-gateway-acceptance/result.json` 为 PASS。直接 SSE 证据含推理、stop、纯 usage 和 `[DONE]`；`cli-tool.stdout.jsonl` 含 Read 调用、实际文件内容、相同 tool_call_id 和 EKD_TOOL_ROUNDTRIP_OK。所有账号、密钥、上游和配置均为隔离合成数据。
+- 原生设置页：最新 embed 版的标签样式、隐藏旧顶栏、核心读取、模型导航、原生标签恢复、主题同步、关闭重开、重复注入及 Core 重启后重新配对均通过。系统截图仍不可用，未宣称最新视觉截图验收。
+
+## 原始自动化输出
+
+日志路径相对项目根目录。没有将旧版本结果充当本轮结果。
+
+| 检查 | 结果 | 日志 |
+|---|---|---|
+| Go 生产范围 go test -v ./cmd/... ./internal/... | 191 顶层、61 子测试通过；1 个显式联网测试跳过 | work/go-core-test.log |
+| 最后一次聊天派发修改后的相关回归 | chat/server 5 顶层、7 子测试通过 | work/final-chat-server.log |
+| go vet ./cmd/... ./internal/... | exit 0，无诊断 | work/go-vet.log |
+| F03 两个异步目标回归 | 2/2 通过 | work/f03-regression.log |
+| 前端测试 | 53/53 通过 | work/frontend-final.log |
+| 最终 TypeScript 类型检查 | exit 0 | work/typecheck-0.2.0.log |
+| 完整 scripts/build.sh | 普通 Vite、host 模块、内嵌 Go、依赖通知成功 | work/build-0.2.0.log |
+| 最终发布二进制 | 21 组通过 | work/binary-final-0.2.0.log |
+| Git Worktree 实际 HTTP 调用 | 临时仓库 detached 创建、文件读回及清理通过 | work/worktree-0.2.0.log |
+| 五平台交叉构建 | exit 0 | work/crossbuild-0.2.0.log、work/platform-sizes-0.2.0.json |
+| UI 机械检查 | 空 findings | work/ui-detector-0.2.0.json |
+
+首次 go test ./... 也扫描到 work/review-0.1.1/return/evidence/ 中依赖旧测试私有函数的孤立探针，导致该目录编译失败。它不是生产包，未删除旧证据；后续命令显式限定 cmd/internal。不能把整个仓库递归测试称为通过。本轮未重新执行 race 检查。
+
+最后的聊天回归覆盖凭据密文、重启锁定、四协议本地 HTTP、请求幂等、空响应 UNKNOWN、不能换 intent 重发、实际响应用量入账、Cookie 来源 storeId 冲突、压缩条件与可信插件。所有供应商响应来自 httptest，不调用真实模型。
+
+## 界面与公开元数据
+
+本轮使用内置浏览器直接访问最终 Go 服务，未启动额外浏览器运行时。
+
+- 真实读取 https://models.dev/api.json，显式将 moonshotai 映射到独立本地 kimi 实例，预览并导入 6 个模型。抓取时间为 2026-11-11T01:46:38.667996Z，不依据模型名称猜测能力。
+- 模型显示名改为本地别名，保存读回；最终服务重启后仍保留相同名称与目录。
+- 在 1280×720 实际查看最终构建的深浅模型页面和返回设置入口。
+- 会话引用通过表单保存，列表、项目和布局区读回一致；不代表官方真实会话。
+- 从一条明确标记 MOCK 的独立历史中只选一条用户消息，进入交接页并成功调用 Go 脱敏预览。返回任务包保留相同消息 ID、来源线程、目标本地会话和项目。页面明确“未发送”，原生提交按钮禁用，Outbox 仍为 0。
+- 最终主题截图保留于 work/ui-dark-models-0.2.0.png 与 work/ui-light-models-0.2.0.png。
+
+独立界面截图不证明宿主兼容性。早期运行时挂载曾保存真实窗口截图 work/ekd-native-acceptance/settings-screen.png，但它是隐藏 EKD 顶栏之前的旧界面，不能作为最新 embed 版视觉证据。最新嵌入版已通过真实设置页的 DOM、计算样式、核心读取与生命周期验收；当前 macOS `screencapture` 连探测区域都返回 `could not create image from rect`，因此最新视觉截图仍未取得。实际交接仍受 Mock 边界限制。网页入口只导航，不执行网站操作。
+
+## 平台、体积与性能
+
+| 平台 | 二进制字节 | 本轮状态 |
+|---|---:|---|
+| macOS ARM64 | 14,227,314 | 原生运行、内嵌界面、21 组二进制验收、性能 |
+| macOS Intel | 14,974,048 | 交叉编译成功，未原生运行 |
+| Windows x64 | 15,033,344 | 交叉编译成功，未原生运行，ACL 未验 |
+| Windows ARM64 | 14,005,248 | 扩展目标交叉编译成功，未原生运行 |
+| Linux x64 | 14,909,600 | 交叉编译成功，未原生运行，官方 Desktop 兼容性另验 |
+
+macOS ARM64 单二进制约 13.57 MiB；gzip 估算 6,430,024 字节，不是安装包。发布程序不包含 Node/Rust/Electron/Chromium。系统浏览器、用户数据和可选 Git 另计，未签名、公证或远程发布。远程 CI 未执行。
+
+macOS 26.6.2 / Apple Silicon，Go 1.27.3。五个新独立数据库；进程启动至鉴权健康就绪，10 ms 轮询，OS 文件缓存已热；启动后 1 秒按 PID 测核心 RSS，不含浏览器。不是冷启动、长期内存或压力测试。
+
+| 指标 | 中位数 | 范围 |
+|---|---:|---:|
+| 就绪 | 27.51 ms | 24.06–30.33 ms |
+| 空闲 RSS | 18.38 MiB | 18.25–18.61 MiB |
+| 关闭 | 4.70 ms | 3.70–6.85 ms |
+
+原始轮次：work/performance-0.2.0.json、work/measure-0.2.0.log。
+
+## 当前未完成项
+
+真实付费模型、真实网站内对话/上传、系统文件选择窗口 GUI 点选、真实账号自动保活/压缩/恢复、真实速度与完整缓存观测、登录态恢复、其他平台原生运行、签名公证及完整窗口合成截图仍未验收。旧通用 Outbox 仍是 Mock；真实 KAP 文本交接与本机文件发送、三会话、内嵌设置与受控调度已通过各自范围，但不能替代真实账号或全平台验收。`go test ./...` 还会扫描 `work/review-0.1.1/return/evidence/` 中依赖旧私有测试函数的孤立探针，因此生产测试必须显式限定 `./cmd/... ./internal/...`；该历史证据包不属于产品包，未修改或删除。

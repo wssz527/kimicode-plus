@@ -1,0 +1,621 @@
+/* ==========================================================================
+   KimiCode+ 设置：官方单级列表 → 内容
+   只消费宿主主题变量（--color-bg/--color-surface/--color-text/--font-ui），
+   缺失时回落到项目 theme.css 的等价 token。
+   ========================================================================== */
+
+.ekds {
+  --ekds-bg: var(--color-bg, var(--paper));
+  --ekds-surface: var(--color-surface, var(--surface-raised));
+  --ekds-text: var(--color-text, var(--ink));
+  --ekds-muted: var(--color-text-secondary, var(--ink-muted));
+  --ekds-faint: var(--color-text-faint, var(--ink-faint));
+  --ekds-line: var(--color-line, var(--line));
+  --ekds-accent: var(--color-accent, var(--accent));
+  --ekds-hover: var(--color-hover, var(--surface-sunken));
+  --ekds-radius: 14px;
+  --ekds-hairline: 1px solid var(--ekds-line);
+  --ekds-ring: var(--p-focus-ring, 0 0 0 2px var(--ekds-accent));
+  container-type: inline-size;
+  display: block;
+  min-width: 0;
+  padding: 2px 0 4px;
+  color: var(--ekds-text);
+  font-family: var(--font-ui, var(--font-sans));
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.ekds *,
+.ekds *::before,
+.ekds *::after {
+  box-sizing: border-box;
+}
+
+.ekds button,
+.ekds input,
+.ekds select,
+.ekds textarea {
+  font: inherit;
+}
+
+/* ---------- 列表 ---------- */
+
+.ekds-group {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  border-radius: var(--ekds-radius);
+  background: var(--ekds-surface);
+}
+
+.ekds-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: 52px;
+  margin: 0;
+  padding: 12px 16px;
+  border: 0;
+  border-top: var(--ekds-hairline);
+  background: transparent;
+  color: inherit;
+  text-align: start;
+  text-decoration: none;
+}
+
+.ekds-row:first-child {
+  border-top: 0;
+}
+
+.ekds-row-button {
+  cursor: pointer;
+}
+
+.ekds-row-button:hover {
+  background: var(--ekds-hover);
+}
+
+.ekds-row-button:focus-visible {
+  outline: none;
+  box-shadow: inset var(--ekds-ring);
+}
+
+.ekds-row-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ekds-row-label strong {
+  color: var(--ekds-text);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
+.ekds-row-label small {
+  color: var(--ekds-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.ekds-chevron {
+  flex: none;
+  color: var(--ekds-faint);
+}
+
+.ekds-row-button:hover .ekds-chevron {
+  color: var(--ekds-text);
+}
+
+.ekds-state {
+  flex: none;
+  color: var(--ekds-muted);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+}
+
+.ekds-state.is-ready {
+  color: var(--success, #27865a);
+}
+
+.ekds-state.is-faulted {
+  color: var(--danger, #c64b52);
+}
+
+.ekds-empty {
+  margin: 0;
+  padding: 14px 16px;
+  color: var(--ekds-muted);
+  font-size: 12px;
+}
+
+/* ---------- 内容页 ---------- */
+
+.ekds-subpage {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding-bottom: 8px;
+}
+
+.ekds-back {
+  display: inline-flex;
+  align-self: flex-start;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  margin: 0 0 2px -4px;
+  padding: 0 8px 0 4px;
+  border: 0;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: var(--ekds-muted);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.ekds-back svg {
+  transform: rotate(180deg);
+}
+
+.ekds-back:hover {
+  background: var(--ekds-hover);
+  color: var(--ekds-text);
+}
+
+.ekds-back:focus-visible {
+  outline: none;
+  box-shadow: var(--ekds-ring);
+}
+
+.ekds-subpage-head {
+  margin: 6px 0 14px;
+}
+
+.ekds-subpage-head h2 {
+  margin: 0;
+  color: var(--ekds-text);
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.ekds-subpage-head p {
+  margin: 4px 0 0;
+  color: var(--ekds-muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.ekds-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+.ekds-note {
+  max-width: 72ch;
+  margin: 0;
+  color: var(--ekds-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* ---------- 事实表 ---------- */
+
+.ekds-facts {
+  margin: 0;
+}
+
+.ekds-facts > div {
+  display: grid;
+  grid-template-columns: minmax(112px, 0.36fr) minmax(0, 1fr);
+  gap: 16px;
+  padding: 9px 0;
+  border-bottom: var(--ekds-hairline);
+}
+
+.ekds-facts dt {
+  color: var(--ekds-muted);
+  font-size: 12px;
+}
+
+.ekds-facts dd {
+  margin: 0;
+  color: var(--ekds-text);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.ekds-facts code {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+}
+
+.ekds-facts.is-inset {
+  padding: 0 16px;
+}
+
+.ekds-facts.is-inset > div:last-child {
+  border-bottom: 0;
+}
+
+/* ---------- 行内按钮 ---------- */
+
+.ekds-btn {
+  flex: none;
+  min-height: 28px;
+  padding: 0 10px;
+  border: var(--ekds-hairline);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--ekds-surface);
+  color: var(--ekds-text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ekds-btn:hover {
+  background: var(--ekds-hover);
+}
+
+.ekds-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--ekds-ring);
+}
+
+/* ---------- 开关（原生 checkbox 视觉隐藏，保留键盘焦点） ---------- */
+
+.ekds .toggle { padding: 0; align-items: center; }
+.ekds .toggle-track { width: 44px; height: 26px; margin: 0; border: 0; background: var(--ekds-line); }
+.ekds .toggle-knob { inset: 3px auto auto 3px; width: 20px; height: 20px; background: #fff; }
+.ekds .toggle input:checked + .toggle-track { background: var(--ekds-accent); }
+.ekds .toggle input:checked + .toggle-track .toggle-knob { transform: translateX(18px); }
+.ekds-row > .toggle { flex: none; }
+.ekds-row > .toggle .toggle-copy { display: none; }
+
+/* ---------- 数字输入 ---------- */
+
+.ekds-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.ekds-field-inline {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  color: var(--ekds-muted);
+  font-size: 12px;
+}
+
+.ekds-num {
+  width: 86px;
+  min-height: 30px;
+  padding: 3px 8px;
+  border: var(--ekds-hairline);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--ekds-bg);
+  color: var(--ekds-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.ekds-num:focus-visible {
+  outline: none;
+  border-color: var(--ekds-accent);
+  box-shadow: var(--ekds-ring);
+}
+
+.ekds-row-controls {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px 14px;
+}
+
+/* ---------- 列表型内容（恢复队列） ---------- */
+
+.ekds-list {
+  display: grid;
+  padding: 0 16px;
+}
+
+.ekds-list > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 12px;
+  padding: 9px 0;
+  border-top: var(--ekds-hairline);
+}
+
+.ekds-list strong {
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.ekds-list span {
+  color: var(--ekds-muted);
+  font-size: 12px;
+}
+
+.ekds-list small {
+  grid-column: 1 / -1;
+  color: var(--ekds-faint);
+  font-size: 11.5px;
+}
+
+/* ---------- 保存栏 ---------- */
+
+.ekds-savebar {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+  padding: 10px 0;
+  border-top: var(--ekds-hairline);
+  background: var(--ekds-bg);
+}
+
+.ekds-savebar > span {
+  margin-right: auto;
+  color: var(--ekds-muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.ekds-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 140px;
+  color: var(--ekds-muted);
+  font-size: 12px;
+}
+
+/* ---------- 内嵌既有页面：密度、宽度、内层标题 ---------- */
+
+.ekds-embed {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.ekds-embed > * {
+  min-width: 0;
+}
+.ekds-embed .form-grid { display: grid; gap: 12px; }
+.ekds-embed .form-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; }
+.ekds-embed :is(.input, .select, .textarea) { width: 100%; min-width: 0; min-height: 32px; padding: 6px 9px; border: 1px solid var(--ekds-line); border-radius: 6px; background: var(--ekds-bg); color: var(--ekds-text); font: inherit; }
+.ekds-embed .textarea { min-height: 80px; resize: vertical; }
+.ekds-embed :is(.input, .select, .textarea):focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.ekds-embed input[type=checkbox] { accent-color: var(--ekds-accent); }
+.ekds-embed input[type=file] { max-width: 100%; color: var(--ekds-muted); font-size: 12px; }
+.ekds-embed input[type=file]::file-selector-button { margin-right: 10px; padding: 5px 9px; border: 1px solid var(--ekds-line); border-radius: 6px; background: var(--ekds-bg); color: var(--ekds-text); font: inherit; cursor: pointer; }
+
+.ekds-embed .page {
+  gap: 14px;
+  min-width: 0;
+  animation: none;
+}
+
+/* 内层页头只保留操作与计数：标题和说明已经在内容页顶部给过一次。 */
+.ekds-embed .page-head {
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.ekds-embed .page-head h1,
+.ekds-embed .page-head-copy > p {
+  display: none;
+}
+
+.ekds-embed .page-head-copy {
+  max-width: 72ch;
+}
+
+.ekds-embed .page-meta {
+  gap: 4px 14px;
+  margin-top: 0;
+  font-size: 11.5px;
+  color: var(--ekds-faint);
+}
+
+.ekds-embed .page-actions {
+  gap: 6px;
+}
+
+.ekds-embed .page-head:not(:has(.page-actions)) {
+  display: none;
+}
+
+.ekds-embed .models-layout,
+.ekds-embed .usage-grid,
+.ekds-embed .settings-grid,
+.ekds-embed .plugins-grid,
+.ekds-embed .handoff-layout,
+.ekds-embed .form-grid,
+.ekds-embed .import-columns {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.ekds-embed .models-rail,
+.ekds-embed .usage-rail,
+.ekds-embed .settings-rail,
+.ekds-embed .plugins-rail,
+.ekds-embed .handoff-rail {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(238px, 1fr));
+  gap: 12px;
+}
+
+.ekds-embed .panel {
+  border-radius: 12px;
+  background: var(--ekds-surface);
+  box-shadow: none;
+}
+
+.ekds-embed .panel-head {
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 40px;
+  padding: 9px 14px;
+}
+
+.ekds-embed .panel-title {
+  flex: none;
+  white-space: nowrap;
+}
+
+.ekds-embed .panel-aside {
+  flex: 1 1 140px;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.ekds-embed .panel-body {
+  padding: 12px 14px;
+}
+
+.ekds-embed .data-table {
+  min-width: 100%;
+  font-size: 12px;
+}
+
+.ekds-embed .data-table th,
+.ekds-embed .data-table td {
+  padding: 7px 12px;
+}
+
+.ekds-embed .table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.ekds-embed .ns-embedded,
+.ekds-embed .ns-embedded .wb {
+  height: auto;
+  min-height: 0;
+}
+
+.ekds-embed .ns-embedded .ns-body {
+  overflow: visible;
+  padding: 0;
+}
+
+.ekds-embed .ns-embedded .ns-lede {
+  margin: 0 0 4px;
+}
+
+.ekds-embed .ns-embedded .ns-row:first-of-type {
+  border-top: var(--ekds-hairline);
+}
+
+/* ---------- 窄宽 ---------- */
+
+@container (max-width: 560px) {
+  .ekds-embed .panel-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .ekds-embed .panel-aside {
+    flex: none;
+    justify-content: flex-start;
+  }
+
+  .ekds-embed .filter-row {
+    width: 100%;
+    gap: 6px;
+  }
+
+  .ekds-embed .filter-row > * {
+    flex: 1 1 120px;
+    min-width: 0;
+  }
+
+  .ekds-embed .filter-row .select-sm {
+    width: auto;
+  }
+
+  .ekds-embed .filter-row .input-with-icon .input {
+    width: 100%;
+  }
+
+  .ekds-embed .data-table {
+    min-width: 560px;
+  }
+
+  .ekds-row {
+    flex-wrap: wrap;
+    padding: 11px 13px;
+    row-gap: 8px;
+  }
+
+  .ekds-row-controls {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .ekds-row-label small {
+    font-size: 11.5px;
+  }
+
+  .ekds-subpage-head h2 {
+    font-size: 15px;
+  }
+
+  .ekds-facts > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+
+  .ekds-facts.is-inset,
+  .ekds-list {
+    padding: 0 13px;
+  }
+
+  .ekds-savebar {
+    flex-wrap: wrap;
+  }
+
+  .ekds-savebar > span {
+    flex: 1 0 100%;
+  }
+
+  .ekds-field-inline {
+    gap: 4px;
+  }
+
+  .ekds-num {
+    width: 74px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ekds .toggle-track,
+  .ekds .toggle-knob {
+    transition: none;
+  }
+}

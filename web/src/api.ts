@@ -1,0 +1,866 @@
+import type {
+  AdapterStatus,
+  DeliveryReceipt,
+  HandoffAttachment,
+  HandoffDirection,
+  HandoffMode,
+  MockBehavior,
+  OutboxRecord,
+  SessionReference,
+  TaskPackage,
+  WebTarget,
+} from "../../adapters/types.js";
+
+export type { AdapterStatus, DeliveryReceipt, HandoffAttachment, HandoffDirection, HandoffMode, MockBehavior, OutboxRecord, SessionReference, TaskPackage };
+
+export interface ApiList<T> {
+  items: T[];
+  total: number;
+}
+
+export interface ApiErrorBody {
+  error: { code: string; message: string };
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly plugin?: PluginRecord;
+
+  constructor(status: number, code: string, message: string, plugin?: PluginRecord) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.plugin = plugin;
+  }
+}
+
+export interface PairResult {
+  sessionToken: string;
+  permissions: string[];
+  expiresAt?: string;
+}
+
+export interface AuthSnapshot {
+  status: "unpaired" | "pairing" | "paired" | "expired";
+  permissions: string[];
+  expiresAt: string | null;
+  message: string | null;
+}
+
+export interface ModuleState {
+  id: string;
+  state: string;
+  message?: string;
+}
+
+export interface Health {
+  status: string;
+  safeMode: boolean;
+  adapter: AdapterStatus;
+  modules: ModuleState[];
+  version: string;
+  uptimeMs?: number;
+  compaction?: string;
+  credentials?: string;
+}
+
+export interface Settings {
+  revision: number;
+  safeMode: boolean;
+  compactionIdleMinutes: number;
+  defaultChatSource: string;
+  modules: Record<string, boolean>;
+}
+
+export interface Provider {
+  id: string;
+  name: string;
+  protocol: string;
+  baseUrl: string;
+  secretRef?: string | null;
+  preset?: boolean;
+  createdAt?: string;
+}
+
+export interface ProviderPreset {
+  id: string;
+  name: string;
+  protocol?: string;
+  baseUrl?: string;
+  note?: string;
+  official?: boolean;
+}
+
+export interface ProviderFieldChange {
+  field: string;
+  before: unknown;
+  after: unknown;
+}
+
+export interface ProviderSnapshot {
+  providerId: string;
+  before: Provider | null;
+  after: Provider;
+  fields: ProviderFieldChange[];
+}
+
+export interface ProviderUpdateResult {
+  revision: number;
+  changeId: number;
+  provider: Provider;
+  snapshot: ProviderSnapshot;
+}
+
+export type CapabilitySource = "manual" | "official" | "registry" | "modelsdev" | "UNKNOWN";
+
+export interface CapabilityField {
+  value: number | boolean | null;
+  source: CapabilitySource;
+  fetchedAt: string | null;
+  updatedAt?: string | null;
+  sourceUrl?: string | null;
+}
+
+export type CapabilityMap = Record<string, CapabilityField>;
+
+export interface ModelRecord {
+  providerId: string;
+  id: string;
+  name: string;
+  displayName?: string;
+  capabilities: CapabilityMap;
+  autoName?: string;
+  manualName?: string | null;
+  autoCapabilities?: CapabilityMap;
+}
+
+export interface FieldChange {
+  field: string;
+  before: CapabilityField;
+  after: CapabilityField;
+}
+
+export interface PreviewChange {
+  providerId: string;
+  id: string;
+  name: string;
+  state: string;
+  fields: FieldChange[];
+  before?: ModelRecord;
+  after: ModelRecord;
+}
+
+export interface ChangeSummary {
+  created: number;
+  updated: number;
+  unchanged: number;
+}
+
+export interface ModelPreview {
+  revision: number;
+  changes: PreviewChange[];
+  summary: ChangeSummary;
+}
+
+export interface ModelImportResult {
+  revision: number;
+  changeId: number;
+  imported: number;
+  created?: number;
+  updated?: number;
+  unchanged?: number;
+}
+
+export interface ModelOverrideResult {
+  revision: number;
+  changeId: number;
+  model: ModelRecord;
+  field: string;
+  before: CapabilityField;
+  after: CapabilityField;
+}
+
+export interface ModelChangeSnapshot {
+  id: number;
+  kind: string;
+  baseRevision: number;
+  revision: number;
+  createdAt: string;
+  summary: string;
+  rolledBack: boolean;
+  rollbackRevision?: number;
+}
+
+export interface RegistrySnapshot { revision: number; provider?: Provider; model?: ModelRecord }
+export interface RollbackPreview { revision: number; detail: { models: unknown[]; providers: unknown[] }; conflicts: string[] }
+
+export interface RollbackResult {
+  revision: number;
+  rollbackChangeId: number;
+  restored: number;
+  deleted: number;
+  restoredProviders: number;
+  deletedProviders: number;
+}
+
+export interface ModelsDevResult {
+  preview: boolean;
+  revision: number;
+  changes?: PreviewChange[];
+  summary: ChangeSummary;
+  import?: ModelImportResult;
+}
+
+export interface PublicCatalogStatus {source:string;state:string;retrievedAt:string;checkedAt:string;etag:string;lastModified:string;sha256:string;bytes:number;providers:{id:string;name:string;models:number}[];lastError:string}
+
+export interface UsagePrice {
+  input: number | null;
+  output: number | null;
+  cacheRead: number | null;
+  cacheWrite: number | null;
+  currency: string | null;
+  source: string;
+  fetchedAt: string | null;
+  unit?: string;
+}
+
+export interface UsageEvent {
+  observationState?: "PARTIAL" | "FINAL" | "CORRECTION";
+  sequence?: number;
+  conflictStatus?: string;
+  id?: number;
+  canonicalKey?: string;
+  providerId: string;
+  model: string;
+  requestId: string;
+  attemptId: string;
+  sessionId: string;
+  projectId: string;
+  agentId: string;
+  role: string;
+  requestKind?: string;
+  protocol: string;
+  source: string;
+  authoritative?: boolean;
+  kind?: string;
+  at: string;
+  fresh?: number | null;
+  input?: number | null;
+  output?: number | null;
+  cacheRead?: number | null;
+  cacheWrite?: number | null;
+  price?: UsagePrice | null;
+  raw: unknown;
+  observedAt?: string;
+}
+
+export interface FieldTotal {
+  sum: number | null;
+  known: number;
+  total: number;
+  complete: boolean;
+}
+
+export interface UsageCoverage {
+  input: FieldTotal;
+  fresh: FieldTotal;
+  output: FieldTotal;
+  cacheRead: FieldTotal;
+  cacheWrite: FieldTotal;
+}
+
+export interface UsageEstimate {
+  kind: string;
+  amount: number | null;
+  currency: string | null;
+  currencies: string[];
+  complete: boolean;
+  pricedEvents: number;
+  unpricedEvents: number;
+  unknownUsageEvents: number;
+  partialKnown: boolean;
+  priceSources: string[];
+  priceFetchedAt: string | null;
+  costBasis?: string;
+  latePriceFallbackEvents?: number;
+  unknownProtocolEvents?: number;
+  unit?: string;
+  note?: string;
+}
+
+export interface ActualBilling {
+  kind: string;
+  amount: number | null;
+  currency: string | null;
+  currencies: string[];
+  attribution?: string;
+  note?: string;
+}
+
+export interface SubscriptionLedger {
+  kind: string;
+  remaining: string | null;
+  resetAt: string | null;
+  source: string | null;
+  observedAt: string | null;
+  note: string;
+}
+
+export interface UsageSummary {
+  requests: number;
+  knownRequests: number;
+  partialKnownRequests?: number;
+  unknownRequests: number;
+  input: number | null;
+  output: number | null;
+  fresh?: number | null;
+  cacheRead: number | null;
+  cacheWrite: number | null;
+  coverage?: Record<string, number>;
+  partialKnown?: UsageCoverage;
+  estimate: UsageEstimate;
+  actual: ActualBilling;
+  subscription: SubscriptionLedger;
+  filters?: Record<string, unknown>;
+  generatedAt?: string;
+  note?: string;
+}
+
+export interface QuotaSnapshot {
+  id: number;
+  ledger: string;
+  providerId: string;
+  scope: string;
+  remaining: string | null;
+  limit: string | null;
+  unit: string | null;
+  resetAt: string | null;
+  currency: string | null;
+  source: string;
+  observedAt: string;
+  note: string;
+}
+
+export interface LedgerOverview {
+  ledger: string;
+  label: string;
+  remaining: number | null;
+  known: boolean;
+  note: string;
+}
+
+export interface QuotaResponse extends ApiList<QuotaSnapshot> {
+  ledgers: LedgerOverview[];
+}
+
+export interface Gateway {
+  id: string;
+  name: string;
+  kind: string;
+  balance: number | null;
+  currency: string | null;
+  checkedAt: string | null;
+  note: string;
+  readOnly: boolean;
+}
+
+export interface PluginRecord {
+  id: string;
+  name: string;
+  version?: string;
+  kind?: string;
+  description?: string;
+  hostRange?: string;
+  capabilities?: string[];
+  builtin?: boolean;
+  sandbox?: string;
+  state: string;
+  enabled?: boolean;
+  faults?: number;
+  error?: string;
+  resources?: number;
+  updatedAt?: string;
+  safeMode?: boolean;
+  controlled?: string;
+}
+
+export interface ChatSource {
+  id: string;
+  name: string;
+  url: string;
+  adapterStatus?: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: string;
+  text: string;
+  at: string;
+}
+
+export interface ChatThread {
+  id: string;
+  title: string;
+  sourceId: string;
+  model?: string;
+  messages?: ChatMessage[];
+  mode?: string;
+}
+
+export interface TaskPreviewResult {
+  task: TaskPackage;
+  redacted: TaskPackage;
+  findings: string[] | null;
+  requiresConfirmation: boolean;
+  confirmationHash: string;
+  previewId: string;
+  warning?: string;
+}
+
+export interface UsageFilters {
+  projectId?: string;
+  sessionId?: string;
+  agentId?: string;
+  model?: string;
+  from?: string;
+  to?: string;
+}
+
+const API_BASE = "/enhance/v1";
+const REQUEST_TIMEOUT_MS = 20_000;
+const DEFAULT_LIMIT = 100;
+
+let sessionToken: string | null = null;
+let sessionExpiresAt: string | null = null;
+let sessionPermissions: string[] = [];
+let authStatus: AuthSnapshot["status"] = "unpaired";
+let authMessage: string | null = null;
+let registryRevision: number | null = null;
+const authListeners = new Set<() => void>();
+
+let authSnapshot: AuthSnapshot = { status: "unpaired", permissions: [], expiresAt: null, message: null };
+
+function publishAuth(): void {
+  authSnapshot = {
+    status: authStatus,
+    permissions: [...sessionPermissions],
+    expiresAt: sessionExpiresAt,
+    message: authMessage,
+  };
+  for (const listener of authListeners) listener();
+}
+
+export function subscribeAuth(listener: () => void): () => void {
+  authListeners.add(listener);
+  return () => authListeners.delete(listener);
+}
+
+export function authSnapshotValue(): AuthSnapshot {
+  return authSnapshot;
+}
+
+export function hasPermission(permission: string): boolean {
+  return sessionPermissions.includes(permission);
+}
+
+export function noteRegistryRevision(value: unknown): void {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) registryRevision = value;
+}
+
+export function knownRegistryRevision(): number | null {
+  return registryRevision;
+}
+
+export function clearSession(message: string | null = null): void {
+  coreTransport = null;
+  sessionToken = null;
+  sessionPermissions = [];
+  sessionExpiresAt = null;
+  registryRevision = null;
+  authStatus = "unpaired";
+  authMessage = message;
+  publishAuth();
+}
+
+export function consumePairingFragment(): string | null {
+  if (typeof window === "undefined") return null;
+  const hash = window.location.hash;
+  if (!hash.startsWith("#pair=")) return null;
+  const raw = hash.slice("#pair=".length);
+  const clean = window.location.pathname + window.location.search;
+  window.history.replaceState(null, "", clean);
+  try {
+    const value = decodeURIComponent(raw).trim();
+    return value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function pair(pairingToken: string): Promise<PairResult> {
+  const token = pairingToken.trim();
+  if (!token) throw new ApiError(400, "PAIRING_EMPTY", "请输入配对凭据");
+  authStatus = "pairing";
+  authMessage = null;
+  publishAuth();
+  try {
+    const result = await request<PairResult>("/pair", {
+      method: "POST",
+      body: { pairingToken: token },
+      anonymous: true,
+    });
+    if (!result.sessionToken) throw new ApiError(500, "PAIRING_INVALID", "核心返回了空会话凭据");
+    sessionToken = result.sessionToken;
+    sessionPermissions = Array.isArray(result.permissions) ? result.permissions : [];
+    sessionExpiresAt = result.expiresAt ?? null;
+    authStatus = "paired";
+    authMessage = null;
+    publishAuth();
+    return result;
+  } catch (error) {
+    sessionToken = null;
+    sessionPermissions = [];
+    sessionExpiresAt = null;
+    authStatus = "unpaired";
+    authMessage = error instanceof Error ? error.message : "配对失败";
+    publishAuth();
+    throw error;
+  }
+}
+
+interface RequestOptions {
+  method?: "GET" | "POST" | "PUT" | "DELETE";
+  body?: unknown;
+  query?: Record<string, string | number | undefined | null>;
+  headers?: Record<string, string>;
+  anonymous?: boolean;
+  signal?: AbortSignal;
+  binaryBody?: ArrayBuffer;
+}
+
+function buildQuery(query: Record<string, string | number | undefined | null> | undefined): string {
+  if (!query) return "";
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  const text = params.toString();
+  return text ? `?${text}` : "";
+}
+
+function friendlyNetworkMessage(error: unknown): string {
+  if (error instanceof DOMException && error.name === "AbortError") {
+    return "请求超时。请确认本地核心仍在运行，然后重试。";
+  }
+  return "无法连接本地核心服务。请确认增强程序已启动，并保持同一地址访问。";
+}
+
+async function parseError(response: Response): Promise<ApiError> {
+  let code = `HTTP_${response.status}`;
+  let message = response.statusText || "请求失败";
+  let plugin: PluginRecord | undefined;
+  try {
+    const data = (await response.json()) as Partial<ApiErrorBody> & { plugin?: PluginRecord };
+    if (data?.error?.code) code = data.error.code;
+    if (data?.error?.message) message = data.error.message;
+    if (data?.plugin && typeof data.plugin === "object") plugin = data.plugin;
+    if (data?.error === null || data?.error === undefined) {
+      const anyBody = data as { code?: unknown; message?: unknown };
+      if (typeof anyBody.code === "string") code = anyBody.code;
+      if (typeof anyBody.message === "string") message = anyBody.message;
+    }
+  } catch {
+    // 非 JSON 错误体保留状态码与通用说明
+  }
+  return new ApiError(response.status, code, message, plugin);
+}
+
+export type CoreTransport = (path: string, init: RequestInit) => Promise<Response>;
+let coreTransport: CoreTransport | null = null;
+export function connectHostTransport(transport: CoreTransport | null, permissions: string[] = []) {
+  sessionToken = null;
+  coreTransport = transport;
+  sessionExpiresAt = null;
+  authMessage = null;
+  registryRevision = null;
+  sessionPermissions = permissions;
+  authStatus = transport ? "paired" : "unpaired";
+  publishAuth();
+}
+export async function coreRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  return request<T>(path, options);
+}
+async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const { method = "GET", body, query, headers: extraHeaders, anonymous = false, signal, binaryBody } = options;
+  if (!anonymous && !sessionToken && !coreTransport) {
+    throw new ApiError(401, "AUTH_REQUIRED", "尚未连接本地核心，请先完成配对");
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const abortFromCaller = () => controller.abort();
+  signal?.addEventListener("abort", abortFromCaller, { once: true });
+  try {
+    const headers: Record<string, string> = { Accept: "application/json", ...extraHeaders };
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    if(binaryBody) headers["Content-Type"]="application/octet-stream";
+    if (!anonymous && sessionToken) headers.Authorization = `Bearer ${sessionToken}`;
+    let response: Response;
+    try {
+      response = await (coreTransport ?? fetch)(`${API_BASE}${path}${buildQuery(query)}`, {
+        method,
+        headers,
+        body: binaryBody ?? (body === undefined ? undefined : JSON.stringify(body)),
+        signal: controller.signal,
+        credentials: "omit",
+        cache: "no-store",
+        referrerPolicy: "no-referrer",
+      });
+    } catch (error) {
+      throw new ApiError(0, "NETWORK", friendlyNetworkMessage(error));
+    }
+    if (!response.ok) {
+      const apiError = await parseError(response);
+      if (apiError.status === 401 && !anonymous) {
+        clearSession("会话已过期或未获授权，请重新配对。凭证只保存在当前页面内存中。");
+      }
+      throw apiError;
+    }
+    if (response.status === 204) return undefined as T;
+    const text = await response.text();
+    if (!text) return undefined as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new ApiError(502, "INVALID_RESPONSE", "核心返回了无法解析的响应。请检查版本是否匹配。");
+    }
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", abortFromCaller);
+  }
+}
+
+function asList<T>(value: unknown): ApiList<T> {
+  if (Array.isArray(value)) return { items: value as T[], total: value.length };
+  if (value && typeof value === "object") {
+    const record = value as { items?: unknown; total?: unknown };
+    if (Array.isArray(record.items)) {
+      return {
+        items: record.items as T[],
+        total: typeof record.total === "number" ? record.total : record.items.length,
+      };
+    }
+  }
+  return { items: [], total: 0 };
+}
+
+function pageQuery(offset = 0, limit = DEFAULT_LIMIT): Record<string, number> {
+  return { offset, limit };
+}
+
+
+export const api = {
+  pair,
+  auth: {
+    snapshot: authSnapshotValue,
+    subscribe: subscribeAuth,
+    clear: clearSession,
+    hasPermission,
+  },
+  health: () => request<Health>("/health"),
+  settings: {
+    get: () => request<Settings>("/settings"),
+    put: (settings: Settings) => request<Settings>("/settings", { method: "PUT", body: settings }),
+  },
+  registry: { snapshot: (providerId?: string, id?: string) => request<RegistrySnapshot>("/registry/snapshot", { query: { providerId, id } }) },
+  providers: {
+    list: async (offset = 0, limit = DEFAULT_LIMIT) =>
+      asList<Provider>(await request<unknown>("/providers", { query: pageQuery(offset, limit) })),
+    create: (body: { id: string; name: string; protocol: string; baseUrl: string; secretRef?: string }) =>
+      request<Provider>("/providers", { method: "POST", body }),
+    update: async (
+      id: string,
+      body: { name: string; protocol: string; baseUrl: string; secretRef?: string | null },
+      revision: number,
+    ) => {
+      const result = await request<ProviderUpdateResult>(`/providers/${encodeURIComponent(id)}`, {
+        method: "PUT",
+        body: { ...body, revision },
+      });
+      noteRegistryRevision(result.revision);
+      return result;
+    },
+    presets: async () => asList<ProviderPreset>(await request<unknown>("/provider-presets")),
+  },
+  models: {
+    catalog:()=>request<PublicCatalogStatus>("/models/catalog"),
+    refreshCatalog:()=>request<PublicCatalogStatus>("/models/catalog/refresh",{method:"POST",body:{}}),
+    catalogImport:(payload:{sourceProvider:string;targetProvider:string;preview:boolean;revision:number;catalogHash?:string})=>request<(ModelPreview & {catalogHash:string}) | ModelImportResult>("/models/catalog/import",{method:"POST",body:payload}),
+    list: async (offset = 0, limit = DEFAULT_LIMIT) =>
+      asList<ModelRecord>(await request<unknown>("/models", { query: pageQuery(offset, limit) })),
+    discovery: async (providerId: string) => {
+      const result = await request<unknown>("/models/discovery", { method: "POST", body: { providerId } });
+      if (Array.isArray(result)) return result as ModelRecord[];
+      if (result && typeof result === "object") {
+        const record = result as { records?: unknown; items?: unknown };
+        if (Array.isArray(record.records)) return record.records as ModelRecord[];
+        if (Array.isArray(record.items)) return record.items as ModelRecord[];
+      }
+      return [];
+    },
+    preview: async (records: ModelRecord[]) => {
+      const result = await request<ModelPreview>("/models/preview", {
+        method: "POST",
+        body: { records },
+      });
+      noteRegistryRevision(result.revision);
+      return result;
+    },
+    // revision 必须来自本次预览；缓存值可能已被同页其他写入推进。
+    import: async (records: ModelRecord[], revision: number) => {
+      const result = await request<ModelImportResult>("/models/import", {
+        method: "POST",
+        body: { records, revision },
+      });
+      noteRegistryRevision(result.revision);
+      return result;
+    },
+    override: async (payload: {
+      providerId: string;
+      id: string;
+      field: string;
+      value: number | boolean | null;
+      revision: number;
+    }) => {
+      const revision = payload.revision;
+      const result = await request<ModelOverrideResult>("/models/override", {
+        method: "POST",
+        body: { ...payload, revision },
+      });
+      noteRegistryRevision(result.revision);
+      return result;
+    },
+    revision: () => freshRevision(),
+    changes: async (offset = 0, limit = DEFAULT_LIMIT) =>
+      asList<ModelChangeSnapshot>(await request<unknown>("/model-changes", { query: pageQuery(offset, limit) })),
+    rollbackPreview: (changeId: number) => request<RollbackPreview>(`/model-changes/${changeId}/preview`),
+    metadata: (payload: {providerId: string; id: string; field: string; value?: string; restoreAutomatic?: boolean; revision: number}) => request<ModelOverrideResult>("/models/metadata",{method:"POST",body:payload}),
+    rollback: async (changeId: number, revision: number) => {
+      const rev = revision;
+      const result = await request<RollbackResult>(`/model-changes/${changeId}/rollback`, {
+        method: "POST",
+        body: { revision: rev },
+      });
+      noteRegistryRevision(result.revision);
+      return result;
+    },
+    // 预览和导入都绑定调用方传入的 revision，避免使用被后续写入覆盖的缓存值。
+    modelsdev: async (catalog: unknown, options: { preview: boolean; revision: number }) => {
+      const result = await request<ModelsDevResult>("/models/modelsdev", {
+        method: "POST",
+        body: { catalog, revision: options.revision, preview: options.preview },
+      });
+      noteRegistryRevision(result.revision);
+      return result;
+    },
+  },
+  gateways: async () => asList<Gateway>(await request<unknown>("/gateways")),
+  usage: {
+    list: async (filters: UsageFilters = {}, offset = 0, limit = DEFAULT_LIMIT) =>
+      asList<UsageEvent>(
+        await request<unknown>("/usage", {
+          query: { ...filters, ...pageQuery(offset, limit) },
+        }),
+      ),
+    add: (events: UsageEvent[]) =>
+      request<{ added: number; duplicates: number; updated: number; unresolved: number }>("/usage", {
+        method: "POST",
+        body: { events },
+      }),
+    summary: (filters: UsageFilters = {}) =>
+      request<UsageSummary>("/usage/summary", { query: { ...filters } }),
+    quotas: async () => {
+      const value = await request<unknown>("/quotas");
+      const base = asList<QuotaSnapshot>(value);
+      const ledgers =
+        value && typeof value === "object" && Array.isArray((value as { ledgers?: unknown }).ledgers)
+          ? ((value as { ledgers: LedgerOverview[] }).ledgers)
+          : [];
+      return { ...base, ledgers };
+    },
+    clearDemo: () => request<{events:number;unlinked:number;quotas:number;preserved:number}>("/usage/demo/clear", {method:"POST",body:{}}),
+    demo: () =>
+      request<{ added: number; duplicates: number; updated: number; unresolved: number }>("/usage/demo", {
+        method: "POST",
+        body: {},
+      }),
+  },
+  adapter: {
+    get: () => request<AdapterStatus>("/adapter"),
+    setMode: (mode: "AVAILABLE" | "UNAVAILABLE" | "CHANGED") =>
+      request<AdapterStatus>("/adapter", { method: "PUT", body: { mode } }),
+  },
+  sessions: async () => asList<SessionReference>(await request<unknown>("/sessions")),
+  webTargets: async () => asList<WebTarget>(await request<unknown>("/web-targets")),
+  attachments: { upload: (attachment:HandoffAttachment) => {
+    const data=Uint8Array.from(atob(attachment.dataBase64 ?? ""),c=>c.charCodeAt(0));
+    return request<HandoffAttachment>("/attachments",{method:"POST",binaryBody:data.buffer,headers:{"X-Attachment-SHA256":attachment.sha256,"X-Attachment-Type":attachment.mime}});
+  }, collect:()=>request<{removed:number}>("/attachments/collect",{method:"POST",body:{}}) },
+  tasks: {
+    list: async (offset = 0, limit = DEFAULT_LIMIT) =>
+      asList<OutboxRecord>(await request<unknown>("/tasks", { query: pageQuery(offset, limit) })),
+    preview: (task: TaskPackage) => request<TaskPreviewResult>("/tasks/preview", { method: "POST", body: { task } }),
+    submit: (
+      intent: string,
+      task: TaskPackage,
+      options: { confirmationHash?: string; mockBehavior?: MockBehavior; acknowledgeUnverifiedAttachments?: boolean } = {},
+    ) =>
+      request<OutboxRecord>("/tasks", {
+        method: "POST",
+        body: {
+          intent,
+          task,
+          confirmed: true,
+          ...(options.confirmationHash ? { confirmationHash: options.confirmationHash } : {}),
+          ...(options.mockBehavior ? { mockBehavior: options.mockBehavior } : {}),
+          ...(options.acknowledgeUnverifiedAttachments ? { acknowledgeUnverifiedAttachments: true } : {}),
+        },
+      }),
+    reconcile: (id: string) =>
+      request<OutboxRecord>(`/tasks/${encodeURIComponent(id)}/reconcile`, { method: "POST", body: {} }),
+  },
+  plugins: {
+    list: async () => asList<PluginRecord>(await request<unknown>("/plugins")),
+    action: (id: string, action: "ENABLE" | "DISABLE" | "FAULT") =>
+      request<PluginRecord>(`/plugins/${encodeURIComponent(id)}`, { method: "POST", body: { action } }),
+  },
+  chat: {
+    sources: async () => asList<ChatSource>(await request<unknown>("/chat/sources")),
+    addSource: (body: { id: string; name: string; url: string }) =>
+      request<ChatSource>("/chat/sources", { method: "POST", body }),
+    threads: async (offset = 0, limit = DEFAULT_LIMIT) =>
+      asList<ChatThread>(await request<unknown>("/chat/threads", { query: pageQuery(offset, limit) })),
+    createThread: (body: { title: string; sourceId: string; model?: string }) =>
+      request<ChatThread>("/chat/threads", { method: "POST", body }),
+    thread: (id: string) => request<ChatThread>(`/chat/threads/${encodeURIComponent(id)}`),
+    send: (id: string, text: string, intent = randomKey()) =>
+      request<ChatThread>(`/chat/threads/${encodeURIComponent(id)}/messages`, {
+        method: "POST",
+        body: { text },
+        headers: { "Idempotency-Key": intent },
+      }),
+  },
+};
+
+function randomKey(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+async function freshRevision(): Promise<number> {
+  const snapshot = await api.registry.snapshot();
+  noteRegistryRevision(snapshot.revision);
+  return snapshot.revision;
+}

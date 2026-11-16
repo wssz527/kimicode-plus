@@ -1,0 +1,35 @@
+# 实施计划与当前聚合阶段
+
+## 当前阶段
+
+本轮已完成隔离宿主聚合及审查返修：统一规划入口默认网页，来源与配置进入菜单；多会话在主聊天区逐次追加，主窗格跟随官方侧栏且保留各会话草稿；设置位于官方对话框内，采用单层 11 项列表与返回导航；Monitor 默认紧凑，未知指标和自动化回执分开。容器隔离覆盖 Vue 动态重建，切回原生界面时释放。
+
+规划/网页真实 Code 交接、三窗格并行与审批、本机文件 KAP 发送、设置保存读回和手动恢复监听已完成合成环境回归。既有页面、开关、菜单和 KAP 客户端复用，不建立平行实现。三项自动化分别授权、默认关闭，已有调度、意图和回执记录；实机脚本恢复隔离环境原值，不代表其原有开关均关闭。
+
+当前证据见 `VALIDATION.md`，不再按早期 demo 截图或历史 Mock 限制判断原生完成度。系统文件选择窗口的 GUI 点选、真实付费模型、真实 managed 账号自动恢复、网站内聊天/上传和其他平台运行仍未验收。
+
+## 第一阶段历史基线
+
+第一阶段目标是独立 Go 可执行程序内嵌 React 工作台，使用受保护 loopback 与 SQLite 完成模型、用量和双向任务 Mock 闭环。以下内容保留为该阶段的设计记录；其中 Mock 和未连接描述不代表现已增加的原生路径。
+
+边界（第一阶段，2026-11-12 按用户政策更新）：开发验证默认只访问本仓库、公开依赖与合成数据；经用户显式授权可连接官方 Desktop 本地 API、只读复用官方配置与凭据，真实账号验收由用户在最后阶段安排。Go 为唯一业务核心，Node 只用于开发构建。
+
+## 核心与存储
+
+main 负责 cmd/enhanced-kimi、internal/storage、internal/security、internal/server、internal/config、internal/platform，纯 Go modernc SQLite、版本迁移与事务、操作系统文件锁、随机配对 token、内存授权会话、Host/Origin 与权限验证、脱敏、生命周期和安全模式。API 前缀 /enhance/v1，JSON 错误统一 error.code/message。静态资源只由 go:embed 提供。
+
+## 业务边界
+
+internal/registry、internal/usage 负责目录来源、事务导入、CAS/回滚及四账本。internal/bridge、internal/desktop、internal/plugins 负责持久 Outbox、Mock 有效回执、检查点、独立会话引用与受控插件模拟。共享底层仅依赖 database/sql、internal/storage 与 internal/httpx。每个模块注册自己路由，独立测试。
+
+## 工作台
+
+web/ 与 adapters/ 是独立前端职责。七个页面接真实 /enhance/v1 接口。来源管理、轻量 Mock 聊天、任务预览与提交、故障/未知核对可操作。默认 Kimi，明确来源管理与完整网站适配的差别。
+
+## 验收
+
+Go 单元与集成测试、race、vet、TS 类型检查、前端构建、内置浏览器桌面/移动检查。发布可执行文件实际启动，任务三个方向、重启恢复、故障隔离与安全模式。CGO_ENABLED=0 交叉构建五个平台，记录实际运行仅 macOS arm64。测量发布文件、压缩大小、新进程就绪时间和 RSS。CI 配置不视作已经远程运行。
+
+## 分工
+
+核心/安全/整体验收由主会话负责。模型用量、任务插件、前端分别有独占路径，以 docs/API_CONTRACT.md 为集成边界。完成后主会话审查完整代码并修复真实问题。

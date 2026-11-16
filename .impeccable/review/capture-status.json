@@ -1,0 +1,12 @@
+{
+  "desktop": {"path": "desktop.png", "viewport": "1280x720", "valid": true, "scope": "viewport from document top; full-page capture unavailable"},
+  "mobile": {
+    "paths": ["mobile.png", "mobile-details.png"],
+    "viewport": "390x700 iframe; DPR 1",
+    "valid": true,
+    "scope": "overview first viewport and scrolled task/status area; responsive CSS layout only, not real mobile hardware or touch validation",
+    "method": "Temporary isolated proxy serves byte-identical final Go HTML, CSS and JS inside a 390 CSS-pixel iframe in the desktop browser. Proxy adjusts Host/Origin/Sec-Fetch-Site/frame-ancestors for this capture only and preserves pairing/Bearer authorization. Production headers/binaries unchanged. Assets verified in work/evidence/narrow-assets-final.json. Proxy stopped after capture.",
+    "deviceEmulation": "UNVERIFIED: original 390x844 DPR3 and 390x700 DPR2 device screenshots were duplicated by the tool and excluded; no claim about mobile browser identity, touch or physical devices",
+    "functionalChecks": ["responsive navigation rendered", "models route loaded persisted records", "browser back restored overview title and route"]
+  }
+}

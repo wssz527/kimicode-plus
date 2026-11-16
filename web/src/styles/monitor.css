@@ -1,0 +1,626 @@
+/* Monitor 面板 · 结构参考 bfjnbvf/kimi-code-monitor（MIT，固定提交
+   1d529f0b424a708971cfac097238df444f3b5beb）的 content.css 与 widget-structure.js。
+   尺寸比例、类名约定与两列模块网格沿用上游；颜色与字体改用宿主主题令牌，
+   深色由宿主 data-color-scheme 自动切换，不在这里另写一套色板。
+
+   全部规则挂在 .ekd-mon 下，避免与其他 surface 的 ksb-* 或通用类互相污染。 */
+
+.ekd-mon {
+  --ksb-text: var(--ink, var(--color-text, rgba(0, 0, 0, 0.9)));
+  --ksb-text-secondary: var(--ink-muted, var(--color-text-secondary, rgba(0, 0, 0, 0.6)));
+  --ksb-text-tertiary: color-mix(in srgb, var(--ksb-text) 58%, transparent);
+  --ksb-text-quaternary: color-mix(in srgb, var(--ksb-text) 42%, transparent);
+  --ksb-fill-1: color-mix(in srgb, var(--ksb-text) 4%, transparent);
+  --ksb-fill-2: color-mix(in srgb, var(--ksb-text) 7%, transparent);
+  --ksb-fill-2-hover: color-mix(in srgb, var(--ksb-text) 11%, transparent);
+  --ksb-border: var(--line, var(--color-line, rgba(0, 0, 0, 0.13)));
+  --ksb-surface: var(--paper, var(--color-bg, #fff));
+  --ksb-accent: var(--accent, var(--blue, #1783ff));
+  --ksb-accent-bg: var(--accent-soft, rgba(23, 131, 255, 0.1));
+  --ksb-green: var(--success, #16c456);
+  --ksb-orange: var(--warn, #ff9500);
+  --ksb-danger: var(--danger, #ff3849);
+  --ksb-mono: var(--font-mono, ui-monospace, "SF Mono", Menlo, Consolas, monospace);
+
+  container-type: inline-size;
+  display: block;
+  min-width: 0;
+  margin: 10px 12px;
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--ksb-fill-1);
+  color: var(--ksb-text-secondary);
+  font-family: var(--font-sans, var(--font-ui, sans-serif));
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ekd-mon *,
+.ekd-mon *::before,
+.ekd-mon *::after {
+  box-sizing: border-box;
+}
+
+.ekd-mon p {
+  margin: 0;
+}
+
+/* ---------- 标题行：状态点 + 名称 + 状态 + 刷新药丸 ---------- */
+
+.ekd-mon .ksb-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.ekd-mon .ksb-status-dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ksb-text-quaternary);
+}
+
+.ekd-mon .ksb-dot-idle { background: var(--ksb-text-quaternary); }
+.ekd-mon .ksb-dot-off { background: var(--ksb-danger); }
+.ekd-mon .ksb-dot-warn { background: var(--ksb-orange); }
+
+.ekd-mon .ksb-title {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ksb-text-quaternary);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.ekd-mon .ksb-title-brief {
+  display: none;
+}
+
+.ekd-mon .ksb-agent-status {
+  color: var(--ksb-text-tertiary);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.ekd-mon .ksb-header-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  padding: 1px 7px;
+  border: 0;
+  border-radius: 100px;
+  background: var(--ksb-fill-2);
+  color: var(--ksb-text-secondary);
+  font: inherit;
+  cursor: pointer;
+  transition: background-color 150ms ease;
+}
+
+.ekd-mon .ksb-header-stat:hover {
+  background: var(--ksb-fill-2-hover);
+}
+
+.ekd-mon .ksb-header-stat:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--ksb-accent-bg), 0 0 0 1px var(--ksb-accent);
+}
+
+.ekd-mon .ksb-refresh {
+  display: inline-flex;
+  align-items: center;
+  color: var(--ksb-text-quaternary);
+}
+
+.ekd-mon .ksb-refresh.spinning {
+  animation: ksb-spin 900ms linear infinite;
+}
+
+@keyframes ksb-spin {
+  to { transform: rotate(360deg); }
+}
+
+.ekd-mon .ksb-header-stat-value {
+  font-family: var(--ksb-mono);
+  font-size: 10px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ---------- 错误 / 异常横幅 ---------- */
+
+.ekd-mon .ksb-banner {
+  position: relative;
+  margin-bottom: 10px;
+  padding: 6px 8px;
+  border: 1px dashed var(--ksb-danger);
+  border-radius: 7px;
+  background: var(--ksb-surface);
+  color: var(--ksb-danger);
+  font-size: 11.5px;
+}
+
+.ekd-mon .ksb-banner span {
+  display: block;
+  font-weight: 500;
+}
+
+.ekd-mon .ksb-banner small {
+  display: block;
+  margin-top: 1px;
+  color: var(--ksb-text-tertiary);
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.ekd-mon .ksb-banner-warn {
+  border-color: var(--ksb-orange);
+  color: var(--ksb-orange);
+}
+
+.ekd-mon .ksb-banner-action {
+  margin-top: 4px;
+  padding: 1px 8px;
+  border: 1px solid currentColor;
+  border-radius: 100px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.ekd-mon .ksb-banner-action:hover {
+  background: var(--ksb-fill-2);
+}
+
+.ekd-mon .ksb-placeholder {
+  padding: 4px 0 8px;
+  color: var(--ksb-text-quaternary);
+  font-size: 11px;
+}
+
+/* ---------- 模块网格：上游两列等宽 + 整宽跨度 ---------- */
+
+.ekd-mon .ksb-region {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 12px;
+}
+
+.ekd-mon .ksb-module {
+  position: relative;
+  min-width: 0;
+}
+
+.ekd-mon .ksb-module.ksb-span-2 {
+  grid-column: 1 / -1;
+}
+
+.ekd-mon .ksb-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.ekd-mon .ksb-quota-label {
+  flex-shrink: 0;
+  color: var(--ksb-text-tertiary);
+  font-size: 10px;
+}
+
+.ekd-mon .ksb-tag {
+  margin-left: auto;
+  padding: 0 6px;
+  border-radius: 100px;
+  background: var(--ksb-fill-2);
+  color: var(--ksb-text-quaternary);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.ekd-mon .ksb-tag.is-unknown {
+  background: transparent;
+  border: 1px solid var(--ksb-border);
+}
+
+/* ---------- 额度窗口：标签 / 倒计时 / 百分比 + 3px 进度条 ---------- */
+
+.ekd-mon .ksb-quota-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  container: ksb-quota / inline-size;
+}
+
+.ekd-mon .ksb-quota-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+.ekd-mon .ksb-reset {
+  flex-shrink: 0;
+  margin-left: auto;
+  color: var(--ksb-text-quaternary);
+  font-family: var(--ksb-mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ekd-mon .ksb-quota-pct {
+  flex-shrink: 0;
+  min-width: 24px;
+  color: var(--ksb-text-secondary);
+  font-family: var(--ksb-mono);
+  font-size: 10px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.ekd-mon .ksb-quota-pct.mid { color: var(--ksb-orange); }
+.ekd-mon .ksb-quota-pct.high { color: var(--ksb-danger); }
+
+.ekd-mon .ksb-progress {
+  position: relative;
+  height: 3px;
+  border-radius: 100px;
+  background: var(--ksb-fill-2);
+  overflow: hidden;
+}
+
+.ekd-mon .ksb-progress-fill {
+  height: 100%;
+  border-radius: 100px;
+  background: var(--ksb-green);
+  transition: background-color 200ms ease;
+}
+
+.ekd-mon .ksb-progress-fill.mid { background: var(--ksb-orange); }
+.ekd-mon .ksb-progress-fill.high { background: var(--ksb-danger); }
+
+/* 未知窗口：不画填充，用斜纹表示"没有数据"而不是"用了 0%"；
+   组件在未知时把宽度直接写到 100%，所以这里不需要覆盖内联样式 */
+.ekd-mon .ksb-progress-fill.is-unknown {
+  background: repeating-linear-gradient(
+    90deg,
+    var(--ksb-fill-2) 0 3px,
+    transparent 3px 6px
+  );
+}
+
+.ekd-mon .ksb-footnote {
+  color: var(--ksb-text-quaternary);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+/* ---------- 整块容器：实时指标、回执 ---------- */
+
+.ekd-mon .ksb-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ekd-mon .ksb-stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 12px;
+}
+
+.ekd-mon .ksb-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.ekd-mon .ksb-stat-label {
+  color: var(--ksb-text-tertiary);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.ekd-mon .ksb-stat-value {
+  color: var(--ksb-text);
+  font-family: var(--ksb-mono);
+  font-size: 14px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ekd-mon .ksb-stat-value.is-unknown {
+  color: var(--ksb-text-quaternary);
+}
+
+/* ---------- 历史柱图缺位：上游用虚线提示框锁住该模块 ---------- */
+
+.ekd-mon .ksb-cli-lock {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  padding: 5px 8px;
+  border: 1px dashed var(--ksb-accent);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ksb-accent);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 150ms ease;
+}
+
+.ekd-mon .ksb-cli-lock:hover {
+  background: var(--ksb-accent-bg);
+}
+
+.ekd-mon .ksb-cli-lock:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--ksb-accent-bg), 0 0 0 1px var(--ksb-accent);
+}
+
+.ekd-mon .ksb-cli-lock span,
+.ekd-mon .ksb-cli-lock small {
+  display: block;
+}
+
+.ekd-mon .ksb-cli-lock span {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.ekd-mon .ksb-cli-lock small {
+  margin-top: 1px;
+  color: var(--ksb-text-quaternary);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+/* ---------- 代理用量表：与上游同样的列宽节奏 ---------- */
+
+.ekd-mon .ksb-agents {
+  width: 100%;
+  overflow: hidden;
+}
+
+.ekd-mon .ksb-agents-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 6ch 6ch 5ch;
+  column-gap: 4px;
+  align-items: baseline;
+  margin-bottom: 3px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.ekd-mon .ksb-agents-head .ksb-quota-label {
+  grid-column: 1 / 3;
+}
+
+.ekd-mon .ksb-agents-head .ksb-agent-metric {
+  color: var(--ksb-text-quaternary);
+  font-size: 9px;
+}
+
+.ekd-mon .ksb-agent-metric {
+  font-family: var(--ksb-mono);
+  text-align: right;
+  overflow: hidden;
+}
+
+.ekd-mon .ksb-agents-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ekd-mon .ksb-agents-empty {
+  color: var(--ksb-text-quaternary);
+  font-size: 10px;
+}
+
+/* ---------- 自动化回执 ---------- */
+
+.ekd-mon .ksb-receipt {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  font-size: 11px;
+}
+
+.ekd-mon .ksb-receipt-kind {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ksb-text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ekd-mon .ksb-receipt-state {
+  flex-shrink: 0;
+  color: var(--ksb-text-tertiary);
+  white-space: nowrap;
+}
+
+.ekd-mon .ksb-receipt-time {
+  flex-shrink: 0;
+  color: var(--ksb-text-quaternary);
+  font-family: var(--ksb-mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ekd-mon .ksb-receipt-empty {
+  color: var(--ksb-text-tertiary);
+  font-size: 11px;
+}
+
+.ekd-mon .ksb-receipt-note {
+  color: var(--ksb-text-tertiary);
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- 诊断折叠 ---------- */
+
+.ekd-mon .ksb-diag-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding: 3px 2px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ksb-text-tertiary);
+  font: inherit;
+  font-size: 10px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ekd-mon .ksb-diag-toggle:hover {
+  color: var(--ksb-text-secondary);
+}
+
+.ekd-mon .ksb-diag-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--ksb-accent-bg), 0 0 0 1px var(--ksb-accent);
+}
+
+.ekd-mon .ksb-diag-toggle small {
+  margin-left: auto;
+  color: var(--ksb-text-quaternary);
+  font-size: 9px;
+}
+
+.ekd-mon .ksb-chevron {
+  display: inline-flex;
+  color: var(--ksb-text-quaternary);
+  transition: transform 150ms ease;
+}
+
+.ekd-mon .ksb-diag-toggle.is-open .ksb-chevron {
+  transform: rotate(180deg);
+}
+
+.ekd-mon .ksb-diag {
+  margin-top: 4px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  background: var(--ksb-surface);
+  border: 1px solid var(--ksb-border);
+}
+
+.ekd-mon .ksb-diag-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+}
+
+.ekd-mon .ksb-diag-row {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 6px;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.ekd-mon .ksb-diag-row dt {
+  color: var(--ksb-text-quaternary);
+}
+
+.ekd-mon .ksb-diag-row dd {
+  margin: 0;
+  color: var(--ksb-text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+/* ---------- 页脚来源归属 ---------- */
+
+.ekd-mon .ksb-foot {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--ksb-border);
+  color: var(--ksb-text-quaternary);
+  font-size: 9px;
+}
+
+.ekd-mon .ksb-foot b {
+  color: var(--ksb-text-tertiary);
+  font-weight: 500;
+}
+
+.ekd-mon .ksb-foot-commit {
+  margin-left: auto;
+  font-family: var(--ksb-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 窄宽度降级：侧栏收到 ~200px 时先让标题与倒计时 ---------- */
+
+@container (max-width: 170px) {
+  .ekd-mon .ksb-title-long { display: none; }
+  .ekd-mon .ksb-title-brief { display: inline; }
+}
+
+@container ksb-quota (max-width: 70px) {
+  .ekd-mon .ksb-reset { display: none; }
+}
+
+@container (max-width: 176px) {
+  .ekd-mon .ksb-stat-grid { grid-template-columns: 1fr; }
+}
+
+@container (max-width: 186px) {
+  .ekd-mon .ksb-foot-prefix { display: none; }
+  .ekd-mon .ksb-foot {
+    flex-wrap: nowrap;
+    min-width: 0;
+  }
+  .ekd-mon .ksb-foot > span:first-of-type {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+/* ---------- 减少动态效果 ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .ekd-mon .ksb-progress-fill,
+  .ekd-mon .ksb-header-stat,
+  .ekd-mon .ksb-chevron,
+  .ekd-mon .ksb-cli-lock {
+    transition: none;
+  }
+  .ekd-mon .ksb-refresh.spinning {
+    animation: none;
+  }
+}
