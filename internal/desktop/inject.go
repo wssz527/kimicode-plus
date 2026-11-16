@@ -95,7 +95,7 @@ func resolveHost(ctx context.Context, options AttachOptions) (ProcessInfo, strin
 }
 
 func AttachNative(ctx context.Context, options AttachOptions) (*AttachResult, error) {
-	if options.CoreURL == "" || len(options.PairingToken) < 32 {
+	if options.CoreURL == "" || len(options.PairingToken) < AttachTokenMinLength {
 		return nil, errors.New("缺少增强核心地址或配对凭据")
 	}
 	info, _, err := resolveHost(ctx, options)

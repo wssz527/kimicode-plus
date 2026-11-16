@@ -25,6 +25,11 @@ const (
 	KimiExecutable = "/Applications/Kimi Code.app/Contents/MacOS/Kimi Code"
 	KimiFramework  = "/Applications/Kimi Code.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
 	InspectorPort  = 9229
+
+	// SupportedElectron is the Electron version every entry of SupportedHosts runs
+	// on. It is the single source of truth for version-gated checks such as the
+	// fuse layout, so they cannot drift from the host contract.
+	SupportedElectron = "45.1.0"
 )
 
 // ProcessInfo is the identity of a running Kimi Code main process. It is taken
@@ -201,8 +206,8 @@ type HostContract struct {
 }
 
 var SupportedHosts = []HostContract{
-	{AppVersion: "1.3.4", Electron: "45.1.0", RendererScheme: "app://renderer/", DOMRevision: 1},
-	{AppVersion: "1.3.5", Electron: "45.1.0", RendererScheme: "app://renderer/", DOMRevision: 1},
+	{AppVersion: "1.3.4", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1},
+	{AppVersion: "1.3.5", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1},
 }
 
 type HostIdentity struct {

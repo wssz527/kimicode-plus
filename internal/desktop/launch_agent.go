@@ -49,8 +49,15 @@ type LaunchAgentConfig struct {
 	Executable string
 }
 
+// launchAgentDir overrides where the plist lives. Tests point it at a temporary
+// directory so no test can install an agent for the user running the suite.
+var launchAgentDir = ""
+
 // LaunchAgentPath is where the plist is installed for the current user.
 func LaunchAgentPath(label string) (string, error) {
+	if launchAgentDir != "" {
+		return filepath.Join(launchAgentDir, label+".plist"), nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -67,24 +74,26 @@ func xmlEscape(value string) string {
 // driven, RunAtLoad covers the case where the client is already running when the
 // user enables it, and ThrottleInterval keeps a burst of profile writes from
 // spawning a storm of runs.
+//
+// The rendered command line must be exactly what `enhanced-kimi attach` accepts
+// for a run. A launchd run has no other way to learn the core address or the
+// pairing token, so leaving either out makes the agent fail on every wake while
+// the settings surface still reports it as enabled. AttachArguments is the single
+// source of truth for that contract and is exercised by tests against the real
+// flag set.
 func LaunchAgentPlist(config LaunchAgentConfig) (string, error) {
 	if config.Executable == "" {
 		return "", errors.New("缺少增强核心路径，无法安装后台接入")
 	}
-	program := []string{
-		config.Executable,
-		"attach",
-		"--data-dir", config.DataDir,
+	if config.DataDir == "" {
+		return "", errors.New("缺少增强数据目录，无法安装后台接入")
 	}
-	if config.KimiHome != "" {
-		program = append(program, "--kimi-home", config.KimiHome)
+	// The agent is useless without somewhere to report, so refuse to render an
+	// agent that would only fail at wake-up time.
+	if config.CoreURL == "" || len(config.PairingToken) < AttachTokenMinLength {
+		return "", errors.New("后台接入需要核心地址和配对凭据，无法生成接入定义")
 	}
-	if config.Profile != "" {
-		program = append(program, "--host-profile", config.Profile)
-	}
-	if config.AllowDailyInstance {
-		program = append(program, "--allow-daily-instance")
-	}
+	program := append([]string{config.Executable}, AttachArguments(config)...)
 	arguments := strings.Builder{}
 	for _, value := range program {
 		arguments.WriteString("<string>" + xmlEscape(value) + "</string>")
@@ -107,6 +116,29 @@ func LaunchAgentPlist(config LaunchAgentConfig) (string, error) {
 <key>StandardErrorPath</key><string>%s</string>
 </dict></plist>
 `, xmlEscape(LaunchAgentLabel), arguments.String(), watch.String(), xmlEscape(logPath), xmlEscape(logPath)), nil
+}
+
+// AttachTokenMinLength is the shortest pairing token the attach command accepts.
+// The core issues 32+ byte tokens; a shorter value means the caller has none.
+const AttachTokenMinLength = 32
+
+// AttachArguments renders the attach subcommand arguments for one agent run. The
+// plist and any programmatic installer share this function so the rendered
+// command can never drift from the CLI contract.
+func AttachArguments(config LaunchAgentConfig) []string {
+	args := []string{"attach", "--data-dir", config.DataDir}
+	if config.KimiHome != "" {
+		args = append(args, "--kimi-home", config.KimiHome)
+	}
+	if config.Profile != "" {
+		args = append(args, "--host-profile", config.Profile)
+	}
+	if config.AllowDailyInstance {
+		args = append(args, "--allow-daily-instance")
+	}
+	// Rendered last so a token containing "=" or "-" cannot be misread as a flag.
+	args = append(args, "--core-url", config.CoreURL, "--pairing-token", config.PairingToken)
+	return args
 }
 
 // LaunchAgentState is what the settings surface reports.
@@ -170,7 +202,7 @@ func InstallLaunchAgent(config LaunchAgentConfig) (LaunchAgentState, error) {
 	if err != nil {
 		return LaunchAgentState{}, err
 	}
-	if err = os.MkdirAll(filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents"), 0o755); err != nil {
+	if err = os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return LaunchAgentState{}, errors.New("无法创建 LaunchAgents 目录")
 	}
 	tmp := path + ".next"

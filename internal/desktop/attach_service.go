@@ -60,7 +60,7 @@ func (s *NativeService) attachStatus(ctx context.Context) map[string]any {
 // silently implies taking over the client the user is working in.
 func (s *NativeService) enableAttach(ctx context.Context, input map[string]any) (map[string]any, error) {
 	config := s.attachConfig()
-	if config.Executable == "" || config.CoreURL == "" || len(config.PairingToken) < 32 {
+	if config.Executable == "" || config.CoreURL == "" || len(config.PairingToken) < AttachTokenMinLength {
 		return nil, errors.New("后台接入需要核心地址和配对凭据，请从完整的增强核心中启用")
 	}
 	allowDaily, _ := input["allowDailyInstance"].(bool)
@@ -72,6 +72,8 @@ func (s *NativeService) enableAttach(ctx context.Context, input map[string]any) 
 	state, err := InstallLaunchAgent(LaunchAgentConfig{
 		DataDir: config.DataDir, KimiHome: config.KimiHome, Profile: config.Profile,
 		AllowDailyInstance: allowDaily, Executable: config.Executable,
+		// Without these the agent wakes, finds no core and fails every time.
+		CoreURL: config.CoreURL, PairingToken: config.PairingToken,
 	})
 	if err != nil {
 		return nil, err

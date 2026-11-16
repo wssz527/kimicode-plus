@@ -37,18 +37,28 @@ func withFakeLaunch(t *testing.T) *fakeLaunch {
 	t.Helper()
 	fake := &fakeLaunch{installedPaths: map[string]bool{}, loadedLabels: map[string]bool{}}
 	previous := launches
+	previousDir := launchAgentDir
 	launches = fake
-	t.Cleanup(func() { launches = previous })
+	launchAgentDir = t.TempDir()
+	t.Cleanup(func() { launches = previous; launchAgentDir = previousDir })
 	return fake
 }
 
+// testAgentConfig is a complete agent definition: it carries the credentials a
+// real settings-page install always has.
+func testAgentConfig() LaunchAgentConfig {
+	return LaunchAgentConfig{
+		DataDir:      "/tmp/ekd",
+		KimiHome:     "/tmp/kimi-home",
+		Profile:      "/tmp/isolated",
+		CoreURL:      "http://127.0.0.1:8321",
+		PairingToken: strings.Repeat("t", 48),
+		Executable:   "/tmp/ekd/enhanced-kimi",
+	}
+}
+
 func TestLaunchAgentPlistIsEventDrivenNotPolling(t *testing.T) {
-	plist, err := LaunchAgentPlist(LaunchAgentConfig{
-		DataDir:    "/tmp/ekd",
-		KimiHome:   "/tmp/kimi-home",
-		Profile:    "/tmp/isolated",
-		Executable: "/tmp/ekd/enhanced-kimi",
-	})
+	plist, err := LaunchAgentPlist(testAgentConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +92,10 @@ func TestLaunchAgentPlistIsEventDrivenNotPolling(t *testing.T) {
 }
 
 func TestLaunchAgentPlistRequiresTheDailyConsentFlag(t *testing.T) {
-	plist, err := LaunchAgentPlist(LaunchAgentConfig{DataDir: "/tmp/ekd", Executable: "/tmp/ekd/enhanced-kimi", AllowDailyInstance: true})
+	config := testAgentConfig()
+	config.Profile = ""
+	config.AllowDailyInstance = true
+	plist, err := LaunchAgentPlist(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +108,10 @@ func TestLaunchAgentPlistRequiresTheDailyConsentFlag(t *testing.T) {
 }
 
 func TestLaunchAgentPlistEscapesValues(t *testing.T) {
-	plist, err := LaunchAgentPlist(LaunchAgentConfig{DataDir: `/tmp/a&b<c>"d"`, Executable: "/tmp/x"})
+	config := testAgentConfig()
+	config.DataDir = `/tmp/a&b<c>"d"`
+	config.Executable = "/tmp/x"
+	plist, err := LaunchAgentPlist(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +124,9 @@ func TestLaunchAgentPlistEscapesValues(t *testing.T) {
 }
 
 func TestLaunchAgentPlistRefusesMissingExecutable(t *testing.T) {
-	if _, err := LaunchAgentPlist(LaunchAgentConfig{DataDir: "/tmp/ekd"}); err == nil {
+	config := testAgentConfig()
+	config.Executable = ""
+	if _, err := LaunchAgentPlist(config); err == nil {
 		t.Fatal("agent built without an executable")
 	}
 }
@@ -145,7 +163,9 @@ func TestInstallLaunchAgentIsAtomicAndReloads(t *testing.T) {
 		_ = os.WriteFile(path, []byte("old"), 0o600)
 	}
 	fake.bootstrapErr = errors.New("synthetic launchd failure")
-	state, err := InstallLaunchAgent(LaunchAgentConfig{DataDir: t.TempDir(), Executable: "/tmp/ekd/enhanced-kimi"})
+	config := testAgentConfig()
+	config.DataDir = t.TempDir()
+	state, err := InstallLaunchAgent(config)
 	if err == nil {
 		t.Fatal("synthetic launchd failure was ignored")
 	}

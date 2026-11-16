@@ -53,6 +53,15 @@ EKD 由 `internal/desktop/inject.go`、`cdp.go`、`inspector_fuse.go` 和内嵌 
 - 同时设置 `RunAtLoad`（开启时客户端已在运行也能立刻接入）与 `ThrottleInterval 5`（避免一次启动写出多份 profile 文件时反复拉起）。
 - 安装采用"写 `.next` 再 rename"的原子替换；旧的已加载 job 先 `bootout` 再 `bootstrap`，避免 EEXIST。卸载幂等。
 - 状态判定要求"plist 存在**且** job 已加载"，只有两者都成立才在界面上显示为已开启。
+- **plist 的 `ProgramArguments` 携带接入所需的全部参数，包括 `--core-url` 与 `--pairing-token`。** launchd 唤醒 agent 时没有任何其他输入渠道，缺任一项都会让每次唤醒失败，而界面仍显示"已开启"。因此这两项与 plist、程序化安装共用同一个参数构造函数（`AttachArguments`），plist 渲染结果与 CLI 参数集合由回归测试逐项比对，防止再次漂移。凭据排在参数末尾，避免含 `=`/`-` 的 token 被当作 flag。
+- **plist 含配对凭据，权限固定 `0600`（仅属主可读写）**；仅在用户显式开启后台接入时写入 `~/Library/LaunchAgents/`，卸载时一并删除。凭据不写入日志；`attach.log` 与 `attach-state.json` 只记录结果与错误原因。
+- 安装前先用真实 flag 集合解析一遍渲染出的参数；解析或必填项校验失败时**不写入** plist，避免留下一个必然失败的 agent。
+
+### Electron fuse 位次与版本绑定
+
+- Node inspector 信号 fuse 的**位次是 Electron 源码顺序的属性，不是从二进制里推得出来的**，跨大版本可能移动。因此位次按 Electron 版本显式绑定在 `VerifiedFuseLayouts` 表中（当前仅 `45.1.0`：block version 1、9 个 fuse、信号位次 3），并与宿主契约共用同一个 `SupportedElectron` 常量。
+- 表中没有的 Electron 版本**失败关闭**，返回"该 Electron 版本未经验证 fuse 布局"，不猜测新布局。声明数量、block version 与位次表不一致时同样判为未知布局，而不是照旧读取可能已指向别的 fuse 的位置。
+- 读取不再整文件加载（本机 `Electron Framework` 约 207MB，而 `attach.status` 会被设置页反复轮询）：改为 1MB 分块流式扫描并保留跨块 carry，内存与文件大小无关；同一文件（size + mtime）与同一 Electron 版本的结果缓存，文件变化即失效。
 - 每次运行的结论写入 `attach-state.json`；需要授权时该文件带 `consentRequired: true`，设置页据此给出说明而不是只显示一个失败状态。
 
 命令行入口：
