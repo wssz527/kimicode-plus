@@ -80,6 +80,14 @@ func WithResolver(resolver *net.Resolver) Option {
 	return func(o *Options) { o.Resolver = resolver }
 }
 
+// EnableGate lets another component refuse an enable before the plugin becomes
+// live. The KCT migration uses it so the adapter cannot start while the
+// standalone injector is still loaded. A gate answers a code the page can act
+// on, or an empty code to allow the enable.
+type EnableGate interface {
+	CheckEnable(ctx context.Context, id string) (code, message string)
+}
+
 // Core is the narrow slice of the App the plugin host needs. nativeService
 // implements it; declaring it here keeps the desktop package out of this
 // package's imports and makes the manager testable with a fake.
@@ -174,6 +182,7 @@ type Manager struct {
 	vault   *credentials.Vault
 	bundled func() (map[string]map[string][]byte, error)
 	now     func() time.Time
+	gate    EnableGate
 
 	mu      sync.Mutex
 	entries map[string]*entry
@@ -234,6 +243,15 @@ func (m *Manager) UseCore(core Core) {
 func (m *Manager) UseVault(vault *credentials.Vault) {
 	m.mu.Lock()
 	m.vault = vault
+	m.mu.Unlock()
+}
+
+// UseEnableGate attaches the gate after construction for the same reason as
+// UseCore: the migration service needs the data directory and the store, which
+// the server knows only once the manager exists.
+func (m *Manager) UseEnableGate(gate EnableGate) {
+	m.mu.Lock()
+	m.gate = gate
 	m.mu.Unlock()
 }
 
@@ -611,6 +629,16 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 		message := redact.Text(err.Error())
 		m.fail(ctx, id, StateCorrupt, message, ActivityCorrupt, now)
 		return m.Get2(id), apiError(http.StatusConflict, "PLUGIN_FILES_INVALID", message)
+	}
+
+	m.mu.Lock()
+	gate := m.gate
+	m.mu.Unlock()
+	if gate != nil {
+		if code, message := gate.CheckEnable(ctx, id); code != "" {
+			m.fail(ctx, id, StateBlocked, message, ActivitySafeMode, now)
+			return m.Get2(id), apiError(http.StatusConflict, code, message)
+		}
 	}
 
 	m.mu.Lock()

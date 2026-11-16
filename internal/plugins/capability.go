@@ -272,6 +272,16 @@ func (g Grants) Authorize(action string) error {
 		// host data and are always available to an enabled plugin.
 		return nil
 	}
+	if strings.HasPrefix(action, "credentials.") {
+		// The status list and the save action are useless without a declared
+		// credential name, so they are granted by the presence of one. The name
+		// itself is checked per call, which is what keeps one plugin's credential
+		// out of another plugin's reach.
+		if len(g.credentials) == 0 {
+			return capabilityDenied(action, capCredentialPre+"<name>")
+		}
+		return nil
+	}
 	capability, ok := actionCapability[action]
 	if !ok {
 		return capabilityDenied(action, "UNKNOWN_ACTION")

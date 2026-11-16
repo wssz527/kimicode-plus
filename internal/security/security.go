@@ -74,12 +74,16 @@ func permission(r *http.Request) string {
 		category = "tasks"
 	case strings.HasPrefix(p, "chat"):
 		category = "chat"
-	case strings.HasPrefix(p, "plugins"), strings.HasPrefix(p, "plugin-runtime"):
+	case strings.HasPrefix(p, "plugins"), strings.HasPrefix(p, "plugin-runtime"), strings.HasPrefix(p, "kct/"):
 		// Plugin runtime calls carry a plugin identity token in the body and are
 		// authorized again in the plugin manager. They still arrive over the core
 		// API, so the core guard must classify them as plugin traffic; leaving them
 		// unmatched maps them to core:write, which a plugin-scoped pairing does not
 		// hold, and every plugin action fails with PERMISSION_DENIED.
+		//
+		// The KCT handover is classified here too: it is part of the plugin page and
+		// gated by the same permission, and without this it would answer 403 to the
+		// page that owns the confirm button.
 		category = "plugins"
 	case strings.HasPrefix(p, "credentials"):
 		category = "credentials"

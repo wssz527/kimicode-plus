@@ -20,6 +20,7 @@ import (
 	"enhancedkimi/internal/future"
 	"enhancedkimi/internal/gateway"
 	"enhancedkimi/internal/httpx"
+	"enhancedkimi/internal/kctmigration"
 	"enhancedkimi/internal/plugins"
 	"enhancedkimi/internal/provider"
 	"enhancedkimi/internal/registry"
@@ -58,6 +59,7 @@ type App struct {
 	started       time.Time
 	gateway       *gateway.Gateway
 	planner       *chat.PlannerService
+	kctMigration  *kctmigration.Service
 	gatewayErr    string
 	gatewayBase   string
 }
@@ -157,6 +159,16 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 			app.pluginManager = s
 			app.pluginClose = s.Close
 			app.pluginSafe = s.EnforceSafeMode
+			// The handover from the standalone KCT extension gates the adapter's
+			// enable, so the gate is attached to the same instance the plugin page
+			// talks to. It is a core route because the adapter is disabled at the
+			// moment the page needs it.
+			if native.DataDir != "" {
+				migration := kctmigration.New(native.DataDir, s, kctmigration.System{})
+				migration.Register(mux)
+				s.UseEnableGate(migration)
+				app.kctMigration = migration
+			}
 			if bundled, bundleErr := bundledPlugins.BundledPlugins(); bundleErr == nil {
 				if releaseErr := s.ReleaseBundled(context.Background(), bundled); releaseErr != nil {
 					log.Printf("bundled plugin release incomplete: %v", releaseErr)

@@ -428,6 +428,31 @@ export interface PluginList {
   apiVersion?: number;
 }
 
+/** Mirrors kctmigration.Report: the handover state, with no secret in it. */
+export interface KctMigrationReport {
+  pluginId: string;
+  label: string;
+  dataDir: string;
+  detected: boolean;
+  plistPresent: boolean;
+  dataDirPresent: boolean;
+  migrated: boolean;
+  needsConfirmation: boolean;
+  settings: Record<string, string>;
+  migratedAt?: string;
+  detail?: string;
+}
+
+/** Mirrors kctmigration.Result. */
+export interface KctMigrationResult {
+  report: KctMigrationReport;
+  stoppedLoader: boolean;
+  disabledPlist: boolean;
+  migratedKeys: string[];
+  alreadyMigrated: boolean;
+  message: string;
+}
+
 export interface ChatSource {
   id: string;
   name: string;
@@ -888,6 +913,10 @@ export const api = {
       request<PluginRecord>(`/plugins/${encodeURIComponent(id)}/force-enable`, { method: "POST", body: {} }),
     activity: async (id: string, before = 0) =>
       asList<PluginActivity>(await request<unknown>(`/plugins/${encodeURIComponent(id)}/activity`, { query: { before, limit: 50 } })),
+    /** The standalone KCT handover. It is a core route because the adapter plugin
+     * is disabled at the moment the page needs it. */
+    kctMigration: () => request<KctMigrationReport>("/kct/migration"),
+    confirmKctMigration: () => request<KctMigrationResult>("/kct/migration/confirm", { method: "POST", body: {} }),
   },
   chat: {
     sources: async () => asList<ChatSource>(await request<unknown>("/chat/sources")),

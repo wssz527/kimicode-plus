@@ -95,7 +95,7 @@ interface PluginContext {
   events: { on(name: string, listener: (payload: unknown) => void): Disposable };
   ui: {
     mount(slot: "sidebar" | "settings", render: (element: HTMLElement) => Disposable | void): Disposable;
-    decorate(target: "thinking" | "message", decorator: (block: HTMLElement, info: BlockInfo) => Disposable | void): Disposable;
+    decorate(target: "thinking" | "message", decorator: (block: HTMLElement, info: BlockInfo) => Disposable | DecorationHandle | void): Disposable;
     theme(): { scheme: "light" | "dark"; tokens: Record<string, string> };
   };
   net: { fetch(url: string, init?: ProxyRequestInit & { credential?: string }): Promise<ProxyResponse> };
@@ -108,7 +108,40 @@ interface PluginContext {
   log(level: "info" | "warn" | "error", message: string): void;
   onDispose(cleanup: () => void): void;
 }
+
+interface BlockInfo {
+  key: string;          // 稳定标识，不要当作正文使用
+  role?: string;        // message 目标：assistant / user
+  slot: "thinking" | "message";
+  open: boolean;        // 思考块是否展开；折叠的块不应读取或翻译
+  streaming: boolean;   // 宿主是否仍在追加内容
+  revision: number;     // 宿主越改越大；插件自己的节点不计入
+}
+
+interface DecorationHandle {
+  dispose(): void;
+  update?(info: BlockInfo): void;  // 同一元素状态变化时调用，不必重建界面
+}
 ```
+
+装饰的两个约束：
+
+- 插件自己写进宿主的节点必须带 `data-ekdp-owned`。运行时按这个标记区分宿主内容与插件输出；缺标记时插件会把自己的渲染当成宿主更新。
+- 状态变化不要改宿主节点的 class（宿主用 class 表达展开/流式）。隐藏原文这类效果用插件自己的属性（例如 `data-ekdp-hide-source`）配合自建样式表实现。
+
+### 凭据动作
+
+```js
+const status = await ctx.core.request("credentials.list");
+// { items: [{ name, stored, unlocked, usable }], unlocked }
+await ctx.core.request("credentials.save", { name: "translator", value: key });
+await ctx.core.request("credentials.delete", { name: "translator" });
+```
+
+- 三个动作都要求清单里声明了 `credentials:<name>`，具体名字逐个校验，未声明的名字一律拒绝。
+- `credentials.save` 只写入、不回读；返回值不含明文，也不含长度。
+- `credentials.list` 只在凭据库可用时给出条目状态，不返回任何值。
+- 凭据库锁定时写操作返回 `PLUGIN_CREDENTIAL_LOCKED`（HTTP 423）。
 
 约定：
 
@@ -177,6 +210,8 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 | POST | `/enhance/v1/plugins/{id}/disable` | 停用并撤销令牌。 |
 | POST | `/enhance/v1/plugins/{id}/uninstall` | 卸载并写墓碑。 |
 | GET | `/enhance/v1/plugins/{id}/activity` | 活动记录，分页，已脱敏。 |
+| GET | `/enhance/v1/kct/migration` | 独立版 KCT 的迁移状态，只含公共设置，按 `plugins:read` 授权。 |
+| POST | `/enhance/v1/kct/migration/confirm` | 用户确认后停用独立版加载器并迁移公共设置，按 `plugins:write` 授权。 |
 
 ## 安装包校验
 
@@ -193,11 +228,14 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 - 异常停用、版本门禁拒绝、安全模式停止
 - 向会话发送消息、修改 Kimi Code 配置
 - 经代理发出的网络请求（方法 + 主机 + 状态码）
+- 凭据的保存与删除（只记名字，不记值）
 - 插件自己通过 `ctx.log` 输出的日志
 
 ## 示例
 
 `plugins/example-hello/` 是本仓库自带的最小示例：侧栏一行文字 + 一个设置子页 + 使用私有存储记录启用次数。它也是第三方开发者的起点，可以直接复制改名。
+
+`plugins/kct/` 是完整示例（移植自 MIT 许可的 `kimi-cot-translate`）：装饰思考块、分段与码块保护、三种翻译服务、`credentials:` 注入与私有存储缓存。它同时演示了「插件被宿主门禁拦住」的场景：独立版 KCT 的后台加载器仍在时，它的启用会被核心以 `PLUGIN_MIGRATION_REQUIRED` 拒绝。
 
 构建与验证：
 

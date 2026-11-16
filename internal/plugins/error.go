@@ -22,6 +22,12 @@ func apiError(status int, code, message string) *Error {
 	return &Error{Status: status, Code: code, Message: message}
 }
 
+// APIError builds the same failure for a collaborator outside this package that
+// has to answer a plugin request itself, such as the KCT migration service.
+func APIError(status int, code, message string) *Error {
+	return apiError(status, code, message)
+}
+
 func fail(w http.ResponseWriter, err error) {
 	var apiErr *Error
 	if errors.As(err, &apiErr) {

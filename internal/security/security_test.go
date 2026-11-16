@@ -99,11 +99,16 @@ func TestPairingRejectsInvalidAndUnknownPermissions(t *testing.T) {
 // used to fail with PERMISSION_DENIED before the plugin manager ever saw it.
 func TestPluginRuntimeRoutesCountAsPluginTraffic(t *testing.T) {
 	cases := map[string]string{
-		"/enhance/v1/plugins":                            "plugins:read",
+		"/enhance/v1/plugins":                             "plugins:read",
 		"/enhance/v1/plugins/kimicode-plus.example-hello": "plugins:read",
 		"/enhance/v1/plugins/x/enable":                    "plugins:write",
 		"/enhance/v1/plugin-runtime/storage.set":          "plugins:write",
 		"/enhance/v1/plugin-runtime/events.poll":          "plugins:write",
+		// The KCT handover is driven by the plugin page, so it has to be plugin
+		// traffic as well. Classified as core traffic, the confirm button answered
+		// 403 to the only client that can press it.
+		"/enhance/v1/kct/migration":         "plugins:read",
+		"/enhance/v1/kct/migration/confirm": "plugins:write",
 	}
 	for path, expected := range cases {
 		method := http.MethodGet

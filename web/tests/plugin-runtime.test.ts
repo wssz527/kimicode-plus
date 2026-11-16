@@ -36,6 +36,12 @@ test("network actions require a declared net host", () => {
   assert.equal(actionAllowed("net.fetch", ["net:api.example.com"]), true);
 });
 
+test("credential actions require a declared credential name", () => {
+  assert.equal(actionAllowed("credentials.list", ["storage"]), false);
+  assert.equal(actionAllowed("credentials.save", ["credentials:translator"]), true);
+  assert.equal(actionAllowed("credentials.save", ["net:api.example.com"]), false);
+});
+
 test("a granted storage call reaches the runtime route with the token", async () => {
   const { request, calls } = recordingTransport(() => ({ value: { saved: true } }));
   const bridge = createBridge({ token: "secret-token", granted: ["storage"], request });

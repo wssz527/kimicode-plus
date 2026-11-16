@@ -42,6 +42,25 @@ export interface BlockInfo {
   key: string;
   role?: string;
   slot: Exclude<SlotName, "sidebar" | "settings">;
+  /** Whether the host currently shows the block's body (a collapsed thinking
+   * block is not read and not translated). */
+  open: boolean;
+  /** Whether the host is still appending to this block. A streaming block is
+   * translated on a stable prefix and settled on the final content. */
+  streaming: boolean;
+  /** Monotonic content revision: incremented by host mutations in the block,
+   * never by the decorator's own nodes (mark those `data-ekdp-owned`). */
+  revision: number;
+}
+
+/**
+ * A decorator may return an optional update channel. The hub calls `update` for
+ * the same element instead of re-running the decorator on every host change, so
+ * a block that streams does not rebuild its UI; `dispose` still releases just
+ * this block. A decorator that returns nothing or a plain cleanup keeps working.
+ */
+export interface DecorationHandle extends Disposable {
+  update?(info: BlockInfo): void;
 }
 
 export interface ProxyResponse {
@@ -73,7 +92,7 @@ export interface PluginContext {
     mount(slot: SlotName, render: (element: HTMLElement) => Cleanup | void): Disposable;
     decorate(
       target: Exclude<SlotName, "sidebar" | "settings">,
-      decorator: (block: HTMLElement, info: BlockInfo) => Cleanup | void,
+      decorator: (block: HTMLElement, info: BlockInfo) => Cleanup | DecorationHandle | void,
     ): Disposable;
     theme(): PluginTheme;
   };

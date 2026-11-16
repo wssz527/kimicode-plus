@@ -124,6 +124,14 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 		return m.reportError(ctx, id, r, params)
 	case strings.HasPrefix(action, "net."):
 		return m.proxy(ctx, id, grants, vault, action, r, params)
+	case strings.HasPrefix(action, "credentials."):
+		// Credentials are handled here rather than forwarded to the core: the
+		// plaintext lives in this process's vault, and a core adapter round trip
+		// would only widen the surface that can see it.
+		if err := grants.Authorize(action); err != nil {
+			return nil, err
+		}
+		return m.credentialsAction(ctx, id, grants, action, r, params)
 	case action == "events.poll":
 		return m.pollEvents(ctx, grants, r, params)
 	case strings.HasPrefix(action, "storage."):
