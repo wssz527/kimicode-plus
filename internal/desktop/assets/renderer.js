@@ -58,6 +58,11 @@ async function installNativeRenderer(options) {
     settingsActive: false,
     settingsRelease: null,
     removed: false,
+    plugins: null,
+    pluginReleases: new Map(),
+    pluginTokens: new Map(),
+    pluginAssets: new Map(),
+    pluginSettings: new Map(),
   };
   const activeSession = () => {
     if (options.sourceSessionId) return options.sourceSessionId;
@@ -643,6 +648,7 @@ async function installNativeRenderer(options) {
   document.addEventListener('click', nativeTabClick, true);
   window.__ekdNativeUI = state;
   await refreshFeatures();
+  if (state.removed) return { status: 'removed', surface: 'host', domRevision: 1 };
   state.unsubscribeFeatures = makeHost(() => {}).subscribe('features', value => applyFeatures(value, false));
   let previousSession = activeSession();
   const sessionStore = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia._s.get('kimi.sessions');
@@ -798,11 +804,6 @@ async function installNativeRenderer(options) {
     reportFault(id, error, true);
   }
 
-  state.plugins = null;
-  state.pluginReleases = new Map();
-  state.pluginTokens = new Map();
-  state.pluginAssets = new Map();
-  state.pluginSettings = new Map();
   let syncPromise = null;
   let syncPending = false;
 
@@ -922,7 +923,7 @@ async function installNativeRenderer(options) {
   // Plugin state changes come from outside this renderer (the settings page is a
   // separate window), so the host re-reads the list whenever the surface becomes
   // visible again instead of only once at startup.
-  const pluginRefresh = () => { void syncPlugins(); };
+  function pluginRefresh() { void syncPlugins(); }
   document.addEventListener('visibilitychange', pluginRefresh);
   window.addEventListener('focus', pluginRefresh);
   // Features carry the enable/disable decisions this App made; the same event
