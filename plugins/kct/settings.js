@@ -82,11 +82,11 @@ export async function renderSettings(ctx, element) {
 
   const custom = document.createElement("div");
   custom.className = "ekdp-stack";
-  const endpoint = field("自定义端点", "例如 http://localhost:11434/v1/chat/completions。只允许本机地址。");
+  const endpoint = field("自定义端点", "例如 http://127.0.0.1:11434/v1/chat/completions。只允许本机地址。");
   const endpointInput = document.createElement("input");
   endpointInput.type = "url";
   endpointInput.className = "ekdp-input";
-  endpointInput.placeholder = "http://localhost:11434/v1/chat/completions";
+  endpointInput.placeholder = "http://127.0.0.1:11434/v1/chat/completions";
   endpointInput.value = settings.customEndpoint || "";
   endpoint.append(endpointInput);
 
@@ -193,7 +193,7 @@ export async function renderSettings(ctx, element) {
       useCredential: credentialUseInput.checked,
     };
     if (next.provider === "custom" && !localEndpoint(next.customEndpoint)) {
-      status.textContent = "自定义端点必须是本机地址（localhost / 127.0.0.1）且以 http 或 https 开头。";
+      status.textContent = "自定义端点必须使用 http(s) 和本机字面 IP（127.0.0.1 或 [::1]）。";
       return;
     }
     save.disabled = true;
@@ -245,9 +245,8 @@ export async function renderSettings(ctx, element) {
 
   async function refreshCache() {
     try {
-      const index = await ctx.storage.get(CACHE_INDEX_KEY);
-      const count = Array.isArray(index) ? index.length : 0;
-      cacheState.textContent = count ? `已缓存 ${count} 个段落。` : "暂无缓存。";
+      const keys = await ctx.storage.list(CACHE_ENTRY_PREFIX);
+      cacheState.textContent = keys.length ? `已缓存 ${keys.length} 个段落。` : "暂无缓存。";
     } catch {
       cacheState.textContent = "无法读取缓存状态。";
     }
@@ -256,11 +255,10 @@ export async function renderSettings(ctx, element) {
   cacheClear.addEventListener("click", async () => {
     cacheClear.disabled = true;
     try {
-      const index = await ctx.storage.get(CACHE_INDEX_KEY).catch(() => undefined);
-      const keys = Array.isArray(index) ? index.map(entry => entry?.[0]).filter(Boolean) : [];
-      for (const key of keys) await ctx.storage.delete(CACHE_ENTRY_PREFIX + key).catch(() => {});
-      await ctx.storage.delete(CACHE_INDEX_KEY).catch(() => {});
-      await ctx.storage.delete("cache.v1").catch(() => {});
+      const keys = await ctx.storage.list(CACHE_ENTRY_PREFIX);
+      for (const key of keys) await ctx.storage.delete(key);
+      await ctx.storage.delete(CACHE_INDEX_KEY);
+      await ctx.storage.delete("cache.v1");
       status.textContent = "翻译缓存已清除。";
       window.dispatchEvent(new Event("ekdp-kct:cache"));
       await refreshCache();
@@ -299,7 +297,7 @@ function localEndpoint(raw) {
     return false;
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return false;
-  return url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "::1" || url.hostname === "[::1]";
+  return url.hostname === "127.0.0.1" || url.hostname === "[::1]";
 }
 
 function messageOf(error) {

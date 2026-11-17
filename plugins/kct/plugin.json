@@ -14,8 +14,8 @@
     "storage",
     "net:edge.microsoft.com",
     "net:translate.googleapis.com",
-    "net:localhost",
     "net:127.0.0.1",
+    "net:::1",
     "credentials:translator"
   ],
   "upstream": {

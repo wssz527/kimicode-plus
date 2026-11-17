@@ -636,7 +636,7 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 	m.mu.Unlock()
 	if gate != nil {
 		if code, message := gate.CheckEnable(ctx, id); code != "" {
-			m.fail(ctx, id, StateBlocked, message, ActivitySafeMode, now)
+			m.fail(ctx, id, StateBlocked, message, ActivityBlocked, now)
 			return m.Get2(id), apiError(http.StatusConflict, code, message)
 		}
 	}

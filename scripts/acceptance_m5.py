@@ -147,6 +147,8 @@ def run(binary, root):
         assert blocked["error"]["code"] == "PLUGIN_MIGRATION_REQUIRED", blocked
         state = core.request("/plugins/" + PLUGIN)
         assert state["enabled"] is False and state["state"] == "BLOCKED", state
+        activity = core.request("/plugins/" + PLUGIN + "/activity")
+        assert activity["items"][0]["kind"] == "ENABLE_BLOCKED", activity
         results.append("the adapter cannot be enabled while the standalone loader is installed")
 
         confirmed = core.request("/kct/migration/confirm", {})

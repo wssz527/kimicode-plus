@@ -53,6 +53,7 @@ const ACTIVITY_LABELS: Record<string, string> = {
   NETWORK: "网络请求",
   CORRUPT: "异常停用",
   VERSION_BLOCKED: "版本门禁",
+  ENABLE_BLOCKED: "门禁拦截",
   SAFE_MODE: "安全模式",
   CREDENTIAL: "凭据",
 };
@@ -60,7 +61,7 @@ const ACTIVITY_LABELS: Record<string, string> = {
 const PLAIN_STATE: Record<string, string> = {
   ENABLED: "已启用",
   DISABLED: "已停用",
-  BLOCKED: "已被安全模式停止",
+  BLOCKED: "已阻止启用",
   FAULTED: "出错",
   CORRUPT: "文件异常",
   INCOMPATIBLE: "未在此版本验证",

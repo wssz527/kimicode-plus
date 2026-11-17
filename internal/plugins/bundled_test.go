@@ -80,7 +80,7 @@ func TestKCTAdapterManifest(t *testing.T) {
 	}
 	// The adapter reaches two public endpoints and a local one; a credential is
 	// only useful for the local endpoint, where the core injects it.
-	for _, host := range []string{"edge.microsoft.com", "translate.googleapis.com", "localhost"} {
+	for _, host := range []string{"edge.microsoft.com", "translate.googleapis.com", "127.0.0.1", "::1"} {
 		if !grants.AllowsHost(host) {
 			t.Fatalf("KCT cannot reach %s", host)
 		}
@@ -95,7 +95,9 @@ func TestKCTAdapterManifest(t *testing.T) {
 	if header.License == "" || header.Upstream.Repo == "" {
 		t.Fatalf("KCT manifest does not attribute its upstream license")
 	}
-	if _, ok := files["LICENSE"]; !ok {
-		t.Fatal("KCT ships without its license")
+	for _, name := range []string{"LICENSE", "NOTICE.md"} {
+		if _, ok := files[name]; !ok {
+			t.Fatalf("KCT ships without %s", name)
+		}
 	}
 }

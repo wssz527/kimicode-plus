@@ -746,8 +746,8 @@ function customEndpoint(settings) {
   } catch {
     return "";
   }
-  // 清单里的 net: 主机是固定的，因此本插件只承载本机端点；远程端点需要单独声明。
-  const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) || url.hostname === "::1";
+  // 主机名可能经 DNS 指向其他地址，只使用清单逐项授权的本机字面 IP。
+  const local = url.hostname === "127.0.0.1" || url.hostname === "[::1]";
   if (!local) return "";
   if (url.protocol !== "https:" && url.protocol !== "http:") return "";
   return url.href;

@@ -246,6 +246,7 @@ const (
 	ActivityNetwork    = "NETWORK"
 	ActivityCorrupt    = "CORRUPT"
 	ActivityVersion    = "VERSION_BLOCKED"
+	ActivityBlocked    = "ENABLE_BLOCKED"
 	ActivitySafeMode   = "SAFE_MODE"
 	ActivityUpgrade    = "UPGRADE"
 	ActivityRestore    = "RESTORE"
