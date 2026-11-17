@@ -102,6 +102,19 @@ test("every registered plugin receives only blocks of its own target", () => {
   h.hub.dispose();
 });
 
+test("a newly inserted block is discovered from its parent's mutation", () => {
+  const h = harness();
+  let runs = 0;
+  h.hub.register("thinking", () => {
+    runs += 1;
+  }, new Scope());
+  const inserted = h.think("added", { id: "inserted" });
+  h.observer.emit([{ type: "childList", target: h.doc.body, addedNodes: [inserted] }]);
+  h.flush();
+  assert.equal(runs, 1, "the added block was not discovered from its parent's mutation");
+  h.hub.dispose();
+});
+
 test("a second plugin still decorates a block the first plugin already saw", () => {
   const h = harness();
   h.think("a", { id: "t1" });

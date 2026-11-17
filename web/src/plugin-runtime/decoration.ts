@@ -280,6 +280,22 @@ export class DecorationHub implements Disposable {
         // plugin invalidate its own result on every render, so a record made up
         // entirely of the plugin's own nodes is not host churn.
         if (onlyOwnedNodes(record)) continue;
+        if (!dirty) {
+          const addedNodes = record.addedNodes;
+          for (let index = 0; addedNodes && index < addedNodes.length; index += 1) {
+            const node = addedNodes[index];
+            const added = elementOf(node);
+            if (!added) continue;
+            for (const registration of this.registrations) {
+              const selector = DECORATION_TARGETS[registration.target].selector;
+              if (closestMatch(added, selector) || added.querySelector?.(selector)) {
+                dirty = true;
+                break;
+              }
+            }
+            if (dirty) break;
+          }
+        }
         const removed = record.removedNodes;
         if (removed) {
           for (let index = 0; index < removed.length; index += 1) {
