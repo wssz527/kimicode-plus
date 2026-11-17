@@ -988,15 +988,15 @@ function injectStyles() {
   style.textContent = `
 .think[data-ekdp-kct-view] [data-ekdp-kct-hidden]{display:none!important}
 .think[data-ekdp-kct-view="original"] .ekdp-kct-translated{display:none!important}
-.ekdp-kct-bar{display:flex;align-items:center;justify-content:flex-end;gap:4px;font:12px/20px var(--font-ui,sans-serif);color:var(--color-text-secondary,#777)}
+.ekdp-kct-bar{display:flex;align-items:center;justify-content:flex-end;gap:4px;font:12px/20px var(--font-ui,sans-serif);color:var(--color-text-secondary,var(--color-text-muted,light-dark(#666,#aaa)))}
 .ekdp-kct-bar[hidden]{display:none}
 .ekdp-kct-btn{font:inherit;color:inherit;background:transparent;border:0;border-radius:4px;padding:0 5px;cursor:pointer;white-space:nowrap}
-.ekdp-kct-btn:hover{color:var(--color-text,#222);background:var(--color-hover,rgba(128,128,128,.1))}
+.ekdp-kct-btn:hover{color:var(--color-text,light-dark(#222,#eee));background:var(--color-hover,rgba(128,128,128,.1))}
 .ekdp-kct-btn:focus-visible{outline:2px solid var(--blue,#4385ef);outline-offset:2px}
 .ekdp-kct-btn:disabled{cursor:default}
-.ekdp-kct-status{color:var(--color-text-secondary,#888);font-size:11px}
+.ekdp-kct-status{color:var(--color-text-secondary,var(--color-text-muted,light-dark(#666,#aaa)));font-size:11px}
 .ekdp-kct-status:empty{display:none}
-.ekdp-kct-status[data-state="error"]{color:var(--red,#b9433e)}
+.ekdp-kct-status[data-state="error"]{color:var(--color-danger,var(--red,light-dark(#b42318,#f97066)))}
 .ekdp-kct-translated{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
 `;
   document.head.appendChild(style);
