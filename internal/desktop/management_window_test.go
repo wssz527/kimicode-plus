@@ -35,6 +35,30 @@ func TestBootstrapRestrictsManagementRoutes(t *testing.T) {
 	}
 }
 
+// The management window renders the injected surface on about:blank and holds a
+// bridge key, so it must not be able to navigate anywhere else, open a window or
+// expose devtools. Each guard is pinned by the literal that implements it.
+func TestBootstrapKeepsManagementWindowContained(t *testing.T) {
+	for _, wanted := range []string{
+		"webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, devTools: false },",
+		"win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));",
+		"win.webContents.on('will-navigate', (event, url) => {",
+		"if (url !== 'about:blank') event.preventDefault();",
+		"await win.loadURL('about:blank');",
+	} {
+		if !strings.Contains(bootstrapSource, wanted) {
+			t.Fatalf("bootstrap.js lost a management window containment guard: %s", wanted)
+		}
+	}
+	// The navigation listener must sit before the renderer is bound, so a page
+	// cannot start loading while the guard is still missing.
+	guard := strings.Index(bootstrapSource, "win.webContents.on('will-navigate', (event, url) => {")
+	bind := strings.Index(bootstrapSource, "if (management) await bindRenderer(win.webContents, 'management'")
+	if guard < 0 || bind < 0 || guard > bind {
+		t.Fatal("the will-navigate guard must be installed before the management renderer is bound")
+	}
+}
+
 // A management window is wider than the planner so a model table fits, and it
 // keeps its own title. Both windows take a fresh bridge key per WebContents.
 func TestBootstrapSizesManagementWindowSeparately(t *testing.T) {

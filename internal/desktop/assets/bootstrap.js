@@ -76,13 +76,19 @@ async function installNativeBootstrap(options) {
       x: previous?.x, y: previous?.y,
       minWidth: management ? 720 : 400, minHeight: management ? 520 : 500,
       show: false, autoHideMenuBar: true, backgroundColor: theme === 'dark' ? '#121212' : '#ffffff',
-      webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+      webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, devTools: false },
     });
     state.windows.set(kind, win);
     const contentsId = win.webContents.id;
     win.on('close', () => { if (!win.isDestroyed()) state.bounds.set(kind, win.getBounds()); });
     win.on('closed', () => { state.channels.delete(contentsId); state.windows.delete(kind); });
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    // The window only ever hosts the injected renderer on about:blank. Any
+    // other navigation would put an external page inside a window that carries
+    // a bridge key, so it is refused instead of followed.
+    win.webContents.on('will-navigate', (event, url) => {
+      if (url !== 'about:blank') event.preventDefault();
+    });
     await win.loadURL('about:blank');
     if (management) await bindRenderer(win.webContents, 'management', { popout: true, theme, initialPath: managementPath(source.path) });
     else await bindRenderer(win.webContents, 'planner', { popout: true, theme, ...source });

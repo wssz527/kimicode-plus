@@ -392,6 +392,15 @@
 .ekds .ns-body {
   overflow: visible;
   padding: 0;
+  height: auto;
+}
+
+.ekds .ns-embedded {
+  height: auto;
+}
+
+.ekds .ns-embedded .wb-body {
+  overflow: visible;
 }
 
 .ekds .ns-lede {

@@ -30,7 +30,7 @@ Core 路由将请求交给 registry、usage、bridge、plugins 或 chat。模块
 
 `KAPClient` 从指定隔离 KIMI_CODE_HOME 读取实例记录与本地服务 token，通过官方 `/api/v1` 读取会话/配置、创建会话、发送 prompt、停止和回复审批。WebSocket 事件按 session scope 进入 EventBus；`turn.ended` 只更新结束状态，不覆盖已流式保存的 Items。消息保留官方时间和附件名称/类型。规划由 Go Planner 单独持久化并通过配置供应商生成，网页选区由增强自建的 WebContentsView/窗口读取，编辑预览后经 `handoff` 向已有或新建 Code 会话发送。没有显式选择时请求不带 model 或 permission_mode，避免暗改目标；原生附件通过 Electron 文件选择取得路径，Go 校验最多 16 个本机常规文件后复用 KAP prompt 的 image/video/file 部件，不经过旧 Outbox blob store。
 
-多会话 surface 最多挂载三个窗格。同一入口逐次追加，官方侧栏驱动主窗格，已显示会话通过交换避免重复。`SessionInputProvider` 按 session ID 集中保存草稿、模型、模式、权限及附件，事件仍按会话订阅。它复用官方会话服务，但不是官方原生的多视图 API。规划位于官方右侧 `pt-body`，多会话位于 `.chat-main`，容器属性与 CSS 持续隐藏 Vue 重建的原生子节点，退出时释放。设置嵌入官方对话框，单层 5 项导航加一条跳转行；模型、凭据与插件改由自建 BrowserWindow 承载，只接受三条固定路由，经同一 `core.fetch` 通道访问核心；Monitor/设置入口沿用官方侧栏结构，网页在菜单/设置弹层出现时隐藏，避免 WebContentsView 覆盖控件。
+多会话 surface 最多挂载三个窗格。同一入口逐次追加，官方侧栏驱动主窗格，已显示会话通过交换避免重复。`SessionInputProvider` 按 session ID 集中保存草稿、模型、模式、权限及附件，事件仍按会话订阅。它复用官方会话服务，但不是官方原生的多视图 API。规划位于官方右侧 `pt-body`，多会话位于 `.chat-main`，容器属性与 CSS 持续隐藏 Vue 重建的原生子节点，退出时释放。设置嵌入官方对话框，单层 5 项导航加一条跳转行，插件在内嵌页面里直接管理；模型与凭据改由自建 BrowserWindow 承载，只接受 `/models`、`/credentials` 两条固定路由，窗口禁用 devtools 并拒绝除 `about:blank` 之外的导航，经同一 `core.fetch` 通道访问核心；Monitor/设置入口沿用官方侧栏结构，网页在菜单/设置弹层出现时隐藏，避免 WebContentsView 覆盖控件。
 
 ## 降级与后续边界
 

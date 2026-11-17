@@ -89,7 +89,7 @@ export function SettingsWindow({ host }: { host: NativeHost }) {
       </header>
       <div className="ekds-body">
         {openId === "cache" ? <CacheSettings host={host} /> : null}
-        {openId === "native" ? <NativeSettings /> : null}
+        {openId === "native" ? <NativeSettings embedded /> : null}
         {openId === "plugins" ? <PluginsSection /> : null}
         {openId === "addons" ? <AddonsSection host={host} /> : null}
         {openId === "diagnostics" ? <DiagnosticsSection host={host} /> : null}

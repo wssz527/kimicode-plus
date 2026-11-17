@@ -238,6 +238,25 @@ export function configMaxSteps(config: unknown): string {
   return typeof value === "number" || typeof value === "string" ? String(value) : "";
 }
 
+/**
+ * The guard defaults to on: the core only reports the field once it was set to
+ * false, so an absent value is not "off".
+ */
+export function readDangerousGuard(config: unknown): boolean {
+  const permission = configSection(asConfigObject(config), ["permission"]);
+  return configField(permission, ["dangerous_command_guard", "dangerousCommandGuard"]) !== false;
+}
+
+/**
+ * `POST /config` merges each top-level section key by key, so a patch that
+ * carries only this field rewrites the guard and leaves the stored permission
+ * rules in place. That is what makes it safe to save the guard on its own while
+ * the rule rows above still hold an uncommitted edit.
+ */
+export function dangerousGuardPatch(enabled: boolean): Record<string, unknown> {
+  return { permission: { dangerous_command_guard: enabled } };
+}
+
 /** Applies an incoming policy patch onto a base, keeping the fields the server owns. */
 export function mergePolicy(base: CachePolicyDraft, incoming: unknown): CachePolicyDraft {
   const source = (incoming ?? {}) as Partial<CachePolicyDraft>;

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { asConfigObject, commitNumberField, configMaxSteps, configSection, configField, configTimeoutMinutes, useHost } from "../native";
+import { asConfigObject, commitNumberField, configMaxSteps, configSection, configField, configTimeoutMinutes, dangerousGuardPatch, readDangerousGuard, useHost } from "../native";
 import { Icon } from "./Icon";
 import { Badge, ErrorNotice, Spinner } from "./ui";
 import "../styles/workbench.css";
@@ -244,7 +244,7 @@ function ModelSelect({
   );
 }
 
-export function NativeSettings() {
+export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}) {
   const host = useHost();
   const [config, setConfig] = useState<Dic | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -267,7 +267,7 @@ export function NativeSettings() {
     setMaxSteps(configMaxSteps(cfg));
     const permission = configSection(cfg, ["permission"]);
     setRules(readRules(configField(permission, ["rules"])));
-    setGuard(configField(permission, ["dangerous_command_guard", "dangerousCommandGuard"]) !== false);
+    setGuard(readDangerousGuard(cfg));
   }
 
   useEffect(() => {
@@ -399,34 +399,66 @@ export function NativeSettings() {
       if (reason) item.reason = reason;
       return item;
     });
+    // The guard has its own immediate save. Writing it here too would let a
+    // stale switch value in this form overwrite a newer server-side setting.
     void save(
       "permission",
       "now",
-      { permission: { rules: payload, dangerous_command_guard: guard } },
+      { permission: { rules: payload } },
       {
         note: "即时生效，下一次权限判定就使用新规则。",
         apply: (cfg) => {
           setConfig(cfg);
           const permission = configSection(cfg, ["permission"]);
           setRules(readRules(configField(permission, ["rules"])));
-          setGuard(configField(permission, ["dangerous_command_guard", "dangerousCommandGuard"]) !== false);
         },
         verify: (cfg) => {
           const permission = configSection(cfg, ["permission"]);
           const actual = Array.isArray(configField(permission, ["rules"])) ? (configField(permission, ["rules"]) as unknown[]) : [];
-          return actual.length === payload.length && configField(permission, ["dangerous_command_guard", "dangerousCommandGuard"]) === guard;
+          return actual.length === payload.length;
         },
       },
     );
   }
 
+  /**
+   * The dangerous-command guard is one boolean that takes effect immediately, so
+   * it saves on its own. `permission` merges key by key on the core, so sending
+   * only this field leaves whatever rules are stored there untouched — and the
+   * in-progress rule rows above are never read, written or reset by this path.
+   */
+  async function saveGuard(next: boolean) {
+    if (!host) return;
+    const previous = guard;
+    setGuard(next);
+    setSaving("guard");
+    setSaveError(null);
+    setSaved(null);
+    try {
+      await host.request("config.save", { patch: dangerousGuardPatch(next) });
+      const latest = asConfigObject(await host.request<Dic>("config.get")) ?? {};
+      const actual = readDangerousGuard(latest);
+      if (actual !== next) {
+        setGuard(actual);
+        setSaveError(READBACK_MISMATCH);
+        return;
+      }
+      setSaved({ key: "guard", timing: "now", note: "护栏已即时更新，下一次权限判定就使用新值。" });
+    } catch (cause) {
+      setGuard(previous);
+      setSaveError(errorText(cause));
+    } finally {
+      setSaving(null);
+    }
+  }
+
   if (!host) {
     return (
-      <div className="wb ns">
-        <header className="wb-head">
+      <div className={embedded ? "wb ns ns-embedded" : "wb ns"}>
+        {embedded ? null : <header className="wb-head">
           <span className="wb-mark" aria-hidden="true" />
           <h1>原生设置</h1>
-        </header>
+        </header>}
         <div className="wb-body">
           <p className="ns-empty">请从 Kimi Code 的宿主入口打开此页面。独立预览拿不到原生配置。</p>
         </div>
@@ -446,8 +478,8 @@ export function NativeSettings() {
   const scopeChoices = SCOPES.map((scope) => scope.value);
 
   return (
-    <div className="wb ns">
-      <header className="wb-head">
+    <div className={embedded ? "wb ns ns-embedded" : "wb ns"}>
+      {embedded ? null : <header className="wb-head">
         <span className="wb-mark" aria-hidden="true" />
         <h1>原生设置</h1>
         <div className="wb-head-actions">
@@ -458,7 +490,7 @@ export function NativeSettings() {
             <Icon name="close" size={15} />
           </button>
         </div>
-      </header>
+      </header>}
 
       <div className="wb-body ns-body">
         <p className="ns-lede">
@@ -778,15 +810,21 @@ export function NativeSettings() {
           </p>
 
           <label className="wb-switch">
-            <input type="checkbox" checked={guard} onChange={(event) => setGuard(event.target.checked)} />
+            <input
+              type="checkbox"
+              checked={guard}
+              disabled={saving === "guard"}
+              onChange={(event) => void saveGuard(event.target.checked)}
+            />
             <span className="wb-switch-track" aria-hidden="true">
               <span />
             </span>
             <span className="wb-switch-copy">
               危险命令护栏
-              <small>对已知危险命令先询问，不会静默放行。改完随上面的规则一起保存。</small>
+              <small>对已知危险命令先询问，不会静默放行。切换即保存，不影响上面尚未保存的规则编辑。</small>
             </span>
           </label>
+          {saved?.key === "guard" ? <p className="ns-saved">{saved.note}</p> : null}
         </SettingRow>
 
         {saved ? (
