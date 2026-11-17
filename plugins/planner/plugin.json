@@ -1,0 +1,23 @@
+{
+  "id": "kimicode-plus.planner",
+  "name": "规划",
+  "version": "1.0.0",
+  "apiVersion": 2,
+  "description": "右侧面板里的规划：网页来源直接打开 Kimi、DeepSeek、Gemini、Claude、ChatGPT 并解析对话，本地来源使用核心规划引擎，结果经可编辑预览交接给 Code 会话。",
+  "author": "KimiCode+",
+  "license": "MIT",
+  "hostVersions": ["1.*"],
+  "entry": { "renderer": "renderer.js" },
+  "capabilities": [
+    "ui:entry",
+    "ui:right-panel",
+    "ui:layout",
+    "browser:view",
+    "planner:run",
+    "handoff",
+    "models:read",
+    "sessions:read",
+    "commands",
+    "storage"
+  ]
+}
