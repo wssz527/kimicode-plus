@@ -8,13 +8,13 @@ Go Core 仍可独立运行。当前原生路径已在隔离 Kimi Code 1.3.5 / El
 
 ## 同窗页面与宿主入口
 
-官方界面以 Vue #app 为根，使用 data-color-scheme 与字体变量。`internal/desktop/assets/renderer.js` 在官方右侧 `pt-body` 挂载规划，在主聊天 `.chat-main` 挂载多会话，在侧栏 `side-footer` 前挂载 Monitor 和设置入口。统一“规划”入口默认网页，来源与配置位于菜单；入口分别克隆已有会话侧栏行和空会话工具菜单行。容器属性与 CSS 持续隐藏 Vue 重建的官方子节点，切回原生工具或单会话时释放。内容采用 Shadow DOM 隔离 CSS，并同步宿主主题。
+官方界面以 Vue #app 为根，使用 data-color-scheme 与字体变量。`internal/desktop/assets/renderer.js` 在官方右侧 `pt-body` 挂载规划，在主聊天 `.chat-main` 挂载多会话，在侧栏 `side-footer` 前挂载设置入口，并给插件运行时留出侧栏锚点（Monitor 插件挂在那里）。统一“规划”入口默认网页，来源与配置位于菜单；入口分别克隆已有会话侧栏行和空会话工具菜单行。容器属性与 CSS 持续隐藏 Vue 重建的官方子节点，切回原生工具或单会话时释放。内容采用 Shadow DOM 隔离 CSS，并同步宿主主题。
 
 入口注入按容器判重：`syncNativeEntries` 遍历每个可见的宿主菜单容器（空面板 `.sit`、`+` 下拉 `.pl`），在该容器内查同动作入口，多于一个则删除多余项，锚点行被重建则重新插入。判断依据是容器内是否已有入口，不使用全局单引用加 `isConnected`，因此官方重渲染任一容器后入口都能恢复且不会重复。
 
 侧栏开合由 `layout.acquireSidebarCollapse()` 引用计数管理：第一次 acquire 时记录当前开合状态，最后一次 release 时按记录恢复；本来就折叠的侧栏不会被展开。规划和同屏各持一份 release，互不影响。
 
-设置嵌入官方设置对话框，KimiCode+ 标签在“已归档”前，不默认创建独立 BrowserWindow。首页为单层列表与子页返回，复用已有核心页面、开关和请求链路。原生标签恢复、动态重附着、窄宽度和保存读回已实机通过。侧栏 Monitor 不依赖右侧工具起始页；侧栏宿主重建时先卸载旧 Monitor，避免遗留订阅和定时器。
+设置嵌入官方设置对话框，KimiCode+ 标签在“已归档”前，不默认创建独立 BrowserWindow。首页为单层列表与子页返回，复用已有核心页面、开关和请求链路。原生标签恢复、动态重附着、窄宽度和保存读回已实机通过。侧栏 Monitor 是预装插件，挂载点由插件运行时自己的锚点管理，宿主重建时随插件停用一起释放，不留订阅和定时器。
 
 `web/src/host-entry.tsx` 同时保留独立管理页的 mountEnhancement 与原生 mountSurface。宿主对象按挂载实例经 React Context 注入（`HostScopeContext` / `useHost`），不再有模块级单例，卸载任一面板不会清空其他面板的宿主。核心传输与内嵌导航按挂载数引用计数，最后一个面板卸载后才断开。`host.ts` 的 `releaseHost(expected)` 只在连接仍是自己安装的那个时才清除。
 
@@ -149,7 +149,7 @@ Monitor 位于会话侧栏，默认约 233px 的紧凑布局，详情折叠。�
 | `cache.retention` | `usage:read` | 按空闲时长分桶统计"空闲后第一次请求"的命中率，作为保活阈值的观测参考，不换算倒计时 |
 | `cache.receipts` | `usage:read` | 保活/压缩/恢复的执行回执，区分"官方已接收"与"官方已完成" |
 
-`monitor.summary` 在 Monitor 插件化之前保留为**过渡兼容层**：把 `cache.summary` 的数据映射回旧结构，并带 `compat` 说明。core 不新增常驻缓存指示（D10）。
+`monitor.summary` 已随 Monitor 插件化删除：侧栏组件是预装插件 `plugins/monitor/`，只经 `metrics:read` 读上面的 `cache.*`，核心不再保留这条私有通道。core 不新增常驻缓存指示（D10）。
 
 ### 缓存策略
 

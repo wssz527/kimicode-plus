@@ -1,6 +1,6 @@
 # 任务桥接、模拟适配器与插件生命周期
 
-本文件记录旧版 `internal/bridge` Outbox、Mock Adapter、`internal/plugins` 与 `internal/redact` 的实现契约、与 `docs/API_CONTRACT.md` 的精确偏差，以及可复现的验证结果。`internal/desktop` 现已另有真实 KAP 会话、规划、运行时接入、后台自动化和额度恢复路径；本机附件也可直接经 KAP prompt 发送，它们不经过本文的 Mock Outbox，详见 `NATIVE_INTEGRATION.md`。`monitor.summary` 的官方额度读取和 UNKNOWN 处理属于原生路径，不能与本文件的兼容事件导入或模拟资源计数混为一谈。侧栏 Monitor 的界面参考固定 MIT 上游版本，许可随构建交付，但不运行上游采集器；自动化回执不代表缓存命中率。
+本文件记录旧版 `internal/bridge` Outbox、Mock Adapter、`internal/plugins` 与 `internal/redact` 的实现契约、与 `docs/API_CONTRACT.md` 的精确偏差，以及可复现的验证结果。`internal/desktop` 现已另有真实 KAP 会话、规划、运行时接入、后台自动化和额度恢复路径；本机附件也可直接经 KAP prompt 发送，它们不经过本文的 Mock Outbox，详见 `NATIVE_INTEGRATION.md`。缓存指标的官方额度读取和 UNKNOWN 处理属于原生路径，不能与本文件的兼容事件导入或模拟资源计数混为一谈。侧栏 Monitor 现在是预装插件（`plugins/monitor/`），只经 `metrics:read` 读 `cache.*`；核心没有 `monitor.summary` 私有通道。界面参考固定 MIT 上游版本，许可随插件包交付，但不运行上游采集器；自动化回执不代表缓存命中率。
 
 ## 模块位置与集成签名
 

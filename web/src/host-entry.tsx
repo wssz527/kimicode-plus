@@ -8,7 +8,7 @@ import { normalizeColorScheme, rewriteAssetURLs } from "./lib/embed";
 import { Workbench } from "./components/Workbench";
 import { createCoreTransport, createEventChannel, createNativeHost, HostScopeContext, type DemoHost, type NativeHost, type HostScopeValue } from "./native";
 import { AuthProvider } from "./auth";
-import { MonitorSurface, PlannerSurface, SettingsWindow } from "./components/Surfaces";
+import { PlannerSurface, SettingsWindow } from "./components/Surfaces";
 import { ManagementWindow } from "./components/ManagementWindow";
 import { SessionGrid } from "./components/SessionGrid";
 import "./styles/surfaces.css";
@@ -170,7 +170,7 @@ export function mountWorkbench(element: HTMLElement, options: { host: DemoHost; 
   return handle;
 }
 
-export type SurfaceName = "planner" | "sessions" | "settings" | "monitor" | "management";
+export type SurfaceName = "planner" | "sessions" | "settings" | "management";
 export interface SurfaceMountOptions {
   host: NativeHost;
   stylesheetURL: string;
@@ -211,8 +211,7 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
   if (surface === "planner") root.render(wrap(<PlannerSurface host={options.host} initialSource={options.initialSource} />));
   else if (surface === "sessions") root.render(wrap(<SessionGrid host={options.host} initialExtraIds={options.initialExtraIds ?? []} onNativeRestore={options.onNativeRestore ?? (() => options.host.close())} />));
   else if (surface === "settings") root.render(wrap(<AuthProvider><SettingsWindow host={options.host} /></AuthProvider>));
-  else if (surface === "management") root.render(wrap(<AuthProvider><ManagementWindow host={options.host} path={managementRoute(options.initialPath)} /></AuthProvider>));
-  else root.render(wrap(<MonitorSurface host={options.host} />));
+  else root.render(wrap(<AuthProvider><ManagementWindow host={options.host} path={managementRoute(options.initialPath)} /></AuthProvider>));
   let mounted = true;
   const handle: EnhancementHandle = {
     updateContext: () => {},

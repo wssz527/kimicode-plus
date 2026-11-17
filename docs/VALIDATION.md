@@ -19,7 +19,7 @@
 | 保活闭环判定 | cacheRead>0 判成功；双零判 unknown（不伪造）；有上报但命中 0 判无效；窗口内被后续保活接手时记 invalid 而不是冒领对方步骤 | `TestJudgeKeepAliveVerdicts`、`TestSupersededKeepAliveDoesNotClaimTheNewerStep`、`TestSupersedeQueryScopesToSession` |
 | 真实会话手算 | 3 个会话与手算一致（含 931657/0.990900 的重合） | 见下方实测记录 |
 | 前端 | typecheck 通过、81 项测试全绿、build 成功 | `web/` |
-| 真实二进制端到端 | 隔离宿主上 `cache.summary`/`sessions`/`history`/`retention`/`receipts` 返回真实值；`monitor.summary` 兼容层正常；阈值 5–60 校验生效；设置写入读回一致 | 隔离宿主运行日志 |
+| 真实二进制端到端 | 隔离宿主上 `cache.summary`/`sessions`/`history`/`retention`/`receipts` 返回真实值；`monitor.summary` 已删除，调用返回未知动作；阈值 5–60 校验生效；设置写入读回一致 | 隔离宿主运行日志、`TestMonitorSummaryActionIsGone` |
 | 保活自动闭环 | 隔离宿主上由调度器自动触发，两次连续保活分别落 `invalid` 与 `verified`，回执在页面上按时间排列可见 | 见下方"保活闭环实测" |
 | 页面截图 | 深浅两种配色均渲染正确：四张指标卡并排、会话表格三列、策略开关、留存条、实际用量柱状图、最近执行记录三种回执状态 | `work/ab/shots/cache-light.png`、`cache-dark.png` |
 

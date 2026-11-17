@@ -7,7 +7,6 @@ import { PlannerPane } from "./workbench/PlannerPane";
 import { WebChatPane } from "./workbench/WebChatPane";
 import { ControlMenu } from "./workbench/ControlMenu";
 export { SettingsWindow } from "./SettingsSurface";
-export { MonitorSurface } from "./MonitorSurface";
 
 export function useNativeBootstrap(host: NativeHost) {
   const [boot, setBoot] = useState<DemoBootstrap | null>(null);
