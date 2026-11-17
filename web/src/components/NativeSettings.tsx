@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { useHost } from "../native";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { asConfigObject, commitNumberField, configMaxSteps, configSection, configField, configTimeoutMinutes, dangerousGuardPatch, matchesModelPool, matchesPermissionRules, readDangerousGuard, useHost } from "../native";
 import { Icon } from "./Icon";
 import { Badge, ErrorNotice, Spinner } from "./ui";
 import "../styles/workbench.css";
@@ -13,6 +13,8 @@ const TIMING: Record<Timing, { label: string; note: string }> = {
   derive: { label: "下次派生", note: "已有的子代理保持旧值，新派生的规划/审查才用新值。" },
   turn: { label: "下一轮", note: "当前回合继续用旧上限，下一轮开始生效。" },
 };
+
+const READBACK_MISMATCH = "官方核心读回的值和刚提交的不一致，可能被这一版忽略。请核对后再改其他项。";
 
 type Dic = Record<string, unknown>;
 
@@ -55,39 +57,6 @@ function nextId(prefix: string): string {
   return `${prefix}-${seq}`;
 }
 
-function asDic(value: unknown): Dic | null {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as Dic) : null;
-}
-
-function section(config: Dic | null, names: string[]): Dic | null {
-  if (!config) return null;
-  for (const name of names) {
-    const found = asDic(config[name]);
-    if (found) return found;
-  }
-  return null;
-}
-
-function field(source: Dic | null, names: string[]): unknown {
-  if (!source) return undefined;
-  for (const name of names) {
-    if (source[name] !== undefined) return source[name];
-  }
-  return undefined;
-}
-
-function listText(value: unknown): string {
-  if (Array.isArray(value)) return value.filter((item) => typeof item === "string").join(", ");
-  return typeof value === "string" ? value : "";
-}
-
-function splitList(text: string): string[] {
-  return text
-    .split(/[,\n]/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
 function omit(source: Dic, keys: string[]): Dic {
   const rest: Dic = { ...source };
   for (const key of keys) delete rest[key];
@@ -95,13 +64,13 @@ function omit(source: Dic, keys: string[]): Dic {
 }
 
 function readPool(raw: Dic | null): PoolEditor {
-  const models = asDic(field(raw, ["models"]));
+  const models = asConfigObject(configField(raw, ["models"]));
   const entries: PoolEntry[] = Object.entries(models ?? {}).map(([key, desc]) => ({
     id: nextId("pool"),
     key,
     desc: typeof desc === "string" ? desc : "",
   }));
-  const single = field(raw, ["defaultModel", "default_model", "model"]);
+  const single = configField(raw, ["defaultModel", "default_model", "model"]);
   const defaultModel = typeof single === "string" ? single : "";
   if (entries.length === 0 && defaultModel) {
     entries.push({ id: nextId("pool"), key: defaultModel, desc: "" });
@@ -118,7 +87,7 @@ function readRules(raw: unknown): RuleRow[] {
   if (!Array.isArray(raw)) return [];
   const rows: RuleRow[] = [];
   for (const item of raw) {
-    const dic = asDic(item);
+    const dic = asConfigObject(item);
     if (!dic) continue;
     rows.push({
       id: nextId("rule"),
@@ -177,58 +146,68 @@ function SaveButton({ busy, disabled, onClick }: { busy: boolean; disabled: bool
   );
 }
 
-function TagsInput({
+/**
+ * A number input that only submits on blur or Enter, so a half-typed value never
+ * reaches the core. The text is owned locally while focused; an incoming value
+ * must not overwrite what the user is still typing.
+ */
+function NumberField({
+  label,
   value,
-  onChange,
-  placeholder,
-  ariaLabel,
+  min,
+  max,
+  unit,
+  hint,
+  onCommit,
 }: {
-  value: string[];
-  onChange: (next: string[]) => void;
-  placeholder: string;
-  ariaLabel: string;
+  label: string;
+  value: string;
+  min: number;
+  max: number;
+  unit: string;
+  hint?: string;
+  onCommit: (value: number) => void;
 }) {
-  const [draft, setDraft] = useState("");
-
-  function commit(text: string) {
-    const added = splitList(text).filter((item) => !value.includes(item));
-    if (added.length > 0) onChange([...value, ...added]);
-    setDraft("");
+  const [text, setText] = useState(value);
+  const focused = useRef(false);
+  useEffect(() => {
+    if (!focused.current) setText(value);
+  }, [value]);
+  const trimmed = text.trim();
+  const parsed = trimmed === "" ? null : commitNumberField(text, min, max);
+  const issue = trimmed === "" ? null : parsed === null ? `填写 ${min}–${max} 之间的整数。` : null;
+  function commit() {
+    if (parsed !== null && String(parsed) !== value) onCommit(parsed);
   }
-
   return (
-    <div className="ns-tags">
-      {value.map((tag) => (
-        <span className="ns-tag" key={tag}>
-          {tag}
-          <button type="button" title={`移除 ${tag}`} onClick={() => onChange(value.filter((item) => item !== tag))}>
-            <Icon name="close" size={11} />
-          </button>
-        </span>
-      ))}
-      <input
-        className="ns-tag-input"
-        aria-label={ariaLabel}
-        value={draft}
-        placeholder={value.length === 0 ? placeholder : ""}
-        onChange={(event) => {
-          const text = event.target.value;
-          if (/[,\n]$/.test(text)) commit(text);
-          else setDraft(text);
-        }}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") {
-            event.preventDefault();
-            commit(draft);
-          } else if (event.key === "Backspace" && draft === "" && value.length > 0) {
-            onChange(value.slice(0, -1));
-          }
-        }}
-        onBlur={() => {
-          if (draft.trim()) commit(draft);
-        }}
-      />
-    </div>
+    <label className="ns-field">
+      <span className="wb-label">{label}</span>
+      <span className="ns-number">
+        <input
+          className="wb-input num"
+          type="number"
+          min={min}
+          max={max}
+          step={1}
+          value={text}
+          aria-invalid={issue ? true : undefined}
+          onFocus={() => {
+            focused.current = true;
+          }}
+          onChange={(event) => setText(event.target.value)}
+          onBlur={() => {
+            focused.current = false;
+            commit();
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") event.currentTarget.blur();
+          }}
+        />
+        <span className="ns-unit">{unit}</span>
+      </span>
+      {issue ? <span className="ns-issue">{issue}</span> : null}
+      {!issue && hint ? <span className="wb-hint">{hint}</span> : null}
+    </label>
   );
 }
 
@@ -265,14 +244,12 @@ function ModelSelect({
   );
 }
 
-export function NativeSettings({ embedded = false }: { embedded?: boolean }) {
+export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}) {
   const host = useHost();
   const [config, setConfig] = useState<Dic | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const [toolsEnabled, setToolsEnabled] = useState<string[]>([]);
-  const [toolsDisabled, setToolsDisabled] = useState<string[]>([]);
   const [pool, setPool] = useState<PoolEditor>({ entries: [], defaultId: "", rest: {} });
   const [timeoutMin, setTimeoutMin] = useState("");
   const [maxSteps, setMaxSteps] = useState("");
@@ -283,26 +260,23 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean }) {
   const [saved, setSaved] = useState<{ key: string; timing: Timing; note?: string } | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
 
+  function applyConfig(cfg: Dic) {
+    setConfig(cfg);
+    setPool(readPool(configSection(cfg, ["secondary_model", "secondaryModel"])));
+    setTimeoutMin(configTimeoutMinutes(cfg));
+    setMaxSteps(configMaxSteps(cfg));
+    const permission = configSection(cfg, ["permission"]);
+    setRules(readRules(configField(permission, ["rules"])));
+    setGuard(readDangerousGuard(cfg));
+  }
+
   useEffect(() => {
     if (!host) return;
     let alive = true;
     host
       .request<Dic>("config.get")
       .then((next) => {
-        if (!alive) return;
-        const cfg = asDic(next) ?? {};
-        setConfig(cfg);
-        const tools = section(cfg, ["tools"]);
-        setToolsEnabled(splitList(listText(field(tools, ["enabled"]))));
-        setToolsDisabled(splitList(listText(field(tools, ["disabled"]))));
-        setPool(readPool(section(cfg, ["secondary_model", "secondaryModel"])));
-        const timeoutMs = Number(field(section(cfg, ["subagent"]), ["timeout_ms", "timeoutMs"]));
-        setTimeoutMin(Number.isFinite(timeoutMs) && timeoutMs > 0 ? String(Math.round(timeoutMs / 60000)) : "");
-        const steps = field(section(cfg, ["loop_control", "loopControl"]), ["max_steps_per_turn", "maxStepsPerTurn"]);
-        setMaxSteps(typeof steps === "number" || typeof steps === "string" ? String(steps) : "");
-        const permission = section(cfg, ["permission"]);
-        setRules(readRules(field(permission, ["rules"])));
-        setGuard(field(permission, ["dangerous_command_guard", "dangerousCommandGuard"]) !== false);
+        if (alive) applyConfig(asConfigObject(next) ?? {});
       })
       .catch((cause) => {
         if (alive) setLoadError(errorText(cause));
@@ -315,7 +289,7 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean }) {
     };
   }, [host]);
 
-  const aliases = useMemo(() => Object.keys(asDic(field(config, ["models"])) ?? {}), [config]);
+  const aliases = useMemo(() => Object.keys(asConfigObject(configField(config, ["models"])) ?? {}), [config]);
 
   const poolKeys = useMemo(
     () => pool.entries.map((entry) => entry.key.trim()).filter(Boolean),
@@ -329,24 +303,33 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean }) {
 
   const ruleIssues = rules.map((rule) => patternIssue(rule.pattern));
 
-  async function save(key: string, timing: Timing, patch: Dic | Dic[], note?: string) {
+  /**
+   * Writes are only reported as saved after a fresh GET agrees. A 200 from
+   * config.save proves the request was accepted, not that the field changed:
+   * the current KAP schema silently drops fields it does not know.
+   */
+  async function save(
+    key: string,
+    timing: Timing,
+    patch: Dic | Dic[],
+    options: { note?: string; verify?: (cfg: Dic) => boolean; apply?: (cfg: Dic) => void },
+  ) {
     if (!host) return;
     const steps = Array.isArray(patch) ? patch : [patch];
     setSaving(key);
     setSaveError(null);
     setSaved(null);
-    let done = 0;
     try {
-      let latest: Dic | null = null;
-      for (const step of steps) {
-        latest = asDic(await host.request<Dic>("config.save", { patch: step })) ?? latest;
-        done += 1;
-        if (latest) setConfig(latest);
+      for (const step of steps) await host.request<Dic>("config.save", { patch: step });
+      const latest = asConfigObject(await host.request<Dic>("config.get")) ?? {};
+      (options.apply ?? applyConfig)(latest);
+      if (options.verify && !options.verify(latest)) {
+        setSaveError(READBACK_MISMATCH);
+        return;
       }
-      setSaved({ key, timing, note });
+      setSaved({ key, timing, note: options.note });
     } catch (cause) {
-      const message = errorText(cause);
-      setSaveError(done === 0 ? message : `${message}（此前的写入已完成，请再保存一次补齐）`);
+      setSaveError(errorText(cause));
     } finally {
       setSaving(null);
     }
@@ -359,28 +342,43 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean }) {
       const key = entry.key.trim();
       if (key) models[key] = entry.desc.trim();
     }
+    const apply = (cfg: Dic) => setPool(readPool(configSection(cfg, ["secondary_model", "secondaryModel"])));
     if (poolKeys.length === 0) {
-      void save("pool", "derive", { secondary_model: null }, "模型池已清空，子代理改为跟随调用方的模型。");
+      void save("pool", "derive", { secondary_model: null }, {
+        note: "模型池已清空，子代理改为跟随调用方的模型。",
+        apply,
+        verify: (cfg) => configSection(cfg, ["secondary_model", "secondaryModel"]) === null,
+      });
       return;
     }
     const chosen = pool.entries.find((entry) => entry.id === pool.defaultId);
     const defaultModel = chosen && models[chosen.key.trim()] !== undefined ? chosen.key.trim() : poolKeys[0]!;
+    const verify = (cfg: Dic) => matchesModelPool(cfg, { models, defaultModel });
     const full: Dic = { ...pool.rest, models, defaultModel };
-    const current = section(config, ["secondary_model", "secondaryModel"]);
-    const currentKeys = Object.keys(asDic(field(current, ["models"])) ?? {});
+    const current = configSection(config, ["secondary_model", "secondaryModel"]);
+    const currentKeys = Object.keys(asConfigObject(configField(current, ["models"])) ?? {});
     const removed = currentKeys.filter((key) => models[key] === undefined);
-    const legacy = field(current, ["model"]) !== undefined;
+    const legacy = configField(current, ["model"]) !== undefined;
     if (removed.length === 0 && !legacy) {
-      void save("pool", "derive", { secondary_model: full }, "下次派生生效，已在运行的子代理保持旧模型。");
+      void save("pool", "derive", { secondary_model: full }, {
+        note: "下次派生生效，已在运行的子代理保持旧模型。",
+        apply,
+        verify,
+      });
       return;
     }
     void save(
       "pool",
       "derive",
       [{ secondary_model: null }, { secondary_model: full }],
-      removed.length > 0
-        ? `已整体替换模型池，移除的 ${removed.length} 个条目不再保留；下次派生生效。`
-        : "已整体替换模型池，旧的单模型设置不再保留；下次派生生效。",
+      {
+        note:
+          removed.length > 0
+            ? `已整体替换模型池，移除的 ${removed.length} 个条目不再保留；下次派生生效。`
+            : "已整体替换模型池，旧的单模型设置不再保留；下次派生生效。",
+        apply,
+        verify,
+      },
     );
   }
 
@@ -397,21 +395,62 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean }) {
       if (reason) item.reason = reason;
       return item;
     });
+    // The guard has its own immediate save. Writing it here too would let a
+    // stale switch value in this form overwrite a newer server-side setting.
     void save(
       "permission",
       "now",
-      { permission: { rules: payload, dangerous_command_guard: guard } },
-      "即时生效，下一次权限判定就使用新规则。",
+      { permission: { rules: payload } },
+      {
+        note: "即时生效，下一次权限判定就使用新规则。",
+        apply: (cfg) => {
+          setConfig(cfg);
+          const permission = configSection(cfg, ["permission"]);
+          setRules(readRules(configField(permission, ["rules"])));
+        },
+        verify: (cfg) => matchesPermissionRules(cfg, payload),
+      },
     );
+  }
+
+  /**
+   * The dangerous-command guard is one boolean that takes effect immediately, so
+   * it saves on its own. `permission` merges key by key on the core, so sending
+   * only this field leaves whatever rules are stored there untouched — and the
+   * in-progress rule rows above are never read, written or reset by this path.
+   */
+  async function saveGuard(next: boolean) {
+    if (!host) return;
+    const previous = guard;
+    setGuard(next);
+    setSaving("guard");
+    setSaveError(null);
+    setSaved(null);
+    try {
+      await host.request("config.save", { patch: dangerousGuardPatch(next) });
+      const latest = asConfigObject(await host.request<Dic>("config.get")) ?? {};
+      const actual = readDangerousGuard(latest);
+      if (actual !== next) {
+        setGuard(actual);
+        setSaveError(READBACK_MISMATCH);
+        return;
+      }
+      setSaved({ key: "guard", timing: "now", note: "护栏已即时更新，下一次权限判定就使用新值。" });
+    } catch (cause) {
+      setGuard(previous);
+      setSaveError(errorText(cause));
+    } finally {
+      setSaving(null);
+    }
   }
 
   if (!host) {
     return (
-      <div className="wb ns">
-        <header className="wb-head">
+      <div className={embedded ? "wb ns ns-embedded" : "wb ns"}>
+        {embedded ? null : <header className="wb-head">
           <span className="wb-mark" aria-hidden="true" />
           <h1>原生设置</h1>
-        </header>
+        </header>}
         <div className="wb-body">
           <p className="ns-empty">请从 Kimi Code 的宿主入口打开此页面。独立预览拿不到原生配置。</p>
         </div>
@@ -428,12 +467,10 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean }) {
     );
   }
 
-  const timeoutValid = Number(timeoutMin) > 0;
-  const stepsValid = Number(maxSteps) > 0 && Number.isInteger(Number(maxSteps));
   const scopeChoices = SCOPES.map((scope) => scope.value);
 
   return (
-    <div className={`wb ns ${embedded ? "ns-embedded" : ""}`}>
+    <div className={embedded ? "wb ns ns-embedded" : "wb ns"}>
       {embedded ? null : <header className="wb-head">
         <span className="wb-mark" aria-hidden="true" />
         <h1>原生设置</h1>
@@ -449,55 +486,13 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean }) {
 
       <div className="wb-body ns-body">
         <p className="ns-lede">
-          这五项管的是 Code 会话的工具、子代理的模型与时限、以及权限规则。保存后按每项标题旁的时机生效。
+          这四项管的是子代理的模型与时限、单轮步数上限，以及权限规则。数字在离开输入框时保存，保存后用官方接口重新读回核对。
         </p>
 
         {loadError ? (
           <ErrorNotice title="配置没有读到" message={loadError} recovery="确认官方核心在运行后重新打开此页。" />
         ) : null}
-        {saveError ? <ErrorNotice title="保存没有完成" message={saveError} /> : null}
-
-        <SettingRow
-          title="Code 工具开关"
-          purpose="控制 Code 会话能用哪些工具。输入后回车或逗号确认，留空沿用官方默认。"
-          timing="now"
-          footer={
-            <>
-              <SaveButton
-                busy={saving === "tools"}
-                disabled={!config}
-                onClick={() =>
-                  void save(
-                    "tools",
-                    "now",
-                    { tools: { enabled: toolsEnabled, disabled: toolsDisabled } },
-                    "即时生效，下一次工具调用就按新列表判定。",
-                  )
-                }
-              />
-              {saved?.key === "tools" ? <span className="ns-saved">{saved.note}</span> : null}
-            </>
-          }
-        >
-          <div className="ns-field">
-            <span className="wb-label">只启用这些工具</span>
-            <TagsInput
-              value={toolsEnabled}
-              onChange={setToolsEnabled}
-              ariaLabel="启用工具"
-              placeholder="例如 read"
-            />
-          </div>
-          <div className="ns-field">
-            <span className="wb-label">停用这些工具</span>
-            <TagsInput
-              value={toolsDisabled}
-              onChange={setToolsDisabled}
-              ariaLabel="停用工具"
-              placeholder="例如 bash"
-            />
-          </div>
-        </SettingRow>
+        {saveError ? <ErrorNotice title="保存没有完成" message={saveError} recovery="读回的值以官方核心为准，可以再改一次。" /> : null}
 
         <SettingRow
           title="子代理模型池"
@@ -608,75 +603,60 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean }) {
 
         <SettingRow
           title="子代理时限"
-          purpose="单个子代理最长运行多久，按分钟填写。超时后该子代理会被终止。"
+          purpose="单个子代理最长运行多久。超时后该子代理会被终止。"
           timing="derive"
           footer={
-            <>
-              <SaveButton
-                busy={saving === "timeout"}
-                disabled={!timeoutValid}
-                onClick={() =>
-                  void save(
-                    "timeout",
-                    "derive",
-                    { subagent: { timeout_ms: Math.round(Number(timeoutMin) * 60000) } },
-                    "下次派生生效，已有的子代理继续用旧时限。",
-                  )
-                }
-              />
-              {saved?.key === "timeout" ? <span className="ns-saved">{saved.note}</span> : null}
-            </>
+            saving === "timeout" ? <span className="ns-saved"><Spinner size={12} /> 正在保存</span> : null
           }
         >
-          <label className="ns-field">
-            <span className="wb-label">分钟</span>
-            <input
-              className="wb-input num"
-              type="number"
-              min={1}
-              step={1}
-              value={timeoutMin}
-              onChange={(event) => setTimeoutMin(event.target.value)}
-              placeholder="120"
-            />
-          </label>
-          <p className="wb-hint">默认 120 分钟，对应 7200000 毫秒。</p>
+          <NumberField
+            label="分钟"
+            value={timeoutMin}
+            min={1}
+            max={10080}
+            unit="分钟"
+            hint="默认 120 分钟，对应 7200000 毫秒。离开输入框即保存。"
+            onCommit={(value) => {
+              void save("timeout", "derive", { subagent: { timeout_ms: Math.round(value * 60000) } }, {
+                note: "下次派生生效，已有的子代理继续用旧时限。",
+                apply: (cfg) => {
+                  setConfig(cfg);
+                  setTimeoutMin(configTimeoutMinutes(cfg));
+                },
+                verify: (cfg) => Number(configField(configSection(cfg, ["subagent"]), ["timeout_ms", "timeoutMs"])) === value * 60000,
+              });
+            }}
+          />
+          {saved?.key === "timeout" ? <p className="ns-saved">{saved.note}</p> : null}
         </SettingRow>
 
         <SettingRow
           title="单轮步数上限"
-          purpose="一个回合里 agent 最多走多少步，用来限制长任务发散。留空则用官方默认。"
+          purpose="一个回合里 agent 最多走多少步，用来限制长任务发散。0 表示不设上限。"
           timing="turn"
           footer={
-            <>
-              <SaveButton
-                busy={saving === "steps"}
-                disabled={!stepsValid}
-                onClick={() =>
-                  void save(
-                    "steps",
-                    "turn",
-                    { loop_control: { max_steps_per_turn: Math.trunc(Number(maxSteps)) } },
-                    "下一轮生效，当前回合继续用旧上限。",
-                  )
-                }
-              />
-              {saved?.key === "steps" ? <span className="ns-saved">{saved.note}</span> : null}
-            </>
+            saving === "steps" ? <span className="ns-saved"><Spinner size={12} /> 正在保存</span> : null
           }
         >
-          <label className="ns-field">
-            <span className="wb-label">步数</span>
-            <input
-              className="wb-input num"
-              type="number"
-              min={1}
-              step={1}
-              value={maxSteps}
-              onChange={(event) => setMaxSteps(event.target.value)}
-              placeholder="未设置"
-            />
-          </label>
+          <NumberField
+            label="步数"
+            value={maxSteps}
+            min={0}
+            max={10000}
+            unit="步"
+            hint="离开输入框即保存；0 表示无上限。"
+            onCommit={(value) => {
+              void save("steps", "turn", { loop_control: { max_steps_per_turn: value } }, {
+                note: "下一轮生效，当前回合继续用旧上限。",
+                apply: (cfg) => {
+                  setConfig(cfg);
+                  setMaxSteps(configMaxSteps(cfg));
+                },
+                verify: (cfg) => Number(configField(configSection(cfg, ["loop_control", "loopControl"]), ["max_steps_per_turn", "maxStepsPerTurn"])) === value,
+              });
+            }}
+          />
+          {saved?.key === "steps" ? <p className="ns-saved">{saved.note}</p> : null}
         </SettingRow>
 
         <SettingRow
@@ -822,21 +802,27 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean }) {
           </p>
 
           <label className="wb-switch">
-            <input type="checkbox" checked={guard} onChange={(event) => setGuard(event.target.checked)} />
+            <input
+              type="checkbox"
+              checked={guard}
+              disabled={saving === "guard"}
+              onChange={(event) => void saveGuard(event.target.checked)}
+            />
             <span className="wb-switch-track" aria-hidden="true">
               <span />
             </span>
             <span className="wb-switch-copy">
               危险命令护栏
-              <small>对已知危险命令先询问，不会静默放行。</small>
+              <small>对已知危险命令先询问，不会静默放行。切换即保存，不影响上面尚未保存的规则编辑。</small>
             </span>
           </label>
+          {saved?.key === "guard" ? <p className="ns-saved">{saved.note}</p> : null}
         </SettingRow>
 
         {saved ? (
           <p className="ns-receipt" role="status">
             <Icon name="check" size={14} />
-            已保存 · {TIMING[saved.timing].label}：{TIMING[saved.timing].note}
+            已保存并读回核对 · {TIMING[saved.timing].label}：{TIMING[saved.timing].note}
           </p>
         ) : null}
       </div>

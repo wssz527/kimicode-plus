@@ -58,6 +58,11 @@ async function installNativeRenderer(options) {
     settingsActive: false,
     settingsRelease: null,
     removed: false,
+    plugins: null,
+    pluginReleases: new Map(),
+    pluginTokens: new Map(),
+    pluginAssets: new Map(),
+    pluginSettings: new Map(),
   };
   const activeSession = () => {
     if (options.sourceSessionId) return options.sourceSessionId;
@@ -626,21 +631,24 @@ async function installNativeRenderer(options) {
   };
   document.addEventListener('click', settingsTabClick, true);
   document.addEventListener('scroll', settingsScroll, true);
-  if (options.surface === 'settings' || options.popout) {
+  if (options.surface === 'settings' || options.surface === 'management' || options.popout) {
     document.documentElement.dataset.colorScheme = options.theme || 'dark';
-    document.title = options.surface === 'settings' ? 'KimiCode+ 设置' : 'KimiCode+ 规划聊天';
+    const title = options.surface === 'settings' ? 'KimiCode+ 设置' : options.surface === 'management' ? 'KimiCode+ 管理' : 'KimiCode+ 规划聊天';
+    document.title = title;
     document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:var(--color-bg,#121212);color:var(--color-text,#eee)';
     const element = document.createElement('div');
     element.style.cssText = 'height:100vh;min-height:0';
     document.body.replaceChildren(element);
     const host = makeHost(() => { void transport.request('window.close'); });
-    mount(element, options.surface === 'settings' ? 'settings' : 'planner', host, { initialSource: options.initialSource || 'web' });
+    if (options.surface === 'management') mount(element, 'management', host, { initialPath: options.initialPath });
+    else mount(element, options.surface === 'settings' ? 'settings' : 'planner', host, { initialSource: options.initialSource || 'web' });
     window.__ekdNativeUI = state;
     return { status: 'installed', surface: options.surface || 'planner' };
   }
   document.addEventListener('click', nativeTabClick, true);
   window.__ekdNativeUI = state;
   await refreshFeatures();
+  if (state.removed) return { status: 'removed', surface: 'host', domRevision: 1 };
   state.unsubscribeFeatures = makeHost(() => {}).subscribe('features', value => applyFeatures(value, false));
   let previousSession = activeSession();
   const sessionStore = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia._s.get('kimi.sessions');
@@ -796,11 +804,6 @@ async function installNativeRenderer(options) {
     reportFault(id, error, true);
   }
 
-  state.plugins = null;
-  state.pluginReleases = new Map();
-  state.pluginTokens = new Map();
-  state.pluginAssets = new Map();
-  state.pluginSettings = new Map();
   let syncPromise = null;
   let syncPending = false;
 
@@ -920,7 +923,7 @@ async function installNativeRenderer(options) {
   // Plugin state changes come from outside this renderer (the settings page is a
   // separate window), so the host re-reads the list whenever the surface becomes
   // visible again instead of only once at startup.
-  const pluginRefresh = () => { void syncPlugins(); };
+  function pluginRefresh() { void syncPlugins(); }
   document.addEventListener('visibilitychange', pluginRefresh);
   window.addEventListener('focus', pluginRefresh);
   // Features carry the enable/disable decisions this App made; the same event

@@ -199,6 +199,106 @@ export function commitNumberField(text: string, min: number, max: number): numbe
   return value;
 }
 
+export type ConfigObject = Record<string, unknown>;
+
+export function asConfigObject(value: unknown): ConfigObject | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as ConfigObject) : null;
+}
+
+/** Reads the first present key, so a camelCase GET and a snake_case write both resolve. */
+export function configSection(config: ConfigObject | null, names: string[]): ConfigObject | null {
+  if (!config) return null;
+  for (const name of names) {
+    const found = asConfigObject(config[name]);
+    if (found) return found;
+  }
+  return null;
+}
+
+export function configField(source: ConfigObject | null, names: string[]): unknown {
+  if (!source) return undefined;
+  for (const name of names) {
+    if (source[name] !== undefined) return source[name];
+  }
+  return undefined;
+}
+
+/**
+ * `GET /config` answers with camelCase for these two fields even though the
+ * write used snake_case. Reading only the snake_case key reported "not set"
+ * for values that were set, so both spellings are checked.
+ */
+export function configTimeoutMinutes(config: unknown): string {
+  const value = Number(configField(configSection(asConfigObject(config), ["subagent"]), ["timeout_ms", "timeoutMs"]));
+  return Number.isFinite(value) && value > 0 ? String(Math.round(value / 60000)) : "";
+}
+
+export function configMaxSteps(config: unknown): string {
+  const value = configField(configSection(asConfigObject(config), ["loop_control", "loopControl"]), ["max_steps_per_turn", "maxStepsPerTurn"]);
+  return typeof value === "number" || typeof value === "string" ? String(value) : "";
+}
+
+/**
+ * The guard defaults to on: the core only reports the field once it was set to
+ * false, so an absent value is not "off".
+ */
+export function readDangerousGuard(config: unknown): boolean {
+  const permission = configSection(asConfigObject(config), ["permission"]);
+  return configField(permission, ["dangerous_command_guard", "dangerousCommandGuard"]) !== false;
+}
+
+/**
+ * `POST /config` merges each top-level section key by key, so a patch that
+ * carries only this field rewrites the guard and leaves the stored permission
+ * rules in place. That is what makes it safe to save the guard on its own while
+ * the rule rows above still hold an uncommitted edit.
+ */
+export function dangerousGuardPatch(enabled: boolean): Record<string, unknown> {
+  return { permission: { dangerous_command_guard: enabled } };
+}
+
+/**
+ * Compares the secondary model pool read back from the core against what was
+ * submitted. `GET /config` answers with camelCase field names while the write
+ * used snake_case, so both spellings resolve; every model keeps its description,
+ * and the default model must be the same key.
+ */
+export function matchesModelPool(config: unknown, expected: { models: Record<string, string>; defaultModel: string }): boolean {
+  const section = configSection(asConfigObject(config), ["secondary_model", "secondaryModel"]);
+  const written = asConfigObject(configField(section, ["models"])) ?? {};
+  const wanted = expected.models;
+  if (Object.keys(written).length !== Object.keys(wanted).length) return false;
+  if (!Object.entries(wanted).every(([key, desc]) => written[key] === desc)) return false;
+  return configField(section, ["defaultModel", "default_model", "model"]) === expected.defaultModel;
+}
+
+/**
+ * Compares the permission rules read back from the core against the submitted
+ * payload, in order and field by field. A length check alone would accept a rule
+ * that kept its count but changed its decision, pattern, scope or a preserved
+ * extra field.
+ */
+export function matchesPermissionRules(config: unknown, expected: readonly unknown[]): boolean {
+  const permission = configSection(asConfigObject(config), ["permission"]);
+  const actual = configField(permission, ["rules"]);
+  if (!Array.isArray(actual) || actual.length !== expected.length) return false;
+  return expected.every((rule, index) => sameConfigValue(actual[index], rule));
+}
+
+function sameConfigValue(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((item, index) => sameConfigValue(item, right[index]));
+  }
+  const leftObject = asConfigObject(left);
+  const rightObject = asConfigObject(right);
+  if (!leftObject || !rightObject) return false;
+  const keys = Object.keys(rightObject);
+  return keys.length === Object.keys(leftObject).length
+    && keys.every((key) => sameConfigValue(leftObject[key], rightObject[key]));
+}
+
 /** Applies an incoming policy patch onto a base, keeping the fields the server owns. */
 export function mergePolicy(base: CachePolicyDraft, incoming: unknown): CachePolicyDraft {
   const source = (incoming ?? {}) as Partial<CachePolicyDraft>;
@@ -252,6 +352,18 @@ export interface NativeHooks {
   close: () => void;
   popout?: (source?: "local" | "web") => Promise<void>;
   pickSession?: (exclude: string[]) => Promise<string>;
+  openManagement?: (path: ManagementPath) => Promise<void>;
+}
+
+/**
+ * The management window is a separate BrowserWindow, so its routes are a fixed
+ * set. Plugins are not here: they are managed inside the settings dialog, which
+ * ships the same PluginSettings component. The bridge rejects anything else.
+ */
+export const managementPaths = ["/models", "/credentials"] as const;
+export type ManagementPath = typeof managementPaths[number];
+export function isManagementPath(value: string): value is ManagementPath {
+  return (managementPaths as readonly string[]).includes(value);
 }
 export interface NativeTransport {
   request: <T = unknown>(action: string, payload?: Record<string, unknown>) => Promise<T>;
@@ -269,6 +381,7 @@ export interface NativeHost {
   ensureWidth: (width: number) => Promise<void>;
   popout: (source?: "local" | "web") => Promise<void>;
   openSettings: () => Promise<void>;
+  openManagement: (path: ManagementPath) => Promise<void>;
   pickSession: (exclude: string[]) => Promise<string>;
   close: () => void;
 }
@@ -417,6 +530,10 @@ export function createNativeHost(transport: NativeTransport, hooks: NativeHooks,
     ensureWidth: async width => { await transport.request("window.ensureWidth", { width }); },
     popout: hooks.popout ?? (async source => { await transport.request("window.popout", { surface: "planner", initialSource: source ?? "web" }); }),
     openSettings: async () => { await transport.request("window.openSettings"); },
+    openManagement: async path => {
+      if (!isManagementPath(path)) throw new Error("管理窗口只打开模型与凭据页");
+      await transport.request("window.openManagement", { path });
+    },
     pickSession: hooks.pickSession ?? (async exclude => transport.request<string>("host.pickSession", { exclude })),
     close: () => {
       if (disposed) return;

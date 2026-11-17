@@ -298,6 +298,8 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return rawAsAny(raw), err
 	case "attach.status":
 		return s.attachStatus(ctx), nil
+	case "diagnostics.get":
+		return s.diagnosticsStatus(), nil
 	case "attach.enable":
 		return s.enableAttach(ctx, input)
 	case "attach.disable":

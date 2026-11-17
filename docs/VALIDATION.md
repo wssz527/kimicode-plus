@@ -56,13 +56,13 @@
 | 范围 | 当前结果 | 证据与限制 |
 |---|---|---|
 | 正式宿主连接 | 隔离 Kimi Code 1.3.5 / Electron 45.1.0 的版本、DOM revision 1、RPC 来源与核心读取检查通过 | 主实例未操作；当前返修脚本为 `../work/ekd-final-integration/verify-review-fixes.mjs`，旧 `verify-native-ui/flow.mjs` 仅保留早期记录 |
-| 核心与界面恢复 | 核心重启、旧连接清理、入口去重、空会话挂载和官方单会话恢复已验证；Vue 重建后原生子节点不漏出；原生浏览器已打开时重连仍恢复侧栏 | `verify-review-fixes.mjs`；最终构建的 `final-native-smoke.mjs` 在工具模板数量为 0 时验证 Monitor/设置入口、默认网页规划和 11 项设置，`final-native-smoke-result.json`；`final-native-settings.png`、`final-native-sidebar.png` 已读回 |
+| 核心与界面恢复 | 核心重启、旧连接清理、入口去重、空会话挂载和官方单会话恢复已验证；Vue 重建后原生子节点不漏出；原生浏览器已打开时重连仍恢复侧栏 | `verify-review-fixes.mjs`；最终构建的 `final-native-smoke.mjs` 在工具模板数量为 0 时验证 Monitor/设置入口、默认网页规划和设置列表，`final-native-smoke-result.json`；`final-native-settings.png`、`final-native-sidebar.png` 已读回 |
 | 原生界面 | 深浅色、760px 设置窄窗、900px 三窗格、双/三窗格输入区无重叠通过；统一规划入口默认网页 | `review-fixes-result.json`、`review-multi-dark.png`、`review-multi-light.png`、`review-multi-narrow.png`；无常驻工作台/选择器/空闲状态带 |
 | 本地规划 | 合成供应商下真实流式、停止、write 审批、多选与编辑交接通过 | `verify-planner-flow.mjs`、`review-planner-flow-dark.png`；批准前未写文件，批准后读回，Code 真实接收文本，未暗改默认模型 |
 | 多会话 | 同一入口从两窗格追加到三窗格，侧栏切换主窗格、已显示会话交换、草稿保留；并行更新、独立停止、模型/模式与 Read 审批通过 | `verify-review-fixes.mjs`、`verify-multi-session.mjs`、`review-multi-session-dark.png`；权限规则在 finally 恢复 |
 | 附件与消息 | 点加号、附件条目、权限选择、真实 KAP 文件发送、消息时间及引用回复通过 | `verify-attachment-flow.mjs`、`review-attachment-result.json`；文件对话框返回值使用确定性替身，未实际 GUI 点选系统文件窗口，后续 KAP 发送和消息读回为真实调用 |
 | 网页到 Code | 合成网页真实 WebContents 选区提取、编辑预览、已有会话交接与回复通过 | `verify-web-flow.mjs`、`review-web-flow-view.png`；可见性、弹层遮挡与坐标核对通过，不证明网站内自动聊天 |
-| 设置聚合 | 单层 11 项列表嵌入官方设置，旧多层导航移除；标签顺序、原生标签恢复、缓存撤销/默认/保存读回通过 | `verify-review-fixes.mjs`；`verify-settings-flow.mjs` 验证布局、网站权限保存后恢复和真实模型目录；`review-settings-list-dark.png`、`review-settings-models-dark.png`、`review-settings-narrow-light.png` |
+| 设置聚合 | 单层 5 项列表加独立管理窗口跳转行嵌入官方设置，旧多层导航与硬嵌页面移除；标签顺序、原生标签恢复、缓存撤销/默认/保存读回通过 | `verify-review-fixes.mjs`；`verify-settings-flow.mjs` 验证布局、网站权限保存后恢复和真实模型目录；`review-settings-list-dark.png`、`review-settings-models-dark.png`、`review-settings-narrow-light.png` |
 | 恢复面板与 Monitor | 手动监听、检查、撤销和官方单会话恢复通过；Monitor 默认约 233px，详情折叠，无样本显示未知 | `verify-recovery-flow.mjs`、`review-sidebar-dark.png`；自动化测试期间暂关并恢复原值，不把隔离配置的 recovery.enabled=true 说成默认值 |
 | 自动化执行 | 五秒调度、保活、compact ACK/完成、额度窗口、Goal 阻断、撤销及重启 UNKNOWN 均有合成 KAP 回归 | `internal/desktop/automation_test.go`；产品三项默认关闭，未启用真实账号自动动作 |
 | 前端静态检查 | TypeScript 类型检查、61 项测试及完整 build 通过 | `web/` 当前源码和 `scripts/build.sh`；含按官方会话切换时不重复窗格的回归 |
