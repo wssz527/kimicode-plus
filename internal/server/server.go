@@ -153,7 +153,7 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 		// the Kimi Code client version (1.3.x), which is discovered when the
 		// enhancer attaches, not to this core's own 0.2.0. An unknown host version
 		// leaves the version gate open rather than inventing a compatibility claim.
-		s, e := plugins.New(db, cfg.Safe, plugins.WithDataDir(native.DataDir), plugins.WithBundled(bundledPlugins.BundledPlugins))
+		s, e := plugins.New(db, cfg.Safe, plugins.WithDataDir(native.DataDir), plugins.WithBundled(bundledPlugins.BundledPlugins), plugins.WithOfficial(bundledPlugins.OfficialDigests))
 		if e == nil {
 			s.Register(mux)
 			app.pluginManager = s
@@ -252,6 +252,16 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 				} else {
 					nativeService.UsePlanner(planner)
 					app.planner = planner
+					// A plugin that is disabled must not keep a planner thread it
+					// started streaming. The hook is attached here because this is
+					// the first point where both the plugin host and the planner
+					// exist.
+					if app.pluginManager != nil {
+						app.pluginManager.UseStopPluginWork(func(ctx context.Context, id string) error {
+							_, stopErr := planner.StopPluginThreads(ctx, id)
+							return stopErr
+						})
+					}
 					app.modules = append(app.modules, Module{"planner", "READY", "持久化流式规划、工作区工具与逐次审批"})
 				}
 			}

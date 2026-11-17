@@ -14,7 +14,7 @@ async function installNativeBootstrap(options) {
   const pair = await pairResponse.json();
   if (!pairResponse.ok) throw new Error(pair?.error?.message || '增强核心配对失败');
   let coreToken = pair.sessionToken;
-  const state = { channels: new Map(), windows: new Map(), views: new Map(), bounds: new Map(), browserWindow: null, server: null, cleanup: null };
+  const state = { channels: new Map(), windows: new Map(), views: new Map(), pluginViews: new Map(), pluginViewTokens: new Map(), bounds: new Map(), browserWindow: null, server: null, cleanup: null };
   globalThis.__ekdNative = state;
   const browserSession = session.fromPartition('persist:ekd-native-browser');
   function json(response, status, value, origin) {
@@ -43,7 +43,103 @@ async function installNativeBootstrap(options) {
     if (!response.ok) { const error = new Error(body?.error?.message || `核心返回 HTTP ${response.status}`); error.code = body?.error?.code || 'CORE_ERROR'; throw error; }
     return body?.value;
   }
+  // A plugin view is owned by one plugin and one view id; both must be present
+  // and well-formed before anything touches Electron.
+  function pluginViewKey(pluginId, viewId) {
+    if (typeof pluginId !== 'string' || !/^[a-z0-9][a-z0-9.-]{0,63}$/.test(pluginId)) throw new Error('插件 ID 无效');
+    if (typeof viewId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(viewId)) throw new Error('网页视图 ID 无效');
+    return pluginId + '/' + viewId;
+  }
+  function isBrowserURL(value) {
+    try {
+      const parsed = new URL(value);
+      return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && !parsed.username && !parsed.password && value.length <= 2048;
+    } catch { return false; }
+  }
+  function browserURL(value) {
+    const text = String(value || '');
+    if (!isBrowserURL(text)) throw new Error('只允许有效的 http 或 https 地址');
+    return text;
+  }
+  // Every plugin browser call is authorized by the core, not by this process.
+  // The bridge forwards the plugin's own token and the core verifies, in one
+  // step, that the token is live, the plugin is enabled, it holds browser:view
+  // and its official digest still matches. The answer names the owner, so a
+  // payload can never name one — and a plugin without the capability can never
+  // reach Electron at all.
+  async function coreBrowserAction(action, token, params) {
+    if (typeof token !== 'string' || token.length < 16 || token.length > 256) throw new Error('插件身份令牌无效');
+    const response = await coreFetch('/enhance/v1/plugin-runtime/' + action, { method: 'POST', body: JSON.stringify({ token, params }) });
+    const answer = await response.json().catch(() => null);
+    if (!response.ok) {
+      const error = new Error(answer?.error?.message || `核心返回 HTTP ${response.status}`);
+      error.code = answer?.error?.code || 'CORE_ERROR';
+      throw error;
+    }
+    const value = answer?.value;
+    if (!value || typeof value.pluginId !== 'string' || typeof value.viewId !== 'string') throw new Error('核心返回的网页视图归属无效');
+    return value;
+  }
+  // Views are keyed by the owner the core named plus the view id. The token that
+  // created each page is recorded next to it, because a plugin being torn down
+  // has already lost its token when its release runs: that recorded token is
+  // what still proves the page is its own to destroy.
+  function dropPluginView(key) {
+    const view = state.pluginViews.get(key);
+    state.pluginViews.delete(key);
+    state.pluginViewTokens.delete(key);
+    if (!view) return false;
+    const owner = BrowserWindow.fromWebContents(wc);
+    try { owner?.contentView.removeChildView(view); } catch {}
+    if (!view.webContents.isDestroyed()) view.webContents.close();
+    return true;
+  }
+  function destroyPluginViews() {
+    for (const key of [...state.pluginViews.keys()]) dropPluginView(key);
+  }
+  // Reading a plugin page works on the page it is actually on, not on the
+  // address core recorded when the view was opened. A sign-in redirect or an
+  // in-page route change moves the plugin's own view, and the plugin owns that
+  // page — browser:view already lets it navigate anywhere http(s). The check
+  // that still matters is the scheme: a view that ended up on file:, data: or
+  // javascript: has left the web and must not be read.
+  function currentPluginPage(view) {
+    const current = String(view.webContents.getURL() || '');
+    if (!isBrowserURL(current)) throw new Error('插件网页视图已离开 http 或 https 页面');
+    return current;
+  }
+  // Resolves the Electron view the core just authorized. A view the core knows
+  // about but this process never built is reported missing rather than created
+  // here: only browser.view.open may create one.
+  function livePluginView(answer) {
+    const key = pluginViewKey(answer.pluginId, answer.viewId);
+    const view = state.pluginViews.get(key);
+    if (!view || view.webContents.isDestroyed()) throw new Error('插件网页视图不存在');
+    return { key, view };
+  }
   function ownedBrowser(target, mode) { return mode === 'exec' ? state.browserWindow?.webContents : state.views.get(target.id)?.webContents; }
+  // A site adapter is a function body the plugin wrote, run once against its own
+  // page. It is evaluated as an expression so a body that is not a function
+  // throws instead of running as a statement, and its answer is serialized to
+  // JSON here: the caller receives data, never a live object it could use to
+  // reach the page or this process.
+  async function runSiteAdapter(contents, adapter) {
+    const source = typeof adapter?.source === 'string' ? adapter.source : '';
+    if (!source) throw new Error('站点适配器缺少函数体');
+    const args = JSON.stringify(adapter?.args ?? null);
+    const expression = [
+      '(() => {',
+      'const run = (' + source + ');',
+      'if (typeof run !== "function") throw new Error("站点适配器必须是函数表达式");',
+      'return Promise.resolve(run(' + args + '));',
+      '})()',
+    ].join('\n');
+    const value = await contents.executeJavaScript(expression, true);
+    const text = JSON.stringify(value === undefined ? null : value);
+    if (typeof text !== 'string') throw new Error('站点适配器返回值无法序列化为 JSON');
+    if (text.length > 200000) throw new Error('站点适配器返回值超过 200000 字符');
+    return JSON.parse(text);
+  }
   // The management window reuses the core.fetch channel, so its routes are a
   // fixed set: a caller cannot point it at anything the settings sheet does not
   // offer, and the renderer never receives the core bearer token. Plugins are
@@ -169,6 +265,97 @@ async function installNativeBootstrap(options) {
         }
         return {};
       }
+      // Plugin-owned views. Each action starts at the core: the plugin's token
+      // is authorized for browser:view, the core answers with the owner and the
+      // canonical URL, and only then does this process touch Electron.
+      case 'browser.view.open': {
+        const answer = await coreBrowserAction('browser.open', payload.token, { viewId: payload.viewId, url: payload.url });
+        const key = pluginViewKey(answer.pluginId, answer.viewId);
+        const url = browserURL(answer.url);
+        let view = state.pluginViews.get(key);
+        let created = false;
+        if (!view) {
+          view = new WebContentsView({ webPreferences: { session: browserSession, contextIsolation: true, nodeIntegration: false, sandbox: true } });
+          const owner = BrowserWindow.fromWebContents(target);
+          if (!owner) {
+            // The core now believes the view exists; without a window here it
+            // cannot, so the registry is put back the way it was.
+            await coreBrowserAction('browser.close', payload.token, { viewId: answer.viewId }).catch(() => {});
+            throw new Error('插件网页视图缺少宿主窗口');
+          }
+          owner.contentView.addChildView(view);
+          view.setVisible(false);
+          view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+          view.webContents.on('will-navigate', (event, next) => {
+            if (!isBrowserURL(next)) event.preventDefault();
+          });
+          state.pluginViews.set(key, view);
+          state.pluginViewTokens.set(key, payload.token);
+          created = true;
+        }
+        try {
+          if (view.webContents.getURL() !== url) await view.webContents.loadURL(url);
+        } catch (error) {
+          // A page that never loaded leaves nothing usable behind: the Electron
+          // view goes away and the core record is released, so a retry starts
+          // from a clean state instead of reusing a broken view.
+          dropPluginView(key);
+          await coreBrowserAction('browser.close', payload.token, { viewId: answer.viewId }).catch(() => {});
+          throw error;
+        }
+        if (!created && state.pluginViewTokens.get(key) !== payload.token) state.pluginViewTokens.set(key, payload.token);
+        return { browserId: view.webContents.id, pluginId: answer.pluginId, viewId: answer.viewId, url: answer.url };
+      }
+      case 'browser.view.navigate': {
+        const answer = await coreBrowserAction('browser.navigate', payload.token, { viewId: payload.viewId, url: payload.url });
+        const { key, view } = livePluginView(answer);
+        const url = browserURL(answer.url);
+        if (view.webContents.getURL() !== url) await view.webContents.loadURL(url);
+        state.pluginViewTokens.set(key, payload.token);
+        return { pluginId: answer.pluginId, viewId: answer.viewId, url: answer.url };
+      }
+      case 'browser.view.bounds': {
+        const visible = Boolean(payload.visible && payload.width > 0 && payload.height > 0);
+        const params = { viewId: payload.viewId, visible, x: payload.x, y: payload.y, width: payload.width, height: payload.height };
+        const answer = await coreBrowserAction(visible ? 'browser.bounds' : 'browser.visible', payload.token, params);
+        const { key, view } = livePluginView(answer);
+        if (visible) view.setBounds({ x: Math.round(payload.x), y: Math.round(payload.y), width: Math.round(payload.width), height: Math.round(payload.height) });
+        view.setVisible(visible);
+        state.pluginViewTokens.set(key, payload.token);
+        return { pluginId: answer.pluginId, viewId: answer.viewId, visible: Boolean(answer.visible) };
+      }
+      case 'browser.view.extract': {
+        const answer = await coreBrowserAction('browser.extract', payload.token, { viewId: payload.viewId });
+        const { key, view } = livePluginView(answer);
+        currentPluginPage(view);
+        const text = await view.webContents.executeJavaScript('window.getSelection()?.toString() || document.querySelector("main")?.innerText || document.body.innerText');
+        state.pluginViewTokens.set(key, payload.token);
+        return String(text || '').slice(0, 200000);
+      }
+      case 'browser.view.adapter': {
+        const answer = await coreBrowserAction('browser.adapter', payload.token, { viewId: payload.viewId, adapter: payload.adapter });
+        const { key, view } = livePluginView(answer);
+        currentPluginPage(view);
+        const result = await runSiteAdapter(view.webContents, answer.adapter);
+        state.pluginViewTokens.set(key, payload.token);
+        return result;
+      }
+      case 'browser.view.close': {
+        if (typeof payload.viewId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(payload.viewId)) throw new Error('网页视图 ID 无效');
+        let key;
+        try {
+          const answer = await coreBrowserAction('browser.close', payload.token, { viewId: payload.viewId });
+          key = pluginViewKey(answer.pluginId, answer.viewId);
+        } catch (error) {
+          // Close also runs while a plugin is being stopped, when its token has
+          // already been revoked. The recorded creator token and the full key
+          // still identify the caller's own page, and teardown must not leak it.
+          const recorded = [...state.pluginViewTokens].find(([candidate, token]) => token === payload.token && candidate.endsWith('/' + payload.viewId));
+          if (!recorded) throw error;
+          key = recorded[0];
+        }
+        return { closed: dropPluginView(key) };
+      }
       case 'host.extractBrowser': {
         const browser = ownedBrowser(target, payload.mode);
         if (!browser || browser.isDestroyed()) throw new Error('请先打开增强程序创建的网页聊天');
@@ -195,7 +382,10 @@ async function installNativeBootstrap(options) {
     try {
       const body = JSON.parse(await readBody(request));
       id = typeof body.id === 'string' ? body.id : '';
-      if (body.protocol !== 1 || !id || id.length > 100 || typeof body.action !== 'string' || !/^(?:[a-z]+\.)?[a-zA-Z]+$/.test(body.action)) throw new Error('增强桥请求格式无效');
+      // Plugin-owned views are addressed over the bridge as namespaced verbs
+      // (`browser.view.open`), so the action grammar allows dotted prefixes
+      // rather than a single one.
+      if (body.protocol !== 1 || !id || id.length > 100 || typeof body.action !== 'string' || body.action.length > 80 || !/^(?:[a-z]+\.){0,4}[a-zA-Z][a-zA-Z0-9]*$/.test(body.action)) throw new Error('增强桥请求格式无效');
       const result = await dispatch(request.owner, { id, action: body.action, payload: body.payload });
       json(response, 200, { protocol: 1, id, result }, origin);
     } catch (error) {
@@ -232,6 +422,7 @@ async function installNativeBootstrap(options) {
     if (state.browserWindow && !state.browserWindow.isDestroyed()) state.browserWindow.destroy();
     for (const view of state.views.values()) if (!view.webContents.isDestroyed()) view.webContents.close();
     state.views.clear();
+    destroyPluginViews();
     state.channels.clear();
     if (server.listening) {
       const closed = new Promise(resolve => server.close(resolve));

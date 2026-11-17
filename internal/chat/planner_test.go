@@ -270,3 +270,88 @@ func TestPlannerPathRejectsEscape(t *testing.T) {
 		}
 	}
 }
+
+// A thread remembers the plugin that created it, and stopping that plugin ends
+// only its own in-flight work: built-in threads and other plugins keep streaming.
+func TestStopPluginThreadsOnlyTouchesItsOwnWork(t *testing.T) {
+	release := make(chan struct{})
+	var started atomic.Int32
+	generator := plannerGeneratorFunc(func(ctx context.Context, model string, messages []provider.Message, tools []map[string]any, session string, emit func(provider.StreamEvent) error) error {
+		if err := emit(provider.StreamEvent{Text: "开始"}); err != nil {
+			return err
+		}
+		started.Add(1)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-release:
+			return emit(provider.StreamEvent{Text: "结束", Finish: "stop"})
+		}
+	})
+	planner, _, _ := newTestPlanner(t, generator)
+
+	create := func(owner string) string {
+		payload := map[string]any{"model": "synthetic", "options": PlannerOptions{}}
+		if owner != "" {
+			payload["pluginOwner"] = owner
+		}
+		value, err := planner.PlannerAction(context.Background(), "planner.create", []byte(mustPlannerJSON(payload)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value.(PlannerThread).ID
+	}
+	pluginThread := create("kimicode-plus.probe")
+	otherThread := create("kimicode-plus.other")
+	builtinThread := create("")
+
+	for _, id := range []string{pluginThread, otherThread, builtinThread} {
+		sendPlanner(t, planner, id)
+	}
+	waitPlanner(t, planner, pluginThread, func(thread PlannerThread) bool { return thread.Status == "running" })
+	waitPlanner(t, planner, otherThread, func(thread PlannerThread) bool { return thread.Status == "running" })
+
+	stopped, err := planner.StopPluginThreads(context.Background(), "kimicode-plus.probe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped != 1 {
+		t.Fatalf("StopPluginThreads stopped %d threads, want 1", stopped)
+	}
+	thread := plannerThread(t, planner, pluginThread)
+	if thread.Status != "stopped" || thread.PluginOwner != "kimicode-plus.probe" {
+		t.Fatalf("plugin thread after stop = %+v", thread)
+	}
+	if thread.Error == "" {
+		t.Fatal("a stopped thread kept no reason")
+	}
+	// History is kept: the partial reply is still there.
+	if len(thread.Messages) < 2 {
+		t.Fatalf("stopping dropped the conversation: %+v", thread.Messages)
+	}
+	for _, id := range []string{otherThread, builtinThread} {
+		if live := plannerThread(t, planner, id); live.Status != "running" {
+			t.Fatalf("stopping one plugin stopped a thread it did not own (%s): %+v", id, live)
+		}
+	}
+	close(release)
+}
+
+// The owner field is what Disable acts on, so a plugin cannot claim another
+// plugin's thread by naming its owner: the plugin layer overwrites the field.
+func TestPlannerOwnerComesFromTheCallingPlugin(t *testing.T) {
+	generator := plannerGeneratorFunc(func(ctx context.Context, model string, messages []provider.Message, tools []map[string]any, session string, emit func(provider.StreamEvent) error) error {
+		return emit(provider.StreamEvent{Text: "ok", Finish: "stop"})
+	})
+	planner, _, _ := newTestPlanner(t, generator)
+	value, err := planner.PlannerAction(context.Background(), "planner.create", []byte(`{"model":"synthetic","options":{},"pluginOwner":"kimicode-plus.claims"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner := value.(PlannerThread).PluginOwner; owner != "kimicode-plus.claims" {
+		t.Fatalf("explicit owner was not stored: %q", owner)
+	}
+	if stopped, err := planner.StopPluginThreads(context.Background(), ""); err != nil || stopped != 0 {
+		t.Fatalf("an empty owner stopped %d threads (%v)", stopped, err)
+	}
+}

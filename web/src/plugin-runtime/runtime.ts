@@ -1,7 +1,19 @@
 import { createBridge } from "./bridge.js";
 import {
   PluginError,
+  type AttachmentPick,
+  type BrowserHost,
+  type BrowserView,
+  type CommandInfo,
   type Disposable,
+  type EntryMountHost,
+  type HandoffPreview,
+  type HandoffResult,
+  type LayoutHost,
+  type MainAreaHost,
+  type PlannerThread,
+  type RightPanelHost,
+  type SessionHistoryPage,
   type PluginContext,
   type PluginIdentity,
   type PluginModule,
@@ -32,6 +44,18 @@ export interface RuntimeOptions {
   theme?: () => PluginTheme;
   /** Called for every failure the runtime isolates from the rest of the page. */
   onError?: (id: string, error: unknown) => void;
+  /**
+   * API v2 host surfaces. Each one is optional: a renderer that does not provide
+   * a surface simply refuses the matching call, which keeps the runtime usable in
+   * tests and in a plain browser preview.
+   */
+  entryHost?: EntryMountHost;
+  mainAreaHost?: MainAreaHost;
+  rightPanelHost?: RightPanelHost;
+  layoutHost?: LayoutHost;
+  browserHost?: BrowserHost;
+  /** File picker for `attachments.pick`. Absent means the core dialog is used. */
+  pickFiles?: () => Promise<Array<{ path: string; name: string }>>;
 }
 
 export interface ActivePlugin {
@@ -60,6 +84,10 @@ const EVENT_IDLE_MS = 5000;
 export function createPluginRuntime(options: RuntimeOptions) {
   const hub = new DecorationHub();
   const active = new Map<string, ActivePlugin>();
+  // Command bodies live here, keyed by owner and name. Go owns the registry and
+  // the authorization; this map is the actual code, and it only ever holds
+  // functions the owning plugin registered in its own scope.
+  const handlers = new Map<string, (args: unknown) => unknown>();
   const theme = options.theme ?? defaultTheme;
   // One loop for the whole renderer, created once and shared by every plugin.
   const pump = createEventPump((id, error, code, message) => reportFailure(id, error, code, message));
@@ -82,18 +110,292 @@ export function createPluginRuntime(options: RuntimeOptions) {
   }
 
 
-  function createContext(id: string, version: string, granted: string[], token: string, scope: Scope): PluginContext {
+  function requireGrant(granted: string[], capability: string, action: string): void {
+    if (!granted.includes(capability)) {
+      throw new PluginError(403, "PLUGIN_CAPABILITY_DENIED", `插件没有 ${capability} 能力，已拒绝 ${action}`);
+    }
+  }
+
+  /**
+   * Mirrors `EventScopeAllowed` in the core. Session scopes need sessions:read,
+   * planner threads need planner:run, and the two internal scopes need
+   * metrics:read. An unlisted scope belongs to nobody, so it is never granted
+   * here even if a future core starts publishing it.
+   */
+  function eventScopeGranted(granted: string[], scope: string): boolean {
+    if (scope === "cache" || scope === "automation") return granted.includes("metrics:read");
+    if (scope.startsWith("session:")) return granted.includes("sessions:read");
+    if (scope.startsWith("planner:")) return granted.includes("planner:run");
+    return false;
+  }
+
+  function createContext(id: string, version: string, apiVersion: number, granted: string[], token: string, scope: Scope): PluginContext {
     const bridge = createBridge({ token, granted, request: options.request });
-    const identity: PluginIdentity = { id, version, dataVersion: 1 };
+    // The plugin sees the API version its own manifest declares, not the newest
+    // one this host supports: a v1 plugin must not be told it is v2.
+    const identity: PluginIdentity = { id, version, dataVersion: apiVersion };
     const slots = grantedSlots(granted);
+
+    const sessionsV2 = granted.includes("sessions:approve") || granted.includes("sessions:abort") || granted.includes("sessions:history") || granted.includes("sessions:read")
+      ? {
+        approve(input: { id: string; interactionId: string; value: unknown }) {
+          requireGrant(granted, "sessions:approve", "sessions.approve");
+          return bridge.call("sessions.approve", input);
+        },
+        abort(sessionId: string) {
+          requireGrant(granted, "sessions:abort", "sessions.abort");
+          return bridge.call("sessions.abort", { id: sessionId });
+        },
+        async history(input: { id: string; beforeOrdinal?: number; pageSize?: number; agentId?: string }): Promise<SessionHistoryPage> {
+          requireGrant(granted, "sessions:history", "sessions.history");
+          const page = await bridge.call<SessionHistoryPage>("sessions.history", {
+            id: input.id,
+            beforeOrdinal: input.beforeOrdinal ?? 0,
+            pageSize: input.pageSize ?? 50,
+            agentId: input.agentId ?? "main",
+          });
+          return { ...page, messages: page?.messages ?? [], approvals: page?.approvals ?? [] };
+        },
+        /**
+         * Holds one reference to the session's event stream. The core subscribes
+         * to the official stream for the first holder only, so two panes on one
+         * session cost one subscription and closing one does not silence the
+         * other. Every watch needs exactly one unwatch.
+         */
+        watch(sessionId: string): Promise<{ watching: boolean; sessionId: string }> {
+          requireGrant(granted, "sessions:read", "sessions.watch");
+          return bridge.call("sessions.watch", { id: sessionId });
+        },
+        unwatch(sessionId: string): Promise<{ watching: boolean; sessionId: string }> {
+          requireGrant(granted, "sessions:read", "sessions.unwatch");
+          return bridge.call("sessions.unwatch", { id: sessionId });
+        },
+      }
+      : undefined;
+
+    const browserV2 = granted.includes("browser:view") ? createBrowserApi(id, granted, scope) : undefined;
+    const plannerV2 = granted.includes("planner:run") ? createPlannerApi(bridge) : undefined;
+    const handoffV2 = granted.includes("handoff")
+      ? {
+        async preview(input: { targetId?: string; text: string; mode?: string }): Promise<HandoffPreview> {
+          return bridge.call<HandoffPreview>("handoff.preview", input);
+        },
+        async commit(input: { targetId?: string; text: string; mode?: string }): Promise<HandoffResult> {
+          return bridge.call<HandoffResult>("handoff.commit", input);
+        },
+      }
+      : undefined;
+    const commandsV2 = granted.includes("commands") ? createCommandsApi(id, bridge) : undefined;
+    const attachmentsV2 = granted.includes("attachments")
+      ? {
+        async pick() {
+          if (!options.pickFiles) {
+            throw new PluginError(409, "PLUGIN_ATTACHMENT_UNAVAILABLE", "当前宿主没有文件选择器");
+          }
+          return options.pickFiles();
+        },
+        /**
+         * Stages files the user dropped. A renderer only holds the File object,
+         * so the bytes go to the core, which writes them under its own staging
+         * root and returns the paths `send` accepts. The batch is removed with
+         * the send; a caller that stages and never sends leaves it to the TTL
+         * sweep.
+         */
+        async stage(files: ArrayLike<File>): Promise<{ files: AttachmentPick[]; batch: string }> {
+          const list = Array.from(files ?? []);
+          if (!list.length) throw new PluginError(400, "PLUGIN_ATTACHMENT_EMPTY", "没有选择附件");
+          const payload = [];
+          for (const file of list) {
+            if (!(file instanceof Blob)) throw new PluginError(400, "PLUGIN_ATTACHMENT_INVALID", "只能暂存拖入的文件");
+            payload.push({ name: file.name, data: await bytesToBase64(new Uint8Array(await file.arrayBuffer())) });
+          }
+          return bridge.call<{ files: AttachmentPick[]; batch: string }>("attachments.stage", { files: payload });
+        },
+        release(batch: string): Promise<{ released: boolean }> {
+          return bridge.call("attachments.release", { batch });
+        },
+        /**
+         * The whole drop interaction a plugin's own surface needs: refuse the
+         * browser default so the web view does not open the file, read the
+         * dropped File objects and stage them. Called from a `drop` listener; a
+         * drop with no files is refused locally instead of staging nothing.
+         */
+        async stageFromDrop(event: DragEvent): Promise<{ files: AttachmentPick[]; batch: string }> {
+          event.preventDefault();
+          if (!event.dataTransfer?.files?.length) {
+            throw new PluginError(400, "PLUGIN_ATTACHMENT_EMPTY", "没有可暂存的拖入文件");
+          }
+          return attachmentsV2!.stage(event.dataTransfer.files);
+        },
+        async send(input: { id: string; text: string; paths: string[]; mode?: "normal" | "plan" | "tower" | "inherit"; batch?: string }) {
+          return bridge.call("attachments.send", input);
+        },
+      }
+      : undefined;
+    const modelsV2 = granted.includes("models:read")
+      ? {
+        async list() {
+          const page = await bridge.call<{ items: Array<{ id: string; name: string }> }>("models.list");
+          return page?.items ?? [];
+        },
+      }
+      : undefined;
+
+    function createBrowserApi(pluginId: string, grants: string[], owner: Scope) {
+      return {
+        async open(viewId: string, url: string): Promise<BrowserView> {
+          requireGrant(grants, "browser:view", "browser.open");
+          const host = options.browserHost;
+          if (!host) throw new PluginError(409, "PLUGIN_BROWSER_UNAVAILABLE", "当前宿主没有网页视图");
+          if (!/^[A-Za-z0-9_-]{1,64}$/.test(viewId)) {
+            throw new PluginError(400, "PLUGIN_BROWSER_VIEW", "viewId 只允许字母、数字、下划线和连字符");
+          }
+          const created = await bridge.call<{ viewId: string; url: string }>("browser.open", { viewId, url });
+          await host.open(pluginId, created.viewId, created.url);
+          let closed = false;
+          const release = () => {
+            if (closed) return;
+            closed = true;
+            void host.close(pluginId, created.viewId).catch(() => {});
+          };
+          owner.add(release);
+          return {
+            id: created.viewId,
+            url: created.url,
+            async navigate(next: string) {
+              const result = await bridge.call<{ url: string }>("browser.navigate", { viewId: created.viewId, url: next });
+              await host.navigate(pluginId, created.viewId, result.url);
+            },
+            async setBounds(bounds) {
+              const visible = bounds.visible && bounds.width > 0 && bounds.height > 0;
+              await bridge.call("browser.bounds", { viewId: created.viewId, ...bounds, visible });
+              await host.bounds(pluginId, created.viewId, { ...bounds, visible });
+            },
+            async show(bounds) {
+              const visible = bounds.width > 0 && bounds.height > 0;
+              await bridge.call("browser.visible", { viewId: created.viewId, ...bounds, visible });
+              await host.bounds(pluginId, created.viewId, { ...bounds, visible });
+            },
+            async hide() {
+              await bridge.call("browser.visible", { viewId: created.viewId, visible: false });
+              await host.bounds(pluginId, created.viewId, { x: 0, y: 0, width: 0, height: 0, visible: false });
+            },
+            async extract() {
+              await bridge.call("browser.extract", { viewId: created.viewId });
+              return host.extract(pluginId, created.viewId);
+            },
+            /**
+             * Runs a site adapter against this view. The plugin supplies the
+             * function body and its arguments; the core authorizes the view and
+             * the host executes it in the page, returning a bounded JSON value.
+             */
+            async adapter<T = unknown>(source: string, args?: unknown): Promise<T> {
+              requireGrant(grants, "browser:view", "browser.adapter");
+              if (typeof source !== "string" || !source.trim()) {
+                throw new PluginError(400, "PLUGIN_ADAPTER_REQUIRED", "站点适配器缺少函数体");
+              }
+              const answer = await bridge.call<{ adapter: { source: string; args: unknown } }>("browser.adapter", {
+                viewId: created.viewId,
+                adapter: { source, args: args ?? null },
+              });
+              return host.adapter(pluginId, created.viewId, answer.adapter) as Promise<T>;
+            },
+            async close() {
+              await bridge.call("browser.close", { viewId: created.viewId });
+              release();
+            },
+          };
+        },
+      };
+    }
+
+    function createPlannerApi(call: typeof bridge) {
+      const map = <T>(thread: T) => thread;
+      return {
+        async threads() {
+          const page = await call.call<{ items: PlannerThread[] }>("planner.threads");
+          return page?.items ?? [];
+        },
+        async models() {
+          const page = await call.call<{ items: Array<{ id: string; name: string; providerId?: string }> }>("planner.models");
+          return page?.items ?? [];
+        },
+        async create(input: { title?: string; model: string; options?: Record<string, boolean> }) {
+          return map(await call.call<PlannerThread>("planner.create", input));
+        },
+        async get(threadId: string) {
+          return call.call<PlannerThread>("planner.get", { id: threadId });
+        },
+        async configure(threadId: string, input: { model: string; options?: Record<string, boolean> }) {
+          return call.call<PlannerThread>("planner.configure", { id: threadId, ...input });
+        },
+        async send(threadId: string, text: string, sourceSessionId?: string) {
+          return call.call<PlannerThread>("planner.send", { id: threadId, text, sourceSessionId });
+        },
+        async retry(threadId: string, revision: number) {
+          return call.call<PlannerThread>("planner.retry", { id: threadId, revision });
+        },
+        async stop(threadId: string) {
+          return call.call<PlannerThread>("planner.stop", { id: threadId });
+        },
+        async approve(threadId: string, approvalId: string, allow: boolean) {
+          return call.call<PlannerThread>("planner.approve", { id: threadId, approvalId, allow });
+        },
+        async remove(threadId: string) {
+          return call.call("planner.delete", { id: threadId });
+        },
+      };
+    }
+
+    function createCommandsApi(pluginId: string, call: typeof bridge) {
+      return {
+        async register(name: string, input?: { title?: string; run?: (args: unknown) => unknown }): Promise<CommandInfo> {
+          if (typeof input?.run === "function" && !handlers.has(`${pluginId}:${name}`)) {
+            // The body lives in the plugin's own renderer scope and dies with it:
+            // the registry below only ever maps a name to code this plugin wrote.
+            handlers.set(`${pluginId}:${name}`, input.run);
+          }
+          return call.call<CommandInfo>("commands.register", { name, title: input?.title });
+        },
+        async unregister(name: string): Promise<boolean> {
+          const result = await call.call<{ removed: boolean }>("commands.unregister", { name });
+          handlers.delete(`${pluginId}:${name}`);
+          return Boolean(result?.removed);
+        },
+        async list(): Promise<CommandInfo[]> {
+          const page = await call.call<{ items: CommandInfo[] }>("commands.list");
+          return page?.items ?? [];
+        },
+        async invoke(name: string, args?: unknown) {
+          // The core decides who owns the command, whether that owner is running
+          // and whether this caller may reach it. Only then is a body looked up,
+          // and only in the owner's own scope: a local handler missing there is a
+          // truthful failure, never a fabricated success.
+          const target = await call.call<{ command: string; ownerId: string; owner: string; title?: string; args?: unknown }>(
+            "commands.invoke",
+            { command: name, args: args ?? null },
+          );
+          if (!target?.ownerId) throw new PluginError(502, "PLUGIN_COMMAND_PROTOCOL", "核心没有返回命令归属");
+          const handler = handlers.get(`${target.ownerId}:${target.command}`);
+          if (!handler) {
+            throw new PluginError(409, "PLUGIN_COMMAND_UNAVAILABLE", `命令 ${target.command} 在宿主端没有可执行实现`);
+          }
+          return await handler(target.args ?? null);
+        },
+      };
+    }
 
     return {
       plugin: identity,
       core: { request: (action, params) => bridge.call(action, params) },
       events: {
         on(name, listener) {
-          if (!granted.includes("metrics:read") && !granted.includes("sessions:read")) {
-            throw new PluginError(403, "PLUGIN_CAPABILITY_DENIED", "插件没有订阅事件的能力");
+          // The same scope-to-capability table the core applies decides this
+          // locally, so a planner-only plugin can subscribe to its own thread
+          // stream without holding sessions:read, and a plugin with neither still
+          // fails here rather than on the wire.
+          if (!eventScopeGranted(granted, name)) {
+            throw new PluginError(403, "PLUGIN_CAPABILITY_DENIED", `插件没有订阅 ${name} 事件的能力`);
           }
           return pump.subscribe(id, bridge, name, listener, scope);
         },
@@ -152,6 +454,49 @@ export function createPluginRuntime(options: RuntimeOptions) {
         theme,
       },
       net: { fetch: (url, init) => bridge.fetch(url, init) },
+      sessions: sessionsV2,
+      browser: browserV2,
+      planner: plannerV2,
+      handoff: handoffV2,
+      commands: commandsV2,
+      attachments: attachmentsV2,
+      models: modelsV2,
+      entry: granted.includes("ui:entry") && options.entryHost
+        ? {
+          add(definition) {
+            const handle = options.entryHost!.register(id, definition);
+            scope.add(handle);
+            return handle;
+          },
+        }
+        : undefined,
+      mainArea: granted.includes("ui:main-area") && options.mainAreaHost
+        ? {
+          mount(definition) {
+            const handle = options.mainAreaHost!.mount(id, definition);
+            scope.add(() => handle.dispose());
+            return handle;
+          },
+        }
+        : undefined,
+      rightPanel: granted.includes("ui:right-panel") && options.rightPanelHost
+        ? {
+          mount(definition) {
+            const handle = options.rightPanelHost!.mount(id, definition);
+            scope.add(() => handle.dispose());
+            return handle;
+          },
+        }
+        : undefined,
+      layout: granted.includes("ui:layout") && options.layoutHost
+        ? {
+          acquireSidebarCollapse() {
+            const handle = options.layoutHost!.acquireSidebarCollapse(id);
+            scope.add(handle);
+            return handle;
+          },
+        }
+        : undefined,
       storage: {
         async get<T>(key: string) {
           const result = await bridge.call<{ value: unknown; found: boolean }>("storage.get", { key });
@@ -185,12 +530,12 @@ export function createPluginRuntime(options: RuntimeOptions) {
 
   async function activate(
     module: PluginModule,
-    install: { id: string; version: string; granted: string[]; token: string },
+    install: { id: string; version: string; apiVersion?: number; granted: string[]; token: string },
   ): Promise<ActivePlugin> {
     const existing = active.get(install.id);
     if (existing) return existing;
     const scope = new Scope();
-    const context = createContext(install.id, install.version, install.granted, install.token, scope);
+    const context = createContext(install.id, install.version, install.apiVersion ?? 2, install.granted, install.token, scope);
     let result: Awaited<ReturnType<PluginModule["activate"]>>;
     try {
       result = await module.activate(context);
@@ -214,6 +559,10 @@ export function createPluginRuntime(options: RuntimeOptions) {
     }
     if (result && typeof result === "object" && "dispose" in result && typeof result.dispose === "function") {
       scope.add(() => result.dispose());
+    } else if (typeof result === "function") {
+      // The module contract allows returning a plain cleanup function, so the
+      // teardown a v2 plugin hands back must run on disable like any other.
+      scope.add(result);
     }
     const granted = [...install.granted];
     const plugin: ActivePlugin = {
@@ -250,6 +599,11 @@ export function createPluginRuntime(options: RuntimeOptions) {
   function deactivate(id: string): void {
     active.get(id)?.dispose();
     active.delete(id);
+    // Command bodies belong to the plugin that wrote them: dropping the owner's
+    // scope without dropping these would leave a callable stub behind.
+    for (const key of [...handlers.keys()]) {
+      if (key.startsWith(id + ":")) handlers.delete(key);
+    }
     // Dropping this plugin's subscriptions leaves the shared loop running for
     // every other plugin.
     pump.release(id);
@@ -417,6 +771,15 @@ function createEventPump(reportFailure: (id: string, error: unknown, code: strin
       return running ? 1 : 0;
     },
   };
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  // Chunked so a large file cannot blow the argument limit of String.fromCharCode.
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return btoa(binary);
 }
 
 export function defaultTheme(): PluginTheme {

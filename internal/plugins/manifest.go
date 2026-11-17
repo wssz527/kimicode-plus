@@ -14,9 +14,11 @@ import (
 	"strings"
 )
 
-// APIVersion is the only plugin API the host implements. A manifest that asks
-// for another version is refused instead of guessed at.
-const APIVersion = 1
+// APIVersion is the newest plugin API the host implements. Version 1 manifests
+// keep their exact meaning; version 2 adds the privileged capabilities listed in
+// capability.go. A manifest that asks for anything else is refused instead of
+// guessed at.
+const APIVersion = 2
 
 // ManifestLimit bounds plugin.json. A manifest is a declaration, not data.
 const ManifestLimit = 64 << 10
@@ -96,8 +98,8 @@ func (m Manifest) Validate() error {
 	if !versionPattern.MatchString(m.Version) {
 		return errors.New("version 必须是 major.minor.patch")
 	}
-	if m.APIVersion != APIVersion {
-		return fmt.Errorf("apiVersion 必须为 %d，收到 %d", APIVersion, m.APIVersion)
+	if m.APIVersion != 1 && m.APIVersion != APIVersion {
+		return fmt.Errorf("apiVersion 必须为 1 或 %d，收到 %d", APIVersion, m.APIVersion)
 	}
 	if len(m.HostVersions) == 0 || len(m.HostVersions) > 32 {
 		return errors.New("hostVersions 必须列出 1–32 个宿主版本")
@@ -115,7 +117,7 @@ func (m Manifest) Validate() error {
 			return fmt.Errorf("entry.settings：%w", err)
 		}
 	}
-	if _, err := ParseCapabilities(m.Capabilities); err != nil {
+	if _, err := m.CapabilityGrants(); err != nil {
 		return err
 	}
 	if len(m.Description) > 500 {
@@ -198,6 +200,25 @@ func (m Manifest) HostVersionSupported(host string) bool {
 		}
 	}
 	return false
+}
+
+// CapabilityGrants parses the declared capabilities and enforces the API version
+// split: a v2 capability in a v1 manifest is refused, because declaring it there
+// would ask for a privilege the v1 contract never had. The reverse is allowed: a
+// v2 manifest may still declare every v1 capability.
+func (m Manifest) CapabilityGrants() (Grants, error) {
+	grants, err := ParseCapabilities(m.Capabilities)
+	if err != nil {
+		return grants, err
+	}
+	if m.APIVersion < 2 {
+		for _, name := range m.Capabilities {
+			if RequiresPrivilege(strings.TrimSpace(name)) {
+				return grants, fmt.Errorf("capability %q 需要 apiVersion 2，当前清单是 %d", strings.TrimSpace(name), m.APIVersion)
+			}
+		}
+	}
+	return grants, nil
 }
 
 // CapabilityNames returns the manifest capabilities in a stable order so the

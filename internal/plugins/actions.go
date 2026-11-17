@@ -82,11 +82,9 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 	vault := m.vault
 	var state string
 	var grants Grants
-	var info map[string]any
 	if ok {
 		state = item.state
 		grants = item.grants
-		info = m.runtimeInfoLocked(item)
 	}
 	m.mu.Unlock()
 	if closed {
@@ -104,7 +102,10 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 
 	switch {
 	case action == "runtime.info":
-		return info, nil
+		// The identity is built on every call and re-verifies the official digest,
+		// so a plugin whose files changed while it ran cannot keep advertising
+		// capabilities the action gate would already refuse.
+		return m.runtimeInfo(id), nil
 	case action == "log":
 		var input struct {
 			Level   string `json:"level"`
@@ -134,6 +135,24 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 		return m.credentialsAction(ctx, id, grants, action, r, params)
 	case action == "events.poll":
 		return m.pollEvents(ctx, grants, r, params)
+	case strings.HasPrefix(action, "commands."):
+		// Commands are process-local bookkeeping: the manager, not the native
+		// service, owns who registered what and which invocation is pending.
+		if err := grants.Authorize(action); err != nil {
+			return nil, err
+		}
+		if err := m.verifyPrivilege(id); err != nil {
+			return nil, err
+		}
+		return m.commandsAction(ctx, id, action, r, params)
+	case strings.HasPrefix(action, "browser."):
+		if err := grants.Authorize(action); err != nil {
+			return nil, err
+		}
+		if err := m.verifyPrivilege(id); err != nil {
+			return nil, err
+		}
+		return m.browserAction(ctx, id, action, r, params)
 	case strings.HasPrefix(action, "storage."):
 		// Storage is a capability like any other: dispatching on the action prefix
 		// before the grant check would let a plugin use storage it never confirmed.
@@ -143,17 +162,108 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 		return m.storage(ctx, id, action, r, params)
 	}
 
+	capability, known := actionCapability[action]
 	if err := grants.Authorize(action); err != nil {
 		return nil, err
 	}
-	if core == nil {
-		return nil, apiError(http.StatusServiceUnavailable, "PLUGIN_CORE_UNAVAILABLE", "核心服务尚未就绪，无法执行该动作")
+	// The privilege gate is deliberately separate from the capability table: a
+	// stored grant or a manifest edit can widen the latter, but only an intact
+	// official bundle passes this re-hash of the installed directory.
+	if known && RequiresPrivilege(capability) {
+		if err := m.verifyPrivilege(id); err != nil {
+			return nil, err
+		}
 	}
 	payload, err := resolveParams(r, params)
 	if err != nil {
 		return nil, err
 	}
-	value, err := core.Action(ctx, action, payload)
+	switch {
+	case action == "attachments.stage":
+		return m.stageAttachments(ctx, id, payload)
+	case action == "attachments.release":
+		return m.releaseStagedAttachments(ctx, id, payload)
+	case action == "attachments.send":
+		return m.sendAttachments(ctx, id, payload)
+	case action == "sessions.watch" || action == "sessions.unwatch":
+		input, err := decodeObject(payload)
+		if err != nil {
+			return nil, err
+		}
+		return m.sessionWatch(ctx, id, stringValue(input["id"]), action == "sessions.watch")
+	case action == "handoff.preview":
+		input, err := decodeObject(payload)
+		if err != nil {
+			return nil, err
+		}
+		return handoffPreview(stringValue(input["targetId"]), stringValue(input["mode"]), stringValue(input["text"]), stringValue(input["cwd"]), stringValue(input["model"]), stringValue(input["title"]))
+	}
+	if core == nil {
+		return nil, apiError(http.StatusServiceUnavailable, "PLUGIN_CORE_UNAVAILABLE", "核心服务尚未就绪，无法执行该动作")
+	}
+	native := action
+	if mapped, ok := coreActionFor[action]; ok {
+		native = mapped
+	}
+	var nativePayload json.RawMessage = payload
+	// Planner threads remember which plugin created them, so stopping a plugin
+	// can stop exactly the work it started. The owner travels as a reserved
+	// field the planner strips; the plugin cannot set it, because this rewrites
+	// whatever it sent.
+	if strings.HasPrefix(action, "planner.") && action != "planner.threads" && action != "planner.models" {
+		input, err := decodeObject(payload)
+		if err != nil {
+			return nil, err
+		}
+		delete(input, "pluginOwner")
+		input["pluginOwner"] = id
+		if nativePayload, err = json.Marshal(input); err != nil {
+			return nil, err
+		}
+	}
+	if action == "handoff.commit" {
+		input, err := decodeObject(payload)
+		if err != nil {
+			return nil, err
+		}
+		targetID, text, mode := stringValue(input["targetId"]), stringValue(input["text"]), stringValue(input["mode"])
+		if _, err := handoffPreview(targetID, mode, text, stringValue(input["cwd"]), stringValue(input["model"]), stringValue(input["title"])); err != nil {
+			return nil, err
+		}
+		// Preview already normalized the mode; forwarding the raw empty string
+		// would leave the core to invent a default a second time.
+		if mode == "" {
+			mode = "normal"
+		}
+		native = "handoff"
+		body := map[string]any{"text": text, "mode": mode}
+		if targetID != "" {
+			body["targetId"] = targetID
+		}
+		// A new session's directory, model and title belong to the commit. They
+		// are passed through only when no target is named; the core ignores them
+		// for an existing session, and refusing them here would make the plugin
+		// guess which of its parameters apply.
+		if targetID == "" {
+			for _, key := range []string{"cwd", "model", "title"} {
+				if value := stringValue(input[key]); value != "" {
+					body[key] = value
+				}
+			}
+		}
+		nativePayload, _ = json.Marshal(body)
+	}
+	if action == "sessions.history" || action == "sessions.approve" || action == "sessions.abort" {
+		input, err := decodeObject(payload)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateSessionAction(action, input); err != nil {
+			return nil, err
+		}
+		nativePayload, _ = json.Marshal(forwardParams(action, input))
+	}
+	value, err := core.Action(ctx, native, nativePayload)
 	if err != nil {
 		return nil, coreFailure(action, err)
 	}
@@ -166,17 +276,49 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 	return value, nil
 }
 
-// runtimeInfoLocked builds the identity answer from an entry the caller already
-// holds the lock for, so a snapshot taken under the lock is consistent.
-func (m *Manager) runtimeInfoLocked(item *entry) map[string]any {
+// effectiveGrants hides v2 capabilities from a plugin that is installed but no
+// longer an intact official bundle. The stored grant is not rewritten: restoring
+// the files (or a later release) makes the same grant effective again.
+func effectiveGrants(item *entry) Grants {
+	if item.official {
+		return item.grants
+	}
+	return item.grants.WithoutPrivileged()
+}
+
+// runtimeInfo builds the identity answer for one plugin. The installed directory
+// is hashed on every call rather than read from the cached flag, because this is
+// the answer the renderer uses to decide which surfaces to offer: a plugin whose
+// files changed while it ran must not keep advertising capabilities the action
+// gate would already refuse.
+func (m *Manager) runtimeInfo(id string) map[string]any {
+	m.mu.Lock()
+	item := m.entries[id]
+	var manifest Manifest
+	var dir, source string
+	var grants Grants
+	var name, version string
+	if item != nil {
+		manifest, dir, source = item.manifest, item.dir, item.source
+		grants, name, version = item.grants, item.manifest.Name, item.manifest.Version
+	}
+	host := m.host
+	m.mu.Unlock()
+	if item == nil {
+		return nil
+	}
+	effective := grants.WithoutPrivileged()
+	if m.officialFor(manifest, dir, source) {
+		effective = grants
+	}
 	return map[string]any{
-		"id":           item.manifest.ID,
-		"name":         item.manifest.Name,
-		"version":      item.manifest.Version,
-		"apiVersion":   APIVersion,
-		"hostVersion":  m.host,
-		"capabilities": item.grants.Names(),
-		"slots":        grantedSlots(item.grants),
+		"id":           id,
+		"name":         name,
+		"version":      version,
+		"apiVersion":   manifest.APIVersion,
+		"hostVersion":  host,
+		"capabilities": effective.Names(),
+		"slots":        grantedSlots(effective),
 	}
 }
 

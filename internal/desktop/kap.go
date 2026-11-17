@@ -109,6 +109,10 @@ type KAPClient struct {
 	watched map[string]bool
 	writeMu sync.Mutex
 	socket  *websocket.Conn
+	// watchHook, when set, decides whether a subscribe succeeds. Tests install it
+	// to exercise the rollback a refused subscribe triggers; production leaves it
+	// nil and only the official side can refuse.
+	watchHook func(string) error
 
 	// resolved marks base/token as read from the official instance record, so
 	// only a disk-derived endpoint is invalidated. Endpoints injected directly

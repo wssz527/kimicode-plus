@@ -24,7 +24,38 @@ const (
 	CapStorage       = "storage"
 	capNetPrefix     = "net:"
 	capCredentialPre = "credentials:"
+
+	// API v2 capabilities. Every one of them is privileged: it is granted only to
+	// an official bundled plugin whose installed content still matches the digest
+	// compiled into this binary. They are listed separately so the v1 consent
+	// path and the v2 privilege gate cannot drift apart.
+	CapUIEntry         = "ui:entry"
+	CapUIMainArea      = "ui:main-area"
+	CapUIRightPanel    = "ui:right-panel"
+	CapUILayout        = "ui:layout"
+	CapSessionsApprove = "sessions:approve"
+	CapSessionsAbort   = "sessions:abort"
+	CapSessionsHistory = "sessions:history"
+	CapAttachments     = "attachments"
+	CapBrowserView     = "browser:view"
+	CapPlannerRun      = "planner:run"
+	CapHandoff         = "handoff"
+	CapModelsReadV2    = "models:read"
+	CapCommands        = "commands"
 )
+
+// privilegedCapabilities is the closed set of v2 high-privilege capabilities.
+// Membership is what the core checks at grant and action time; a name that is
+// not here is an ordinary v1 capability and keeps its old consent path.
+var privilegedCapabilities = []string{
+	CapUIEntry, CapUIMainArea, CapUIRightPanel, CapUILayout,
+	CapSessionsApprove, CapSessionsAbort, CapSessionsHistory,
+	CapAttachments, CapBrowserView, CapPlannerRun, CapHandoff, CapModelsReadV2, CapCommands,
+}
+
+// RequiresPrivilege reports whether a capability belongs to the v2 set that is
+// reserved for official bundled plugins.
+func RequiresPrivilege(name string) bool { return contains(privilegedCapabilities, name) }
 
 // uiCapabilities are the mount points a plugin may ask for. Each one is checked
 // twice: the renderer will not mount an ungranted slot, and this list is what
@@ -33,10 +64,10 @@ var uiCapabilities = []string{CapUISidebar, CapUISettings, CapUIThinking, CapUIM
 
 // fixedCapabilities is every capability with no parameter. Anything else must
 // carry a parameter behind a documented prefix.
-var fixedCapabilities = []string{
+var fixedCapabilities = append([]string{
 	CapMetricsRead, CapSessionsRead, CapSessionsSend, CapConfigRead, CapConfigWrite,
 	CapUISidebar, CapUISettings, CapUIThinking, CapUIMessage, CapStorage,
-}
+}, privilegedCapabilities...)
 
 var (
 	netHostPattern      = regexp.MustCompile(`^(\*\.)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
@@ -226,21 +257,56 @@ func (g Grants) AllowsSlot(slot string) bool {
 // An action that is not in this table cannot be called at all: the default is
 // denial, so adding an action without its capability fails closed.
 var actionCapability = map[string]string{
-	"cache.summary":   CapMetricsRead,
-	"cache.sessions":  CapMetricsRead,
-	"cache.history":   CapMetricsRead,
-	"cache.retention": CapMetricsRead,
-	"cache.receipts":  CapMetricsRead,
-	"sessions.list":   CapSessionsRead,
-	"sessions.view":   CapSessionsRead,
-	"sessions.send":   CapSessionsSend,
-	"sessions.create": CapSessionsSend,
-	"config.get":      CapConfigRead,
-	"config.save":     CapConfigWrite,
-	"storage.get":     CapStorage,
-	"storage.set":     CapStorage,
-	"storage.delete":  CapStorage,
-	"storage.list":    CapStorage,
+	"cache.summary":    CapMetricsRead,
+	"cache.sessions":   CapMetricsRead,
+	"cache.history":    CapMetricsRead,
+	"cache.retention":  CapMetricsRead,
+	"cache.receipts":   CapMetricsRead,
+	"sessions.list":    CapSessionsRead,
+	"sessions.view":    CapSessionsRead,
+	"sessions.watch":   CapSessionsRead,
+	"sessions.unwatch": CapSessionsRead,
+	"sessions.send":    CapSessionsSend,
+	"sessions.create":  CapSessionsSend,
+	"config.get":       CapConfigRead,
+	"config.save":      CapConfigWrite,
+	"storage.get":      CapStorage,
+	"storage.set":      CapStorage,
+	"storage.delete":   CapStorage,
+	"storage.list":     CapStorage,
+
+	// v2 actions. The privilege gate is applied separately in runAction, so a
+	// tampered stored grant cannot turn one of these on by itself.
+	"sessions.approve":    CapSessionsApprove,
+	"sessions.abort":      CapSessionsAbort,
+	"sessions.history":    CapSessionsHistory,
+	"attachments.stage":   CapAttachments,
+	"attachments.release": CapAttachments,
+	"attachments.send":    CapAttachments,
+	"browser.open":        CapBrowserView,
+	"browser.navigate":    CapBrowserView,
+	"browser.bounds":      CapBrowserView,
+	"browser.visible":     CapBrowserView,
+	"browser.extract":     CapBrowserView,
+	"browser.close":       CapBrowserView,
+	"browser.adapter":     CapBrowserView,
+	"planner.threads":     CapPlannerRun,
+	"planner.models":      CapPlannerRun,
+	"planner.create":      CapPlannerRun,
+	"planner.get":         CapPlannerRun,
+	"planner.configure":   CapPlannerRun,
+	"planner.send":        CapPlannerRun,
+	"planner.retry":       CapPlannerRun,
+	"planner.stop":        CapPlannerRun,
+	"planner.approve":     CapPlannerRun,
+	"planner.delete":      CapPlannerRun,
+	"handoff.preview":     CapHandoff,
+	"handoff.commit":      CapHandoff,
+	"models.list":         CapModelsReadV2,
+	"commands.register":   CapCommands,
+	"commands.invoke":     CapCommands,
+	"commands.unregister": CapCommands,
+	"commands.list":       CapCommands,
 }
 
 // eventScopeCapability maps an event scope to the capability that reveals it.
@@ -259,6 +325,11 @@ func EventScopeAllowed(grants Grants, scope string) bool {
 	}
 	if strings.HasPrefix(scope, "session:") {
 		return grants.Has(CapSessionsRead)
+	}
+	// Planner threads publish progress under `planner:<threadId>`. A plugin that
+	// may run the planner needs that stream, and nothing else can subscribe to it.
+	if strings.HasPrefix(scope, "planner:") {
+		return grants.Has(CapPlannerRun)
 	}
 	return false
 }
@@ -311,6 +382,19 @@ func (g Grants) AuthorizeCredential(action, name string) error {
 
 func capabilityDenied(action, capability string) error {
 	return apiError(403, "PLUGIN_CAPABILITY_DENIED", fmt.Sprintf("插件没有 %s 能力，已拒绝 %s", capability, action))
+}
+
+// WithoutPrivileged drops every v2 capability. The stored grant is the user's
+// decision, but a plugin that is not an intact official bundle must never see
+// those names in its runtime identity.
+func (g Grants) WithoutPrivileged() Grants {
+	out := Grants{fixed: make(map[string]bool), hosts: append([]string(nil), g.hosts...), credentials: append([]string(nil), g.credentials...)}
+	for name := range g.fixed {
+		if !RequiresPrivilege(name) {
+			out.fixed[name] = true
+		}
+	}
+	return out
 }
 
 func contains(list []string, value string) bool {

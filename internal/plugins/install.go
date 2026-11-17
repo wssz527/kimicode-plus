@@ -149,6 +149,14 @@ func (m *Manager) Install(ctx context.Context, request InstallRequest) (Plugin, 
 	if err != nil {
 		return Plugin{}, err
 	}
+	// A local install is never official. Refusing the privileged names at consent
+	// time is clearer than storing a grant the action gate would refuse anyway,
+	// and it keeps a mistaken "granted" row out of the plugin page.
+	for _, name := range *request.Capabilities {
+		if RequiresPrivilege(strings.TrimSpace(name)) {
+			return Plugin{}, apiError(http.StatusForbidden, "PLUGIN_CAPABILITY_PRIVILEGED", "高权限能力只授予官方预装插件，不能授予本地插件")
+		}
+	}
 	grants, err := m.resolveGrants(manifest, *request.Capabilities)
 	if err != nil {
 		return Plugin{}, err
@@ -655,9 +663,12 @@ func (m *Manager) adopt(ctx context.Context, id, dir, source string) error {
 		return nil
 	}
 	now := m.now()
+	// The digest is computed before taking the lock: it reads the directory, and
+	// holding m.mu across file I/O would stall every other plugin operation.
+	official := m.officialFor(manifest, dir, source)
 	item := &entry{
 		manifest: manifest, grants: grants, declared: manifest.CapabilityNames(),
-		source: source, dir: dir, state: StateDisabled, enabled: desired,
+		source: source, dir: dir, official: official, state: StateDisabled, enabled: desired,
 		forced:  desired && !m.compatible(manifest),
 		updated: now, installed: now,
 	}

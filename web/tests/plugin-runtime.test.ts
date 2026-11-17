@@ -615,3 +615,379 @@ test("defaultTheme follows explicit schemes and the system media query", () => {
     }
   }
 });
+
+// --- API v2 ---------------------------------------------------------------
+//
+// The v2 surfaces are host-provided, so the tests use small doubles that record
+// calls and can be inspected after a deactivation. The point of each test is the
+// lifetime: every resource a plugin creates must be gone when its scope is.
+
+function fakeHosts() {
+  const entries: string[] = [];
+  const mainAreas: Array<{ pluginId: string; disposed: boolean }> = [];
+  const panels: Array<{ pluginId: string; disposed: boolean }> = [];
+  let sidebarReleased = 0;
+  const browserCalls: string[] = [];
+  const hosts = {
+    entryHost: {
+      register(pluginId: string, definition: { id: string }) {
+        entries.push(`${pluginId}:${definition.id}`);
+        return { dispose: () => { const index = entries.indexOf(`${pluginId}:${definition.id}`); if (index >= 0) entries.splice(index, 1); } };
+      },
+    },
+    mainAreaHost: {
+      mount(pluginId: string) {
+        const record = { pluginId, disposed: false };
+        mainAreas.push(record);
+        return { setWidth: () => {}, width: () => 420, dispose: () => { record.disposed = true; } };
+      },
+    },
+    rightPanelHost: {
+      mount(pluginId: string) {
+        const record = { pluginId, disposed: false };
+        panels.push(record);
+        return { open: () => {}, close: () => {}, open_: false, dispose: () => { record.disposed = true; } };
+      },
+    },
+    layoutHost: {
+      acquireSidebarCollapse() {
+        let released = false;
+        return { dispose: () => { if (!released) { released = true; sidebarReleased += 1; } } };
+      },
+    },
+    browserHost: {
+      open: async (pluginId: string, viewId: string) => { browserCalls.push(`open:${pluginId}/${viewId}`); },
+      navigate: async (pluginId: string, viewId: string) => { browserCalls.push(`navigate:${pluginId}/${viewId}`); },
+      bounds: async (pluginId: string, viewId: string) => { browserCalls.push(`bounds:${pluginId}/${viewId}`); },
+      extract: async () => "page text",
+      adapter: async (_pluginId: string, _viewId: string, adapter: { source: string; args: unknown }) => ({ ran: adapter.source.length > 0, args: adapter.args }),
+      close: async (pluginId: string, viewId: string) => { browserCalls.push(`close:${pluginId}/${viewId}`); },
+    },
+  };
+  return { hosts, entries, mainAreas, panels, browserCalls, sidebarReleased: () => sidebarReleased };
+}
+
+test("deactivating a plugin releases every v2 surface it mounted", async () => {
+  const fake = fakeHosts();
+  const runtime = createPluginRuntime({
+    slots: {},
+    request: async () => ({ value: {} }),
+    ...fake.hosts,
+  });
+  await runtime.activate(
+    {
+      activate: context => {
+        context.entry!.add({ id: "open", label: "打开", run: () => {} });
+        context.mainArea!.mount({ render: () => {} });
+        context.rightPanel!.mount({ title: "面板", render: () => {} });
+        context.layout!.acquireSidebarCollapse();
+      },
+    },
+    {
+      id: "test.plugin",
+      version: "2.0.0",
+      granted: ["ui:entry", "ui:main-area", "ui:right-panel", "ui:layout"],
+      token: "t",
+    },
+  );
+  assert.deepEqual(fake.entries, ["test.plugin:open"]);
+  assert.equal(fake.mainAreas.length, 1);
+  assert.equal(fake.panels.length, 1);
+  runtime.deactivate("test.plugin");
+  assert.deepEqual(fake.entries, [], "entry survived deactivation");
+  assert.equal(fake.mainAreas[0]!.disposed, true, "main area survived deactivation");
+  assert.equal(fake.panels[0]!.disposed, true, "right panel survived deactivation");
+  assert.equal(fake.sidebarReleased(), 1, "sidebar reference was not released");
+  runtime.dispose();
+});
+
+test("deactivating one plugin leaves another plugin's v2 surfaces alone", async () => {
+  const fake = fakeHosts();
+  const runtime = createPluginRuntime({ slots: {}, request: async () => ({ value: {} }), ...fake.hosts });
+  const grant = ["ui:entry", "ui:main-area"];
+  await runtime.activate(
+    { activate: context => { context.entry!.add({ id: "a", label: "A", run: () => {} }); context.mainArea!.mount({ render: () => {} }); } },
+    { id: "plugin.one", version: "2.0.0", granted: grant, token: "t1" },
+  );
+  await runtime.activate(
+    { activate: context => { context.entry!.add({ id: "b", label: "B", run: () => {} }); context.mainArea!.mount({ render: () => {} }); } },
+    { id: "plugin.two", version: "2.0.0", granted: grant, token: "t2" },
+  );
+  runtime.deactivate("plugin.one");
+  assert.deepEqual(fake.entries, ["plugin.two:b"]);
+  assert.equal(fake.mainAreas.find(item => item.pluginId === "plugin.two")!.disposed, false);
+  runtime.dispose();
+});
+
+test("a v2 surface without its grant is refused before reaching the host", async () => {
+  const fake = fakeHosts();
+  const runtime = createPluginRuntime({ slots: {}, request: async () => ({ value: {} }), ...fake.hosts });
+  await runtime.activate(
+    {
+      activate: context => {
+        // The context exposes no v2 surface at all when the grant is absent, so a
+        // plugin cannot even call one by mistake.
+        assert.equal(context.entry, undefined);
+        assert.equal(context.mainArea, undefined);
+        assert.equal(context.browser, undefined);
+        assert.equal(context.planner, undefined);
+      },
+    },
+    { id: "test.plugin", version: "2.0.0", granted: [], token: "t" },
+  );
+  runtime.dispose();
+});
+
+test("a browser view is created through the core and destroyed with the plugin", async () => {
+  const calls: string[] = [];
+  const fake = fakeHosts();
+  const runtime = createPluginRuntime({
+    slots: {},
+    ...fake.hosts,
+    request: async (path, body) => {
+      calls.push(path);
+      if (path === "/plugin-runtime/browser.open") {
+        return { value: { viewId: (body as { params: { viewId: string } }).params.viewId, url: "https://example.com/" } };
+      }
+      return { value: {} };
+    },
+  });
+  await runtime.activate(
+    {
+      activate: async context => {
+        const view = await context.browser!.open("main", "https://example.com/");
+        await view.setBounds({ x: 0, y: 0, width: 600, height: 400, visible: true });
+        await view.extract();
+      },
+    },
+    { id: "test.plugin", version: "2.0.0", granted: ["browser:view"], token: "t" },
+  );
+  assert.ok(calls.includes("/plugin-runtime/browser.open"));
+  assert.ok(fake.browserCalls.includes("open:test.plugin/main"));
+  runtime.deactivate("test.plugin");
+  assert.ok(fake.browserCalls.includes("close:test.plugin/main"), "view was not destroyed with the plugin");
+  runtime.dispose();
+});
+
+test("a browser adapter runs through the core and returns the host's JSON", async () => {
+  const calls: Array<{ path: string; params: unknown }> = [];
+  const fake = fakeHosts();
+  const runtime = createPluginRuntime({
+    slots: {},
+    ...fake.hosts,
+    request: async (path, body) => {
+      calls.push({ path, params: (body as { params?: unknown }).params });
+      if (path === "/plugin-runtime/browser.open") return { value: { viewId: "main", url: "https://example.com/" } };
+      if (path === "/plugin-runtime/browser.adapter") {
+        const params = (body as { params: { viewId: string; adapter: { source: string; args: unknown } } }).params;
+        return { value: { pluginId: "test.plugin", viewId: "main", url: "https://example.com/", adapter: params.adapter } };
+      }
+      return { value: {} };
+    },
+  });
+  let answer: unknown = null;
+  await runtime.activate(
+    {
+      activate: async context => {
+        const view = await context.browser!.open("main", "https://example.com/");
+        answer = await view.adapter("(args) => ({ title: document.title, asked: args })", { page: 2 });
+      },
+    },
+    { id: "test.plugin", version: "2.0.0", granted: ["browser:view"], token: "t" },
+  );
+  const adapterCall = calls.find(call => call.path === "/plugin-runtime/browser.adapter");
+  assert.ok(adapterCall, "the adapter did not go through the core");
+  const params = adapterCall.params as { viewId: string; adapter: { source: string; args: unknown } };
+  assert.equal(params.viewId, "main");
+  assert.match(params.adapter.source, /document\.title/);
+  assert.deepEqual(params.adapter.args, { page: 2 });
+  assert.deepEqual(answer, { ran: true, args: { page: 2 } });
+  runtime.dispose();
+});
+
+test("an empty adapter is refused before it reaches the core", async () => {
+  const calls: string[] = [];
+  const fake = fakeHosts();
+  const runtime = createPluginRuntime({
+    slots: {},
+    ...fake.hosts,
+    request: async (path, body) => {
+      calls.push(path);
+      if (path === "/plugin-runtime/browser.open") return { value: { viewId: "main", url: "https://example.com/" } };
+      return { value: {} };
+    },
+  });
+  await runtime.activate(
+    {
+      activate: async context => {
+        const view = await context.browser!.open("main", "https://example.com/");
+        await assert.rejects(() => view.adapter("   "), { code: "PLUGIN_ADAPTER_REQUIRED" });
+      },
+    },
+    { id: "test.plugin", version: "2.0.0", granted: ["browser:view"], token: "t" },
+  );
+  assert.equal(calls.filter(path => path === "/plugin-runtime/browser.adapter").length, 0);
+  runtime.dispose();
+});
+
+test("the cleanup an activate returns runs when the plugin is deactivated", async () => {  const runtime = createPluginRuntime({ slots: {}, request: async () => ({ value: {} }) });
+  let cleaned = 0;
+  await runtime.activate(
+    { activate: () => () => { cleaned += 1; } },
+    { id: "test.plugin", version: "2.0.0", granted: [], token: "t" },
+  );
+  assert.equal(cleaned, 0);
+  runtime.deactivate("test.plugin");
+  assert.equal(cleaned, 1, "a function returned from activate was not registered in the scope");
+  runtime.dispose();
+});
+
+test("an invalid view id is refused before the core is called", async () => {
+  let called = false;
+  const fake = fakeHosts();
+  const runtime = createPluginRuntime({
+    slots: {},
+    ...fake.hosts,
+    request: async () => { called = true; return { value: {} }; },
+  });
+  await runtime.activate(
+    {
+      activate: async context => {
+        await assert.rejects(() => context.browser!.open("../evil", "https://example.com/"), /viewId/);
+      },
+    },
+    { id: "test.plugin", version: "2.0.0", granted: ["browser:view"], token: "t" },
+  );
+  assert.equal(called, false);
+  runtime.dispose();
+});
+
+test("session history pages carry hasMore and nextBefore through", async () => {
+  const runtime = createPluginRuntime({
+    slots: {},
+    request: async path => {
+      if (path !== "/plugin-runtime/sessions.history") return { value: {} };
+      return { value: { sessionId: "s1", agentId: "main", messages: [{ id: "m1", role: "user", text: "hi" }], approvals: [], hasMore: true, nextBefore: 12, pageSize: 20 } };
+    },
+  });
+  let page: { hasMore: boolean; nextBefore: number | null; messages: unknown[] } | null = null;
+  await runtime.activate(
+    { activate: async context => { page = await context.sessions!.history({ id: "s1", pageSize: 20 }); } },
+    { id: "test.plugin", version: "2.0.0", granted: ["sessions:history"], token: "t" },
+  );
+  assert.equal(page!.hasMore, true);
+  assert.equal(page!.nextBefore, 12);
+  assert.equal(page!.messages.length, 1);
+  runtime.dispose();
+});
+
+test("a command runs the owner's own body and returns its real answer", async () => {
+  const fake = fakeHosts();
+  const sideEffects: string[] = [];
+  const runtime = createPluginRuntime({
+    slots: {},
+    ...fake.hosts,
+    request: async (path, body) => {
+      if (path === "/plugin-runtime/commands.register") {
+        const params = (body as { params: { name: string; title?: string } }).params;
+        return { value: { name: params.name, pluginId: "kimicode-plus.owner", pluginName: "Owner", title: params.title } };
+      }
+      if (path !== "/plugin-runtime/commands.invoke") return { value: {} };
+      const name = (body as { params: { command: string } }).params.command;
+      if (name === "multiSession.open") {
+        // The core authorizes the owner and forwards the args it was given.
+        return { value: { command: name, ownerId: "kimicode-plus.owner", owner: "Owner", title: "同屏打开", args: { sessionId: "s1" } } };
+      }
+      throw new Error("没有插件注册命令 " + name);
+    },
+  });
+  // The owner registers a body; the caller is a different plugin.
+  await runtime.activate(
+    {
+      activate: async context => {
+        await context.commands!.register("multiSession.open", {
+          title: "同屏打开",
+          run: (args: unknown) => {
+            const input = args as { sessionId: string };
+            sideEffects.push("opened:" + input.sessionId);
+            return { opened: input.sessionId };
+          },
+        });
+      },
+    },
+    { id: "kimicode-plus.owner", version: "2.0.0", granted: ["commands"], token: "t-owner" },
+  );
+  let answer: unknown = null;
+  let failure: unknown = null;
+  await runtime.activate(
+    {
+      activate: async context => {
+        answer = await context.commands!.invoke("multiSession.open", { sessionId: "s1" });
+        failure = await context.commands!.invoke("missing.command").catch(error => error);
+      },
+    },
+    { id: "kimicode-plus.caller", version: "2.0.0", granted: ["commands"], token: "t-caller" },
+  );
+  assert.deepEqual(sideEffects, ["opened:s1"], "the owner's body did not run with the forwarded args");
+  assert.deepEqual(answer, { opened: "s1" }, "the caller received the protocol object instead of the command's answer");
+  assert.match(String(failure), /没有插件注册命令/);
+
+  // A body is gone with its owner: the same call must now fail honestly.
+  runtime.deactivate("kimicode-plus.owner");
+  let afterDisable: unknown = null;
+  await runtime.activate(
+    {
+      activate: async context => {
+        afterDisable = await context.commands!.invoke("multiSession.open", { sessionId: "s2" }).catch(error => error);
+      },
+    },
+    { id: "kimicode-plus.caller2", version: "2.0.0", granted: ["commands"], token: "t-caller2" },
+  );
+  assert.match(String(afterDisable), /没有可执行实现/);
+  assert.deepEqual(sideEffects, ["opened:s1"], "a disabled owner still ran its command body");
+  runtime.dispose();
+});
+
+test("a command whose owner has no local body fails instead of returning metadata", async () => {
+  const fake = fakeHosts();
+  const runtime = createPluginRuntime({
+    slots: {},
+    ...fake.hosts,
+    request: async (path, body) => {
+      if (path !== "/plugin-runtime/commands.invoke") return { value: {} };
+      const name = (body as { params: { command: string } }).params.command;
+      // The core knows the command and its owner, but that owner registered no
+      // body in this renderer: that is a truthful "unavailable", not a success.
+      return { value: { command: name, ownerId: "kimicode-plus.absent", owner: "Absent" } };
+    },
+  });
+  let failure: unknown = null;
+  await runtime.activate(
+    {
+      activate: async context => {
+        failure = await context.commands!.invoke("multiSession.open", {}).catch(error => error);
+      },
+    },
+    { id: "test.plugin", version: "2.0.0", granted: ["commands"], token: "t" },
+  );
+  assert.match(String(failure), /PLUGIN_COMMAND_UNAVAILABLE|没有可执行实现/);
+  runtime.dispose();
+});
+
+test("a plugin is told its own manifest apiVersion, not the host's newest", async () => {
+  const seen: Array<{ id: string; dataVersion: number }> = [];
+  const runtime = createPluginRuntime({ slots: {}, request: async () => ({ value: {} }) });
+  await runtime.activate(
+    { activate: context => { seen.push({ id: context.plugin.id, dataVersion: context.plugin.dataVersion }); } },
+    { id: "test.v1", version: "1.0.0", apiVersion: 1, granted: [], token: "t1" },
+  );
+  await runtime.activate(
+    { activate: context => { seen.push({ id: context.plugin.id, dataVersion: context.plugin.dataVersion }); } },
+    { id: "test.v2", version: "2.0.0", apiVersion: 2, granted: [], token: "t2" },
+  );
+  assert.deepEqual(seen, [
+    { id: "test.v1", dataVersion: 1 },
+    { id: "test.v2", dataVersion: 2 },
+  ]);
+  runtime.dispose();
+});

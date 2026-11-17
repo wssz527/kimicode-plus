@@ -34,9 +34,12 @@ type NativeItem struct {
 }
 
 type NativeTurn struct {
-	TurnID string           `json:"turn_id"`
-	Items  []NativeItem     `json:"items"`
-	Error  *NativeTurnError `json:"error"`
+	TurnID string `json:"turn_id"`
+	// Ordinal is the official page cursor. Older turns carry a smaller ordinal,
+	// so a history page asks for the turns below the smallest one it already has.
+	Ordinal *int64           `json:"ordinal,omitempty"`
+	Items   []NativeItem     `json:"items"`
+	Error   *NativeTurnError `json:"error"`
 }
 
 type NativeFrame struct {
@@ -73,6 +76,17 @@ func (k *KAPClient) sendFrame(value any) error {
 func (k *KAPClient) Watch(id string) error {
 	if id == "" {
 		return errors.New("缺少会话 ID")
+	}
+	// Tests replace the official side with a refusing hook so a failed subscribe
+	// can be exercised without a socket: the rollback it triggers is the whole
+	// point of serializing the transition.
+	k.mu.Lock()
+	hook := k.watchHook
+	k.mu.Unlock()
+	if hook != nil {
+		if err := hook(id); err != nil {
+			return err
+		}
 	}
 	k.mu.Lock()
 	k.watched[id] = true
