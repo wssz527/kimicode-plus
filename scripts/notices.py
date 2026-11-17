@@ -70,6 +70,10 @@ for plugin in sorted((ROOT / 'plugins').iterdir()):
         '\n\n=== Bundled plugin: ' + manifest.get('id', plugin.name) + '@' + manifest.get('version', '') + ' (' + manifest.get('license', 'UNKNOWN') + ') ===',
         license_file.read_text(errors='replace'),
     ])
+    for notice_name in ('NOTICE', 'NOTICE.md'):
+        notice_file = plugin / notice_name
+        if notice_file.is_file():
+            output.extend(['\n\n--- ' + notice_name + ' ---', notice_file.read_text(errors='replace')])
 (ROOT / 'dist').mkdir(exist_ok=True)
 target = ROOT / 'dist/THIRD_PARTY_NOTICES.txt'
 target.write_text('\n'.join(output) + '\n')
