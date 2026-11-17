@@ -91,7 +91,7 @@ v2 能力由构建时机制授权：`plugins/registry.go` 对每个嵌入插件�
 | `sessions:approve` | 处理会话审批/提问 | `sessions.approve` → 原生 `session.reply` |
 | `sessions:abort` | 停止运行中的会话 | `sessions.abort` → 原生 `session.abort` |
 | `sessions:history` | 真正分页的历史回合（官方 `before_ordinal` + `page_size`） | `sessions.history` |
-| `sessions:read`（v1 已有） | 会话列表与读取；显式引用计数的实时订阅；打开已读取的官方会话 | `sessions.list/view/open/watch/unwatch` |
+| `sessions:read`（v1 已有） | 会话列表与读取；显式引用计数的实时订阅；打开已读取的官方会话；读取会话工作区 Git Diff（已脱敏） | `sessions.list/view/diff/open/watch/unwatch` |
 | `attachments` | 系统文件选择、拖入文件暂存与发送附件 | `attachments.stage/release/send`（发送经 `sessions.send`） |
 | `browser:view` | 创建、导航、后退、前进、刷新、显隐、销毁隔离网页视图；读选区/正文；执行站点适配器；在系统浏览器打开当前页 | `browser.open/navigate/back/forward/reload/bounds/visible/extract/adapter/openExternal/close` |
 | `planner:run` | 本地规划引擎：线程、模型、流式、审批 | `planner.*` |
@@ -114,6 +114,7 @@ v2 能力由构建时机制授权：`plugins/registry.go` 对每个嵌入插件�
 | `sessions.approve` | `{id, interactionId, value}` | 原生 reply 结果 |
 | `sessions.abort` | `{id}` | 原生 abort 结果 |
 | `sessions.open` | `{id}` | 核心读取并校验会话后返回 `{id}`；宿主再打开官方会话 |
+| `sessions.diff` | `{id}` | 读取该会话工作区的 Git 状态与未提交 Diff（经密钥脱敏与长度截断）；无仓库或无变更时返回 `available`/`clean` 与说明 |
 | `ui.popout` | `{}` | 核心按令牌返回 `{pluginId}`；调用方不能指定其他插件 |
 | `sessions.watch` / `sessions.unwatch` | `{id}` | `{sessionId, watching, forwarded}`；`forwarded` 表示这次是否真的向官方订阅/退订 |
 | `attachments.stage` | `{files:[{name, data}]}`，`data` 为 base64 | `{files:[{path, name, size}], batch}`；单文件 ≤ 8 MiB，总量 ≤ 16 MiB，最多 16 个 |

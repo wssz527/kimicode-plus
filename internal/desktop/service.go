@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -9,13 +10,16 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"enhancedkimi/internal/cache"
 	"enhancedkimi/internal/httpx"
+	"enhancedkimi/internal/redact"
 	"enhancedkimi/internal/storage"
 )
 
@@ -302,6 +306,8 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return map[string]any{"items": sessions, "total": len(sessions)}, nil
 	case "sessions.view":
 		return s.sessionView(ctx, stringInput(input, "id"))
+	case "sessions.diff":
+		return s.sessionDiff(ctx, stringInput(input, "id"))
 	case "sessions.watch":
 		id := stringInput(input, "id")
 		if err := s.WatchSession(id); err != nil {
@@ -1158,4 +1164,133 @@ func (s *NativeService) handoffNewSession(ctx context.Context, input map[string]
 		title = "规划交接"
 	}
 	return cwd, model, title, nil
+}
+
+type limitedBuffer struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if b.limit <= 0 {
+		b.truncated = true
+		return len(p), nil
+	}
+	remain := b.limit - b.buf.Len()
+	if remain <= 0 {
+		b.truncated = true
+		return len(p), nil
+	}
+	if len(p) > remain {
+		b.buf.Write(p[:remain])
+		b.truncated = true
+		return len(p), nil
+	}
+	return b.buf.Write(p)
+}
+
+func runGitCapped(ctx context.Context, cwd string, limit int, args ...string) (string, bool, error) {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", cwd}, args...)...)
+	out := &limitedBuffer{limit: limit}
+	var errBuf bytes.Buffer
+	cmd.Stdout = out
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+	return out.buf.String(), out.truncated, err
+}
+
+func truncateUTF8(text string, maxBytes int) (string, bool) {
+	if maxBytes <= 0 || len(text) <= maxBytes {
+		return text, false
+	}
+	end := maxBytes
+	for end > 0 && !utf8.ValidString(text[:end]) {
+		end--
+	}
+	return strings.TrimRight(text[:end], "\r\n") + "\n…（内容已按长度上限截断）", true
+}
+
+func (s *NativeService) sessionDiff(ctx context.Context, id string) (any, error) {
+	if id == "" {
+		return nil, errors.New("缺少会话 ID")
+	}
+	raw, err := s.kap.Request(ctx, http.MethodGet, "/sessions/"+url.PathEscape(id), nil)
+	if err != nil {
+		return nil, err
+	}
+	session, err := mapNativeSession(raw)
+	if err != nil {
+		return nil, err
+	}
+	cwd := strings.TrimSpace(session.CWD)
+	unavailable := func(reason string) map[string]any {
+		return map[string]any{
+			"sessionId": id,
+			"title":     session.Title,
+			"cwd":       cwd,
+			"available": false,
+			"clean":     false,
+			"status":    "",
+			"diff":      "",
+			"truncated": false,
+			"reason":    reason,
+		}
+	}
+	if cwd == "" || !filepath.IsAbs(cwd) {
+		return unavailable("该会话没有记录本地工作目录，无法读取 Git Diff。"), nil
+	}
+	info, err := os.Stat(cwd)
+	if err != nil || !info.IsDir() {
+		return unavailable("该会话的工作目录不存在，无法读取 Git Diff。"), nil
+	}
+	gitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	inside, _, insideErr := runGitCapped(gitCtx, cwd, 256, "rev-parse", "--is-inside-work-tree")
+	if insideErr != nil || strings.TrimSpace(inside) != "true" {
+		return unavailable("该会话工作目录不是 Git 仓库，无法读取工作区 Diff。"), nil
+	}
+	statusRaw, statusCap, statusErr := runGitCapped(gitCtx, cwd, 16<<10, "status", "--short", "--untracked-files=normal")
+	if statusErr != nil {
+		return unavailable("无法读取 Git 工作区状态，请确认 Git 仓库可访问。"), nil
+	}
+	var diffRaw string
+	var diffCap bool
+	if _, _, headErr := runGitCapped(gitCtx, cwd, 256, "rev-parse", "--verify", "HEAD"); headErr == nil {
+		var diffErr error
+		diffRaw, diffCap, diffErr = runGitCapped(gitCtx, cwd, 64<<10, "diff", "--no-color", "--no-ext-diff", "HEAD")
+		if diffErr != nil {
+			return unavailable("读取 Git Diff 失败，请确认工作区可访问。"), nil
+		}
+	} else {
+		staged, stagedCap, _ := runGitCapped(gitCtx, cwd, 32<<10, "diff", "--no-color", "--no-ext-diff", "--cached")
+		unstaged, unstagedCap, _ := runGitCapped(gitCtx, cwd, 32<<10, "diff", "--no-color", "--no-ext-diff")
+		diffCap = stagedCap || unstagedCap
+		parts := []string{}
+		if strings.TrimSpace(staged) != "" {
+			parts = append(parts, strings.TrimSpace(staged))
+		}
+		if strings.TrimSpace(unstaged) != "" {
+			parts = append(parts, strings.TrimSpace(unstaged))
+		}
+		diffRaw = strings.Join(parts, "\n")
+	}
+	status, statusCut := truncateUTF8(strings.TrimSpace(redact.Text(statusRaw)), 4000)
+	diff, diffCut := truncateUTF8(strings.TrimSpace(redact.Text(diffRaw)), 20000)
+	clean := status == "" && diff == ""
+	reason := ""
+	if clean {
+		reason = "当前工作区没有未提交的 Git 变更。"
+	}
+	return map[string]any{
+		"sessionId": id,
+		"title":     session.Title,
+		"cwd":       cwd,
+		"available": true,
+		"clean":     clean,
+		"status":    status,
+		"diff":      diff,
+		"truncated": statusCap || diffCap || statusCut || diffCut,
+		"reason":    reason,
+	}, nil
 }

@@ -477,7 +477,7 @@ func forwardParams(action string, payload map[string]any) map[string]any {
 			"interactionId": payload["interactionId"],
 			"value":         payload["value"],
 		}
-	case "sessions.abort":
+	case "sessions.abort", "sessions.diff":
 		return map[string]any{"id": payload["id"]}
 	case "sessions.history":
 		return map[string]any{

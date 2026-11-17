@@ -94,3 +94,22 @@ func TestBrowserViewsIsolateByWindowInstanceID(t *testing.T) {
 		t.Fatalf("closing popup view affected host view: %#v", views)
 	}
 }
+
+func TestSessionDiffRequiresSessionsReadAndValidID(t *testing.T) {
+	core := &pluginCoreDouble{}
+	manager, token := officialManager(t, core, []string{CapSessionsRead})
+	code, value := callPlugin(t, manager, token, "sessions.diff", map[string]any{"id": "session-1", "extra": "drop-me"})
+	if code != http.StatusOK {
+		t.Fatalf("sessions.diff => %d %#v", code, value)
+	}
+	if last := core.last(); last.action != "sessions.diff" || last.payload["id"] != "session-1" || last.payload["extra"] != nil {
+		t.Fatalf("unexpected forwarded payload: %#v", last)
+	}
+	if code, _ := callPlugin(t, manager, token, "sessions.diff", map[string]any{}); code != http.StatusBadRequest {
+		t.Fatalf("missing session id => %d", code)
+	}
+	managerWithoutGrant, tokenWithoutGrant := officialFixture(t, []string{CapSessionsHistory})
+	if code, value := callPlugin(t, managerWithoutGrant, tokenWithoutGrant, "sessions.diff", map[string]any{"id": "session-1"}); code != http.StatusForbidden || !strings.Contains(mustString(value), "PLUGIN_CAPABILITY_DENIED") {
+		t.Fatalf("sessions.diff without sessions:read => %d %#v", code, value)
+	}
+}

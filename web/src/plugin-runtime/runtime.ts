@@ -274,18 +274,34 @@ export function createPluginRuntime(options: RuntimeOptions) {
             throw error;
           }
           let closed = false;
+          let currentUrl = created.url;
+          const navListeners = new Set<(url: string) => void>();
+          const unlistenNav = host.onNavigate?.(pluginId, created.viewId, nextUrl => {
+            if (closed || typeof nextUrl !== "string" || !nextUrl) return;
+            currentUrl = nextUrl;
+            for (const listener of [...navListeners]) {
+              try {
+                listener(nextUrl);
+              } catch (error) {
+                reportFailure(pluginId, error, "PLUGIN_BROWSER_NAVIGATE", "浏览器导航监听错误");
+              }
+            }
+          });
           const release = () => {
             if (closed) return;
             closed = true;
+            navListeners.clear();
+            unlistenNav?.();
             void host.close(pluginId, created.viewId).catch(() => {});
           };
           owner.add(release);
           return {
             id: created.viewId,
-            url: created.url,
+            get url() { return currentUrl; },
             async navigate(next: string) {
               const result = await bridge.call<{ url: string }>("browser.navigate", { viewId: created.viewId, url: next, instanceId });
               await host.navigate(pluginId, created.viewId, result.url);
+              currentUrl = result.url;
             },
             async back() {
               await bridge.call("browser.back", { viewId: created.viewId, instanceId });
@@ -337,6 +353,13 @@ export function createPluginRuntime(options: RuntimeOptions) {
                 adapter: { source, args: args ?? null },
               });
               return host.adapter(pluginId, created.viewId, answer.adapter) as Promise<T>;
+            },
+            onNavigate(listener: (url: string) => void) {
+              if (closed) return { dispose() {} };
+              navListeners.add(listener);
+              const dispose = () => { navListeners.delete(listener); };
+              owner.add(dispose);
+              return { dispose };
             },
             async close() {
               await bridge.call("browser.close", { viewId: created.viewId, instanceId });

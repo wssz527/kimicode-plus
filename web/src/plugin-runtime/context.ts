@@ -82,6 +82,7 @@ export interface BrowserView {
    * instead of returning a partial result.
    */
   adapter<T = unknown>(source: string, args?: unknown): Promise<T>;
+  onNavigate?(listener: (url: string) => void): Disposable;
   close(): Promise<void>;
 }
 
@@ -163,6 +164,7 @@ export interface BrowserHost {
   extract(pluginId: string, viewId: string): Promise<string>;
   /** Executes an authorized site adapter in the plugin's own view. */
   adapter(pluginId: string, viewId: string, adapter: { source: string; args: unknown }): Promise<unknown>;
+  onNavigate?(pluginId: string, viewId: string, listener: (url: string) => void): () => void;
   close(pluginId: string, viewId: string): Promise<void>;
 }
 

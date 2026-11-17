@@ -264,7 +264,7 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 		}
 		nativePayload, _ = json.Marshal(body)
 	}
-	if action == "sessions.history" || action == "sessions.approve" || action == "sessions.abort" {
+	if action == "sessions.history" || action == "sessions.approve" || action == "sessions.abort" || action == "sessions.diff" {
 		input, err := decodeObject(payload)
 		if err != nil {
 			return nil, err

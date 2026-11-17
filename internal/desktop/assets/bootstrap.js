@@ -340,6 +340,15 @@ async function installNativeBootstrap(options) {
           view.webContents.on('will-navigate', (event, next) => {
             if (!isBrowserURL(next)) event.preventDefault();
           });
+          const pushNavigate = nextUrl => {
+            if (!isBrowserURL(nextUrl)) return;
+            const ownerContents = webContents.fromId(state.pluginViewOwners.get(key));
+            if (!ownerContents || ownerContents.isDestroyed()) return;
+            const event = { pluginId: answer.pluginId, instanceId: answer.instanceId, viewId: answer.viewId, url: String(nextUrl) };
+            ownerContents.executeJavaScript('window.__ekdPluginBrowserNavigated?.(' + JSON.stringify(event) + ')').catch(() => {});
+          };
+          view.webContents.on('did-navigate', (_event, nextUrl) => pushNavigate(nextUrl));
+          view.webContents.on('did-navigate-in-page', (_event, nextUrl) => pushNavigate(nextUrl));
           state.pluginViews.set(key, view);
           state.pluginViewTokens.set(key, payload.token);
           state.pluginViewOwners.set(key, target.id);

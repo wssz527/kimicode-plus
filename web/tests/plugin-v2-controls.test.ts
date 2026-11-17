@@ -131,3 +131,48 @@ test("browser open rolls back the core record when host.open rejects", async () 
   ]);
   runtime.dispose();
 });
+
+test("browser view tracks navigation events and releases listener on dispose", async () => {
+  const seen: string[] = [];
+  let pushNav: ((url: string) => void) | undefined;
+  let unsubscribed = false;
+  let viewRef: { readonly url: string } | undefined;
+  const runtime = createPluginRuntime({
+    slots: {},
+    instanceId: "win-nav",
+    request: async path => path === "/plugin-runtime/browser.open"
+      ? { value: { viewId: "web", url: "https://www.kimi.com/" } }
+      : { value: { closed: true } },
+    browserHost: {
+      open: async () => {},
+      navigate: async () => {},
+      history: async () => false,
+      external: async () => {},
+      bounds: async () => {},
+      extract: async () => "",
+      adapter: async () => null,
+      onNavigate: (_pluginId, _viewId, listener) => {
+        pushNav = listener;
+        return () => { unsubscribed = true; };
+      },
+      close: async () => {},
+    },
+  });
+  await runtime.activate(
+    {
+      activate: async context => {
+        const view = await context.browser!.open("web", "https://www.kimi.com/");
+        viewRef = view;
+        view.onNavigate?.(url => seen.push(url));
+      },
+    },
+    { id: "test.plugin", version: "2.0.0", granted: ["browser:view"], token: "t" },
+  );
+  pushNav?.("https://www.kimi.com/chat/42");
+  assert.equal(viewRef?.url, "https://www.kimi.com/chat/42");
+  assert.deepEqual(seen, ["https://www.kimi.com/chat/42"]);
+  runtime.dispose();
+  assert.equal(unsubscribed, true);
+  pushNav?.("https://www.kimi.com/chat/99");
+  assert.deepEqual(seen, ["https://www.kimi.com/chat/42"]);
+});

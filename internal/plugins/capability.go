@@ -264,6 +264,7 @@ var actionCapability = map[string]string{
 	"cache.receipts":   CapMetricsRead,
 	"sessions.list":    CapSessionsRead,
 	"sessions.view":    CapSessionsRead,
+	"sessions.diff":    CapSessionsRead,
 	"sessions.open":    CapSessionsRead,
 	"sessions.watch":   CapSessionsRead,
 	"sessions.unwatch": CapSessionsRead,

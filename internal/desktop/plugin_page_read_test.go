@@ -51,6 +51,11 @@ type probeRun struct {
 		ExternalAddress string      `json:"externalAddress"`
 		ReloadCount     int         `json:"reloadCount"`
 	} `json:"controls"`
+	NavEvents []struct {
+		PluginID string `json:"pluginId"`
+		ViewID   string `json:"viewId"`
+		URL      string `json:"url"`
+	} `json:"navEvents"`
 	Redirected pageRead `json:"redirected"`
 	PushState  pageRead `json:"pushState"`
 	FileScheme pageRead `json:"fileScheme"`
@@ -109,6 +114,9 @@ func TestPluginPageReadsFollowTheAPageThatMoved(t *testing.T) {
 	}
 	if run.Controls.ExternalAddress != run.RecordedURL || run.Controls.External.Value.URL != run.RecordedURL {
 		t.Fatalf("system browser did not receive the current page: %#v", run.Controls)
+	}
+	if len(run.NavEvents) != 1 || run.NavEvents[0].ViewID != "probe-view" || !strings.HasSuffix(run.NavEvents[0].URL, "/list/app/99") {
+		t.Fatalf("in-page navigation did not push URL to owning renderer: %#v", run.NavEvents)
 	}
 
 	allowed := map[string]pageRead{"重定向后": run.Redirected, "改路由后": run.PushState}

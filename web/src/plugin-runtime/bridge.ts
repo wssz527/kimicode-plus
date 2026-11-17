@@ -42,6 +42,7 @@ const ACTION_CAPABILITY: Record<string, string> = {
   "cache.receipts": "metrics:read",
   "sessions.list": "sessions:read",
   "sessions.view": "sessions:read",
+  "sessions.diff": "sessions:read",
   "sessions.open": "sessions:read",
   "sessions.watch": "sessions:read",
   "sessions.unwatch": "sessions:read",

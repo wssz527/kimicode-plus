@@ -40,6 +40,12 @@ function fakeContents(url) {
     loadURL(next) { page.url = next; return Promise.resolve(); },
     executeJavaScript(expression) {
       if (!page.destroyed) {
+        if (expression.startsWith('window.__ekdPluginBrowserNavigated')) {
+          page.navEvents = page.navEvents || [];
+          const match = expression.match(/\((.*)\)$/);
+          if (match) page.navEvents.push(JSON.parse(match[1]));
+          return Promise.resolve(null);
+        }
         // The page an adapter or a text read sees is the page it is on now.
         return Promise.resolve(expression.startsWith('window.getSelection')
           ? `text of ${page.url}`
@@ -166,6 +172,10 @@ async function main() {
 
   await read('redirected', `http://127.0.0.1:${fixture.address().port}/after-sign-in`);
   await read('pushState', `http://127.0.0.1:${fixture.address().port}/list/app/42`);
+  const inPageUrl = `http://127.0.0.1:${fixture.address().port}/list/app/99`;
+  view.webContents.listeners.get('did-navigate-in-page')?.({}, inPageUrl);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  findings.navEvents = hostContents.navEvents || [];
   findings.controls = {
     back: await bridge('browser.view.history', { token, viewId: 'probe-view', operation: 'back' }),
     forward: await bridge('browser.view.history', { token, viewId: 'probe-view', operation: 'forward' }),

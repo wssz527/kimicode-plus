@@ -69,6 +69,7 @@ async function installNativeRenderer(options) {
     pluginTokens: new Map(),
     pluginAssets: new Map(),
     pluginSettings: new Map(),
+    browserNavListeners: new Map(),
   };
   const activeSession = () => {
     if (options.sourceSessionId) return options.sourceSessionId;
@@ -623,6 +624,8 @@ async function installNativeRenderer(options) {
     state.pluginReleases.clear();
     for (const release of [...state.pluginSettings.values()]) release.dispose();
     state.pluginSettings.clear();
+    state.browserNavListeners.clear();
+    delete window.__ekdPluginBrowserNavigated;
     state.plugins?.dispose();
     state.plugins = null;
     delete window.__ekdPlugins;
@@ -1092,6 +1095,14 @@ async function installNativeRenderer(options) {
     unregister: (pluginId, name) => transport.request('plugin.command.unregister', { token: pluginToken(pluginId), name }),
     invoke: (pluginId, name, args) => transport.request('plugin.command.invoke', { token: pluginToken(pluginId), name, args }),
   };
+  window.__ekdPluginBrowserNavigated = payload => {
+    if (!payload || typeof payload.pluginId !== 'string' || typeof payload.viewId !== 'string' || typeof payload.url !== 'string') return;
+    const listeners = state.browserNavListeners.get(payload.pluginId + ':' + payload.viewId);
+    if (!listeners) return;
+    for (const listener of [...listeners]) {
+      try { listener(payload.url); } catch {}
+    }
+  };
   const pluginBrowserHost = {
     open: (pluginId, viewId, url) => transport.request("browser.view.open", { token: pluginToken(pluginId), viewId, url }),
     navigate: (pluginId, viewId, url) => transport.request("browser.view.navigate", { token: pluginToken(pluginId), viewId, url }),
@@ -1100,6 +1111,19 @@ async function installNativeRenderer(options) {
     bounds: (pluginId, viewId, bounds) => transport.request("browser.view.bounds", { token: pluginToken(pluginId), viewId, ...bounds }),
     extract: (pluginId, viewId) => transport.request("browser.view.extract", { token: pluginToken(pluginId), viewId }),
     adapter: (pluginId, viewId, adapter) => transport.request("browser.view.adapter", { token: pluginToken(pluginId), viewId, adapter }),
+    onNavigate: (pluginId, viewId, listener) => {
+      const key = pluginId + ':' + viewId;
+      let set = state.browserNavListeners.get(key);
+      if (!set) {
+        set = new Set();
+        state.browserNavListeners.set(key, set);
+      }
+      set.add(listener);
+      return () => {
+        set.delete(listener);
+        if (set.size === 0) state.browserNavListeners.delete(key);
+      };
+    },
     close: (pluginId, viewId) => transport.request("browser.view.close", { token: pluginToken(pluginId), viewId }),
   };
 
