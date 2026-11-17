@@ -632,7 +632,8 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
     <div className={embedded ? "ekds-plugins" : "page"}>
       <div className="plugins-list-head">
         <div>
-          <h2>插件</h2>
+          {/* The settings dialog already prints this title above the subpage. */}
+          {embedded ? null : <h2>插件</h2>}
           <p>插件运行在当前界面里，可以读取你看到的会话内容。只安装你信任的插件。</p>
         </div>
         <div className="plugins-list-actions">

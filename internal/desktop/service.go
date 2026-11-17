@@ -298,6 +298,8 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return rawAsAny(raw), err
 	case "attach.status":
 		return s.attachStatus(ctx), nil
+	case "diagnostics.get":
+		return s.diagnosticsStatus(), nil
 	case "attach.enable":
 		return s.enableAttach(ctx, input)
 	case "attach.disable":
@@ -312,11 +314,6 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.cacheRetention(ctx, time.Now().UTC())
 	case "cache.receipts":
 		return s.cacheReceipts(ctx, parseCacheLimit(input))
-	case "monitor.summary":
-		// Transitional compatibility for the built-in Monitor surface. Plan D10
-		// keeps the persistent indicator out of the core, but this existing call
-		// must not regress before Monitor becomes a plugin.
-		return s.monitorSummaryCompat(ctx), nil
 	case "automation.get":
 		return s.automationSettings(ctx)
 	case "automation.set":

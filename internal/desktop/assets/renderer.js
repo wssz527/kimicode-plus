@@ -58,6 +58,11 @@ async function installNativeRenderer(options) {
     settingsActive: false,
     settingsRelease: null,
     removed: false,
+    plugins: null,
+    pluginReleases: new Map(),
+    pluginTokens: new Map(),
+    pluginAssets: new Map(),
+    pluginSettings: new Map(),
   };
   const activeSession = () => {
     if (options.sourceSessionId) return options.sourceSessionId;
@@ -541,8 +546,7 @@ async function installNativeRenderer(options) {
     }
     // Entries whose host container went away are dropped from the registry.
     // Only entry buttons are owned by the container loop. Other tracked nodes
-    // (the planner tab, the Monitor host) are kept so remove() can still clean
-    // them; dropping them here is what used to leave an orphan Monitor behind.
+    // (the planner tab) are kept so remove() can still clean them up.
     for (const entry of [...state.entries]) {
       if (entry.classList?.contains('ekd-native-entry') && !live.has(entry)) state.entries.delete(entry);
     }
@@ -556,23 +560,9 @@ async function installNativeRenderer(options) {
       for (const element of [wrapper, button]) for (const attribute of attributes) element.setAttribute(attribute.name, attribute.value);
       wrapper.append(button); tabs.append(wrapper); state.plannerTab = button; state.entries.add(wrapper);
     }
-    const footer = document.querySelector('.side-footer');
-    const column = footer?.closest('.col');
-    if (footer && column) {
-      // Remove any Monitor host this instance does not track. A previous runtime
-      // that was removed mid-flight can leave one behind, and mounting a second
-      // would show two Monitors in the same sidebar.
-      for (const stale of document.querySelectorAll('[data-ekd-monitor]')) {
-        if (stale !== state.monitorHost) { state.entries.delete(stale); stale.remove(); }
-      }
-      if (!state.monitorHost?.isConnected) {
-        unmountHandle(state.monitorHandle);
-        const element = document.createElement('div'); element.className = 'ekd-monitor-host'; element.dataset.ekdMonitor = '';
-        footer.before(element); state.monitorHost = element;
-        const host = makeHost(() => { unmountHandle(state.monitorHandle); state.monitorHandle = null; element.remove(); state.entries.delete(element); });
-        state.monitorHandle = mount(element, 'monitor', host); state.entries.add(element);
-      }
-    }
+    // The sidebar cache widget used to be mounted here. It is now the preinstalled
+    // Monitor plugin, which mounts through the plugin runtime's own sidebar slot,
+    // so this file owns no cache surface and no private channel for one.
     syncSettingsTab();
     if (state.sessionContainer && !state.sessionContainer.isConnected) closeSessions();
     if (state.sessionContainer) state.sessionContainer.setAttribute('data-ekd-containment', 'sessions');
@@ -641,21 +631,24 @@ async function installNativeRenderer(options) {
   };
   document.addEventListener('click', settingsTabClick, true);
   document.addEventListener('scroll', settingsScroll, true);
-  if (options.surface === 'settings' || options.popout) {
+  if (options.surface === 'settings' || options.surface === 'management' || options.popout) {
     document.documentElement.dataset.colorScheme = options.theme || 'dark';
-    document.title = options.surface === 'settings' ? 'KimiCode+ 设置' : 'KimiCode+ 规划聊天';
+    const title = options.surface === 'settings' ? 'KimiCode+ 设置' : options.surface === 'management' ? 'KimiCode+ 管理' : 'KimiCode+ 规划聊天';
+    document.title = title;
     document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:var(--color-bg,#121212);color:var(--color-text,#eee)';
     const element = document.createElement('div');
     element.style.cssText = 'height:100vh;min-height:0';
     document.body.replaceChildren(element);
     const host = makeHost(() => { void transport.request('window.close'); });
-    mount(element, options.surface === 'settings' ? 'settings' : 'planner', host, { initialSource: options.initialSource || 'web' });
+    if (options.surface === 'management') mount(element, 'management', host, { initialPath: options.initialPath });
+    else mount(element, options.surface === 'settings' ? 'settings' : 'planner', host, { initialSource: options.initialSource || 'web' });
     window.__ekdNativeUI = state;
     return { status: 'installed', surface: options.surface || 'planner' };
   }
   document.addEventListener('click', nativeTabClick, true);
   window.__ekdNativeUI = state;
   await refreshFeatures();
+  if (state.removed) return { status: 'removed', surface: 'host', domRevision: 1 };
   state.unsubscribeFeatures = makeHost(() => {}).subscribe('features', value => applyFeatures(value, false));
   let previousSession = activeSession();
   const sessionStore = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia._s.get('kimi.sessions');
@@ -811,11 +804,6 @@ async function installNativeRenderer(options) {
     reportFault(id, error, true);
   }
 
-  state.plugins = null;
-  state.pluginReleases = new Map();
-  state.pluginTokens = new Map();
-  state.pluginAssets = new Map();
-  state.pluginSettings = new Map();
   let syncPromise = null;
   let syncPending = false;
 
@@ -935,7 +923,7 @@ async function installNativeRenderer(options) {
   // Plugin state changes come from outside this renderer (the settings page is a
   // separate window), so the host re-reads the list whenever the surface becomes
   // visible again instead of only once at startup.
-  const pluginRefresh = () => { void syncPlugins(); };
+  function pluginRefresh() { void syncPlugins(); }
   document.addEventListener('visibilitychange', pluginRefresh);
   window.addEventListener('focus', pluginRefresh);
   // Features carry the enable/disable decisions this App made; the same event

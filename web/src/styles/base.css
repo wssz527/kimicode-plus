@@ -16,12 +16,22 @@
   --accent-soft: #e6eefb;
   --success: #17694a;
   --success-soft: #e3f1e9;
+  --success-line: #b9dcc9;
   --warn: #8a5a00;
   --warn-soft: #fbf0d8;
+  --warn-line: #e6d3a4;
   --danger: #a92a33;
   --danger-soft: #fbe7e7;
+  --danger-line: #edc3c3;
   --info: #1d5e74;
   --info-soft: #e2f0f4;
+  --info-line: #b9d6df;
+  --accent-line: #bfd2f2;
+  /* Notice copy sits on its own tinted background, so it needs a darker ink
+     than the accent colour that marks the icon. */
+  --notice-danger-ink: #7f2b32;
+  --notice-warn-ink: #6e4a06;
+  --notice-info-ink: #1a4e60;
   --focus: #1c5fd0;
   --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.05), 0 8px 24px -12px rgba(0, 0, 0, 0.14);
   --radius-sm: 5px;

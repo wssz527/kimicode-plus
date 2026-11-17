@@ -231,6 +231,26 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 - 凭据的保存与删除（只记名字，不记值）
 - 插件自己通过 `ctx.log` 输出的日志
 
+## 预装适配插件
+
+### Monitor（`kimicode-plus.monitor`）
+
+`plugins/monitor/` 是核心侧栏缓存组件的正式实现；核心不再有任何 Monitor 界面或私有动作（计划 D5、D10）。
+
+| 项 | 实际内容 |
+|---|---|
+| 能力 | `metrics:read`、`ui:sidebar`、`ui:settings`、`storage`。**不申请** `sessions:read`：它只读指标，不读会话正文。 |
+| 数据 | 仅 `ctx.core.request`：`cache.summary`（今日/近 1 小时、按模型、速度、额度）、`cache.sessions`、`cache.history`（24h/7d/30d）、`cache.receipts`。与设置里的“缓存与额度”页同一时刻同源。 |
+| 未知 | `NOT_REPORTED`、`null`、`UNKNOWN` 一律显示为 `--`／“未上报”，从不补零；额度按 `quota.value.quota.usages` 读 `usedRatio`，实际 0% 仍是 0%。 |
+| 子代理 | `cache.sessions` 只提供会话级的 `openBackground`（未返回的后台子代理数）与 `blocked`。插件按会话列出等待中的计数，并明确说明拿不到逐个代理的名称；不虚构代理行或 token。 |
+| 刷新 | 订阅 `cache`／`automation` 事件触发，10 秒合并窗口 + 60 秒兜底；手动刷新会开新一代，旧响应不会覆盖新结果。 |
+| 设置 | 默认迷你、是否显示 Kimi 形象、默认统计窗口；全部经 `ctx.storage` 持久化，重启后恢复。侧栏与设置子页通过同一个 `ctx` 上的命名空间通道同步，无需重新启用插件。 |
+| 样式 | 单文件内的 `<style>` 注入挂载元素的 shadow root，容器完全透明，颜色全部取自宿主 `--color-*`/`--ink*` 变量，`color-mix` 派生次级色；无网络请求、无全局 observer、无私有存储。 |
+
+`plugins/monitor/LICENSE` 随包交付上游 `bfjnbvf/kimi-code-monitor@1d529f0b` 的 MIT 全文与归属；`plugin.json` 的 `upstream` 字段与 `scripts/notices.py` 使用同一来源。Kimi 形象是插件自绘的几何图形，不使用官方商标素材，也不联网下载。
+
+停用 Monitor 后，核心的“缓存与额度”页数据不受影响，侧栏恢复为纯官方样式：插件只拥有自己的挂载节点，不由核心代管。
+
 ## 示例
 
 `plugins/example-hello/` 是本仓库自带的最小示例：侧栏一行文字 + 一个设置子页 + 使用私有存储记录启用次数。它也是第三方开发者的起点，可以直接复制改名。

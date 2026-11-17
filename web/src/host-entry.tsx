@@ -8,7 +8,8 @@ import { normalizeColorScheme, rewriteAssetURLs } from "./lib/embed";
 import { Workbench } from "./components/Workbench";
 import { createCoreTransport, createEventChannel, createNativeHost, HostScopeContext, type DemoHost, type NativeHost, type HostScopeValue } from "./native";
 import { AuthProvider } from "./auth";
-import { MonitorSurface, PlannerSurface, SettingsWindow } from "./components/Surfaces";
+import { PlannerSurface, SettingsWindow } from "./components/Surfaces";
+import { ManagementWindow } from "./components/ManagementWindow";
 import { SessionGrid } from "./components/SessionGrid";
 import "./styles/surfaces.css";
 import "./styles/plugin-surfaces.css";
@@ -72,6 +73,7 @@ function acquireTransport(transport: CoreTransport, permissions: string[]): () =
 
 // Embedded navigation is also process-wide. Reset it only when the last
 // enhancement mount goes away, so one panel closing keeps the others routed.
+// The management window is its own BrowserWindow and does not use it at all.
 let navigationMounts = 0;
 
 function acquireNavigation(): () => void {
@@ -168,7 +170,7 @@ export function mountWorkbench(element: HTMLElement, options: { host: DemoHost; 
   return handle;
 }
 
-export type SurfaceName = "planner" | "sessions" | "settings" | "monitor";
+export type SurfaceName = "planner" | "sessions" | "settings" | "management";
 export interface SurfaceMountOptions {
   host: NativeHost;
   stylesheetURL: string;
@@ -178,9 +180,16 @@ export interface SurfaceMountOptions {
   initialExtraIds?: string[];
   initialSource?: "local" | "web";
   onNativeRestore?: () => void;
+  /** Management routes start here instead of "/". Other surfaces ignore it. */
+  initialPath?: string;
 }
 
 const SETTINGS_PERMISSIONS = ["core:read", "settings:write", "models:read", "models:write", "usage:read", "usage:write", "plugins:read", "plugins:write", "credentials:read", "credentials:write"];
+
+/** The bridge already rejects other paths; this narrows the type for the UI. */
+function managementRoute(value: string | undefined) {
+  return value === "/credentials" ? "/credentials" : "/models";
+}
 
 export function mountSurface(element: HTMLElement, surface: SurfaceName, options: SurfaceMountOptions): EnhancementHandle {
   mounts.get(element)?.unmount();
@@ -194,13 +203,15 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
   const observer = new MutationObserver(syncTheme);
   observer.observe(element.ownerDocument.documentElement, { attributes: true, attributeFilter: ["data-color-scheme"] });
   shadow.append(styles, container);
-  const releaseTransport = surface === "settings" ? acquireTransport(createCoreTransport(options.host), SETTINGS_PERMISSIONS) : null;
+  const releaseTransport = surface === "settings" || surface === "management"
+    ? acquireTransport(createCoreTransport(options.host), SETTINGS_PERMISSIONS)
+    : null;
   const root = createRoot(container);
   const wrap = (children: React.ReactNode) => <HostScopeProvider host={options.host}>{children}</HostScopeProvider>;
   if (surface === "planner") root.render(wrap(<PlannerSurface host={options.host} initialSource={options.initialSource} />));
   else if (surface === "sessions") root.render(wrap(<SessionGrid host={options.host} initialExtraIds={options.initialExtraIds ?? []} onNativeRestore={options.onNativeRestore ?? (() => options.host.close())} />));
   else if (surface === "settings") root.render(wrap(<AuthProvider><SettingsWindow host={options.host} /></AuthProvider>));
-  else root.render(wrap(<MonitorSurface host={options.host} />));
+  else root.render(wrap(<AuthProvider><ManagementWindow host={options.host} path={managementRoute(options.initialPath)} /></AuthProvider>));
   let mounted = true;
   const handle: EnhancementHandle = {
     updateContext: () => {},
