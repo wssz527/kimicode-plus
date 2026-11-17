@@ -68,7 +68,7 @@ func TestNativeActionPermissionsFollowIntent(t *testing.T) {
 		"bootstrap": "core:read", "events.poll": "core:read", "session.view": "tasks:read",
 		"session.watch": "tasks:read", "session.unwatch": "tasks:read", "config.get": "core:read",
 		"diagnostics.get": "core:read",
-		"config.save": "settings:write", "managed.usage": "usage:read", "cache.summary": "usage:read",
+		"config.save":     "settings:write", "managed.usage": "usage:read", "cache.summary": "usage:read",
 		"automation.get": "core:read", "automation.set": "settings:write",
 		"recovery.get": "core:read", "recovery.set": "settings:write", "recovery.watch": "tasks:write",
 		"recovery.check": "tasks:write", "planner.get": "chat:read", "planner.send": "chat:write",
@@ -100,11 +100,16 @@ func TestPairingRejectsInvalidAndUnknownPermissions(t *testing.T) {
 // used to fail with PERMISSION_DENIED before the plugin manager ever saw it.
 func TestPluginRuntimeRoutesCountAsPluginTraffic(t *testing.T) {
 	cases := map[string]string{
-		"/enhance/v1/plugins":                            "plugins:read",
+		"/enhance/v1/plugins":                             "plugins:read",
 		"/enhance/v1/plugins/kimicode-plus.example-hello": "plugins:read",
 		"/enhance/v1/plugins/x/enable":                    "plugins:write",
 		"/enhance/v1/plugin-runtime/storage.set":          "plugins:write",
 		"/enhance/v1/plugin-runtime/events.poll":          "plugins:write",
+		// The KCT handover is driven by the plugin page, so it has to be plugin
+		// traffic as well. Classified as core traffic, the confirm button answered
+		// 403 to the only client that can press it.
+		"/enhance/v1/kct/migration":         "plugins:read",
+		"/enhance/v1/kct/migration/confirm": "plugins:write",
 	}
 	for path, expected := range cases {
 		method := http.MethodGet

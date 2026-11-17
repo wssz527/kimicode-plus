@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -212,22 +213,44 @@ func storageClear(ctx context.Context, db *sql.DB, pluginID string) error {
 	return err
 }
 
+// PluginStorage and SetPluginStorage are the same rows the storage actions
+// serve, exposed so a host service can seed or read a plugin's settings without
+// an HTTP round trip. The key still has to satisfy the renderer's key rules.
+func (m *Manager) PluginStorage(ctx context.Context, id, key string) ([]byte, bool, error) {
+	if err := validateStorageKey(key); err != nil {
+		return nil, false, err
+	}
+	return storageGet(ctx, m.db, id, key)
+}
+
+func (m *Manager) SetPluginStorage(ctx context.Context, id, key string, value []byte) error {
+	if err := validateStorageKey(key); err != nil {
+		return err
+	}
+	if len(value) > storageValueLimit {
+		return apiError(http.StatusRequestEntityTooLarge, "PLUGIN_STORAGE_LIMIT", fmt.Sprintf("单个值不超过 %d 字节", storageValueLimit))
+	}
+	return storageSet(ctx, m.db, id, key, value, m.now())
+}
+
 // ActivityKind names the audited event classes. The set is closed so the UI can
 // label every row without a fallback for unknown kinds.
 const (
-	ActivityInstall   = "INSTALL"
-	ActivityEnable    = "ENABLE"
-	ActivityDisable   = "DISABLE"
-	ActivityUninstall = "UNINSTALL"
-	ActivityError     = "ERROR"
-	ActivitySession   = "SESSIONS_SEND"
-	ActivityConfig    = "CONFIG_WRITE"
-	ActivityNetwork   = "NETWORK"
-	ActivityCorrupt   = "CORRUPT"
-	ActivityVersion   = "VERSION_BLOCKED"
-	ActivitySafeMode  = "SAFE_MODE"
-	ActivityUpgrade   = "UPGRADE"
-	ActivityRestore   = "RESTORE"
+	ActivityInstall    = "INSTALL"
+	ActivityEnable     = "ENABLE"
+	ActivityDisable    = "DISABLE"
+	ActivityUninstall  = "UNINSTALL"
+	ActivityError      = "ERROR"
+	ActivitySession    = "SESSIONS_SEND"
+	ActivityConfig     = "CONFIG_WRITE"
+	ActivityNetwork    = "NETWORK"
+	ActivityCorrupt    = "CORRUPT"
+	ActivityVersion    = "VERSION_BLOCKED"
+	ActivityBlocked    = "ENABLE_BLOCKED"
+	ActivitySafeMode   = "SAFE_MODE"
+	ActivityUpgrade    = "UPGRADE"
+	ActivityRestore    = "RESTORE"
+	ActivityCredential = "CREDENTIAL"
 )
 
 type Activity struct {

@@ -104,6 +104,32 @@ func (v *Vault) Unlock(ctx context.Context, password string) error {
 	return nil
 }
 func (v *Vault) Lock() { v.mu.Lock(); defer v.mu.Unlock(); clear(v.key); v.key = nil }
+
+// Unlocked reports whether this process currently holds the vault key. It says
+// nothing about which entries exist, so it is safe to show a plugin.
+func (v *Vault) Unlocked() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return len(v.key) > 0
+}
+
+// Exists reports whether an entry is stored, without decrypting it and without
+// requiring the vault to be unlocked: a reference name is not a secret, and a
+// locked vault must still be able to tell a plugin that its credential is
+// present but unusable until the user unlocks.
+func (v *Vault) Exists(ctx context.Context, ref string) (bool, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	var one int
+	err := v.db.QueryRowContext(ctx, `SELECT 1 FROM vault_entries WHERE ref=?`, ref).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
 func (v *Vault) Put(ctx context.Context, ref string, value []byte) error {
 	return v.put(ctx, ref, value, true)
 }

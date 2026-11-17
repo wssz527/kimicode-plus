@@ -135,14 +135,19 @@ export function createPluginRuntime(options: RuntimeOptions) {
           if (!granted.includes(SLOT_CAPABILITY[slot])) {
             throw new PluginError(403, "PLUGIN_CAPABILITY_DENIED", `插件没有装饰 ${slot} 的能力`);
           }
-          return hub.register(slot, (block, info) => {
-            try {
-              return decorator(block, info);
-            } catch (error) {
-              reportFailure(id, error, "PLUGIN_DECORATE_FAILED", `装饰 ${slot} 失败`);
-              throw error;
-            }
-          }, scope);
+          return hub.register(
+            slot,
+            (block, info) => {
+              try {
+                return decorator(block, info);
+              } catch (error) {
+                reportFailure(id, error, "PLUGIN_DECORATE_FAILED", `装饰 ${slot} 失败`);
+                throw error;
+              }
+            },
+            scope,
+            error => reportFailure(id, error, "PLUGIN_DECORATE_FAILED", `装饰 ${slot} 失败`),
+          );
         },
         theme,
       },

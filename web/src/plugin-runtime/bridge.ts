@@ -24,6 +24,10 @@ export function actionAllowed(action: string, granted: string[]): boolean {
   if (OPEN_ACTIONS.has(action)) return true;
   if (action.startsWith("net.")) return granted.some(name => name.startsWith("net:"));
   if (action.startsWith("storage.")) return granted.includes("storage");
+  // Credential names are declared as `credentials:<name>`, so the grant is a
+  // pattern rather than a fixed entry. The core still checks the exact name on
+  // every call; this check only refuses a plugin that declared no credential.
+  if (action.startsWith("credentials.")) return granted.some(name => name.startsWith("credentials:"));
   const capability = ACTION_CAPABILITY[action];
   // An action with no entry in this table is unknown to the runtime, which must
   // refuse rather than forward and rely on the core to catch it.
