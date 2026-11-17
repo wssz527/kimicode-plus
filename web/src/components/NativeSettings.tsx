@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { asConfigObject, commitNumberField, configMaxSteps, configSection, configField, configTimeoutMinutes, dangerousGuardPatch, readDangerousGuard, useHost } from "../native";
+import { asConfigObject, commitNumberField, configMaxSteps, configSection, configField, configTimeoutMinutes, dangerousGuardPatch, matchesModelPool, matchesPermissionRules, readDangerousGuard, useHost } from "../native";
 import { Icon } from "./Icon";
 import { Badge, ErrorNotice, Spinner } from "./ui";
 import "../styles/workbench.css";
@@ -343,11 +343,6 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
       if (key) models[key] = entry.desc.trim();
     }
     const apply = (cfg: Dic) => setPool(readPool(configSection(cfg, ["secondary_model", "secondaryModel"])));
-    const verify = (cfg: Dic) => {
-      const written = asConfigObject(configField(configSection(cfg, ["secondary_model", "secondaryModel"]), ["models"]));
-      const keys = Object.keys(written ?? {});
-      return keys.length === Object.keys(models).length && keys.every((key) => written?.[key] !== undefined);
-    };
     if (poolKeys.length === 0) {
       void save("pool", "derive", { secondary_model: null }, {
         note: "模型池已清空，子代理改为跟随调用方的模型。",
@@ -358,6 +353,7 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
     }
     const chosen = pool.entries.find((entry) => entry.id === pool.defaultId);
     const defaultModel = chosen && models[chosen.key.trim()] !== undefined ? chosen.key.trim() : poolKeys[0]!;
+    const verify = (cfg: Dic) => matchesModelPool(cfg, { models, defaultModel });
     const full: Dic = { ...pool.rest, models, defaultModel };
     const current = configSection(config, ["secondary_model", "secondaryModel"]);
     const currentKeys = Object.keys(asConfigObject(configField(current, ["models"])) ?? {});
@@ -412,11 +408,7 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
           const permission = configSection(cfg, ["permission"]);
           setRules(readRules(configField(permission, ["rules"])));
         },
-        verify: (cfg) => {
-          const permission = configSection(cfg, ["permission"]);
-          const actual = Array.isArray(configField(permission, ["rules"])) ? (configField(permission, ["rules"]) as unknown[]) : [];
-          return actual.length === payload.length;
-        },
+        verify: (cfg) => matchesPermissionRules(cfg, payload),
       },
     );
   }

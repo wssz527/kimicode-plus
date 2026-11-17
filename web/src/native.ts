@@ -257,6 +257,48 @@ export function dangerousGuardPatch(enabled: boolean): Record<string, unknown> {
   return { permission: { dangerous_command_guard: enabled } };
 }
 
+/**
+ * Compares the secondary model pool read back from the core against what was
+ * submitted. `GET /config` answers with camelCase field names while the write
+ * used snake_case, so both spellings resolve; every model keeps its description,
+ * and the default model must be the same key.
+ */
+export function matchesModelPool(config: unknown, expected: { models: Record<string, string>; defaultModel: string }): boolean {
+  const section = configSection(asConfigObject(config), ["secondary_model", "secondaryModel"]);
+  const written = asConfigObject(configField(section, ["models"])) ?? {};
+  const wanted = expected.models;
+  if (Object.keys(written).length !== Object.keys(wanted).length) return false;
+  if (!Object.entries(wanted).every(([key, desc]) => written[key] === desc)) return false;
+  return configField(section, ["defaultModel", "default_model", "model"]) === expected.defaultModel;
+}
+
+/**
+ * Compares the permission rules read back from the core against the submitted
+ * payload, in order and field by field. A length check alone would accept a rule
+ * that kept its count but changed its decision, pattern, scope or a preserved
+ * extra field.
+ */
+export function matchesPermissionRules(config: unknown, expected: readonly unknown[]): boolean {
+  const permission = configSection(asConfigObject(config), ["permission"]);
+  const actual = configField(permission, ["rules"]);
+  if (!Array.isArray(actual) || actual.length !== expected.length) return false;
+  return expected.every((rule, index) => sameConfigValue(actual[index], rule));
+}
+
+function sameConfigValue(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((item, index) => sameConfigValue(item, right[index]));
+  }
+  const leftObject = asConfigObject(left);
+  const rightObject = asConfigObject(right);
+  if (!leftObject || !rightObject) return false;
+  const keys = Object.keys(rightObject);
+  return keys.length === Object.keys(leftObject).length
+    && keys.every((key) => sameConfigValue(leftObject[key], rightObject[key]));
+}
+
 /** Applies an incoming policy patch onto a base, keeping the fields the server owns. */
 export function mergePolicy(base: CachePolicyDraft, incoming: unknown): CachePolicyDraft {
   const source = (incoming ?? {}) as Partial<CachePolicyDraft>;
