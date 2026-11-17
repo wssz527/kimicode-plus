@@ -344,4 +344,3 @@ func (s *NativeService) finishKeepAlive(ctx context.Context, intentID, sessionID
 	s.publishAutomationReceipt("keepalive", sessionID, verdict.State, verdict.Note)
 	return nil
 }
-

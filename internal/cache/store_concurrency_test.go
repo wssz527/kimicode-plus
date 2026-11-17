@@ -64,13 +64,22 @@ func TestConcurrentRealCallersMatchProduction(t *testing.T) {
 		func(ctx context.Context, now time.Time) error { _, err := store.Sessions(ctx, now, 20); return err },
 		func(ctx context.Context, now time.Time) error { _, err := store.Retention(ctx, now); return err },
 		func(ctx context.Context, now time.Time) error { _, err := store.History(ctx, now, "24h"); return err },
-		func(ctx context.Context, _ time.Time) error { _, _, err := store.LastMainStep(ctx, "session_concurrent"); return err },
+		func(ctx context.Context, _ time.Time) error {
+			_, _, err := store.LastMainStep(ctx, "session_concurrent")
+			return err
+		},
 		func(ctx context.Context, _ time.Time) error {
 			_, _, err := store.StepAfter(ctx, "session_concurrent", base)
 			return err
 		},
-		func(ctx context.Context, _ time.Time) error { _, err := store.Live(ctx, "session_concurrent"); return err },
-		func(ctx context.Context, _ time.Time) error { _, err := store.AllSessions(ctx, time.Now().UTC()); return err },
+		func(ctx context.Context, _ time.Time) error {
+			_, err := store.Live(ctx, "session_concurrent")
+			return err
+		},
+		func(ctx context.Context, _ time.Time) error {
+			_, err := store.AllSessions(ctx, time.Now().UTC())
+			return err
+		},
 		func(_ context.Context, _ time.Time) error { _ = store.Home(); return nil },
 	}
 	for _, reader := range readers {
