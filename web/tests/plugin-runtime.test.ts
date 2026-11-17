@@ -658,6 +658,8 @@ function fakeHosts() {
     browserHost: {
       open: async (pluginId: string, viewId: string) => { browserCalls.push(`open:${pluginId}/${viewId}`); },
       navigate: async (pluginId: string, viewId: string) => { browserCalls.push(`navigate:${pluginId}/${viewId}`); },
+      history: async (pluginId: string, viewId: string, action: "back" | "forward" | "reload") => { browserCalls.push(`${action}:${pluginId}/${viewId}`); return true; },
+      external: async (pluginId: string, viewId: string) => { browserCalls.push(`external:${pluginId}/${viewId}`); },
       bounds: async (pluginId: string, viewId: string) => { browserCalls.push(`bounds:${pluginId}/${viewId}`); },
       extract: async () => "page text",
       adapter: async (_pluginId: string, _viewId: string, adapter: { source: string; args: unknown }) => ({ ran: adapter.source.length > 0, args: adapter.args }),
@@ -757,6 +759,10 @@ test("a browser view is created through the core and destroyed with the plugin",
       activate: async context => {
         const view = await context.browser!.open("main", "https://example.com/");
         await view.setBounds({ x: 0, y: 0, width: 600, height: 400, visible: true });
+        assert.equal(await view.back(), true);
+        assert.equal(await view.forward(), true);
+        await view.reload();
+        await view.openExternal();
         await view.extract();
       },
     },
@@ -764,6 +770,11 @@ test("a browser view is created through the core and destroyed with the plugin",
   );
   assert.ok(calls.includes("/plugin-runtime/browser.open"));
   assert.ok(fake.browserCalls.includes("open:test.plugin/main"));
+  assert.ok(fake.browserCalls.includes("back:test.plugin/main"));
+  assert.ok(fake.browserCalls.includes("forward:test.plugin/main"));
+  assert.ok(fake.browserCalls.includes("reload:test.plugin/main"));
+  assert.ok(fake.browserCalls.includes("external:test.plugin/main"));
+  assert.ok(calls.includes("/plugin-runtime/browser.openExternal"));
   runtime.deactivate("test.plugin");
   assert.ok(fake.browserCalls.includes("close:test.plugin/main"), "view was not destroyed with the plugin");
   runtime.dispose();

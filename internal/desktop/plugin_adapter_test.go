@@ -85,7 +85,7 @@ func TestSiteAdapterIsAuthorizedBeforeItRuns(t *testing.T) {
 			t.Fatalf("%s is not followed by another view action", action)
 		}
 		block := bootstrapSource[start : start+len(action)+end]
-		if !strings.Contains(block, "livePluginView(answer);") {
+		if !strings.Contains(block, "livePluginView(answer, target);") {
 			t.Fatalf("%s no longer resolves the view the core authorized", action)
 		}
 		if !strings.Contains(block, "currentPluginPage(view);") {

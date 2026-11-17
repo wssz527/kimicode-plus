@@ -191,6 +191,17 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 			return nil, err
 		}
 		return m.sessionWatch(ctx, id, stringValue(input["id"]), action == "sessions.watch")
+	case action == "ui.popout":
+		return map[string]any{"pluginId": id}, nil
+	case action == "sessions.open":
+		input, err := decodeObject(payload)
+		if err != nil {
+			return nil, err
+		}
+		if core == nil {
+			return nil, apiError(http.StatusServiceUnavailable, "PLUGIN_CORE_UNAVAILABLE", "核心服务尚未就绪，无法执行该动作")
+		}
+		return m.openSession(ctx, core, input)
 	case action == "handoff.preview":
 		input, err := decodeObject(payload)
 		if err != nil {

@@ -1,6 +1,6 @@
 async function installNativeBootstrap(options) {
   const req = typeof require === 'function' ? require : process.mainModule.require.bind(process.mainModule);
-  const { webContents, BrowserWindow, WebContentsView, session, app, dialog } = req('electron');
+  const { webContents, BrowserWindow, WebContentsView, session, app, dialog, shell } = req('electron');
   const http = req('node:http');
   const crypto = req('node:crypto');
   if (app.getVersion() !== options.expectedApp || process.versions.electron !== options.expectedElectron) throw new Error('宿主版本在接入时发生变化');
@@ -14,7 +14,7 @@ async function installNativeBootstrap(options) {
   const pair = await pairResponse.json();
   if (!pairResponse.ok) throw new Error(pair?.error?.message || '增强核心配对失败');
   let coreToken = pair.sessionToken;
-  const state = { channels: new Map(), windows: new Map(), views: new Map(), pluginViews: new Map(), pluginViewTokens: new Map(), bounds: new Map(), browserWindow: null, server: null, cleanup: null };
+  const state = { channels: new Map(), windows: new Map(), views: new Map(), pluginViews: new Map(), pluginViewTokens: new Map(), pluginViewOwners: new Map(), pluginCommands: new Map(), bounds: new Map(), browserWindow: null, server: null, cleanup: null };
   globalThis.__ekdNative = state;
   const browserSession = session.fromPartition('persist:ekd-native-browser');
   function json(response, status, value, origin) {
@@ -45,10 +45,11 @@ async function installNativeBootstrap(options) {
   }
   // A plugin view is owned by one plugin and one view id; both must be present
   // and well-formed before anything touches Electron.
-  function pluginViewKey(pluginId, viewId) {
+  function pluginViewKey(pluginId, viewId, instanceId) {
     if (typeof pluginId !== 'string' || !/^[a-z0-9][a-z0-9.-]{0,63}$/.test(pluginId)) throw new Error('插件 ID 无效');
     if (typeof viewId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(viewId)) throw new Error('网页视图 ID 无效');
-    return pluginId + '/' + viewId;
+    if (typeof instanceId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(instanceId)) throw new Error('网页视图实例 ID 无效');
+    return instanceId + '/' + pluginId + '/' + viewId;
   }
   function isBrowserURL(value) {
     try {
@@ -67,7 +68,7 @@ async function installNativeBootstrap(options) {
   // and its official digest still matches. The answer names the owner, so a
   // payload can never name one — and a plugin without the capability can never
   // reach Electron at all.
-  async function coreBrowserAction(action, token, params) {
+  async function corePluginAction(action, token, params) {
     if (typeof token !== 'string' || token.length < 16 || token.length > 256) throw new Error('插件身份令牌无效');
     const response = await coreFetch('/enhance/v1/plugin-runtime/' + action, { method: 'POST', body: JSON.stringify({ token, params }) });
     const answer = await response.json().catch(() => null);
@@ -76,7 +77,10 @@ async function installNativeBootstrap(options) {
       error.code = answer?.error?.code || 'CORE_ERROR';
       throw error;
     }
-    const value = answer?.value;
+    return answer?.value;
+  }
+  async function coreBrowserAction(action, token, params) {
+    const value = await corePluginAction(action, token, params);
     if (!value || typeof value.pluginId !== 'string' || typeof value.viewId !== 'string') throw new Error('核心返回的网页视图归属无效');
     return value;
   }
@@ -88,14 +92,33 @@ async function installNativeBootstrap(options) {
     const view = state.pluginViews.get(key);
     state.pluginViews.delete(key);
     state.pluginViewTokens.delete(key);
+    const ownerId = state.pluginViewOwners.get(key);
+    state.pluginViewOwners.delete(key);
     if (!view) return false;
-    const owner = BrowserWindow.fromWebContents(wc);
+    const contents = webContents.fromId(ownerId);
+    const owner = contents && !contents.isDestroyed() ? BrowserWindow.fromWebContents(contents) : null;
     try { owner?.contentView.removeChildView(view); } catch {}
     if (!view.webContents.isDestroyed()) view.webContents.close();
     return true;
   }
   function destroyPluginViews() {
     for (const key of [...state.pluginViews.keys()]) dropPluginView(key);
+  }
+  function releaseOwnedPluginViews(contentsId) {
+    const pending = [];
+    for (const [key, owner] of [...state.pluginViewOwners]) {
+      if (owner !== contentsId) continue;
+      const token = state.pluginViewTokens.get(key);
+      const slash = key.indexOf('/');
+      const secondSlash = slash >= 0 ? key.indexOf('/', slash + 1) : -1;
+      const instanceId = slash > 0 ? key.slice(0, slash) : '';
+      const viewId = secondSlash > slash ? key.slice(secondSlash + 1) : '';
+      dropPluginView(key);
+      if (token && instanceId && viewId) {
+        pending.push(coreBrowserAction('browser.close', token, { viewId, instanceId }).catch(() => {}));
+      }
+    }
+    return Promise.all(pending);
   }
   // Reading a plugin page works on the page it is actually on, not on the
   // address core recorded when the view was opened. A sign-in redirect or an
@@ -111,8 +134,10 @@ async function installNativeBootstrap(options) {
   // Resolves the Electron view the core just authorized. A view the core knows
   // about but this process never built is reported missing rather than created
   // here: only browser.view.open may create one.
-  function livePluginView(answer) {
-    const key = pluginViewKey(answer.pluginId, answer.viewId);
+  function livePluginView(answer, target) {
+    const instanceId = state.channels.get(target.id)?.instanceId || '';
+    if (answer.instanceId !== instanceId) throw new Error('网页视图实例与宿主窗口不匹配');
+    const key = pluginViewKey(answer.pluginId, answer.viewId, instanceId);
     const view = state.pluginViews.get(key);
     if (!view || view.webContents.isDestroyed()) throw new Error('插件网页视图不存在');
     return { key, view };
@@ -165,6 +190,7 @@ async function installNativeBootstrap(options) {
     const theme = await wc.executeJavaScript('document.documentElement.dataset.colorScheme||"dark"');
     const previous = state.bounds.get(kind);
     const management = kind === 'management';
+    const plugin = kind.startsWith('plugin:');
     const win = new BrowserWindow({
       title: management ? 'KimiCode+ 管理' : 'KimiCode+ 规划',
       width: previous?.width || (management ? 1080 : 640),
@@ -176,8 +202,23 @@ async function installNativeBootstrap(options) {
     });
     state.windows.set(kind, win);
     const contentsId = win.webContents.id;
-    win.on('close', () => { if (!win.isDestroyed()) state.bounds.set(kind, win.getBounds()); });
-    win.on('closed', () => { state.channels.delete(contentsId); state.windows.delete(kind); });
+    let closing = false;
+    win.on('close', event => {
+      if (!win.isDestroyed()) state.bounds.set(kind, win.getBounds());
+      if (!plugin || closing) return;
+      closing = true;
+      event.preventDefault();
+      void win.webContents.executeJavaScript('window.__ekdNativeUI?.remove()')
+        .catch(() => {})
+        .then(() => Promise.race([releaseOwnedPluginViews(contentsId), new Promise(resolve => setTimeout(resolve, 250))]))
+        .finally(() => { if (!win.isDestroyed()) win.destroy(); });
+    });
+    win.on('closed', () => {
+      state.channels.delete(contentsId);
+      for (const [key, owner] of [...state.pluginCommands]) if (owner === contentsId) state.pluginCommands.delete(key);
+      if (state.windows.get(kind) === win) state.windows.delete(kind);
+      releaseOwnedPluginViews(contentsId);
+    });
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     // The window only ever hosts the injected renderer on about:blank. Any
     // other navigation would put an external page inside a window that carries
@@ -187,21 +228,26 @@ async function installNativeBootstrap(options) {
     });
     await win.loadURL('about:blank');
     if (management) await bindRenderer(win.webContents, 'management', { popout: true, theme, initialPath: managementPath(source.path) });
+    else if (plugin) await bindRenderer(win.webContents, 'plugin', { popout: true, theme, pluginId: source.pluginId });
     else await bindRenderer(win.webContents, 'planner', { popout: true, theme, ...source });
     win.show(); win.focus();
     return { opened: true };
   }
   async function bindRenderer(target, surface, extra = {}) {
+    for (const [key, owner] of [...state.pluginCommands]) if (owner === target.id) state.pluginCommands.delete(key);
+    releaseOwnedPluginViews(target.id);
     const key = crypto.randomBytes(32).toString('base64url');
-    state.channels.set(target.id, { key, expectedOrigin: target === wc ? 'app://renderer' : 'null' });
+    const instanceId = crypto.randomBytes(16).toString('base64url');
+    state.channels.set(target.id, { key, instanceId, expectedOrigin: target === wc ? 'app://renderer' : 'null' });
     const config = {
-      endpoint: state.endpoint, bridgeKey: key, moduleSource: options.moduleSource, cssSource: options.cssSource,
+      endpoint: state.endpoint, bridgeKey: key, instanceId, moduleSource: options.moduleSource, cssSource: options.cssSource,
       surface, ...extra,
     };
     return target.executeJavaScript('(' + options.rendererSource + ')(' + JSON.stringify(config) + ')');
   }
   async function dispatch(target, message) {
     const payload = message.payload || {};
+    if (message.action.startsWith('browser.view.')) payload.instanceId = state.channels.get(target.id)?.instanceId || '';
     switch (message.action) {
       case 'core.fetch': {
         if (typeof payload.path !== 'string' || !payload.path.startsWith('/enhance/v1/') || payload.path.includes('..') || payload.path.includes('\\')) throw new Error('核心请求路径不被允许');
@@ -218,6 +264,11 @@ async function installNativeBootstrap(options) {
         return { status: response.status, headers: [['Content-Type', response.headers.get('content-type') || 'application/json']], bodyBase64: result };
       }
       case 'window.openSettings': return wc.executeJavaScript('window.__ekdNativeUI.openSettings()');
+      case 'plugin.window.open': {
+        const answer = await corePluginAction('ui.popout', payload.token, {});
+        if (typeof answer?.pluginId !== 'string' || !/^[a-z0-9][a-z0-9.-]{0,63}$/.test(answer.pluginId)) throw new Error('核心返回的插件窗口归属无效');
+        return openWindow('plugin:' + answer.pluginId, { pluginId: answer.pluginId });
+      }
       case 'window.popout': return openWindow('planner', { sourceSessionId: payload.sourceSessionId || '', initialSource: payload.initialSource === 'local' ? 'local' : 'web' });
       case 'window.openManagement': return openWindow('management', { path: managementPath(payload.path) });
       case 'window.close': BrowserWindow.fromWebContents(target)?.close(); return {};
@@ -269,8 +320,8 @@ async function installNativeBootstrap(options) {
       // is authorized for browser:view, the core answers with the owner and the
       // canonical URL, and only then does this process touch Electron.
       case 'browser.view.open': {
-        const answer = await coreBrowserAction('browser.open', payload.token, { viewId: payload.viewId, url: payload.url });
-        const key = pluginViewKey(answer.pluginId, answer.viewId);
+        const answer = await coreBrowserAction('browser.open', payload.token, { viewId: payload.viewId, instanceId: payload.instanceId, url: payload.url });
+        const key = pluginViewKey(answer.pluginId, answer.viewId, answer.instanceId);
         const url = browserURL(answer.url);
         let view = state.pluginViews.get(key);
         let created = false;
@@ -280,7 +331,7 @@ async function installNativeBootstrap(options) {
           if (!owner) {
             // The core now believes the view exists; without a window here it
             // cannot, so the registry is put back the way it was.
-            await coreBrowserAction('browser.close', payload.token, { viewId: answer.viewId }).catch(() => {});
+            await coreBrowserAction('browser.close', payload.token, { viewId: answer.viewId, instanceId: answer.instanceId }).catch(() => {});
             throw new Error('插件网页视图缺少宿主窗口');
           }
           owner.contentView.addChildView(view);
@@ -291,6 +342,7 @@ async function installNativeBootstrap(options) {
           });
           state.pluginViews.set(key, view);
           state.pluginViewTokens.set(key, payload.token);
+          state.pluginViewOwners.set(key, target.id);
           created = true;
         }
         try {
@@ -300,41 +352,65 @@ async function installNativeBootstrap(options) {
           // view goes away and the core record is released, so a retry starts
           // from a clean state instead of reusing a broken view.
           dropPluginView(key);
-          await coreBrowserAction('browser.close', payload.token, { viewId: answer.viewId }).catch(() => {});
+          await coreBrowserAction('browser.close', payload.token, { viewId: answer.viewId, instanceId: answer.instanceId }).catch(() => {});
           throw error;
         }
         if (!created && state.pluginViewTokens.get(key) !== payload.token) state.pluginViewTokens.set(key, payload.token);
-        return { browserId: view.webContents.id, pluginId: answer.pluginId, viewId: answer.viewId, url: answer.url };
+        return { browserId: view.webContents.id, pluginId: answer.pluginId, instanceId: answer.instanceId, viewId: answer.viewId, url: answer.url };
       }
       case 'browser.view.navigate': {
-        const answer = await coreBrowserAction('browser.navigate', payload.token, { viewId: payload.viewId, url: payload.url });
-        const { key, view } = livePluginView(answer);
+        const answer = await coreBrowserAction('browser.navigate', payload.token, { viewId: payload.viewId, instanceId: payload.instanceId, url: payload.url });
+        const { key, view } = livePluginView(answer, target);
         const url = browserURL(answer.url);
         if (view.webContents.getURL() !== url) await view.webContents.loadURL(url);
         state.pluginViewTokens.set(key, payload.token);
         return { pluginId: answer.pluginId, viewId: answer.viewId, url: answer.url };
       }
+      case 'browser.view.history': {
+        if (!['back','forward','reload'].includes(payload.operation)) throw new Error('网页导航动作无效');
+        const answer = await coreBrowserAction('browser.' + payload.operation, payload.token, { viewId: payload.viewId, instanceId: payload.instanceId });
+        const { key, view } = livePluginView(answer, target);
+        currentPluginPage(view);
+        let changed = true;
+        if (payload.operation === 'back') {
+          changed = view.webContents.canGoBack();
+          if (changed) view.webContents.goBack();
+        } else if (payload.operation === 'forward') {
+          changed = view.webContents.canGoForward();
+          if (changed) view.webContents.goForward();
+        } else view.webContents.reload();
+        state.pluginViewTokens.set(key, payload.token);
+        return { pluginId: answer.pluginId, viewId: answer.viewId, changed };
+      }
+      case 'browser.view.external': {
+        const answer = await coreBrowserAction('browser.openExternal', payload.token, { viewId: payload.viewId, instanceId: payload.instanceId });
+        const { key, view } = livePluginView(answer, target);
+        const url = currentPluginPage(view);
+        await shell.openExternal(url);
+        state.pluginViewTokens.set(key, payload.token);
+        return { pluginId: answer.pluginId, viewId: answer.viewId, url };
+      }
       case 'browser.view.bounds': {
         const visible = Boolean(payload.visible && payload.width > 0 && payload.height > 0);
-        const params = { viewId: payload.viewId, visible, x: payload.x, y: payload.y, width: payload.width, height: payload.height };
+        const params = { viewId: payload.viewId, instanceId: payload.instanceId, visible, x: payload.x, y: payload.y, width: payload.width, height: payload.height };
         const answer = await coreBrowserAction(visible ? 'browser.bounds' : 'browser.visible', payload.token, params);
-        const { key, view } = livePluginView(answer);
+        const { key, view } = livePluginView(answer, target);
         if (visible) view.setBounds({ x: Math.round(payload.x), y: Math.round(payload.y), width: Math.round(payload.width), height: Math.round(payload.height) });
         view.setVisible(visible);
         state.pluginViewTokens.set(key, payload.token);
         return { pluginId: answer.pluginId, viewId: answer.viewId, visible: Boolean(answer.visible) };
       }
       case 'browser.view.extract': {
-        const answer = await coreBrowserAction('browser.extract', payload.token, { viewId: payload.viewId });
-        const { key, view } = livePluginView(answer);
+        const answer = await coreBrowserAction('browser.extract', payload.token, { viewId: payload.viewId, instanceId: payload.instanceId });
+        const { key, view } = livePluginView(answer, target);
         currentPluginPage(view);
         const text = await view.webContents.executeJavaScript('window.getSelection()?.toString() || document.querySelector("main")?.innerText || document.body.innerText');
         state.pluginViewTokens.set(key, payload.token);
         return String(text || '').slice(0, 200000);
       }
       case 'browser.view.adapter': {
-        const answer = await coreBrowserAction('browser.adapter', payload.token, { viewId: payload.viewId, adapter: payload.adapter });
-        const { key, view } = livePluginView(answer);
+        const answer = await coreBrowserAction('browser.adapter', payload.token, { viewId: payload.viewId, instanceId: payload.instanceId, adapter: payload.adapter });
+        const { key, view } = livePluginView(answer, target);
         currentPluginPage(view);
         const result = await runSiteAdapter(view.webContents, answer.adapter);
         state.pluginViewTokens.set(key, payload.token);
@@ -344,17 +420,50 @@ async function installNativeBootstrap(options) {
         if (typeof payload.viewId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(payload.viewId)) throw new Error('网页视图 ID 无效');
         let key;
         try {
-          const answer = await coreBrowserAction('browser.close', payload.token, { viewId: payload.viewId });
-          key = pluginViewKey(answer.pluginId, answer.viewId);
+          const answer = await coreBrowserAction('browser.close', payload.token, { viewId: payload.viewId, instanceId: payload.instanceId });
+          key = pluginViewKey(answer.pluginId, answer.viewId, answer.instanceId);
         } catch (error) {
           // Close also runs while a plugin is being stopped, when its token has
           // already been revoked. The recorded creator token and the full key
           // still identify the caller's own page, and teardown must not leak it.
-          const recorded = [...state.pluginViewTokens].find(([candidate, token]) => token === payload.token && candidate.endsWith('/' + payload.viewId));
+          const recorded = [...state.pluginViewTokens].find(([candidate, token]) => token === payload.token && candidate.endsWith('/' + payload.viewId) && state.pluginViewOwners.get(candidate) === target.id);
           if (!recorded) throw error;
           key = recorded[0];
         }
         return { closed: dropPluginView(key) };
+      }
+      case 'plugin.command.register': {
+        const identity = await corePluginAction('runtime.info', payload.token, {});
+        const answer = await corePluginAction('commands.list', payload.token, {});
+        const command = answer?.items?.find(item => item?.name === payload.name && item?.pluginId === identity?.id);
+        if (!command || typeof command.pluginId !== 'string') throw new Error('核心没有确认这个命令属于当前插件');
+        state.pluginCommands.set(command.pluginId + ':' + command.name, target.id);
+        return { registered: true, ownerId: command.pluginId, command: command.name };
+      }
+      case 'plugin.command.unregister': {
+        await corePluginAction('commands.list', payload.token, {});
+        let removed = false;
+        for (const [key, owner] of [...state.pluginCommands]) {
+          if (owner === target.id && key.endsWith(':' + payload.name)) {
+            state.pluginCommands.delete(key);
+            removed = true;
+          }
+        }
+        return { removed };
+      }
+      case 'plugin.command.invoke': {
+        const answer = await corePluginAction('commands.invoke', payload.token, { command: payload.name, args: payload.args ?? null });
+        const key = answer?.ownerId + ':' + answer?.command;
+        const ownerId = state.pluginCommands.get(key);
+        const owner = webContents.fromId(ownerId);
+        if (!owner || owner.isDestroyed()) {
+          const error = new Error('命令所属插件没有可执行的宿主窗口');
+          error.code = 'PLUGIN_COMMAND_UNAVAILABLE';
+          throw error;
+        }
+        const targetCommand = { command: answer.command, ownerId: answer.ownerId, args: answer.args ?? null };
+        const value = await owner.executeJavaScript('window.__ekdPlugins ? window.__ekdPlugins.invokeCommand(' + JSON.stringify(targetCommand) + ') : Promise.reject(new Error("命令所属插件的宿主尚未就绪"))');
+        return value === undefined ? null : value;
       }
       case 'host.extractBrowser': {
         const browser = ownedBrowser(target, payload.mode);
@@ -423,6 +532,7 @@ async function installNativeBootstrap(options) {
     for (const view of state.views.values()) if (!view.webContents.isDestroyed()) view.webContents.close();
     state.views.clear();
     destroyPluginViews();
+    state.pluginCommands.clear();
     state.channels.clear();
     if (server.listening) {
       const closed = new Promise(resolve => server.close(resolve));

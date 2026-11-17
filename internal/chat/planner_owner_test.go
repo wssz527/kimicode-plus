@@ -31,6 +31,7 @@ func TestPlannerChangesStayWithTheThreadOwner(t *testing.T) {
 		payload map[string]any
 	}{
 		{"planner.configure", map[string]any{"model": "synthetic", "options": map[string]any{}}},
+		{"planner.rename", map[string]any{"title": "不能替别人改名"}},
 		{"planner.send", map[string]any{"text": "替别的插件发起规划"}},
 		{"planner.retry", map[string]any{"revision": 1}},
 		{"planner.stop", map[string]any{}},
@@ -133,7 +134,7 @@ func TestPlannerRefusesForeignThreadBeforeDoingAnything(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, action := range []string{"planner.configure", "planner.send", "planner.retry", "planner.stop", "planner.approve", "planner.delete"} {
+	for _, action := range []string{"planner.configure", "planner.rename", "planner.send", "planner.retry", "planner.stop", "planner.approve", "planner.delete"} {
 		payload, _ := json.Marshal(map[string]any{"id": id, "pluginOwner": "kimicode-plus.stranger", "model": "synthetic", "text": "x", "revision": 1})
 		if _, err := planner.PlannerAction(context.Background(), action, payload); err == nil {
 			t.Fatalf("%s reached a thread owned by another plugin", action)

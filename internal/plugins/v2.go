@@ -36,11 +36,12 @@ var (
 // its authorization; the Electron side owns the actual WebContentsView and is
 // told what the core accepted.
 type browserView struct {
-	PluginID string `json:"pluginId"`
-	ID       string `json:"viewId"`
-	URL      string `json:"url"`
-	Visible  bool   `json:"visible"`
-	Created  string `json:"createdAt"`
+	PluginID   string `json:"pluginId"`
+	InstanceID string `json:"instanceId"`
+	ID         string `json:"viewId"`
+	URL        string `json:"url"`
+	Visible    bool   `json:"visible"`
+	Created    string `json:"createdAt"`
 }
 
 // owned is the shape every browser answer uses. The host applies an Electron
@@ -49,8 +50,9 @@ type browserView struct {
 // A plugin therefore cannot address another plugin's page by naming it.
 func owned(view browserView) map[string]any {
 	return map[string]any{
-		"pluginId":  view.PluginID,
-		"viewId":    view.ID,
+		"pluginId":   view.PluginID,
+		"instanceId": view.InstanceID,
+		"viewId":     view.ID,
 		"url":       view.URL,
 		"visible":   view.Visible,
 		"createdAt": view.Created,
@@ -81,8 +83,9 @@ func validateBrowserURL(raw string) (string, error) {
 // used to enumerate other plugins.
 func (m *Manager) browserAction(ctx context.Context, id, action string, r *http.Request, params json.RawMessage) (any, error) {
 	var input struct {
-		ViewID  string  `json:"viewId"`
-		URL     string  `json:"url"`
+		ViewID     string  `json:"viewId"`
+		InstanceID string  `json:"instanceId"`
+		URL        string  `json:"url"`
 		Visible bool    `json:"visible"`
 		X       float64 `json:"x"`
 		Y       float64 `json:"y"`
@@ -99,6 +102,11 @@ func (m *Manager) browserAction(ctx context.Context, id, action string, r *http.
 		return nil, err
 	}
 	viewID := strings.TrimSpace(input.ViewID)
+	instanceID := strings.TrimSpace(input.InstanceID)
+	if !viewIDExpr.MatchString(instanceID) {
+		return nil, apiError(http.StatusBadRequest, "PLUGIN_BROWSER_VIEW", "网页视图实例 ID 无效")
+	}
+	registryID := instanceID + "/" + viewID
 	if action != "browser.open" && viewID == "" {
 		return nil, apiError(http.StatusBadRequest, "PLUGIN_BROWSER_VIEW", "缺少 viewId")
 	}
@@ -120,18 +128,18 @@ func (m *Manager) browserAction(ctx context.Context, id, action string, r *http.
 			views = map[string]*browserView{}
 			m.views[id] = views
 		}
-		if _, exists := views[viewID]; !exists && len(views) >= maxViewsPerPlug {
+		if _, exists := views[registryID]; !exists && len(views) >= maxViewsPerPlug {
 			m.mu.Unlock()
 			return nil, apiError(http.StatusConflict, "PLUGIN_BROWSER_LIMIT", fmt.Sprintf("每个插件最多 %d 个网页视图", maxViewsPerPlug))
 		}
-		view := &browserView{PluginID: id, ID: viewID, URL: target, Created: m.now().UTC().Format(time.RFC3339)}
-		views[viewID] = view
+		view := &browserView{PluginID: id, InstanceID: instanceID, ID: viewID, URL: target, Created: m.now().UTC().Format(time.RFC3339)}
+		views[registryID] = view
 		snapshot := *view
 		m.mu.Unlock()
 		return owned(snapshot), nil
 	}
 	m.mu.Lock()
-	view := m.views[id][viewID]
+	view := m.views[id][registryID]
 	if view == nil {
 		m.mu.Unlock()
 		return nil, apiError(http.StatusNotFound, "PLUGIN_BROWSER_VIEW_MISSING", "没有这个网页视图")
@@ -147,6 +155,10 @@ func (m *Manager) browserAction(ctx context.Context, id, action string, r *http.
 		snapshot := *view
 		m.mu.Unlock()
 		return owned(snapshot), nil
+	case "browser.back", "browser.forward", "browser.reload", "browser.openExternal":
+		snapshot := *view
+		m.mu.Unlock()
+		return owned(snapshot), nil
 	case "browser.bounds", "browser.visible":
 		visible := input.Visible && input.Width > 0 && input.Height > 0
 		view.Visible = visible
@@ -155,7 +167,7 @@ func (m *Manager) browserAction(ctx context.Context, id, action string, r *http.
 		return owned(snapshot), nil
 	case "browser.close":
 		snapshot := *view
-		delete(m.views[id], viewID)
+		delete(m.views[id], registryID)
 		if len(m.views[id]) == 0 {
 			delete(m.views, id)
 		}
@@ -315,7 +327,12 @@ func (m *Manager) Views(id string) []browserView {
 	for _, view := range m.views[id] {
 		out = append(out, *view)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ID == out[j].ID {
+			return out[i].InstanceID < out[j].InstanceID
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out
 }
 
@@ -441,6 +458,7 @@ var coreActionFor = map[string]string{
 	"planner.create":    "planner.service.planner.create",
 	"planner.get":       "planner.service.planner.get",
 	"planner.configure": "planner.service.planner.configure",
+	"planner.rename":    "planner.service.planner.rename",
 	"planner.send":      "planner.service.planner.send",
 	"planner.retry":     "planner.service.planner.retry",
 	"planner.stop":      "planner.service.planner.stop",
@@ -495,6 +513,18 @@ func validateSessionAction(action string, payload map[string]any) error {
 		}
 	}
 	return nil
+}
+
+func (m *Manager) openSession(ctx context.Context, core Core, payload map[string]any) (any, error) {
+	if err := validateSessionAction("sessions.open", payload); err != nil {
+		return nil, err
+	}
+	id := stringValue(payload["id"])
+	body, _ := json.Marshal(map[string]any{"id": id})
+	if _, err := core.Action(ctx, "sessions.view", body); err != nil {
+		return nil, coreFailure("sessions.open", err)
+	}
+	return map[string]any{"id": id}, nil
 }
 
 func (m *Manager) commandsAction(ctx context.Context, id, action string, r *http.Request, params json.RawMessage) (any, error) {

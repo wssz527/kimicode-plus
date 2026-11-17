@@ -86,14 +86,14 @@ v2 能力由构建时机制授权：`plugins/registry.go` 对每个嵌入插件�
 |---|---|---|
 | `ui:entry` | 右侧「可打开」列表和 `+` 菜单入口；按容器幂等注入 | 运行时 `ctx.entry.add()`，无独立动作 |
 | `ui:main-area` | 主聊天区右侧分栏，可拖动分隔条调整原生视图宽度 | 运行时 `ctx.mainArea.mount()` |
-| `ui:right-panel` | 右侧面板动态标签页，带关闭键，宽度沿用官方侧边聊天 | 运行时 `ctx.rightPanel.mount()` |
+| `ui:right-panel` | 右侧面板动态标签页，带关闭键，宽度沿用官方侧边聊天；可弹出独立插件窗口 | 运行时 `ctx.rightPanel.mount()`、`ctx.window.popout()`；`ui.popout` |
 | `ui:layout` | 按引用计数收起左侧栏，全部释放后恢复原状 | 运行时 `ctx.layout.acquireSidebarCollapse()` |
 | `sessions:approve` | 处理会话审批/提问 | `sessions.approve` → 原生 `session.reply` |
 | `sessions:abort` | 停止运行中的会话 | `sessions.abort` → 原生 `session.abort` |
 | `sessions:history` | 真正分页的历史回合（官方 `before_ordinal` + `page_size`） | `sessions.history` |
-| `sessions:read`（v1 已有） | 会话列表与读取；显式引用计数的实时订阅 | `sessions.list/view/watch/unwatch` |
+| `sessions:read`（v1 已有） | 会话列表与读取；显式引用计数的实时订阅；打开已读取的官方会话 | `sessions.list/view/open/watch/unwatch` |
 | `attachments` | 系统文件选择、拖入文件暂存与发送附件 | `attachments.stage/release/send`（发送经 `sessions.send`） |
-| `browser:view` | 创建、导航、显隐、销毁隔离网页视图；读选区/正文；执行站点适配器 | `browser.open/navigate/bounds/visible/extract/adapter/close` |
+| `browser:view` | 创建、导航、后退、前进、刷新、显隐、销毁隔离网页视图；读选区/正文；执行站点适配器；在系统浏览器打开当前页 | `browser.open/navigate/back/forward/reload/bounds/visible/extract/adapter/openExternal/close` |
 | `planner:run` | 本地规划引擎：线程、模型、流式、审批 | `planner.*` |
 | `handoff` | 交接预览与提交（新/已有会话，普通/Plan/Tower） | `handoff.preview`、`handoff.commit` |
 | `models:read` | 可用模型列表 | `models.list` |
@@ -113,12 +113,16 @@ v2 能力由构建时机制授权：`plugins/registry.go` 对每个嵌入插件�
 | `sessions.history` | `{id, beforeOrdinal?, pageSize? (1–100), agentId?}` | `{sessionId, agentId, messages, approvals, hasMore, nextBefore, pageSize}` |
 | `sessions.approve` | `{id, interactionId, value}` | 原生 reply 结果 |
 | `sessions.abort` | `{id}` | 原生 abort 结果 |
+| `sessions.open` | `{id}` | 核心读取并校验会话后返回 `{id}`；宿主再打开官方会话 |
+| `ui.popout` | `{}` | 核心按令牌返回 `{pluginId}`；调用方不能指定其他插件 |
 | `sessions.watch` / `sessions.unwatch` | `{id}` | `{sessionId, watching, forwarded}`；`forwarded` 表示这次是否真的向官方订阅/退订 |
 | `attachments.stage` | `{files:[{name, data}]}`，`data` 为 base64 | `{files:[{path, name, size}], batch}`；单文件 ≤ 8 MiB，总量 ≤ 16 MiB，最多 16 个 |
 | `attachments.release` | `{batch}` | `{released:true}` |
 | `attachments.send` | `{id, text?, paths[], mode?, batch?}` | `{sessionId}`；路径必须是本机绝对路径，最多 16 个。带 `batch` 时无论成功失败都会清理该批次 |
 | `browser.open` | `{viewId, url}` | `{pluginId, viewId, url, visible, createdAt}` |
 | `browser.navigate` | `{viewId, url}` | 同上 |
+| `browser.back` / `browser.forward` / `browser.reload` | `{viewId}` | 授权结果含当前视图归属；宿主执行对应导航，后退/前进不可用时返回 `changed:false` |
+| `browser.openExternal` | `{viewId}` | 宿主在系统浏览器打开该视图的当前 `http(s)` 页面，不能由插件另传地址 |
 | `browser.bounds` / `browser.visible` | `{viewId, x, y, width, height, visible}` | 同上 |
 | `browser.extract` | `{viewId}` | 选中文字或正文，最多 200000 字符 |
 | `browser.adapter` | `{viewId, adapter:{source, args?}}` | 授权结果 + `adapter`；宿主在页面里执行 `source` 并返回限长 JSON |
@@ -126,9 +130,10 @@ v2 能力由构建时机制授权：`plugins/registry.go` 对每个嵌入插件�
 | `handoff.preview` | `{targetId?, text, mode?, cwd?, model?, title?}` | `{targetId, mode, text, bytes, newSession}`；新建会话时另含 `cwd`/`model`/`title` |
 | `handoff.commit` | `{targetId?, text, mode?, cwd?, model?, title?}` | `{sessionId, created}`；`created` 表示是否新建 |
 | `models.list` | `{}` | `{items:[{id,name}], total}` |
-| `commands.invoke` | `{command, args?}` | `{command, ownerId, owner, title, args}`（授权结果），或明确的错误码 |
+| `planner.rename` | `{id, title}` | 持久化后的完整线程；标题去首尾空白后为 1–200 字节，且线程必须属于当前插件 |
+| `commands.invoke` | `{command, args?}` | `{command, ownerId, owner, title, args}`（核心授权响应）；`ctx.commands.invoke` 最终返回所属窗口中命令本体的真实结果 |
 
-错误语义：授权失败 `403 PLUGIN_CAPABILITY_DENIED` / `PLUGIN_PRIVILEGE_DENIED`；参数不合法 `400 PLUGIN_PARAMS_INVALID`（`sessions.*` 另用 `PLUGIN_SESSION_REQUIRED`、`PLUGIN_APPROVAL_REQUIRED`、`PLUGIN_HISTORY_PAGE` 指出具体字段；附件用 `PLUGIN_ATTACHMENT_*`，站点适配器用 `PLUGIN_ADAPTER_*`）；资源不存在 `404`；插件未运行 `409`；核心不可用 `503 PLUGIN_CORE_UNAVAILABLE`。网页视图只接受 `http`/`https`，不跟随凭据 URL，单插件最多 4 个视图。
+错误语义：授权失败 `403 PLUGIN_CAPABILITY_DENIED` / `PLUGIN_PRIVILEGE_DENIED`；参数不合法 `400 PLUGIN_PARAMS_INVALID`（`sessions.*` 另用 `PLUGIN_SESSION_REQUIRED`、`PLUGIN_APPROVAL_REQUIRED`、`PLUGIN_HISTORY_PAGE` 指出具体字段；附件用 `PLUGIN_ATTACHMENT_*`，站点适配器用 `PLUGIN_ADAPTER_*`）；资源不存在 `404`；插件未运行 `409`；核心不可用 `503 PLUGIN_CORE_UNAVAILABLE`。所有 `browser.*` 核心动作还需携带窗口实例标识 `instanceId`（经运行时与宿主桥接自动按所在窗口注入，缺省或非法会返回 `400 PLUGIN_BROWSER_VIEW`）。网页视图只接受 `http`/`https`，不跟随凭据 URL，单插件最多 4 个（跨窗口共享配额）。
 
 转发到官方接口后被拒绝的操作（例如不存在的会话）会以 `422 PLUGIN_ACTION_FAILED` 返回，原始原因只记录在核心日志里，不回传给插件；参数本身不合法时在插件门禁处就以 400 明确拒绝，不会走到转发。
 
@@ -218,10 +223,12 @@ interface PluginContext {
   entry?: { add(definition: { id: string; label: string; run(): void | Promise<void> }): Disposable };
   mainArea?: { mount(definition: { render(el: HTMLElement): Cleanup | void; width?: number; minWidth?: number; maxWidth?: number }): { setWidth(px: number): void; width(): number; dispose(): void } };
   rightPanel?: { mount(definition: { title: string; render(el: HTMLElement): Cleanup | void }): { open(): void; close(): void; readonly open_: boolean; dispose(): void } };
+  window?: { popout(): Promise<void>; close(): Promise<void> };
   layout?: { acquireSidebarCollapse(): Disposable };
   sessions?: {
     approve(input): Promise<unknown>;
     abort(id): Promise<unknown>;
+    open(id): Promise<void>;
     history(input): Promise<SessionHistoryPage>;
     watch(id): Promise<{ watching: boolean; sessionId: string }>;
     unwatch(id): Promise<{ watching: boolean; sessionId: string }>;
@@ -236,9 +243,9 @@ interface PluginContext {
     send(input): Promise<unknown>;
   };
   browser?: { open(viewId: string, url: string): Promise<BrowserView> };
-  // BrowserView: navigate(url)、setBounds(bounds)、show(bounds)、hide()、
-  // extract()、adapter(source, args?)、close()
-  planner?: { threads(); models(); create(input); get(id); configure(id, input); send(id, text, sourceSessionId?); retry(id, revision); stop(id); approve(id, approvalId, allow); remove(id) };
+  // BrowserView: navigate(url)、back()、forward()、reload()、openExternal()、
+  // setBounds(bounds)、show(bounds)、hide()、extract()、adapter(source, args?)、close()
+  planner?: { threads(); models(); create(input); get(id); configure(id, input); rename(id, title); send(id, text, sourceSessionId?); retry(id, revision); stop(id); approve(id, approvalId, allow); remove(id) };
   handoff?: { preview(input): Promise<HandoffPreview>; commit(input): Promise<{ sessionId: string; created?: boolean }> };
   models?: { list(): Promise<Array<{ id: string; name: string }>> };
   commands?: { register(name, input?): Promise<CommandInfo>; unregister(name): Promise<boolean>; list(): Promise<CommandInfo[]>; invoke(name, args?): Promise<unknown> };

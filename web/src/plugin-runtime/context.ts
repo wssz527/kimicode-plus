@@ -68,6 +68,10 @@ export interface BrowserView {
   readonly id: string;
   readonly url: string;
   navigate(url: string): Promise<void>;
+  back(): Promise<boolean>;
+  forward(): Promise<boolean>;
+  reload(): Promise<void>;
+  openExternal(): Promise<void>;
   setBounds(bounds: BrowserViewBounds): Promise<void>;
   show(bounds: BrowserViewBounds): Promise<void>;
   hide(): Promise<void>;
@@ -153,6 +157,8 @@ export interface LayoutHost {
 export interface BrowserHost {
   open(pluginId: string, viewId: string, url: string): Promise<void>;
   navigate(pluginId: string, viewId: string, url: string): Promise<void>;
+  history(pluginId: string, viewId: string, action: "back" | "forward" | "reload"): Promise<boolean>;
+  external(pluginId: string, viewId: string): Promise<void>;
   bounds(pluginId: string, viewId: string, bounds: BrowserViewBounds): Promise<void>;
   extract(pluginId: string, viewId: string): Promise<string>;
   /** Executes an authorized site adapter in the plugin's own view. */
@@ -186,6 +192,7 @@ export interface PluginIdentity {
   version: string;
   /** The plugin manifest API version, so a plugin can branch on the contract. */
   dataVersion: number;
+  surface?: "host" | "popout";
 }
 
 export interface PluginTheme {
@@ -270,10 +277,12 @@ export interface PluginContext {
   mainArea?: { mount(definition: MainAreaDefinition): MainAreaHandle };
   /** A dynamic right-panel tab with a close button. */
   rightPanel?: { mount(definition: RightPanelDefinition): RightPanelHandle };
+  window?: { popout(): Promise<void>; close(): Promise<void> };
   layout?: { acquireSidebarCollapse(): Disposable };
   sessions?: {
     approve(input: { id: string; interactionId: string; value: unknown }): Promise<unknown>;
     abort(id: string): Promise<unknown>;
+    open(id: string): Promise<void>;
     history(input: { id: string; beforeOrdinal?: number; pageSize?: number; agentId?: string }): Promise<SessionHistoryPage>;
     /**
      * Holds one reference to a session's event stream; every call needs exactly
@@ -301,6 +310,7 @@ export interface PluginContext {
     create(input: { title?: string; model: string; options?: Record<string, boolean> }): Promise<PlannerThread>;
     get(id: string): Promise<PlannerThread>;
     configure(id: string, input: { model: string; options?: Record<string, boolean> }): Promise<PlannerThread>;
+    rename(id: string, title: string): Promise<PlannerThread>;
     send(id: string, text: string, sourceSessionId?: string): Promise<PlannerThread>;
     retry(id: string, revision: number): Promise<PlannerThread>;
     stop(id: string): Promise<PlannerThread>;

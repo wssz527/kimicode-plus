@@ -55,6 +55,16 @@ func manifestFor(id string, apiVersion int, capabilities []string) string {
 // the body carries the params, exactly like the renderer.
 func callPlugin(t *testing.T, manager *Manager, token, action string, params any) (int, map[string]any) {
 	t.Helper()
+	if strings.HasPrefix(action, "browser.") {
+		if params == nil {
+			params = map[string]any{}
+		}
+		if input, ok := params.(map[string]any); ok {
+			if _, present := input["instanceId"]; !present {
+				input["instanceId"] = "test-window"
+			}
+		}
+	}
 	mux := http.NewServeMux()
 	manager.Register(mux)
 	body, _ := json.Marshal(map[string]any{"token": token, "params": params})

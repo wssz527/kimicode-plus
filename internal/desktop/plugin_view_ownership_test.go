@@ -53,7 +53,7 @@ func TestPluginViewOpenRollsBackAFailedCreation(t *testing.T) {
 	block := bootstrapSource[start : start+end]
 	for _, wanted := range []string{
 		// The registry is released when the window or the load is missing.
-		"await coreBrowserAction('browser.close', payload.token, { viewId: answer.viewId }).catch(() => {});",
+		"await coreBrowserAction('browser.close', payload.token, { viewId: answer.viewId, instanceId: answer.instanceId }).catch(() => {});",
 		"dropPluginView(key);",
 	} {
 		if !strings.Contains(block, wanted) {
@@ -93,12 +93,12 @@ func TestRendererSendsPluginTokensForViews(t *testing.T) {
 	if strings.Contains(host, "pluginId:") || strings.Contains(host, "{ pluginId") {
 		t.Fatal("the plugin browser host still sends a plugin id")
 	}
-	for _, action := range []string{"browser.view.open", "browser.view.navigate", "browser.view.bounds", "browser.view.extract", "browser.view.adapter", "browser.view.close"} {
+	for _, action := range []string{"browser.view.open", "browser.view.navigate", "browser.view.history", "browser.view.external", "browser.view.bounds", "browser.view.extract", "browser.view.adapter", "browser.view.close"} {
 		if !strings.Contains(host, action) {
 			t.Fatalf("the plugin browser host no longer reaches %s", action)
 		}
 	}
-	if strings.Count(host, "token: pluginToken(pluginId)") != 6 {
+	if strings.Count(host, "token: pluginToken(pluginId)") != 8 {
 		t.Fatal("every plugin view action must carry the caller's own token")
 	}
 }
@@ -111,7 +111,7 @@ func TestClosingAPluginViewUsesTheRecordedCreatorToken(t *testing.T) {
 	for _, wanted := range []string{
 		"state.pluginViewTokens.set(key, payload.token);",
 		"state.pluginViewTokens.delete(key);",
-		"const recorded = [...state.pluginViewTokens].find(([candidate, token]) => token === payload.token && candidate.endsWith('/' + payload.viewId));",
+		"const recorded = [...state.pluginViewTokens].find(([candidate, token]) => token === payload.token && candidate.endsWith('/' + payload.viewId) && state.pluginViewOwners.get(candidate) === target.id);",
 	} {
 		if !strings.Contains(bootstrapSource, wanted) {
 			t.Fatalf("a stopped plugin can no longer destroy its own views: %s", wanted)

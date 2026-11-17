@@ -64,6 +64,7 @@ async function installNativeRenderer(options) {
     activePluginPanel: null,
     panelContract: null,
     plugins: null,
+    popoutRoot: null,
     pluginReleases: new Map(),
     pluginTokens: new Map(),
     pluginAssets: new Map(),
@@ -641,7 +642,11 @@ async function installNativeRenderer(options) {
     delete window.__ekdNativeUI;
   };
   const nativeTabClick = event => {
-    if (state.plannerHandle && (event.target.closest('.ptb-tab:not([data-ekd-planner-tab])') || event.target.closest('.sit-link:not([data-ekd-entry]), .pt-body .pl button.ui-menu-item:not([data-ekd-entry])'))) closePlanner(false);
+    const clickedNative = event.target.closest('.ptb-tab:not([data-ekd-planner-tab]):not([data-ekdp-plugin-panel])')
+      || event.target.closest('.sit-link:not([data-ekd-entry]), .pt-body .pl button.ui-menu-item:not([data-ekd-entry])');
+    if (!clickedNative) return;
+    if (state.plannerHandle) closePlanner(false);
+    if (state.activePluginPanel) deactivatePluginPanel(state.activePluginPanel, false);
   };
   const settingsTabClick = event => {
     const tab = event.target.closest('.settings-tab-list button.tab[role="tab"]');
@@ -656,7 +661,15 @@ async function installNativeRenderer(options) {
   };
   document.addEventListener('click', settingsTabClick, true);
   document.addEventListener('scroll', settingsScroll, true);
-  if (options.surface === 'settings' || options.surface === 'management' || options.popout) {
+  if (options.surface === 'plugin') {
+    document.documentElement.dataset.colorScheme = options.theme || 'dark';
+    document.title = 'KimiCode+ 插件';
+    document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:var(--color-bg,#121212);color:var(--color-text,#eee)';
+    state.popoutRoot = document.createElement('div');
+    state.popoutRoot.style.cssText = 'height:100vh;min-height:0;overflow:hidden';
+    document.body.replaceChildren(state.popoutRoot);
+    window.__ekdNativeUI = publishNativeUI();
+  } else if (options.surface === 'settings' || options.surface === 'management' || options.popout) {
     document.documentElement.dataset.colorScheme = options.theme || 'dark';
     const title = options.surface === 'settings' ? 'KimiCode+ 设置' : options.surface === 'management' ? 'KimiCode+ 管理' : 'KimiCode+ 规划聊天';
     document.title = title;
@@ -772,6 +785,7 @@ async function installNativeRenderer(options) {
       const key = pluginId + ":" + definition.id;
       state.pluginEntries.set(key, { pluginId, definition });
       syncNativeEntries();
+      if (options.surface === 'plugin' && pluginId === options.pluginId) queueMicrotask(() => runPluginEntry(pluginId, definition));
       // Dropping the registry alone would leave the button in the container: the
       // next sync only reconciles the entries still planned, so the removed one
       // has to take its own element with it.
@@ -921,6 +935,7 @@ async function installNativeRenderer(options) {
     const contract = panelContract();
     if (!entry || !body) return;
     state.activePluginPanel = pluginId;
+    if (contract?.activeTabId) contract.activeTabId.value = null;
     contract?.showPanel?.();
     if (contract?.previewWidth) {
       contract.previewWidth.value = Math.min(contract.previewMax?.value ?? 900, Math.max(contract.previewWidth.value, 605));
@@ -934,7 +949,7 @@ async function installNativeRenderer(options) {
     }
   }
 
-  function deactivatePluginPanel(pluginId) {
+  function deactivatePluginPanel(pluginId, hidePanel = true) {
     const entry = state.pluginPanels.get(pluginId);
     if (!entry) return;
     entry.tab.setAttribute("aria-selected", "false");
@@ -944,12 +959,37 @@ async function installNativeRenderer(options) {
       state.activePluginPanel = null;
       const body = panelBody();
       if (body) delete body.dataset.ekdpPanel;
-      state.panelContract?.hidePanel?.();
+      if (hidePanel) state.panelContract?.hidePanel?.();
     }
   }
 
   const pluginRightPanelHost = {
     mount(pluginId, definition) {
+      if (options.surface === 'plugin') {
+        if (pluginId !== options.pluginId || !state.popoutRoot) throw new Error('插件窗口只能挂载所属插件');
+        const host = state.popoutRoot;
+        const mountScope = localScope();
+        document.title = definition?.title || 'KimiCode+ 插件';
+        try {
+          mountScope.add(definition.render(host));
+        } catch (error) {
+          mountScope.dispose();
+          host.replaceChildren();
+          throw error;
+        }
+        let released = false;
+        return {
+          open: () => { if (!released) host.hidden = false; },
+          close: () => { void transport.request('window.close'); },
+          get open_() { return !released; },
+          dispose: () => {
+            if (released) return;
+            released = true;
+            mountScope.dispose();
+            host.replaceChildren();
+          },
+        };
+      }
       const tabs = document.querySelector(".ptb-tabs");
       const body = panelBody();
       if (!tabs || !body) throw new Error("右侧面板契约未就绪");
@@ -1043,9 +1083,20 @@ async function installNativeRenderer(options) {
   function pluginToken(id) {
     return state.pluginTokens.get(id) || '';
   }
+  const pluginWindowHost = {
+    popout: async pluginId => { await transport.request('plugin.window.open', { token: pluginToken(pluginId) }); },
+    close: async () => { await transport.request('window.close'); },
+  };
+  const pluginCommandHost = {
+    register: (pluginId, name) => transport.request('plugin.command.register', { token: pluginToken(pluginId), name }),
+    unregister: (pluginId, name) => transport.request('plugin.command.unregister', { token: pluginToken(pluginId), name }),
+    invoke: (pluginId, name, args) => transport.request('plugin.command.invoke', { token: pluginToken(pluginId), name, args }),
+  };
   const pluginBrowserHost = {
     open: (pluginId, viewId, url) => transport.request("browser.view.open", { token: pluginToken(pluginId), viewId, url }),
     navigate: (pluginId, viewId, url) => transport.request("browser.view.navigate", { token: pluginToken(pluginId), viewId, url }),
+    history: async (pluginId, viewId, operation) => Boolean((await transport.request("browser.view.history", { token: pluginToken(pluginId), viewId, operation }))?.changed),
+    external: (pluginId, viewId) => transport.request("browser.view.external", { token: pluginToken(pluginId), viewId }).then(() => {}),
     bounds: (pluginId, viewId, bounds) => transport.request("browser.view.bounds", { token: pluginToken(pluginId), viewId, ...bounds }),
     extract: (pluginId, viewId) => transport.request("browser.view.extract", { token: pluginToken(pluginId), viewId }),
     adapter: (pluginId, viewId, adapter) => transport.request("browser.view.adapter", { token: pluginToken(pluginId), viewId, adapter }),
@@ -1195,18 +1246,23 @@ async function installNativeRenderer(options) {
     if (state.removed) return;
     const items = list?.items || [];
     state.pluginList = items;
-    const enabled = items.filter(plugin => plugin.enabled);
+    const enabled = items.filter(plugin => plugin.enabled && (options.surface !== 'plugin' || plugin.id === options.pluginId));
     if (!state.plugins) {
       state.plugins = module.createPluginRuntime({
         slots: pluginSlots,
         request: pluginRequest,
+        surface: options.surface === 'plugin' ? 'popout' : 'host',
+        instanceId: options.instanceId,
         onError: (id, error) => noteFault(id, error),
         entryHost: pluginEntryHost,
         mainAreaHost: pluginMainAreaHost,
         rightPanelHost: pluginRightPanelHost,
-        layoutHost: pluginLayoutHost,
+        layoutHost: options.surface === 'plugin' ? { acquireSidebarCollapse: () => ({ dispose: () => {} }) } : pluginLayoutHost,
         browserHost: pluginBrowserHost,
+        windowHost: pluginWindowHost,
+        commandHost: pluginCommandHost,
         pickFiles: async () => (await transport.request('host.pickFiles', {})) || [],
+        openSession: async id => { await transport.request('host.openSession', { id }); },
       });
     }
     // A plugin the runtime reports as stopped must leave the page: dropping the
@@ -1268,6 +1324,7 @@ async function installNativeRenderer(options) {
   window.__ekdPlugins = {
     sync: syncPlugins,
     mountSettings: mountPluginSettings,
+    invokeCommand: target => state.plugins?.invokeLocal(target),
     list: () => state.pluginList || [],
   };
 

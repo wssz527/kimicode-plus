@@ -42,12 +42,14 @@ const ACTION_CAPABILITY: Record<string, string> = {
   "cache.receipts": "metrics:read",
   "sessions.list": "sessions:read",
   "sessions.view": "sessions:read",
+  "sessions.open": "sessions:read",
   "sessions.watch": "sessions:read",
   "sessions.unwatch": "sessions:read",
   "sessions.send": "sessions:send",
   "sessions.create": "sessions:send",
   "config.get": "config:read",
   "config.save": "config:write",
+  "ui.popout": "ui:right-panel",
 
   // API v2. The privilege check is in Go; the runtime only needs to know which
   // grant admits the call so a plugin fails locally instead of on the wire.
@@ -59,6 +61,10 @@ const ACTION_CAPABILITY: Record<string, string> = {
   "attachments.send": "attachments",
   "browser.open": "browser:view",
   "browser.navigate": "browser:view",
+  "browser.back": "browser:view",
+  "browser.forward": "browser:view",
+  "browser.reload": "browser:view",
+  "browser.openExternal": "browser:view",
   "browser.bounds": "browser:view",
   "browser.visible": "browser:view",
   "browser.extract": "browser:view",
@@ -69,6 +75,7 @@ const ACTION_CAPABILITY: Record<string, string> = {
   "planner.create": "planner:run",
   "planner.get": "planner:run",
   "planner.configure": "planner:run",
+  "planner.rename": "planner:run",
   "planner.send": "planner:run",
   "planner.retry": "planner:run",
   "planner.stop": "planner:run",

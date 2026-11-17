@@ -208,6 +208,8 @@ func (p *PlannerService) PlannerAction(ctx context.Context, action string, paylo
 		return p.snapshot(state), nil
 	case "planner.configure":
 		return p.configure(state, input.Model, input.Options)
+	case "planner.rename":
+		return p.rename(state, input.Title)
 	case "planner.send":
 		return p.send(state, input.Text, input.SourceSessionID)
 	case "planner.retry":
@@ -228,7 +230,7 @@ func (p *PlannerService) PlannerAction(ctx context.Context, action string, paylo
 // thread at all and never reach here.
 func plannerChangesThread(action string) bool {
 	switch action {
-	case "planner.configure", "planner.send", "planner.retry", "planner.stop", "planner.approve", "planner.delete":
+	case "planner.configure", "planner.rename", "planner.send", "planner.retry", "planner.stop", "planner.approve", "planner.delete":
 		return true
 	}
 	return false
@@ -343,6 +345,15 @@ func (p *PlannerService) update(state *plannerState, mutate func(*PlannerThread)
 	}
 	p.bus.Publish("planner:"+state.thread.ID, plannerSnapshot(state))
 	return nil
+}
+
+func (p *PlannerService) rename(state *plannerState, title string) (PlannerThread, error) {
+	title = strings.TrimSpace(title)
+	if title == "" || len(title) > 200 {
+		return PlannerThread{}, errors.New("规划标题必须为 1–200 字节")
+	}
+	err := p.update(state, func(thread *PlannerThread) { thread.Title = title })
+	return p.snapshot(state), err
 }
 
 func (p *PlannerService) configure(state *plannerState, model string, options PlannerOptions) (PlannerThread, error) {

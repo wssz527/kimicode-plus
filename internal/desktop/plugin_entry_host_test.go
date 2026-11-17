@@ -53,3 +53,16 @@ func TestV2HostsRegisterInThePluginScope(t *testing.T) {
 		}
 	}
 }
+
+func TestNativeTabClickDeactivatesPluginRightPanelWithoutHidingPanel(t *testing.T) {
+	for _, wanted := range []string{
+		".ptb-tab:not([data-ekd-planner-tab]):not([data-ekdp-plugin-panel])",
+		"if (state.activePluginPanel) deactivatePluginPanel(state.activePluginPanel, false);",
+		"if (contract?.activeTabId) contract.activeTabId.value = null;",
+		"if (hidePanel) state.panelContract?.hidePanel?.();",
+	} {
+		if !strings.Contains(rendererSource, wanted) {
+			t.Fatalf("renderer.js lost plugin panel / native tab switch guard: %s", wanted)
+		}
+	}
+}

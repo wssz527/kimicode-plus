@@ -42,6 +42,8 @@ export interface RuntimeOptions {
   /** Transport for core requests. The runtime never calls fetch directly. */
   request: RuntimeRequest;
   theme?: () => PluginTheme;
+  surface?: "host" | "popout";
+  instanceId?: string;
   /** Called for every failure the runtime isolates from the rest of the page. */
   onError?: (id: string, error: unknown) => void;
   /**
@@ -56,6 +58,13 @@ export interface RuntimeOptions {
   browserHost?: BrowserHost;
   /** File picker for `attachments.pick`. Absent means the core dialog is used. */
   pickFiles?: () => Promise<Array<{ path: string; name: string }>>;
+  openSession?: (id: string) => Promise<void>;
+  windowHost?: { popout(pluginId: string): Promise<void>; close(): Promise<void> };
+  commandHost?: {
+    register(pluginId: string, name: string): Promise<unknown>;
+    unregister(pluginId: string, name: string): Promise<unknown>;
+    invoke(pluginId: string, name: string, args: unknown): Promise<unknown>;
+  };
 }
 
 export interface ActivePlugin {
@@ -133,7 +142,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
     const bridge = createBridge({ token, granted, request: options.request });
     // The plugin sees the API version its own manifest declares, not the newest
     // one this host supports: a v1 plugin must not be told it is v2.
-    const identity: PluginIdentity = { id, version, dataVersion: apiVersion };
+    const identity: PluginIdentity = { id, version, dataVersion: apiVersion, surface: options.surface ?? "host" };
     const slots = grantedSlots(granted);
 
     const sessionsV2 = granted.includes("sessions:approve") || granted.includes("sessions:abort") || granted.includes("sessions:history") || granted.includes("sessions:read")
@@ -145,6 +154,12 @@ export function createPluginRuntime(options: RuntimeOptions) {
         abort(sessionId: string) {
           requireGrant(granted, "sessions:abort", "sessions.abort");
           return bridge.call("sessions.abort", { id: sessionId });
+        },
+        async open(sessionId: string): Promise<void> {
+          requireGrant(granted, "sessions:read", "sessions.open");
+          const answer = await bridge.call<{ id: string }>("sessions.open", { id: sessionId });
+          if (!options.openSession) throw new PluginError(409, "PLUGIN_SESSION_UNAVAILABLE", "当前宿主不能打开官方会话");
+          await options.openSession(answer.id);
         },
         async history(input: { id: string; beforeOrdinal?: number; pageSize?: number; agentId?: string }): Promise<SessionHistoryPage> {
           requireGrant(granted, "sessions:history", "sessions.history");
@@ -174,6 +189,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
       : undefined;
 
     const browserV2 = granted.includes("browser:view") ? createBrowserApi(id, granted, scope) : undefined;
+    const instanceId = options.instanceId ?? globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     const plannerV2 = granted.includes("planner:run") ? createPlannerApi(bridge) : undefined;
     const handoffV2 = granted.includes("handoff")
       ? {
@@ -250,8 +266,13 @@ export function createPluginRuntime(options: RuntimeOptions) {
           if (!/^[A-Za-z0-9_-]{1,64}$/.test(viewId)) {
             throw new PluginError(400, "PLUGIN_BROWSER_VIEW", "viewId 只允许字母、数字、下划线和连字符");
           }
-          const created = await bridge.call<{ viewId: string; url: string }>("browser.open", { viewId, url });
-          await host.open(pluginId, created.viewId, created.url);
+          const created = await bridge.call<{ viewId: string; url: string }>("browser.open", { viewId, url, instanceId });
+          try {
+            await host.open(pluginId, created.viewId, created.url);
+          } catch (error) {
+            await bridge.call("browser.close", { viewId: created.viewId, instanceId }).catch(() => {});
+            throw error;
+          }
           let closed = false;
           const release = () => {
             if (closed) return;
@@ -263,25 +284,41 @@ export function createPluginRuntime(options: RuntimeOptions) {
             id: created.viewId,
             url: created.url,
             async navigate(next: string) {
-              const result = await bridge.call<{ url: string }>("browser.navigate", { viewId: created.viewId, url: next });
+              const result = await bridge.call<{ url: string }>("browser.navigate", { viewId: created.viewId, url: next, instanceId });
               await host.navigate(pluginId, created.viewId, result.url);
+            },
+            async back() {
+              await bridge.call("browser.back", { viewId: created.viewId, instanceId });
+              return host.history(pluginId, created.viewId, "back");
+            },
+            async forward() {
+              await bridge.call("browser.forward", { viewId: created.viewId, instanceId });
+              return host.history(pluginId, created.viewId, "forward");
+            },
+            async reload() {
+              await bridge.call("browser.reload", { viewId: created.viewId, instanceId });
+              await host.history(pluginId, created.viewId, "reload");
+            },
+            async openExternal() {
+              await bridge.call("browser.openExternal", { viewId: created.viewId, instanceId });
+              await host.external(pluginId, created.viewId);
             },
             async setBounds(bounds) {
               const visible = bounds.visible && bounds.width > 0 && bounds.height > 0;
-              await bridge.call("browser.bounds", { viewId: created.viewId, ...bounds, visible });
+              await bridge.call("browser.bounds", { viewId: created.viewId, ...bounds, instanceId, visible });
               await host.bounds(pluginId, created.viewId, { ...bounds, visible });
             },
             async show(bounds) {
               const visible = bounds.width > 0 && bounds.height > 0;
-              await bridge.call("browser.visible", { viewId: created.viewId, ...bounds, visible });
+              await bridge.call("browser.visible", { viewId: created.viewId, ...bounds, instanceId, visible });
               await host.bounds(pluginId, created.viewId, { ...bounds, visible });
             },
             async hide() {
-              await bridge.call("browser.visible", { viewId: created.viewId, visible: false });
+              await bridge.call("browser.visible", { viewId: created.viewId, visible: false, instanceId });
               await host.bounds(pluginId, created.viewId, { x: 0, y: 0, width: 0, height: 0, visible: false });
             },
             async extract() {
-              await bridge.call("browser.extract", { viewId: created.viewId });
+              await bridge.call("browser.extract", { viewId: created.viewId, instanceId });
               return host.extract(pluginId, created.viewId);
             },
             /**
@@ -296,12 +333,13 @@ export function createPluginRuntime(options: RuntimeOptions) {
               }
               const answer = await bridge.call<{ adapter: { source: string; args: unknown } }>("browser.adapter", {
                 viewId: created.viewId,
+                instanceId,
                 adapter: { source, args: args ?? null },
               });
               return host.adapter(pluginId, created.viewId, answer.adapter) as Promise<T>;
             },
             async close() {
-              await bridge.call("browser.close", { viewId: created.viewId });
+              await bridge.call("browser.close", { viewId: created.viewId, instanceId });
               release();
             },
           };
@@ -329,6 +367,9 @@ export function createPluginRuntime(options: RuntimeOptions) {
         async configure(threadId: string, input: { model: string; options?: Record<string, boolean> }) {
           return call.call<PlannerThread>("planner.configure", { id: threadId, ...input });
         },
+        async rename(threadId: string, title: string) {
+          return call.call<PlannerThread>("planner.rename", { id: threadId, title });
+        },
         async send(threadId: string, text: string, sourceSessionId?: string) {
           return call.call<PlannerThread>("planner.send", { id: threadId, text, sourceSessionId });
         },
@@ -355,11 +396,14 @@ export function createPluginRuntime(options: RuntimeOptions) {
             // the registry below only ever maps a name to code this plugin wrote.
             handlers.set(`${pluginId}:${name}`, input.run);
           }
-          return call.call<CommandInfo>("commands.register", { name, title: input?.title });
+          const registered = await call.call<CommandInfo>("commands.register", { name, title: input?.title });
+          await options.commandHost?.register(pluginId, name);
+          return registered;
         },
         async unregister(name: string): Promise<boolean> {
           const result = await call.call<{ removed: boolean }>("commands.unregister", { name });
           handlers.delete(`${pluginId}:${name}`);
+          await options.commandHost?.unregister(pluginId, name);
           return Boolean(result?.removed);
         },
         async list(): Promise<CommandInfo[]> {
@@ -367,6 +411,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
           return page?.items ?? [];
         },
         async invoke(name: string, args?: unknown) {
+          if (options.commandHost) return options.commandHost.invoke(pluginId, name, args ?? null);
           // The core decides who owns the command, whether that owner is running
           // and whether this caller may reach it. Only then is a body looked up,
           // and only in the owner's own scope: a local handler missing there is a
@@ -375,12 +420,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
             "commands.invoke",
             { command: name, args: args ?? null },
           );
-          if (!target?.ownerId) throw new PluginError(502, "PLUGIN_COMMAND_PROTOCOL", "核心没有返回命令归属");
-          const handler = handlers.get(`${target.ownerId}:${target.command}`);
-          if (!handler) {
-            throw new PluginError(409, "PLUGIN_COMMAND_UNAVAILABLE", `命令 ${target.command} 在宿主端没有可执行实现`);
-          }
-          return await handler(target.args ?? null);
+          return invokeLocal(target);
         },
       };
     }
@@ -488,6 +528,15 @@ export function createPluginRuntime(options: RuntimeOptions) {
           },
         }
         : undefined,
+      window: granted.includes("ui:right-panel") && options.windowHost
+        ? {
+          async popout() {
+            await bridge.call("ui.popout");
+            await options.windowHost!.popout(id);
+          },
+          close: () => options.windowHost!.close(),
+        }
+        : undefined,
       layout: granted.includes("ui:layout") && options.layoutHost
         ? {
           acquireSidebarCollapse() {
@@ -526,6 +575,15 @@ export function createPluginRuntime(options: RuntimeOptions) {
         scope.add(cleanup);
       },
     };
+  }
+
+  async function invokeLocal(target: { command: string; ownerId: string; args?: unknown }): Promise<unknown> {
+    if (!target?.ownerId) throw new PluginError(502, "PLUGIN_COMMAND_PROTOCOL", "核心没有返回命令归属");
+    const handler = handlers.get(`${target.ownerId}:${target.command}`);
+    if (!handler) {
+      throw new PluginError(409, "PLUGIN_COMMAND_UNAVAILABLE", `命令 ${target.command} 在宿主端没有可执行实现`);
+    }
+    return await handler(target.args ?? null);
   }
 
   async function activate(
@@ -613,6 +671,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
     activate,
     deactivate,
     get: (id: string) => active.get(id) ?? null,
+    invokeLocal,
     dispose() {
       for (const id of [...active.keys()]) deactivate(id);
       pump.stop();

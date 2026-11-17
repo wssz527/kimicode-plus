@@ -31,6 +31,11 @@ function fakeContents(url) {
     once(event, handler) { page.listeners.set(event, handler); return page; },
     removeListener(event) { page.listeners.delete(event); return page; },
     setWindowOpenHandler() {},
+    canGoBack() { return page.url !== 'about:blank'; },
+    canGoForward() { return false; },
+    goBack() { page.url = recorded.url; },
+    goForward() {},
+    reload() { page.reloaded = (page.reloaded || 0) + 1; },
     close() { page.destroyed = true; },
     loadURL(next) { page.url = next; return Promise.resolve(); },
     executeJavaScript(expression) {
@@ -53,6 +58,7 @@ const fakeElectron = {
   app: { getVersion: () => '9.9.9' },
   session: { fromPartition: () => ({}) },
   dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+  shell: { opened: [], async openExternal(url) { this.opened.push(url); } },
   BrowserWindow: Object.assign(function BrowserWindow() {}, {
     fromWebContents: () => ownerWindow,
   }),
@@ -82,7 +88,7 @@ const core = http.createServer((request, response) => {
     }
     const action = request.url.replace('/enhance/v1/plugin-runtime/', '');
     const params = body ? JSON.parse(body).params || {} : {};
-    const value = { pluginId: 'test.probe', viewId: params.viewId, url: recorded.url, action };
+    const value = { pluginId: 'test.probe', instanceId: params.instanceId, viewId: params.viewId, url: recorded.url, action };
     // browser.adapter answers with the adapter the core accepted, which is what
     // the host runs; extract and the rest carry the ownership fields alone.
     if (params.adapter) value.adapter = params.adapter;
@@ -139,7 +145,7 @@ async function main() {
   const findings = { installed, recordedURL: recorded.url };
   const opened = await bridge('browser.view.open', { token, viewId: 'probe-view', url: recorded.url });
   findings.opened = opened;
-  const view = state.pluginViews.get('test.probe/probe-view');
+  const view = state.pluginViews.get(opened.value.instanceId + '/test.probe/probe-view');
   if (!view) {
     findings.fatal = 'the view was never registered';
     return findings;
@@ -160,6 +166,14 @@ async function main() {
 
   await read('redirected', `http://127.0.0.1:${fixture.address().port}/after-sign-in`);
   await read('pushState', `http://127.0.0.1:${fixture.address().port}/list/app/42`);
+  findings.controls = {
+    back: await bridge('browser.view.history', { token, viewId: 'probe-view', operation: 'back' }),
+    forward: await bridge('browser.view.history', { token, viewId: 'probe-view', operation: 'forward' }),
+    reload: await bridge('browser.view.history', { token, viewId: 'probe-view', operation: 'reload' }),
+    external: await bridge('browser.view.external', { token, viewId: 'probe-view' }),
+  };
+  findings.controls.externalAddress = fakeElectron.shell.opened[0] || '';
+  findings.controls.reloadCount = view.webContents.reloaded || 0;
   await read('fileScheme', 'file:///etc/passwd');
   await read('dataScheme', 'data:text/html,<h1>hi</h1>');
 

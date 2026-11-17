@@ -28,6 +28,14 @@ type pageRead struct {
 	} `json:"adapter"`
 }
 
+type probeResult struct {
+	OK    bool `json:"ok"`
+	Value struct {
+		Changed bool   `json:"changed"`
+		URL     string `json:"url"`
+	} `json:"value"`
+}
+
 // probeRun is the whole answer the probe prints, in the shape it prints it.
 type probeRun struct {
 	Installed struct {
@@ -35,11 +43,19 @@ type probeRun struct {
 	} `json:"installed"`
 	RecordedURL string         `json:"recordedURL"`
 	Opened      map[string]any `json:"opened"`
-	Redirected  pageRead       `json:"redirected"`
-	PushState   pageRead       `json:"pushState"`
-	FileScheme  pageRead       `json:"fileScheme"`
-	DataScheme  pageRead       `json:"dataScheme"`
-	Fatal       string         `json:"fatal"`
+	Controls    struct {
+		Back            probeResult `json:"back"`
+		Forward         probeResult `json:"forward"`
+		Reload          probeResult `json:"reload"`
+		External        probeResult `json:"external"`
+		ExternalAddress string      `json:"externalAddress"`
+		ReloadCount     int         `json:"reloadCount"`
+	} `json:"controls"`
+	Redirected pageRead `json:"redirected"`
+	PushState  pageRead `json:"pushState"`
+	FileScheme pageRead `json:"fileScheme"`
+	DataScheme pageRead `json:"dataScheme"`
+	Fatal      string   `json:"fatal"`
 }
 
 // Reading a plugin's page must follow the page the view is actually on. A
@@ -82,6 +98,17 @@ func TestPluginPageReadsFollowTheAPageThatMoved(t *testing.T) {
 	}
 	if run.Opened["ok"] != true {
 		t.Fatalf("the probe could not open a view: %#v", run.Opened)
+	}
+	for label, control := range map[string]probeResult{"back": run.Controls.Back, "forward": run.Controls.Forward, "reload": run.Controls.Reload, "external": run.Controls.External} {
+		if !control.OK {
+			t.Fatalf("%s was refused by the real host: %#v", label, control)
+		}
+	}
+	if !run.Controls.Back.Value.Changed || run.Controls.Forward.Value.Changed || run.Controls.ReloadCount != 1 {
+		t.Fatalf("the controls did not reach the owning view: %#v", run.Controls)
+	}
+	if run.Controls.ExternalAddress != run.RecordedURL || run.Controls.External.Value.URL != run.RecordedURL {
+		t.Fatalf("system browser did not receive the current page: %#v", run.Controls)
 	}
 
 	allowed := map[string]pageRead{"重定向后": run.Redirected, "改路由后": run.PushState}
