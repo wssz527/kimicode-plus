@@ -249,3 +249,17 @@ func TestDisabledPluginCannotUseSessionActions(t *testing.T) {
 }
 
 var _ = sql.ErrNoRows
+
+// The v2 history action must page through the official cursor instead of taking
+// the newest 50 turns. The fake records the query so a regression to a fixed
+// page size is visible here, not only in the renderer.
+func TestPluginHistoryPagesByOrdinal(t *testing.T) {
+	manager, _, token := newPluginCoreFixture(t, []string{"sessions:read"})
+	// The fixture is a local install with a v1 manifest, so the capability table
+	// refuses the v2 action before the core is reached. The digest half of the
+	// gate is covered in package plugins, where the allowlist can be stubbed.
+	code, body := callRuntime(t, manager, "sessions.history", token, map[string]any{"id": "s1", "beforeOrdinal": 40, "pageSize": 20})
+	if code != http.StatusForbidden || !strings.Contains(string(body), "PLUGIN_CAPABILITY_DENIED") {
+		t.Fatalf("non-official plugin paged history: %d %s", code, body)
+	}
+}

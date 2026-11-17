@@ -4,6 +4,162 @@
 
 export type SlotName = "sidebar" | "settings" | "thinking" | "message";
 
+/** Host surfaces that exist only for the v2 privileged capabilities. */
+export interface EntryDefinition {
+  /** Stable id inside the plugin; registering twice with one id replaces it. */
+  id: string;
+  label: string;
+  /** Optional one-line description shown in the host menu. */
+  title?: string;
+  run(): void | Promise<void>;
+  /** Whether the official tab bar shows a matching dynamic tab. */
+  tab?: boolean;
+}
+
+export interface MainAreaDefinition {
+  render(element: HTMLElement): Cleanup | void;
+  /** Initial split width in CSS pixels for the plugin's own side. */
+  width?: number;
+  minWidth?: number;
+  maxWidth?: number;
+}
+
+export interface MainAreaHandle extends Disposable {
+  setWidth(px: number): void;
+  width(): number;
+}
+
+export interface RightPanelDefinition {
+  title: string;
+  render(element: HTMLElement): Cleanup | void;
+  width?: number;
+}
+
+export interface RightPanelHandle extends Disposable {
+  open(): void;
+  close(): void;
+  readonly open_: boolean;
+}
+
+export interface SessionHistoryPage {
+  sessionId: string;
+  agentId: string;
+  messages: Array<{ id: string; role: string; text: string; tool?: string; at?: string }>;
+  approvals: Array<{ id: string; title: string; detail?: string; options?: Array<{ label: string; value: string }> }>;
+  hasMore: boolean;
+  nextBefore: number | null;
+  pageSize: number;
+}
+
+export interface AttachmentPick {
+  path: string;
+  name: string;
+}
+
+export interface BrowserViewBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  visible: boolean;
+}
+
+export interface BrowserView {
+  readonly id: string;
+  readonly url: string;
+  navigate(url: string): Promise<void>;
+  setBounds(bounds: BrowserViewBounds): Promise<void>;
+  show(bounds: BrowserViewBounds): Promise<void>;
+  hide(): Promise<void>;
+  extract(): Promise<string>;
+  /**
+   * Runs a site adapter (a function body this plugin writes) against its own
+   * page. The answer is bounded JSON; an adapter that throws fails the call
+   * instead of returning a partial result.
+   */
+  adapter<T = unknown>(source: string, args?: unknown): Promise<T>;
+  close(): Promise<void>;
+}
+
+export interface PlannerThread {
+  id: string;
+  title: string;
+  model: string;
+  status: string;
+  revision: number;
+  messages: Array<{ id: string; role: string; text: string; at?: string }>;
+  approval?: { id: string; title: string; detail?: string };
+  error?: string;
+}
+
+export interface HandoffPreview {
+  targetId: string;
+  mode: "normal" | "plan" | "tower";
+  text: string;
+  bytes: number;
+  newSession: boolean;
+  /** Present for a new session only: the directory it would be created in. */
+  cwd?: string;
+  /** Present for a new session only: the model its first turn would run on. */
+  model?: string;
+  /** Present for a new session only. */
+  title?: string;
+}
+
+export interface HandoffInput {
+  targetId?: string;
+  text: string;
+  mode?: string;
+  cwd?: string;
+  model?: string;
+  title?: string;
+}
+
+export interface HandoffResult {
+  sessionId: string;
+  /** False when the handoff went into an existing session. */
+  created?: boolean;
+}
+
+export interface CommandInfo {
+  name: string;
+  pluginId: string;
+  pluginName: string;
+  title?: string;
+}
+
+/**
+ * Host-owned v2 surfaces. The renderer implements these; the runtime only
+ * enforces grants, ownership and disposal, so a plugin cannot reach the host
+ * DOM beyond the container it is given.
+ */
+export interface EntryMountHost {
+  register(pluginId: string, definition: EntryDefinition): Disposable;
+}
+
+export interface MainAreaHost {
+  mount(pluginId: string, definition: MainAreaDefinition): MainAreaHandle;
+}
+
+export interface RightPanelHost {
+  mount(pluginId: string, definition: RightPanelDefinition): RightPanelHandle;
+}
+
+export interface LayoutHost {
+  /** Returns a release handle; calling it drops one reference only. */
+  acquireSidebarCollapse(pluginId: string): Disposable;
+}
+
+export interface BrowserHost {
+  open(pluginId: string, viewId: string, url: string): Promise<void>;
+  navigate(pluginId: string, viewId: string, url: string): Promise<void>;
+  bounds(pluginId: string, viewId: string, bounds: BrowserViewBounds): Promise<void>;
+  extract(pluginId: string, viewId: string): Promise<string>;
+  /** Executes an authorized site adapter in the plugin's own view. */
+  adapter(pluginId: string, viewId: string, adapter: { source: string; args: unknown }): Promise<unknown>;
+  close(pluginId: string, viewId: string): Promise<void>;
+}
+
 export interface Disposable {
   dispose(): void;
 }
@@ -106,6 +262,72 @@ export interface PluginContext {
   log(level: "info" | "warn" | "error", message: string): void;
   /** Register a teardown that runs when the plugin is disabled or the host closes. */
   onDispose(cleanup: () => void): void;
+
+  // --- API v2, privileged -------------------------------------------------
+  /** Right-panel "openable" list and `+` menu entry. Requires ui:entry. */
+  entry?: { add(definition: EntryDefinition): Disposable };
+  /** A container beside the native chat view, with a resizable split. */
+  mainArea?: { mount(definition: MainAreaDefinition): MainAreaHandle };
+  /** A dynamic right-panel tab with a close button. */
+  rightPanel?: { mount(definition: RightPanelDefinition): RightPanelHandle };
+  layout?: { acquireSidebarCollapse(): Disposable };
+  sessions?: {
+    approve(input: { id: string; interactionId: string; value: unknown }): Promise<unknown>;
+    abort(id: string): Promise<unknown>;
+    history(input: { id: string; beforeOrdinal?: number; pageSize?: number; agentId?: string }): Promise<SessionHistoryPage>;
+    /**
+     * Holds one reference to a session's event stream; every call needs exactly
+     * one `unwatch`. The core opens the official subscription for the first
+     * holder and closes it when the last one releases. Requires sessions:read.
+     */
+    watch(id: string): Promise<{ watching: boolean; sessionId: string }>;
+    unwatch(id: string): Promise<{ watching: boolean; sessionId: string }>;
+  };
+  attachments?: {
+    pick(): Promise<AttachmentPick[]>;
+    /** Stages files the user dropped; the returned batch is released with `send`. */
+    stage(files: ArrayLike<File>): Promise<{ files: AttachmentPick[]; batch: string }>;
+    /** The full drop handler: refuses the browser default, then stages. */
+    stageFromDrop(event: DragEvent): Promise<{ files: AttachmentPick[]; batch: string }>;
+    release(batch: string): Promise<{ released: boolean }>;
+    send(input: { id: string; text: string; paths: string[]; mode?: "normal" | "plan" | "tower" | "inherit"; batch?: string }): Promise<unknown>;
+  };
+  browser?: {
+    open(viewId: string, url: string): Promise<BrowserView>;
+  };
+  planner?: {
+    threads(): Promise<PlannerThread[]>;
+    models(): Promise<Array<{ id: string; name: string; providerId?: string }>>;
+    create(input: { title?: string; model: string; options?: Record<string, boolean> }): Promise<PlannerThread>;
+    get(id: string): Promise<PlannerThread>;
+    configure(id: string, input: { model: string; options?: Record<string, boolean> }): Promise<PlannerThread>;
+    send(id: string, text: string, sourceSessionId?: string): Promise<PlannerThread>;
+    retry(id: string, revision: number): Promise<PlannerThread>;
+    stop(id: string): Promise<PlannerThread>;
+    approve(id: string, approvalId: string, allow: boolean): Promise<PlannerThread>;
+    remove(id: string): Promise<unknown>;
+  };
+  handoff?: {
+    /**
+     * `cwd`, `model` and `title` choose the new session's directory, model and
+     * title. They apply only when no `targetId` is given; an existing session
+     * keeps its own and the core ignores them.
+     */
+    preview(input: HandoffInput): Promise<HandoffPreview>;
+    commit(input: HandoffInput): Promise<HandoffResult>;
+  };
+  models?: { list(): Promise<Array<{ id: string; name: string }>> };
+  commands?: {
+    /**
+     * Registers a command. `run` is the body this plugin's own renderer executes
+     * when any plugin invokes it through `ctx.commands.invoke`; the core decides
+     * ownership and authorization, and the body dies with the plugin.
+     */
+    register(name: string, input?: { title?: string; run?: (args: unknown) => unknown }): Promise<CommandInfo>;
+    unregister(name: string): Promise<boolean>;
+    list(): Promise<CommandInfo[]>;
+    invoke(name: string, args?: unknown): Promise<unknown>;
+  };
 }
 
 export interface PluginModule {

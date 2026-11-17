@@ -268,7 +268,7 @@ func (s *NativeService) runCompaction(ctx context.Context, settings AutomationSe
 		_ = s.updateAutomation(ctx, intent.ID, "cancelled", "压缩前出现新活动或审批，候选已失效", now)
 		return
 	}
-	if err = s.kap.Watch(id); err != nil {
+	if err = s.WatchSessionInternal(id); err != nil {
 		_ = s.updateAutomation(ctx, intent.ID, "failed", "无法订阅压缩完成事件："+err.Error(), now)
 		return
 	}

@@ -60,6 +60,12 @@ type Options struct {
 	// Resolver overrides DNS for outbound plugin requests. Nil means the system
 	// resolver; a test supplies one to exercise rebinding deterministically.
 	Resolver *net.Resolver
+	// Official is the build-time allowlist of bundled plugin content digests.
+	// Nil means no plugin is treated as official, so every privileged capability
+	// stays unusable without failing the ordinary v1 surface.
+	Official OfficialDigests
+	// StopPluginWork ends background work a plugin started outside this package.
+	StopPluginWork func(ctx context.Context, id string) error
 }
 
 // Option mutates Options during construction.
@@ -72,6 +78,12 @@ func WithVault(v *credentials.Vault) Option { return func(o *Options) { o.Vault 
 
 func WithBundled(load func() (map[string]map[string][]byte, error)) Option {
 	return func(o *Options) { o.Bundled = load }
+}
+
+// WithStopPluginWork installs the hook that stops a plugin's background work
+// when it is disabled, faulted or shut down.
+func WithStopPluginWork(stop func(ctx context.Context, id string) error) Option {
+	return func(o *Options) { o.StopPluginWork = stop }
 }
 
 // WithResolver replaces the resolver used for outbound plugin requests. Tests
@@ -132,8 +144,12 @@ type Plugin struct {
 	Declared     []string `json:"declaredCapabilities"`
 	Slots        []string `json:"slots"`
 	HostVersions []string `json:"hostVersions"`
-	Compatible   bool     `json:"compatible"`
-	HasSettings  bool     `json:"hasSettings"`
+	// APIVersion is the version this plugin's own manifest declares. The list
+	// response advertises the newest API the host implements separately, so a v1
+	// plugin keeps reporting 1 no matter which host build reads it.
+	APIVersion  int  `json:"apiVersion"`
+	Compatible  bool `json:"compatible"`
+	HasSettings bool `json:"hasSettings"`
 	// Entry is the manifest entry, which the renderer needs to load the module.
 	Entry       Entry  `json:"entry"`
 	Upstream    string `json:"upstream,omitempty"`
@@ -146,6 +162,10 @@ type Plugin struct {
 	// Forced records that the user enabled a plugin whose host version was not
 	// declared in hostVersions.
 	Forced bool `json:"forced,omitempty"`
+	// Official marks a bundled plugin whose installed content still matches the
+	// compiled allowlist. Only such a plugin can use the v2 privileged
+	// capabilities; the flag is informational, the action gate re-hashes.
+	Official bool `json:"official,omitempty"`
 	// Restorable marks a bundled plugin the user uninstalled. It is not
 	// installed, holds no files and is not running; it appears in the list only
 	// so the page can offer to restore the embedded copy. Nothing is released
@@ -171,6 +191,11 @@ type entry struct {
 	forced    bool
 	updated   time.Time
 	installed time.Time
+	// official records, at load or enable time, that this entry is a bundled
+	// plugin whose content matched the allowlist. It is a cache for display and
+	// for the cheap half of the privilege gate; verifyOfficialForAction re-hashes
+	// the directory before every privileged call.
+	official bool
 }
 
 type Manager struct {
@@ -183,6 +208,25 @@ type Manager struct {
 	bundled func() (map[string]map[string][]byte, error)
 	now     func() time.Time
 	gate    EnableGate
+
+	officialDigests OfficialDigests
+	views           map[string]map[string]*browserView
+	commands        map[string]command
+	// sessionWatches counts, per plugin, how many of its own handles watch each
+	// session. The plugin layer forwards only the first and last reference, so
+	// the official stream follows the plugin's real interest rather than the
+	// number of panes it happens to have open.
+	sessionWatches map[string]map[string]int
+	// sessionWatchMu serializes the whole observe-then-forward transition. It is
+	// separate from m.mu because the forward itself is a core call, and it is
+	// what keeps two panes opening on one session from both believing they are
+	// the first holder: the second one reads the rolled-back count, not a count
+	// the first one is about to undo.
+	sessionWatchMu sync.Mutex
+	// stopPluginWork is the hook that ends background work a plugin started
+	// outside this package (a planner thread, for instance). It is a function so
+	// the plugin host does not have to import the engine it is stopping.
+	stopPluginWork func(ctx context.Context, id string) error
 
 	mu      sync.Mutex
 	entries map[string]*entry
@@ -213,17 +257,22 @@ func New(db *sql.DB, safe func() bool, options ...Option) (*Manager, error) {
 		return nil, err
 	}
 	manager := &Manager{
-		db:      db,
-		safe:    safe,
-		dataDir: opts.DataDir,
-		host:    opts.HostVersion,
-		core:    opts.Core,
-		vault:   opts.Vault,
-		bundled: opts.Bundled,
-		now:     opts.Now,
-		entries: make(map[string]*entry),
-		tokens:  make(map[string]string),
-		lookup:  opts.Resolver,
+		db:              db,
+		safe:            safe,
+		dataDir:         opts.DataDir,
+		host:            opts.HostVersion,
+		core:            opts.Core,
+		vault:           opts.Vault,
+		bundled:         opts.Bundled,
+		officialDigests: opts.Official,
+		stopPluginWork:  opts.StopPluginWork,
+		views:           map[string]map[string]*browserView{},
+		commands:        map[string]command{},
+		sessionWatches:  map[string]map[string]int{},
+		now:             opts.Now,
+		entries:         make(map[string]*entry),
+		tokens:          make(map[string]string),
+		lookup:          opts.Resolver,
 	}
 	if err := manager.load(); err != nil {
 		return nil, err
@@ -243,6 +292,15 @@ func (m *Manager) UseCore(core Core) {
 func (m *Manager) UseVault(vault *credentials.Vault) {
 	m.mu.Lock()
 	m.vault = vault
+	m.mu.Unlock()
+}
+
+// UseStopPluginWork attaches the background-work hook after construction, for
+// the same reason as UseCore: the planner exists only once the native service
+// has been built, which happens after the plugin host.
+func (m *Manager) UseStopPluginWork(stop func(ctx context.Context, id string) error) {
+	m.mu.Lock()
+	m.stopPluginWork = stop
 	m.mu.Unlock()
 }
 
@@ -320,10 +378,12 @@ func (m *Manager) load() error {
 				state = StateDisabled
 			}
 		}
+		dir := filepath.Join(m.pluginsDir(), manifest.DataDirName())
 		m.entries[item.id] = &entry{
 			manifest: manifest, grants: grants, declared: manifest.CapabilityNames(),
-			source: item.source, dir: filepath.Join(m.pluginsDir(), manifest.DataDirName()),
-			state: state, errText: item.err, enabled: item.desired,
+			source: item.source, dir: dir,
+			official: m.officialFor(manifest, dir, item.source),
+			state:    state, errText: item.err, enabled: item.desired,
 			// Force-enabling an incompatible plugin is not a separate column: it is
 			// exactly a desired plugin the host version does not cover, so the flag
 			// is re-derived instead of drifting from what was stored.
@@ -413,10 +473,12 @@ func (m *Manager) presentLocked(item *entry) Plugin {
 		Desired:      item.enabled,
 		Forced:       item.forced,
 		Error:        item.errText,
-		Capabilities: item.grants.Names(),
+		Capabilities: effectiveGrants(item).Names(),
 		Declared:     append([]string(nil), item.declared...),
-		Slots:        grantedSlots(item.grants),
+		Official:     item.official,
+		Slots:        grantedSlots(effectiveGrants(item)),
 		HostVersions: append([]string(nil), item.manifest.HostVersions...),
+		APIVersion:   item.manifest.APIVersion,
 		Compatible:   m.compatible(item.manifest),
 		HasSettings:  item.manifest.Entry.Settings != "",
 		Entry:        item.manifest.Entry,
@@ -613,6 +675,7 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 	safe := m.safe()
 	manifest := item.manifest
 	dir := item.dir
+	source := item.source
 	m.mu.Unlock()
 
 	now := m.now()
@@ -631,6 +694,7 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 		return m.Get2(id), apiError(http.StatusConflict, "PLUGIN_FILES_INVALID", message)
 	}
 
+	official := m.officialFor(manifest, dir, source)
 	m.mu.Lock()
 	gate := m.gate
 	m.mu.Unlock()
@@ -650,6 +714,10 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 	item.state = StateEnabled
 	item.errText = ""
 	item.enabled = true
+	// A user who repaired or replaced the files gets the privileged surface back
+	// without reinstalling; a tampered bundle loses it here and on every call.
+	// The hash is computed outside this lock, before the state transition.
+	item.official = official
 	item.forced = force && !m.compatible(manifest)
 	item.updated = now
 	token, tokenErr := m.issueTokenLocked(id)
@@ -703,12 +771,40 @@ func (m *Manager) fail(ctx context.Context, id, state, message, kind string, now
 	}
 	delete(m.tokens, id)
 	m.mu.Unlock()
+	// A fault is a stop like any other: the token is gone, so everything the
+	// running instance owned has to go with it. Leaving a view, a command, an
+	// official subscription or a planner thread behind would keep working under
+	// an identity the core already revoked — and the faulted plugin can never
+	// come back to release them, because it is not running.
+	m.releaseViews(id)
+	m.releaseCommands(id)
+	if err := m.releaseSessionWatches(ctx, id); err != nil {
+		_ = recordActivity(ctx, m.db, id, kind, "插件已停止，但会话订阅未能全部释放："+err.Error(), now)
+	}
+	if err := m.stopWork(ctx, id); err != nil {
+		_ = recordActivity(ctx, m.db, id, kind, "插件已停止，但后台任务未能全部结束："+err.Error(), now)
+	}
+	m.purgeStagedAndRecord(ctx, id, kind, "插件已停止，但暂存附件未能清理：", now)
+	// Cleanup runs before the record is written, and a cleanup error is only ever
+	// an activity row: the faulted state and its reason are what the user reads,
+	// so a failed release must not turn into a different outcome here.
 	_ = setState(ctx, m.db, id, state, false, message, now)
 	_ = recordActivity(ctx, m.db, id, kind, message, now)
 }
 
 // Disable stops a plugin and revokes its renderer token in the same step, so a
 // renderer that keeps polling cannot act after the user turned it off.
+// stopWork ends the background work a plugin started elsewhere. A manager
+// built without the hook simply has nothing to stop, which keeps headless tests
+// and the CLI usable.
+func (m *Manager) stopWork(ctx context.Context, id string) error {
+	stop := m.stopPluginWork
+	if stop == nil {
+		return nil
+	}
+	return stop(ctx, id)
+}
+
 func (m *Manager) Disable(ctx context.Context, id string) error {
 	m.mu.Lock()
 	item, ok := m.entries[id]
@@ -727,6 +823,23 @@ func (m *Manager) Disable(ctx context.Context, id string) error {
 	item.updated = m.now()
 	delete(m.tokens, id)
 	m.mu.Unlock()
+	// Views, commands, session subscriptions, staged files and background work
+	// belong to the running instance, not to the install, so they are dropped
+	// with the token. A disabled plugin must not leave a view alive, a command
+	// another plugin can still call, an official event stream held open, or
+	// dropped bytes waiting for a TTL sweep that will never run again.
+	m.releaseViews(id)
+	m.releaseCommands(id)
+	if err := m.releaseSessionWatches(ctx, id); err != nil {
+		_ = recordActivity(ctx, m.db, id, ActivityDisable, "插件已停用，但会话订阅未能全部释放："+err.Error(), m.now())
+	}
+	// Work the plugin started elsewhere (a planner thread still streaming or
+	// waiting for approval) ends with it. The hook runs after the token is gone,
+	// so a concurrent call cannot restart what is being stopped.
+	if err := m.stopWork(ctx, id); err != nil {
+		_ = recordActivity(ctx, m.db, id, ActivityDisable, "插件已停止，但后台任务未能全部结束："+err.Error(), m.now())
+	}
+	m.purgeStagedAndRecord(ctx, id, ActivityDisable, "插件已停用，但暂存附件未能清理：", m.now())
 	if err := setState(ctx, m.db, id, StateDisabled, false, "", m.now()); err != nil {
 		return apiError(http.StatusInternalServerError, "PLUGIN_STATE_UNAVAILABLE", "无法保存插件状态")
 	}
@@ -757,6 +870,18 @@ func (m *Manager) Uninstall(ctx context.Context, id string) error {
 	item.updated = now
 	delete(m.tokens, id)
 	m.mu.Unlock()
+	m.releaseViews(id)
+	m.releaseCommands(id)
+	if err := m.releaseSessionWatches(ctx, id); err != nil {
+		_ = recordActivity(ctx, m.db, id, ActivityDisable, "卸载前已停止插件，但会话订阅未能全部释放："+err.Error(), now)
+	}
+	if err := m.stopWork(ctx, id); err != nil {
+		_ = recordActivity(ctx, m.db, id, ActivityDisable, "卸载前已停止插件，但后台任务未能全部结束："+err.Error(), now)
+	}
+	// Staged bytes are part of the running instance: nothing can release a batch
+	// once the plugin is gone, and the TTL sweep only runs when the plugin stages
+	// again, so removal has to clear the root here.
+	stagedErr := m.purgeStaged(id)
 	if err := setState(ctx, m.db, id, StateDisabled, false, "", now); err != nil {
 		return apiError(http.StatusInternalServerError, "PLUGIN_STATE_UNAVAILABLE", "无法保存插件状态，插件仍保持停用")
 	}
@@ -764,6 +889,9 @@ func (m *Manager) Uninstall(ctx context.Context, id string) error {
 
 	if err := os.RemoveAll(dir); err != nil {
 		return apiError(http.StatusInternalServerError, "PLUGIN_UNINSTALL_FAILED", "无法删除插件文件，插件仍保持停用")
+	}
+	if stagedErr != nil {
+		_ = recordActivity(ctx, m.db, id, ActivityUninstall, "插件已卸载，但暂存附件未能清理："+stagedErr.Error(), now)
 	}
 	_ = storageClear(ctx, m.db, id)
 	if err := deleteRecord(ctx, m.db, id); err != nil {
@@ -820,7 +948,43 @@ func (m *Manager) EnforceSafeMode() {
 		}
 		delete(m.tokens, id)
 	}
+	owners := map[string]bool{}
+	for id := range m.views {
+		owners[id] = true
+	}
+	for _, entry := range m.commands {
+		owners[entry.OwnerID] = true
+	}
+	for id := range m.sessionWatches {
+		owners[id] = true
+	}
+	// Staged bytes are not tracked per instance: a plugin that only ever staged
+	// files holds no view, command or subscription to be found above, and every
+	// installed plugin has to lose them when safe mode stops it.
+	staged := make([]string, 0, len(m.entries))
+	for id := range m.entries {
+		staged = append(staged, id)
+	}
 	m.mu.Unlock()
+	for id := range owners {
+		m.releaseViews(id)
+		m.releaseCommands(id)
+		if err := m.releaseSessionWatches(ctx, id); err != nil {
+			_ = recordActivity(ctx, m.db, id, ActivitySafeMode, "安全模式已停止插件，但会话订阅未能全部释放："+err.Error(), m.now())
+		}
+	}
+	// Only the plugins safe mode actually stopped lose their background work.
+	// Work another plugin started is not this transition's to end, and a plugin
+	// that was already disabled has nothing running. The planner marks its
+	// threads stopped and keeps their history, so this is a stop, not a delete.
+	for _, id := range changed {
+		if err := m.stopWork(ctx, id); err != nil {
+			_ = recordActivity(ctx, m.db, id, ActivitySafeMode, "安全模式已停止插件，但后台任务未能全部结束："+err.Error(), m.now())
+		}
+	}
+	for _, id := range staged {
+		m.purgeStagedAndRecord(ctx, id, ActivitySafeMode, "安全模式已停止插件，但暂存附件未能清理：", m.now())
+	}
 	for _, id := range changed {
 		_ = setState(ctx, m.db, id, StateBlocked, false, "安全模式已阻止插件运行。", m.now())
 		_ = recordActivity(ctx, m.db, id, ActivitySafeMode, "安全模式已阻止插件运行。", m.now())
@@ -844,9 +1008,11 @@ func (m *Manager) Close() error {
 	// lock, so iterating m.entries after the unlock reads memory another
 	// goroutine may be rewriting or deleting.
 	stopped := make([]record, 0, len(m.entries))
+	wasEnabled := make([]string, 0, len(m.entries))
 	for id, item := range m.entries {
 		if item.state == StateEnabled {
 			item.state = StateDisabled
+			wasEnabled = append(wasEnabled, id)
 		}
 		stopped = append(stopped, record{
 			id:      id,
@@ -856,9 +1022,31 @@ func (m *Manager) Close() error {
 		})
 	}
 	m.tokens = make(map[string]string)
+	m.views = map[string]map[string]*browserView{}
+	m.commands = map[string]command{}
+	// Session subscriptions are collected before the map is cleared: shutdown
+	// must not leave an official event stream open to a plugin that no longer
+	// exists in this process.
+	watchers := make([]string, 0, len(m.sessionWatches))
+	for id := range m.sessionWatches {
+		watchers = append(watchers, id)
+	}
 	m.mu.Unlock()
 	ctx := context.Background()
 	var failures []string
+	for _, id := range watchers {
+		if err := m.releaseSessionWatches(ctx, id); err != nil {
+			failures = append(failures, id+": "+err.Error())
+		}
+	}
+	// A plugin that was streaming or waiting for approval must not keep a
+	// generator alive after the core has shut down; the threads are marked
+	// stopped and their history stays.
+	for _, id := range wasEnabled {
+		if err := m.stopWork(ctx, id); err != nil {
+			failures = append(failures, id+": "+err.Error())
+		}
+	}
 	for _, item := range stopped {
 		// desired stays as recorded: it is what the user asked for, not what this
 		// process managed to keep running.

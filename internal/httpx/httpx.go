@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 )
 
 type Error struct {
@@ -28,6 +29,12 @@ func Fail(w http.ResponseWriter, status int, code, message string) {
 func BodyLimit(r *http.Request) int64 {
 	if r.URL.Path == "/enhance/v1/models/modelsdev" {
 		return 16 << 20
+	}
+	// Plugin actions carry dropped files as base64, which inflates them by a
+	// third; a limit below the plugin staging budget would reject the payload in
+	// the HTTP layer before the action can explain the real reason.
+	if strings.HasPrefix(r.URL.Path, "/enhance/v1/plugin-runtime/") || strings.Contains(r.URL.Path, "/plugins/") && strings.Contains(r.URL.Path, "/action/") {
+		return 24 << 20
 	}
 	return 2 << 20
 }

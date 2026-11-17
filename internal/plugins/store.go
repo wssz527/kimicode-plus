@@ -251,6 +251,9 @@ const (
 	ActivityUpgrade    = "UPGRADE"
 	ActivityRestore    = "RESTORE"
 	ActivityCredential = "CREDENTIAL"
+	ActivityCommand    = "COMMAND"
+	ActivityHandoff    = "HANDOFF"
+	ActivityPlanner    = "PLANNER"
 )
 
 type Activity struct {

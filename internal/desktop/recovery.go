@@ -415,7 +415,7 @@ func (s *NativeService) recoveryTick(ctx context.Context, settings AutomationSet
 			s.mu.Lock()
 			s.cache[id] = loaded
 			s.mu.Unlock()
-			_ = s.kap.Watch(id)
+			_ = s.WatchSessionInternal(id)
 			snapshot = snapshotFromCache(loaded)
 		} else {
 			snapshot, exists, err = s.refreshAutomationSnapshot(ctx, id, now)

@@ -181,7 +181,7 @@ func (s *NativeService) runKeepAliveOnce(ctx context.Context, settings Automatio
 		_ = s.updateAutomation(ctx, intent.ID, "cancelled", "发送前后台子代理已返回，候选已失效", now)
 		return
 	}
-	if err = s.kap.Watch(id); err != nil {
+	if err = s.WatchSessionInternal(id); err != nil {
 		_ = s.updateAutomation(ctx, intent.ID, "failed", "无法订阅保活回执："+err.Error(), now)
 		return
 	}

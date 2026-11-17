@@ -43,6 +43,10 @@ type PlannerThread struct {
 	Error     string           `json:"error,omitempty"`
 	Approval  *PlannerApproval `json:"approval,omitempty"`
 	Workspace string           `json:"workspace,omitempty"`
+	// PluginOwner names the plugin that created this thread. It is empty for the
+	// built-in planner, whose threads outlive any plugin. Stopping a plugin stops
+	// only the threads it owns.
+	PluginOwner string `json:"pluginOwner,omitempty"`
 }
 
 type PlannerGenerator interface {
@@ -173,6 +177,7 @@ func (p *PlannerService) PlannerAction(ctx context.Context, action string, paylo
 		Approval        string         `json:"approvalId"`
 		SourceSessionID string         `json:"sourceSessionId"`
 		Revision        uint64         `json:"revision"`
+		PluginOwner     string         `json:"pluginOwner"`
 	}
 	if len(payload) > 0 {
 		if err := json.Unmarshal(payload, &input); err != nil {
@@ -180,7 +185,7 @@ func (p *PlannerService) PlannerAction(ctx context.Context, action string, paylo
 		}
 	}
 	if action == "planner.create" {
-		return p.create(ctx, input.Title, input.Model, input.Options)
+		return p.create(ctx, input.Title, input.Model, input.PluginOwner, input.Options)
 	}
 	if !idPattern.MatchString(input.ID) {
 		return nil, errors.New("规划线程 ID 无效")
@@ -188,6 +193,15 @@ func (p *PlannerService) PlannerAction(ctx context.Context, action string, paylo
 	state, err := p.state(ctx, input.ID)
 	if err != nil {
 		return nil, err
+	}
+	// A plugin may only change the threads it created. Reads stay open — a
+	// plugin that lists threads must still see what it can act on — but every
+	// action that rewrites one is refused unless the thread carries the caller's
+	// own owner. A built-in caller sends no owner and keeps its older reach.
+	if plannerChangesThread(action) {
+		if err := ownedByCaller(state, input.PluginOwner); err != nil {
+			return nil, err
+		}
 	}
 	switch action {
 	case "planner.get":
@@ -209,6 +223,34 @@ func (p *PlannerService) PlannerAction(ctx context.Context, action string, paylo
 	}
 }
 
+// plannerChangesThread separates the actions that rewrite a thread from the ones
+// that only report it. `planner.threads` and `planner.models` do not name a
+// thread at all and never reach here.
+func plannerChangesThread(action string) bool {
+	switch action {
+	case "planner.configure", "planner.send", "planner.retry", "planner.stop", "planner.approve", "planner.delete":
+		return true
+	}
+	return false
+}
+
+// ownedByCaller refuses a change to a thread another plugin created. A caller
+// with no owner is the built-in UI, which has always addressed every thread, so
+// an empty owner keeps that reach.
+func ownedByCaller(state *plannerState, owner string) error {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return nil
+	}
+	state.mu.Lock()
+	threadOwner := state.thread.PluginOwner
+	state.mu.Unlock()
+	if threadOwner != owner {
+		return errors.New("规划线程不属于该插件")
+	}
+	return nil
+}
+
 func normalizePlannerOptions(options PlannerOptions) PlannerOptions {
 	if !options.Tools {
 		options.ReadOnly = true
@@ -224,7 +266,7 @@ func validatePlannerModel(model string) error {
 	return nil
 }
 
-func (p *PlannerService) create(ctx context.Context, title, model string, options PlannerOptions) (PlannerThread, error) {
+func (p *PlannerService) create(ctx context.Context, title, model, owner string, options PlannerOptions) (PlannerThread, error) {
 	if err := validatePlannerModel(model); err != nil {
 		return PlannerThread{}, err
 	}
@@ -235,7 +277,7 @@ func (p *PlannerService) create(ctx context.Context, title, model string, option
 	if len(title) > 200 {
 		return PlannerThread{}, errors.New("规划标题不能超过 200 字节")
 	}
-	thread := PlannerThread{ID: security.Random()[:24], Title: title, Model: strings.TrimSpace(model), Options: normalizePlannerOptions(options), Messages: []Message{}, Status: "idle"}
+	thread := PlannerThread{ID: security.Random()[:24], Title: title, Model: strings.TrimSpace(model), Options: normalizePlannerOptions(options), Messages: []Message{}, Status: "idle", PluginOwner: strings.TrimSpace(owner)}
 	if err := p.save(ctx, &thread); err != nil {
 		return PlannerThread{}, err
 	}
@@ -428,6 +470,87 @@ func (p *PlannerService) stop(ctx context.Context, state *plannerState) (Planner
 		return PlannerThread{}, errors.New("停止请求已发送，正在等待供应商连接关闭")
 	}
 	return p.snapshot(state), nil
+}
+
+// StopPluginThreads stops the threads one plugin created and left running or
+// waiting for approval. Built-in threads (empty owner) and other plugins' threads
+// are untouched, and history is kept: the thread is marked stopped with a reason
+// rather than deleted, the same shape a core restart leaves behind.
+func (p *PlannerService) StopPluginThreads(ctx context.Context, owner string) (int, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return 0, nil
+	}
+	p.mu.Lock()
+	states := make([]*plannerState, 0, len(p.states))
+	for _, state := range p.states {
+		states = append(states, state)
+	}
+	p.mu.Unlock()
+
+	stopped := 0
+	for _, state := range states {
+		state.mu.Lock()
+		owned := state.thread.PluginOwner == owner
+		active := state.cancel != nil || state.thread.Approval != nil || state.thread.Status == "running" || state.thread.Status == "quota"
+		if !owned || !active {
+			state.mu.Unlock()
+			continue
+		}
+		cancel, done := state.cancel, state.done
+		state.stopped = true
+		state.thread.Approval = nil
+		state.mu.Unlock()
+
+		if cancel != nil {
+			cancel()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return stopped, ctx.Err()
+			case <-time.After(5 * time.Second):
+			}
+		}
+		// The reason is written after the generator has exited, so a late write
+		// from the worker cannot overwrite it.
+		if err := p.update(state, func(thread *PlannerThread) {
+			thread.Status = "stopped"
+			thread.Error = "插件已停止，正在进行的规划被中止；历史保留。"
+			thread.Approval = nil
+		}); err != nil {
+			return stopped, err
+		}
+		stopped += 1
+	}
+
+	// Threads that are not loaded in memory still carry the owner: a restart
+	// leaves them idle, so only an in-flight one needs the stopped marker.
+	rows, err := p.db.QueryContext(ctx, `SELECT id, data FROM planner_threads`)
+	if err != nil {
+		return stopped, err
+	}
+	pending := []PlannerThread{}
+	for rows.Next() {
+		var id, raw string
+		var thread PlannerThread
+		if rows.Scan(&id, &raw) == nil && json.Unmarshal([]byte(raw), &thread) == nil && thread.PluginOwner == owner && (thread.Status == "running" || thread.Approval != nil) {
+			pending = append(pending, thread)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return stopped, err
+	}
+	for _, thread := range pending {
+		thread.Status = "stopped"
+		thread.Error = "插件已停止，正在进行的规划被中止；历史保留。"
+		thread.Approval = nil
+		if err := p.save(ctx, &thread); err != nil {
+			return stopped, err
+		}
+		stopped += 1
+	}
+	return stopped, nil
 }
 
 func (p *PlannerService) delete(ctx context.Context, state *plannerState) (map[string]any, error) {

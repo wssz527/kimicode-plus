@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,8 +54,26 @@ type NativeService struct {
 	automationMu sync.Mutex
 	featureMu    sync.Mutex
 	cacheMu      sync.Mutex
-	wg           sync.WaitGroup
-	cache        map[string]cachedSession
+	watchMu      sync.Mutex
+	// watchOpMu serializes subscribe and unsubscribe transitions. It is separate
+	// from watchMu because one transition includes a network call: holding the
+	// reference map only while it is read would let a second caller see a
+	// reference for a subscription the official side has not accepted yet, and
+	// answer "watching" for a stream that never opened.
+	watchOpMu sync.Mutex
+	wg        sync.WaitGroup
+	cache     map[string]cachedSession
+	// watchRefs counts the consumers of each session's official event stream.
+	// The KAP subscription is opened for the first consumer and closed when the
+	// last one releases, so one pane closing cannot stop another's updates.
+	watchRefs map[string]int
+	// internalWatches names the sessions an internal module (automation,
+	// keepalive, recovery) keeps listening to. It is a set rather than a count
+	// because those modules re-assert the same interest on every tick and never
+	// pair it with a release, so a count would grow without bound. A session in
+	// this set keeps its subscription open across a plugin's last unwatch, which
+	// is what stops a plugin from silencing automation for the whole process.
+	internalWatches map[string]bool
 	// store is the session-record metrics layer. It is created lazily because the
 	// official records directory may not exist yet.
 	store    *cache.Store
@@ -197,6 +216,42 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 			return nil, errors.New("动作参数必须是对象")
 		}
 	}
+	if strings.HasPrefix(action, "planner.service.") {
+		// The v2 plugin path to the local planner. It deliberately skips the old
+		// addon feature flag: that flag belongs to the frozen built-in planner UI,
+		// while a plugin asks for the engine itself and brings its own surface.
+		s.mu.Lock()
+		planner := s.planner
+		s.mu.Unlock()
+		if planner == nil {
+			return nil, errors.New("规划模块尚未启用")
+		}
+		return planner.PlannerAction(ctx, strings.TrimPrefix(action, "planner.service."), payload)
+	}
+	// Thread and model discovery is read-only and has no plugin-visible meaning
+	// behind the frozen built-in planner, so it is answered here before the
+	// feature flag is consulted. It must come before the generic `planner.` branch
+	// below, which would otherwise demand that flag and never reach these cases.
+	if action == "planner.threads" || action == "planner.models" {
+		s.mu.Lock()
+		planner := s.planner
+		s.mu.Unlock()
+		if planner == nil {
+			return nil, errors.New("规划模块尚未启用")
+		}
+		if action == "planner.threads" {
+			threads, err := planner.PlannerThreads(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"items": threads}, nil
+		}
+		models, err := planner.PlannerModels(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"items": models}, nil
+	}
 	if strings.HasPrefix(action, "planner.") {
 		features, err := s.addonFeatures(ctx)
 		if err != nil {
@@ -247,6 +302,24 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return map[string]any{"items": sessions, "total": len(sessions)}, nil
 	case "sessions.view":
 		return s.sessionView(ctx, stringInput(input, "id"))
+	case "sessions.watch":
+		id := stringInput(input, "id")
+		if err := s.WatchSession(id); err != nil {
+			return nil, err
+		}
+		return map[string]any{"watching": true, "sessionId": id}, nil
+	case "sessions.unwatch":
+		id := stringInput(input, "id")
+		s.UnwatchSession(id)
+		return map[string]any{"watching": false, "sessionId": id}, nil
+	case "sessions.history":
+		return s.sessionHistory(ctx, input)
+	case "models.list":
+		models, err := s.kap.Models(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"items": models, "total": len(models)}, nil
 	case "sessions.create":
 		return s.createSession(ctx, input)
 	case "sessions.send":
@@ -258,13 +331,26 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		if err != nil {
 			return nil, err
 		}
+		// The v1 action keeps its shape but now takes a reference, so a reader
+		// that paired it with the v1 unwatch cannot drop a subscription another
+		// consumer still holds.
+		if err = s.WatchSession(id); err != nil {
+			return nil, err
+		}
 		return map[string]any{"watching": true}, nil
 	case "session.unwatch":
 		id := stringInput(input, "id")
-		s.kap.Unwatch(id)
-		s.mu.Lock()
-		delete(s.cache, id)
-		s.mu.Unlock()
+		s.UnwatchSession(id)
+		// The cache belongs to the session, not to this reader: another pane, a
+		// plugin or automation may still be subscribed, and dropping it here would
+		// make applyFrame discard every later frame for want of a cache entry.
+		// Only a session nobody watches any more is dropped, and the next read
+		// rebuilds it from the official record anyway.
+		if !s.sessionHeld(id) {
+			s.mu.Lock()
+			delete(s.cache, id)
+			s.mu.Unlock()
+		}
 		return map[string]any{"watching": false}, nil
 	case "session.create":
 		return s.createSession(ctx, input)
@@ -408,6 +494,80 @@ func (s *NativeService) nativeTurns(ctx context.Context, id string, count int) (
 	return page.Turns, err
 }
 
+// sessionHistory reads one page of an agent's turns with the official ordinal
+// cursor. Unlike sessionView it is not capped at the newest 50 turns and does not
+// fill the live cache: history is read-only paging, and mixing it into the cache
+// would make the next event frame replace the newest page with an older one.
+func (s *NativeService) sessionHistory(ctx context.Context, input map[string]any) (any, error) {
+	id := stringInput(input, "id")
+	if id == "" {
+		return nil, errors.New("缺少会话 ID")
+	}
+	agent := stringInput(input, "agentId")
+	if agent == "" {
+		agent = "main"
+	}
+	size := intInput(input, "size", 50)
+	if size < 1 {
+		size = 1
+	}
+	if size > 100 {
+		size = 100
+	}
+	query := fmt.Sprintf("/sessions/%s/agents/%s/turns?page_size=%d", url.PathEscape(id), url.PathEscape(agent), size)
+	before := intInput(input, "before", 0)
+	if before > 0 {
+		query += fmt.Sprintf("&before_ordinal=%d", before)
+	}
+	raw, err := s.kap.Request(ctx, http.MethodGet, query, nil)
+	if err != nil {
+		return nil, err
+	}
+	page, err := decodeNative[struct {
+		Turns   []NativeTurn `json:"turns"`
+		HasMore bool         `json:"has_more"`
+	}](raw, "会话历史")
+	if err != nil {
+		return nil, err
+	}
+	messages := []NativeMessage{}
+	for _, turn := range page.Turns {
+		messages = append(messages, turnMessages(turn)...)
+		if turn.Error != nil {
+			messages = append(messages, NativeMessage{ID: turn.TurnID + "-error", Role: "error", Text: turn.Error.Message})
+		}
+	}
+	var nextBefore *int64
+	for _, turn := range page.Turns {
+		if turn.Ordinal == nil {
+			continue
+		}
+		if nextBefore == nil || *turn.Ordinal < *nextBefore {
+			value := *turn.Ordinal
+			nextBefore = &value
+		}
+	}
+	return map[string]any{
+		"sessionId":  id,
+		"agentId":    agent,
+		"messages":   messages,
+		"approvals":  turnApprovals(page.Turns),
+		"hasMore":    page.HasMore,
+		"nextBefore": nextBefore,
+		"pageSize":   size,
+	}, nil
+}
+
+func intInput(input map[string]any, key string, fallback int) int {
+	switch value := input[key].(type) {
+	case float64:
+		return int(value)
+	case int:
+		return value
+	}
+	return fallback
+}
+
 func (s *NativeService) readSession(ctx context.Context, id string) (cachedSession, error) {
 	raw, err := s.kap.Request(ctx, http.MethodGet, "/sessions/"+id, nil)
 	if err != nil {
@@ -446,10 +606,157 @@ func (s *NativeService) sessionView(ctx context.Context, id string) (SessionView
 	loaded.lastActivity = time.Now().UTC()
 	s.cache[id] = loaded
 	s.mu.Unlock()
-	if err = s.kap.Watch(id); err != nil {
-		return SessionView{}, err
-	}
+	// A read does not subscribe: watching is an explicit, reference-counted
+	// decision, so a plugin that only looks at a session never holds the
+	// official event stream open. The v1 `sessions.view` capability still works;
+	// it just no longer changes the watch set as a side effect.
 	return sessionViewFromCache(loaded), nil
+}
+
+// WatchSession adds one consumer of a session's official event stream. The KAP
+// watch is sent only for the first consumer, and each holder must release with
+// exactly one UnwatchSession: another pane, plugin or automation watching the
+// same session keeps it alive.
+//
+// The whole transition is serialized. Two concurrent first watches would
+// otherwise both see a zero count, both answer success, and the loser's rollback
+// would leave a reference for a stream nobody subscribed to — a caller told it
+// is watching while no frame ever arrives.
+func (s *NativeService) WatchSession(id string) error {
+	if id == "" {
+		return errors.New("缺少会话 ID")
+	}
+	s.watchOpMu.Lock()
+	defer s.watchOpMu.Unlock()
+	s.watchMu.Lock()
+	if s.watchRefs == nil {
+		s.watchRefs = map[string]int{}
+	}
+	first := s.watchRefs[id] == 0 && !s.internalWatches[id]
+	s.watchRefs[id] += 1
+	s.watchMu.Unlock()
+	if !first {
+		return nil
+	}
+	if err := s.kap.Watch(id); err != nil {
+		// A failed first watch leaves no reference behind; otherwise a later
+		// retry would believe the stream is already open.
+		s.watchMu.Lock()
+		if s.watchRefs[id] == 1 {
+			delete(s.watchRefs, id)
+		} else if s.watchRefs[id] > 1 {
+			s.watchRefs[id] -= 1
+		}
+		s.watchMu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// UnwatchSession releases one consumer. The official unsubscribe is sent only
+// when the last one leaves and no internal module is still listening, so closing
+// one pane cannot stop another's updates and a plugin cannot silence automation.
+// Releasing an id that was never watched is a no-op, which makes teardown safe
+// to run on every path.
+func (s *NativeService) UnwatchSession(id string) {
+	if id == "" {
+		return
+	}
+	s.watchOpMu.Lock()
+	defer s.watchOpMu.Unlock()
+	s.releaseRef(id, false)
+}
+
+// releaseRef drops one reference and, when nothing holds the session any more,
+// sends the official unsubscribe. Callers hold watchOpMu. A release with no
+// reference to drop is a no-op: it must neither send a frame nor make an
+// unrelated module's subscription look ended.
+func (s *NativeService) releaseRef(id string, internal bool) {
+	s.watchMu.Lock()
+	held := true
+	if internal {
+		if !s.internalWatches[id] {
+			held = false
+		}
+		delete(s.internalWatches, id)
+	} else if refs := s.watchRefs[id]; refs > 1 {
+		s.watchRefs[id] = refs - 1
+	} else if refs == 1 {
+		delete(s.watchRefs, id)
+	} else {
+		held = false
+	}
+	empty := s.watchRefs[id] == 0 && !s.internalWatches[id]
+	s.watchMu.Unlock()
+	if held && empty {
+		s.kap.Unwatch(id)
+	}
+}
+
+// WatchSessionInternal records an internal module's lasting interest in a
+// session and subscribes when nothing else holds it. The interest is a set
+// member, not a reference: automation re-asserts it every tick and never
+// releases it, so counting it would grow until the process exits. The
+// subscription therefore survives the last plugin unwatch, and the reconnecting
+// event loop re-subscribes it from `kap.watched` like any other.
+func (s *NativeService) WatchSessionInternal(id string) error {
+	if id == "" {
+		return errors.New("缺少会话 ID")
+	}
+	s.watchOpMu.Lock()
+	defer s.watchOpMu.Unlock()
+	s.watchMu.Lock()
+	if s.internalWatches == nil {
+		s.internalWatches = map[string]bool{}
+	}
+	first := !s.internalWatches[id] && s.watchRefs[id] == 0
+	s.internalWatches[id] = true
+	s.watchMu.Unlock()
+	if !first {
+		return nil
+	}
+	if err := s.kap.Watch(id); err != nil {
+		s.watchMu.Lock()
+		delete(s.internalWatches, id)
+		s.watchMu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// WatchedSessions reports the reference count per session. It is the observable
+// proof that a release actually dropped the KAP subscription.
+func (s *NativeService) WatchedSessions() map[string]int {
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+	out := make(map[string]int, len(s.watchRefs))
+	for id, refs := range s.watchRefs {
+		out[id] = refs
+	}
+	return out
+}
+
+// HeldSessions reports every session with an open official subscription,
+// counting the internal modules' standing interest as one holder each. It is
+// what tells a release whether the stream still has a consumer.
+func (s *NativeService) HeldSessions() map[string]int {
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+	out := make(map[string]int, len(s.watchRefs))
+	for id, refs := range s.watchRefs {
+		out[id] = refs
+	}
+	for id := range s.internalWatches {
+		out[id] += 1
+	}
+	return out
+}
+
+// sessionHeld reports whether anything still needs a session's event stream.
+func (s *NativeService) sessionHeld(id string) bool {
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+	return s.watchRefs[id] > 0 || s.internalWatches[id]
 }
 
 func sessionViewFromCache(cache cachedSession) SessionView {
@@ -772,16 +1079,83 @@ func (s *NativeService) reply(ctx context.Context, input map[string]any) (any, e
 
 func (s *NativeService) handoff(ctx context.Context, input map[string]any) (map[string]any, error) {
 	id := stringInput(input, "targetId")
-	if id == "" {
-		created, err := s.createSession(ctx, map[string]any{"title": "规划交接", "cwd": s.cwd})
-		if err != nil {
-			return nil, err
-		}
-		id = created.ID
-	}
-	input["id"] = id
-	if _, err := s.sendPrompt(ctx, input); err != nil {
+	// The new session's working directory, model and title are chosen by the
+	// caller. They only apply when this handoff creates the session: handing off
+	// into an existing conversation must not silently move it to another
+	// directory or switch its model out from under the user. `model` is validated
+	// here and applied through the prompt below, which is where the official
+	// client reads it.
+	cwd, _, title, err := s.handoffNewSession(ctx, input)
+	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"sessionId": id}, nil
+	created := false
+	if id == "" {
+		session, createErr := s.createSession(ctx, map[string]any{"title": title, "cwd": cwd})
+		if createErr != nil {
+			return nil, createErr
+		}
+		id = session.ID
+		created = true
+	}
+	input["id"] = id
+	// A model in the prompt body is only meaningful for a session this call just
+	// created; an existing target keeps whatever model it already uses. It is
+	// applied on the first turn because that is where the official client reads
+	// it, and it is dropped for an existing session for the same reason.
+	if !created {
+		delete(input, "model")
+	}
+	if _, err = s.sendPrompt(ctx, input); err != nil {
+		return nil, err
+	}
+	return map[string]any{"sessionId": id, "created": created}, nil
+}
+
+// handoffNewSession validates what a handoff may choose for a new session. The
+// directory must be an existing directory, the model must be in the official
+// catalog, and the title is bounded; an existing target ignores all three, so a
+// bad value is only an error when it would actually be used.
+func (s *NativeService) handoffNewSession(ctx context.Context, input map[string]any) (cwd, model, title string, err error) {
+	if stringInput(input, "targetId") != "" {
+		return "", "", "", nil
+	}
+	title = stringInput(input, "title")
+	if len([]rune(title)) > 120 {
+		return "", "", "", errors.New("交接标题不超过 120 个字符")
+	}
+	cwd = stringInput(input, "cwd")
+	model = stringInput(input, "model")
+	if cwd == "" {
+		cwd = s.cwd
+	} else {
+		if !filepath.IsAbs(cwd) {
+			return "", "", "", errors.New("交接目录必须是绝对路径")
+		}
+		info, statErr := os.Stat(cwd)
+		if statErr != nil || !info.IsDir() {
+			return "", "", "", errors.New("交接目录不存在或不是目录")
+		}
+		cwd = filepath.Clean(cwd)
+	}
+	if model != "" {
+		catalog, catalogErr := s.kap.Models(ctx)
+		if catalogErr != nil {
+			return "", "", "", errors.New("无法核对模型列表，请稍后重试")
+		}
+		known := false
+		for _, item := range catalog {
+			if item["id"] == model {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return "", "", "", errors.New("交接模型不在可用模型列表中")
+		}
+	}
+	if title == "" {
+		title = "规划交接"
+	}
+	return cwd, model, title, nil
 }

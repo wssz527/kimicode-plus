@@ -92,14 +92,15 @@ func TestParseManifestRejectsUnknownAndTrailingContent(t *testing.T) {
 
 func TestManifestRejectsCapabilityEscapes(t *testing.T) {
 	cases := map[string]string{
-		"parent path": `{"id":"test.sample","name":"S","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"../evil.js"},"capabilities":[]}`,
-		"absolute":    `{"id":"test.sample","name":"S","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"/etc/passwd.js"},"capabilities":[]}`,
-		"unknown cap": `{"id":"test.sample","name":"S","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":["root:everything"]}`,
-		"duplicate":   `{"id":"test.sample","name":"S","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":["storage","storage"]}`,
-		"bad id":      `{"id":"NotAPublisher","name":"S","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":[]}`,
-		"bad version": `{"id":"test.sample","name":"S","version":"1.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":[]}`,
-		"bad api":     `{"id":"test.sample","name":"S","version":"1.0.0","apiVersion":2,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":[]}`,
-		"no renderer": `{"id":"test.sample","name":"S","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{},"capabilities":[]}`,
+		"parent path":  `{"id":"test.sample","name":"S","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"../evil.js"},"capabilities":[]}`,
+		"absolute":     `{"id":"test.sample","name":"S","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"/etc/passwd.js"},"capabilities":[]}`,
+		"unknown cap":  `{"id":"test.sample","name":"S","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":["root:everything"]}`,
+		"duplicate":    `{"id":"test.sample","name":"S","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":["storage","storage"]}`,
+		"bad id":       `{"id":"NotAPublisher","name":"S","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":[]}`,
+		"bad version":  `{"id":"test.sample","name":"S","version":"1.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":[]}`,
+		"bad api":      `{"id":"test.sample","name":"S","version":"1.0.0","apiVersion":3,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":[]}`,
+		"v2 cap in v1": `{"id":"test.sample","name":"S","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":["ui:right-panel"]}`,
+		"no renderer":  `{"id":"test.sample","name":"S","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{},"capabilities":[]}`,
 	}
 	for name, manifest := range cases {
 		t.Run(name, func(t *testing.T) {

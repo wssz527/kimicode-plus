@@ -58,6 +58,11 @@ async function installNativeRenderer(options) {
     settingsActive: false,
     settingsRelease: null,
     removed: false,
+    pluginEntries: new Map(),
+    pluginPanels: new Map(),
+    pluginMainAreas: new Map(),
+    activePluginPanel: null,
+    panelContract: null,
     plugins: null,
     pluginReleases: new Map(),
     pluginTokens: new Map(),
@@ -396,6 +401,14 @@ async function installNativeRenderer(options) {
   nativeStyle.textContent = `
     [data-ekd-containment=planner]>:not(.ekd-planner-host),[data-ekd-containment=sessions]>:not(.ekd-session-host),[data-ekd-containment=settings]>:not(.ekd-settings-mount){display:none!important}
     .ekd-planner-host,.ekd-session-host{display:flex;flex:1;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden}
+    .pt-body[data-ekdp-panel]>:not(.ekdp-panel-host){display:none!important}
+    .pt-body[data-ekdp-panel]>.ekdp-panel-host[hidden]{display:none!important}
+    .ekdp-panel-host{display:flex;flex:1;flex-direction:column;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden}
+    .ekdp-main-split{display:flex;flex:1 1 auto;min-width:0;min-height:0;width:100%;overflow:hidden}
+    .ekdp-main-native{display:flex;flex:1 1 auto;flex-direction:column;min-width:0;min-height:0}
+    .ekdp-main-pane{display:flex;flex:0 0 auto;flex-direction:column;min-width:0;min-height:0}
+    .ekdp-main-splitter{flex:0 0 5px;cursor:col-resize;background:var(--color-line,#8884);opacity:.55;touch-action:none}
+    .ekdp-main-splitter:hover,.ekdp-main-splitter:focus-visible,.ekdp-main-splitter.dragging{opacity:1;outline:none;background:var(--blue,#5b8def)}
     /* The official settings body is a fixed-height box that does not scroll. The
        mount therefore owns the scroll for the enhanced page only: it is clamped to
        the body's height and scrolls its own content. Without this the tail of the
@@ -477,6 +490,12 @@ async function installNativeRenderer(options) {
     const plan = [];
     if (state.features.planner) plan.push({ action: 'planner', label: '规划' });
     if (state.features.multiSession) plan.push({ action: 'split', label: '添加同屏会话' });
+    // Plugin entries follow the frozen built-ins. The action name carries the
+    // plugin and entry id, so the per-container duplicate guard stays exact and
+    // two plugins may publish the same visible label without colliding.
+    for (const [key, entry] of state.pluginEntries) {
+      plan.push({ action: 'plugin:' + key, label: entry.definition.label, plugin: entry.pluginId, definition: entry.definition });
+    }
     return plan;
   }
   function removeEntry(action) {
@@ -530,7 +549,7 @@ async function installNativeRenderer(options) {
       const anchorHost = sideChatIn(container);
       if (!anchorHost) continue;
       let anchor = anchorHost;
-      for (const { action, label } of addonEntries) {
+      for (const { action, label, plugin, definition } of addonEntries) {
         // Duplicate guard lives inside this container: exactly one entry with
         // this action may exist here, and a re-rendered anchor gets a new entry.
         const existing = [...container.querySelectorAll(`button.ekd-native-entry[data-ekd-entry="${action}"]`)];
@@ -539,6 +558,7 @@ async function installNativeRenderer(options) {
         if (!entry || entry.previousElementSibling !== anchor) {
           entry?.remove();
           entry = makeEntry(label, action, anchor, anchorHost);
+          if (plugin && definition) entry.addEventListener('click', () => runPluginEntry(plugin, definition));
         }
         anchor = entry;
         live.add(entry);
@@ -594,6 +614,11 @@ async function installNativeRenderer(options) {
     document.removeEventListener('visibilitychange', pluginRefresh);
     window.removeEventListener('focus', pluginRefresh);
     for (const release of [...state.pluginReleases.values()]) release();
+    for (const entry of [...state.pluginPanels.values()]) entry.dispose?.();
+    state.pluginPanels.clear();
+    for (const handle of [...state.pluginMainAreas.values()]) handle.dispose();
+    state.pluginMainAreas.clear();
+    state.pluginEntries.clear();
     state.pluginReleases.clear();
     for (const release of [...state.pluginSettings.values()]) release.dispose();
     state.pluginSettings.clear();
@@ -642,11 +667,11 @@ async function installNativeRenderer(options) {
     const host = makeHost(() => { void transport.request('window.close'); });
     if (options.surface === 'management') mount(element, 'management', host, { initialPath: options.initialPath });
     else mount(element, options.surface === 'settings' ? 'settings' : 'planner', host, { initialSource: options.initialSource || 'web' });
-    window.__ekdNativeUI = state;
+    window.__ekdNativeUI = publishNativeUI();
     return { status: 'installed', surface: options.surface || 'planner' };
   }
   document.addEventListener('click', nativeTabClick, true);
-  window.__ekdNativeUI = state;
+  publishNativeUI();
   await refreshFeatures();
   if (state.removed) return { status: 'removed', surface: 'host', domRevision: 1 };
   state.unsubscribeFeatures = makeHost(() => {}).subscribe('features', value => applyFeatures(value, false));
@@ -662,12 +687,6 @@ async function installNativeRenderer(options) {
   ensure();
   state.observer = new MutationObserver(ensure);
   state.observer.observe(document.body, { childList: true, subtree: true });
-  window.__ekdNativeUI.openPlanner = openPlanner;
-  window.__ekdNativeUI.mountSessions = mountSessions;
-  window.__ekdNativeUI.pickSession = pickSession;
-  window.__ekdNativeUI.openOfficial = openOfficial;
-  window.__ekdNativeUI.activateSession = activateSession;
-  window.__ekdNativeUI.openSettings = openSettings;
   // Plugin host wiring. The runtime implementation lives in the host bundle
   // (exported from host-entry); this file only supplies mount points and drives
   // the lifecycle.
@@ -705,6 +724,334 @@ async function installNativeRenderer(options) {
     thinking: () => document.querySelector('.chat-main') ?? null,
     message: () => document.querySelector('.chat-main') ?? null,
   };
+
+  // --- API v2 host surfaces -------------------------------------------------
+  //
+  // Every surface here belongs to exactly one plugin and is released by that
+  // plugin's Scope. Nothing is shared between plugins, so stopping one plugin
+  // cannot leave another plugin's pane or tab behind.
+
+  function localScope() {
+    let items = [];
+    let disposed = false;
+    return {
+      add(cleanup) {
+        if (cleanup === undefined || cleanup === null) return;
+        const run = typeof cleanup === "function" ? cleanup : () => cleanup.dispose();
+        if (disposed) {
+          try { run(); } catch { /* a failing teardown must not strand the rest */ }
+          return;
+        }
+        items.push(run);
+      },
+      dispose() {
+        if (disposed) return;
+        disposed = true;
+        for (const run of items.reverse()) {
+          try { run(); } catch { /* one failing teardown must not skip the rest */ }
+        }
+        items = [];
+      },
+    };
+  }
+
+  function pluginTabContainers() {
+    return [...document.querySelectorAll(".ptb-tabs")];
+  }
+
+  function tabAttributes(container) {
+    return [...(container?.attributes ?? [])].filter(attribute => attribute.name.startsWith("data-v-"));
+  }
+
+  const pluginEntryHost = {
+    register(pluginId, definition) {
+      if (!definition || typeof definition.id !== "string" || !definition.id || typeof definition.run !== "function") {
+        throw new Error("插件入口必须提供 id 和 run()");
+      }
+      if (typeof definition.label !== "string" || !definition.label.trim()) throw new Error("插件入口必须有标签");
+      const key = pluginId + ":" + definition.id;
+      state.pluginEntries.set(key, { pluginId, definition });
+      syncNativeEntries();
+      // Dropping the registry alone would leave the button in the container: the
+      // next sync only reconciles the entries still planned, so the removed one
+      // has to take its own element with it.
+      return { dispose: () => {
+        state.pluginEntries.delete(key);
+        removeEntry('plugin:' + key);
+        syncNativeEntries();
+      } };
+    },
+  };
+
+  function runPluginEntry(pluginId, definition) {
+    Promise.resolve()
+      .then(() => definition.run())
+      .catch(error => {
+        noteFault(pluginId, Object.assign(error instanceof Error ? error : new Error(String(error)), { code: "PLUGIN_ENTRY_FAILED" }));
+      });
+  }
+
+  // A main-area mount wraps the native chat column so the plugin's pane sits
+  // beside it and the split width shrinks the native column. Unwrapping puts the
+  // exact DOM the official shell produced back where it was.
+  function mountMainArea(pluginId, definition) {
+    const container = document.querySelector(".composer")?.closest(".chat-main") || document.querySelector(".chat")?.closest(".chat-main");
+    if (!container) throw new Error("主聊天区契约未就绪");
+    const row = document.createElement("div");
+    row.className = "ekdp-main-split";
+    row.dataset.ekdpPlugin = pluginId;
+    const native = document.createElement("div");
+    native.className = "ekdp-main-native";
+    const splitter = document.createElement("div");
+    splitter.className = "ekdp-main-splitter";
+    splitter.setAttribute("role", "separator");
+    splitter.setAttribute("aria-orientation", "vertical");
+    splitter.setAttribute("aria-label", "调整同屏宽度");
+    splitter.tabIndex = 0;
+    const pane = document.createElement("div");
+    pane.className = "ekdp-main-pane";
+    pane.dataset.ekdpPlugin = pluginId;
+    for (const child of [...container.childNodes]) native.append(child);
+    row.append(native, splitter, pane);
+    container.append(row);
+    container.dataset.ekdpSplit = pluginId;
+    const min = Math.max(280, Number(definition?.minWidth) || 360);
+    const max = Math.max(min, Number(definition?.maxWidth) || 900);
+    let width = Math.min(max, Math.max(min, Number(definition?.width) || 420));
+    const apply = () => {
+      container.style.display = "flex";
+      container.style.flexDirection = "column";
+      native.style.flex = "1 1 auto";
+      native.style.minWidth = "0";
+      native.style.minHeight = "0";
+      native.style.display = "flex";
+      native.style.flexDirection = "column";
+      pane.style.flex = "0 0 auto";
+      pane.style.width = width + "px";
+      pane.style.minWidth = "0";
+      pane.style.minHeight = "0";
+      pane.style.display = "flex";
+      pane.style.flexDirection = "column";
+    };
+    apply();
+    let dragging = null;
+    const onPointerMove = event => {
+      if (!dragging) return;
+      const next = dragging.startWidth - (event.clientX - dragging.startX);
+      width = Math.min(max, Math.max(min, next));
+      apply();
+    };
+    const stopDrag = () => {
+      dragging = null;
+      splitter.classList.remove("dragging");
+      window.removeEventListener("pointermove", onPointerMove, true);
+      window.removeEventListener("pointerup", stopDrag, true);
+    };
+    splitter.addEventListener("pointerdown", event => {
+      event.preventDefault();
+      dragging = { startX: event.clientX, startWidth: width };
+      splitter.classList.add("dragging");
+      window.addEventListener("pointermove", onPointerMove, true);
+      window.addEventListener("pointerup", stopDrag, true);
+    });
+    splitter.addEventListener("keydown", event => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      width = Math.min(max, Math.max(min, width + (event.key === "ArrowLeft" ? 24 : -24)));
+      apply();
+    });
+    const mountScope = localScope();
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      stopDrag();
+      mountScope.dispose();
+      for (const child of [...native.childNodes]) container.append(child);
+      row.remove();
+      container.style.removeProperty("display");
+      container.style.removeProperty("flex-direction");
+      delete container.dataset.ekdpSplit;
+    };
+    try {
+      mountScope.add(definition.render(pane));
+    } catch (error) {
+      release();
+      throw error;
+    }
+    return {
+      setWidth(px) {
+        width = Math.min(max, Math.max(min, Number(px) || width));
+        apply();
+      },
+      width: () => width,
+      dispose: release,
+    };
+  }
+
+  const pluginMainAreaHost = {
+    mount(pluginId, definition) {
+      // A plugin has one main area; asking twice replaces it instead of stacking
+      // two panes the user cannot tell apart.
+      state.pluginMainAreas.get(pluginId)?.dispose();
+      const handle = mountMainArea(pluginId, definition);
+      state.pluginMainAreas.set(pluginId, handle);
+      const release = handle.dispose.bind(handle);
+      handle.dispose = () => {
+        release();
+        if (state.pluginMainAreas.get(pluginId) === handle) state.pluginMainAreas.delete(pluginId);
+      };
+      return handle;
+    },
+  };
+
+  function panelBody() {
+    return document.querySelector(".pt-body");
+  }
+
+  function panelContract() {
+    if (state.panelContract) return state.panelContract;
+    state.panelContract = panel();
+    return state.panelContract;
+  }
+
+  function activatePluginPanel(pluginId) {
+    const entry = state.pluginPanels.get(pluginId);
+    const body = panelBody();
+    const contract = panelContract();
+    if (!entry || !body) return;
+    state.activePluginPanel = pluginId;
+    contract?.showPanel?.();
+    if (contract?.previewWidth) {
+      contract.previewWidth.value = Math.min(contract.previewMax?.value ?? 900, Math.max(contract.previewWidth.value, 605));
+    }
+    body.dataset.ekdpPanel = pluginId;
+    for (const [id, other] of state.pluginPanels) {
+      const active = id === pluginId;
+      other.host.hidden = !active;
+      other.tab.setAttribute("aria-selected", String(active));
+      other.tab.parentElement?.classList.toggle("on", active);
+    }
+  }
+
+  function deactivatePluginPanel(pluginId) {
+    const entry = state.pluginPanels.get(pluginId);
+    if (!entry) return;
+    entry.tab.setAttribute("aria-selected", "false");
+    entry.tab.parentElement?.classList.remove("on");
+    entry.host.hidden = true;
+    if (state.activePluginPanel === pluginId) {
+      state.activePluginPanel = null;
+      const body = panelBody();
+      if (body) delete body.dataset.ekdpPanel;
+      state.panelContract?.hidePanel?.();
+    }
+  }
+
+  const pluginRightPanelHost = {
+    mount(pluginId, definition) {
+      const tabs = document.querySelector(".ptb-tabs");
+      const body = panelBody();
+      if (!tabs || !body) throw new Error("右侧面板契约未就绪");
+      const wrapper = document.createElement("div");
+      wrapper.className = "ptb-tab";
+      wrapper.dataset.ekdpPluginPanel = pluginId;
+      const tab = document.createElement("button");
+      tab.type = "button";
+      tab.className = "ptb-tab-main";
+      tab.textContent = definition?.title || "插件面板";
+      tab.setAttribute("aria-selected", "false");
+      const close = document.createElement("button");
+      close.type = "button";
+      close.className = "ptb-tab-close";
+      close.setAttribute("aria-label", "关闭面板");
+      close.textContent = "×";
+      const attributes = tabAttributes(tabs);
+      for (const element of [wrapper, tab, close]) for (const attribute of attributes) element.setAttribute(attribute.name, attribute.value);
+      wrapper.append(tab, close);
+      tabs.append(wrapper);
+      const host = document.createElement("div");
+      host.className = "ekdp-panel-host";
+      host.dataset.ekdpPlugin = pluginId;
+      host.hidden = true;
+      body.append(host);
+      const mountScope = localScope();
+      try {
+        mountScope.add(definition.render(host));
+      } catch (error) {
+        wrapper.remove();
+        host.remove();
+        throw error;
+      }
+      const entry = { tab, close, host };
+      state.pluginPanels.set(pluginId, entry);
+      tab.addEventListener("click", () => activatePluginPanel(pluginId));
+      close.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        deactivatePluginPanel(pluginId);
+      });
+      let released = false;
+      const dispose = () => {
+        if (released) return;
+        released = true;
+        deactivatePluginPanel(pluginId);
+        if (state.pluginPanels.get(pluginId) === entry) state.pluginPanels.delete(pluginId);
+        mountScope.dispose();
+        wrapper.remove();
+        host.remove();
+      };
+      entry.dispose = dispose;
+      return {
+        open: () => activatePluginPanel(pluginId),
+        close: () => deactivatePluginPanel(pluginId),
+        get open_() { return state.activePluginPanel === pluginId; },
+        dispose,
+      };
+    },
+  };
+
+  const pluginLayoutHost = { acquireSidebarCollapse: () => ({ dispose: acquireSidebarCollapse() }) };
+
+  // The published native surface is a fixed, read-only set of host entry points.
+  // `state` itself stays private: it carries the bridge transport and the plugin
+  // runtime, and a page script that reached either of them could act with the
+  // host's own core token or drive another plugin's scope.
+  function publishNativeUI() {
+    const ui = {
+      remove: () => state.remove(),
+      openPlanner: source => openPlanner(source),
+      mountSessions: extraIds => mountSessions(extraIds),
+      pickSession: exclude => pickSession(exclude),
+      openOfficial: id => openOfficial(id),
+      activateSession: id => activateSession(id),
+      openSettings: () => openSettings(),
+      get plugins() {
+        const runtime = state.plugins;
+        if (!runtime) return null;
+        return { stats: () => runtime.stats(), eventLoops: () => runtime.eventLoops() };
+      },
+      get sidebarRefs() { return state.sidebarRefs; },
+      get sidebarCollapsed() { return state.sidebarCollapsed; },
+    };
+    window.__ekdNativeUI = ui;
+    return ui;
+  }
+  // A plugin's own token is the only identity the browser bridge carries; the
+  // host process asks the core whose it is. A closed plugin has already lost its
+  // token, so close sends the token the runtime still holds in scope.
+  function pluginToken(id) {
+    return state.pluginTokens.get(id) || '';
+  }
+  const pluginBrowserHost = {
+    open: (pluginId, viewId, url) => transport.request("browser.view.open", { token: pluginToken(pluginId), viewId, url }),
+    navigate: (pluginId, viewId, url) => transport.request("browser.view.navigate", { token: pluginToken(pluginId), viewId, url }),
+    bounds: (pluginId, viewId, bounds) => transport.request("browser.view.bounds", { token: pluginToken(pluginId), viewId, ...bounds }),
+    extract: (pluginId, viewId) => transport.request("browser.view.extract", { token: pluginToken(pluginId), viewId }),
+    adapter: (pluginId, viewId, adapter) => transport.request("browser.view.adapter", { token: pluginToken(pluginId), viewId, adapter }),
+    close: (pluginId, viewId) => transport.request("browser.view.close", { token: pluginToken(pluginId), viewId }),
+  };
+
   // `core.fetch` carries the request body as base64 (`bodyBase64`) and ignores a
   // string `body`; this mirrors `createCoreTransport` in native.ts, which is the
   // one place that encoding is defined.
@@ -854,6 +1201,12 @@ async function installNativeRenderer(options) {
         slots: pluginSlots,
         request: pluginRequest,
         onError: (id, error) => noteFault(id, error),
+        entryHost: pluginEntryHost,
+        mainAreaHost: pluginMainAreaHost,
+        rightPanelHost: pluginRightPanelHost,
+        layoutHost: pluginLayoutHost,
+        browserHost: pluginBrowserHost,
+        pickFiles: async () => (await transport.request('host.pickFiles', {})) || [],
       });
     }
     // A plugin the runtime reports as stopped must leave the page: dropping the
@@ -880,6 +1233,7 @@ async function installNativeRenderer(options) {
         await state.plugins.activate(entry, {
           id: plugin.id,
           version: plugin.version,
+          apiVersion: plugin.apiVersion,
           granted: plugin.capabilities || [],
           token,
         });
