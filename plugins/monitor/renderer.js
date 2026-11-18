@@ -9985,6 +9985,7 @@ function readValue(key) {
   return memory.has(key) ? memory.get(key) : void 0;
 }
 async function bindStorage(ctx) {
+  installHost();
   bridge = ctx;
   memory.clear();
   let keys = [];
@@ -10091,16 +10092,19 @@ var localStorageShim = {
     }
   }
 };
-globalThis.chrome = chromeShim;
 var nativeLocalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
-try {
-  Object.defineProperty(globalThis, "localStorage", {
-    value: localStorageShim,
-    configurable: true,
-    writable: true
-  });
-} catch (error) {
+function installHost() {
+  globalThis.chrome = chromeShim;
+  try {
+    Object.defineProperty(globalThis, "localStorage", {
+      value: localStorageShim,
+      configurable: true,
+      writable: true
+    });
+  } catch (error) {
+  }
 }
+installHost();
 function syncStorageKey(key, value) {
   if (value === void 0) memory.delete(String(key));
   else memory.set(String(key), value);
@@ -13293,10 +13297,11 @@ function handleQuota(msg) {
     updateBalance(msg.extraUsage);
     return;
   }
-  if ("wallet" in quota) {
+  if ("wallet" in quota || "wallet" in msg && msg.wallet !== void 0) {
+    const wallet = "wallet" in quota ? quota.wallet : msg.wallet;
     const snapshotAt = Date.parse(msg.walletFetchedAt || "") || 0;
     if (!liveBalanceAt || snapshotAt > liveBalanceAt) {
-      updateBalance(quota.wallet, msg.walletFetchedAt);
+      updateBalance(wallet, msg.walletFetchedAt);
     }
   }
 }
@@ -13723,16 +13728,16 @@ function quotaFromBalances(state2) {
     else if (key.includes("month")) quota.limitMonth = entry;
   }
   const wallet = code?.wallet;
-  const message = { quota };
+  let walletFetchedAt = "";
   if (wallet && num(wallet.balanceCents) != null) {
-    message.wallet = {
+    quota.wallet = {
       balanceCents: num(wallet.balanceCents),
       totalCents: num(wallet.totalCents),
       currency: wallet.currency || "CNY"
     };
-    message.walletFetchedAt = code?.observedAt || "";
+    walletFetchedAt = code?.observedAt || "";
   }
-  return message;
+  return { quota, walletFetchedAt };
 }
 function statusFromSummary(summary) {
   const state2 = summary?.quota?.state;
@@ -13833,8 +13838,8 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
     }
     if (balances) {
       const quota = quotaFromBalances(balances);
-      if (Object.keys(quota.quota).length || quota.wallet) {
-        send({ v: 1, type: "quota", quota: quota.quota, wallet: quota.wallet || void 0, walletFetchedAt: quota.walletFetchedAt });
+      if (Object.keys(quota.quota).length) {
+        send({ v: 1, type: "quota", quota: quota.quota, walletFetchedAt: quota.walletFetchedAt || void 0 });
       }
       const external = externalFromBalances(balances);
       if (external.providers.length || external.unsupported.length) {
@@ -13898,8 +13903,8 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
       void request("quota.balances", { refresh: true }).then((balances) => {
         if (disposed || !balances) return;
         const quota = quotaFromBalances(balances);
-        if (Object.keys(quota.quota).length || quota.wallet) {
-          send({ v: 1, type: "quota", quota: quota.quota, wallet: quota.wallet || void 0, walletFetchedAt: quota.walletFetchedAt });
+        if (Object.keys(quota.quota).length) {
+          send({ v: 1, type: "quota", quota: quota.quota, walletFetchedAt: quota.walletFetchedAt || void 0 });
         }
         const external = externalFromBalances(balances);
         if (external.providers.length || external.unsupported.length) {
@@ -15883,10 +15888,12 @@ html[data-color-scheme="dark"] .ksb-pet-status.ksb-cache-warn {
     // 桌面上由宿主给出焦点会话：返回空串时退回 'panel'，数据源据此跳过逐轮读取，
     // 面板保留历史数字而不是清零。
     () => ctx.activeSessionId?.() || getSessionId(),
-    // 余额只在余额相关模块可见时轮询，模块收起即停止
+    // 余额只在当前视图可见的余额相关模块激活时轮询，模块收起或处于 Mini 未展示时即停止
     () => {
       const modules = panel.widgetConfig.modules;
-      return modules.external?.show !== "hidden" || modules.header?.show !== "hidden" && modules.header?.stat === "balance" || modules.pet?.show !== "hidden" && modules.pet?.stat === "balance";
+      const isMini = Boolean(panel.els?.widget?.classList.contains("ksb-mini"));
+      const isVisible = (m) => Boolean(m && m.show !== "hidden" && (!isMini || m.show === "mini"));
+      return isVisible(modules.external) || isVisible(modules.header) && modules.header?.stat === "balance" || isVisible(modules.pet) && modules.pet?.stat === "balance";
     }
   );
   track(datasource);

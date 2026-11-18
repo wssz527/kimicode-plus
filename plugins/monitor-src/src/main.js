@@ -242,12 +242,14 @@ export async function activate(ctx) {
     // 桌面上由宿主给出焦点会话：返回空串时退回 'panel'，数据源据此跳过逐轮读取，
     // 面板保留历史数字而不是清零。
     () => ctx.activeSessionId?.() || getSessionId(),
-    // 余额只在余额相关模块可见时轮询，模块收起即停止
+    // 余额只在当前视图可见的余额相关模块激活时轮询，模块收起或处于 Mini 未展示时即停止
     () => {
       const modules = panel.widgetConfig.modules;
-      return modules.external?.show !== "hidden"
-        || (modules.header?.show !== "hidden" && modules.header?.stat === "balance")
-        || (modules.pet?.show !== "hidden" && modules.pet?.stat === "balance");
+      const isMini = Boolean(panel.els?.widget?.classList.contains("ksb-mini"));
+      const isVisible = (m) => Boolean(m && m.show !== "hidden" && (!isMini || m.show === "mini"));
+      return isVisible(modules.external)
+        || (isVisible(modules.header) && modules.header?.stat === "balance")
+        || (isVisible(modules.pet) && modules.pet?.stat === "balance");
     }
   );
   track(datasource);

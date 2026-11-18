@@ -150,7 +150,7 @@ func (q *quotaService) engine() (*quota.Manager, error) {
 		codeClient = &http.Client{Timeout: 15 * time.Second}
 	}
 	code := quota.NewCodeUsage(quota.CodeUsageOptions{
-		HomeDir:    home,
+		KimiHome:   home,
 		HTTPClient: codeClient,
 	})
 	magpieClient := q.httpClient

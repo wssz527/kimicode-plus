@@ -43,6 +43,7 @@ function readValue(key) {
 
 /** 预取本插件的全部键，并把落盘通道接到 ctx。装配在任何读取之前 await 它。 */
 export async function bindStorage(ctx) {
+  installHost();
   bridge = ctx;
   memory.clear();
   let keys = [];
@@ -161,18 +162,23 @@ const localStorageShim = {
   }
 };
 
-// 模块求值即安装：上游模块顶层调用 chrome.runtime.getURL
-globalThis.chrome = chromeShim;
 const nativeLocalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
-try {
-  Object.defineProperty(globalThis, "localStorage", {
-    value: localStorageShim,
-    configurable: true,
-    writable: true
-  });
-} catch (error) {
-  // 无法覆盖时上游自己的 try/catch 兜底，面板仍可用，只是偏好不持久
+
+function installHost() {
+  globalThis.chrome = chromeShim;
+  try {
+    Object.defineProperty(globalThis, "localStorage", {
+      value: localStorageShim,
+      configurable: true,
+      writable: true
+    });
+  } catch (error) {
+    // 无法覆盖时上游自己的 try/catch 兜底，面板仍可用，只是偏好不持久
+  }
 }
+
+// 模块求值即安装：上游模块顶层调用 chrome.runtime.getURL
+installHost();
 
 /** 同步来自同窗口其他视图（如设置页）写入的 storage 键值。 */
 export function syncStorageKey(key, value) {

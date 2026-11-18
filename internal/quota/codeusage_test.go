@@ -229,3 +229,51 @@ func TestKimiCodeStateMakesNoRequest(t *testing.T) {
 		}
 	}
 }
+
+func TestKimiHomeReadsCredentialsDirectlyWithoutDoubleDotKimiCode(t *testing.T) {
+	const token = "{{SECRET_7kqz9mna}}"
+	kimiHome := t.TempDir()
+	credDir := filepath.Join(kimiHome, "credentials")
+	if err := os.MkdirAll(credDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]any{"access_token": token, "expires_at": 1794973223})
+	if err := os.WriteFile(filepath.Join(credDir, "kimi-code.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := &recorder{reply: func(call) (int, string) { return 200, codeUsageReply }}
+	reader := quota.NewCodeUsage(quota.CodeUsageOptions{
+		KimiHome:   kimiHome,
+		HTTPClient: recorder.client(),
+		Now:        func() int64 { return 1794196800000 },
+	})
+	state := reader.Refresh(context.Background())
+	if state.Status != "ok" {
+		t.Fatalf("expected ok from KimiHome, got %+v", state)
+	}
+	if len(recorder.calls) != 1 || recorder.calls[0].Headers.Get("Authorization") != "Bearer "+token {
+		t.Fatalf("expected Bearer token from KimiHome, calls=%+v", recorder.calls)
+	}
+}
+
+func TestEmptyHomeNeverFallsBackToUserHomeDir(t *testing.T) {
+	realHome := t.TempDir()
+	writeSignIn(t, realHome, "real-host-token-must-not-be-read")
+	t.Setenv("HOME", realHome)
+
+	recorder := &recorder{reply: func(call) (int, string) { return 200, codeUsageReply }}
+	reader := quota.NewCodeUsage(quota.CodeUsageOptions{HTTPClient: recorder.client()})
+	state := reader.Refresh(context.Background())
+	if len(recorder.calls) != 0 {
+		t.Fatalf("empty home must not fall back to os.UserHomeDir, got calls=%+v", recorder.calls)
+	}
+	if state.Status != "not_configured" {
+		t.Fatalf("expected not_configured, got %+v", state)
+	}
+	for _, source := range state.Sources {
+		if source.ID == quota.CodeSourceLocal && source.Availability != quota.CodeMissing {
+			t.Fatalf("expected local source missing, got %+v", source)
+		}
+	}
+}

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -151,5 +153,94 @@ func TestQuotaBalancesReadsExternalWithoutLeakingKeys(t *testing.T) {
 	}
 	if len(fallback.Cards) != 2 || *fallback.Cards[0].Records[0].Remaining != 20.5 {
 		t.Fatalf("fallback cards = %#v", fallback.Cards)
+	}
+}
+
+func TestQuotaBalancesReadsKimiHomeCredentialsAndWalletWithoutLeak(t *testing.T) {
+	const kimiToken = "{{SECRET_9x3kpvwd}}"
+
+	// Populate a decoy credential under HOME/.kimi-code to confirm empty-home isolation too.
+	decoyHome := t.TempDir()
+	decoyCredDir := filepath.Join(decoyHome, ".kimi-code", "credentials")
+	if err := os.MkdirAll(decoyCredDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(decoyCredDir, "kimi-code.json"), []byte(`{"access_token":"decoy-host-token"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", decoyHome)
+
+	kapHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeNativeTestEnvelope(w, map[string]any{"items": []any{}})
+	})
+
+	kimiHome := t.TempDir()
+	credDir := filepath.Join(kimiHome, "credentials")
+	if err := os.MkdirAll(credDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	credBody, _ := json.Marshal(map[string]any{"access_token": kimiToken, "expires_at": 1795000000})
+	if err := os.WriteFile(filepath.Join(credDir, "kimi-code.json"), credBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	service, _ := newAutomationTestServiceWithHome(t, kapHandler, kimiHome)
+	service.quota.httpClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.String() == quota.CodeUsageEndpoint {
+				if auth := req.Header.Get("Authorization"); auth != "Bearer "+kimiToken {
+					t.Fatalf("codeusage auth = %q", auth)
+				}
+				return jsonResponse(http.StatusOK, `{
+					"usages": {
+						"limit_5h": {"used_ratio": 0.44, "reset_time": "2026-11-18T14:00:00Z"},
+						"limit_7d": {"used_ratio": 0.56, "reset_time": "2026-11-23T05:00:00Z"}
+					},
+					"boosterWallet": {
+						"balance": {"type": "BOOSTER", "amount": 2500000000, "amountLeft": 1975000000}
+					}
+				}`), nil
+			}
+			return jsonResponse(http.StatusNotFound, `{}`), nil
+		}),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	raw, err := service.Action(ctx, "quota.balances", json.RawMessage(`{"refresh":true}`))
+	if err != nil {
+		t.Fatalf("quota.balances refresh: %v", err)
+	}
+	state := raw.(quota.State)
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), kimiToken) {
+		t.Fatalf("quota.balances leaked kimi token: %s", encoded)
+	}
+	kimiCode, ok := state.KimiCode.(quota.CodeUsageState)
+	if !ok || kimiCode.Status != "ok" {
+		t.Fatalf("kimiCode = %#v", state.KimiCode)
+	}
+	if len(kimiCode.Windows) != 2 {
+		t.Fatalf("kimiCode windows = %#v", kimiCode.Windows)
+	}
+	if kimiCode.Wallet == nil || kimiCode.Wallet.BalanceCents == nil || *kimiCode.Wallet.BalanceCents != 1975 {
+		t.Fatalf("kimiCode wallet = %#v", kimiCode.Wallet)
+	}
+
+	// Empty kap home must never fall back to HOME/.kimi-code.
+	isolatedSvc, _ := newAutomationTestServiceWithHome(t, kapHandler, "")
+	isolatedSvc.quota.httpClient = service.quota.httpClient
+	isolatedRaw, err := isolatedSvc.Action(ctx, "quota.balances", json.RawMessage(`{"refresh":true}`))
+	if err != nil {
+		t.Fatalf("empty home quota.balances: %v", err)
+	}
+	isolatedState := isolatedRaw.(quota.State)
+	isolatedKimi, ok := isolatedState.KimiCode.(quota.CodeUsageState)
+	if !ok || isolatedKimi.Status != "not_configured" {
+		t.Fatalf("empty home kimiCode = %#v, want not_configured", isolatedState.KimiCode)
 	}
 }

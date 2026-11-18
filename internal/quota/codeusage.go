@@ -100,7 +100,12 @@ type CodeUsageState struct {
 // account shown to a person is a hash of the key that actually answered, so the
 // card can never claim an account the reading did not come from.
 type CodeUsageOptions struct {
-	// HomeDir is the user's home; the local Kimi Code sign-in is read from it.
+	// KimiHome is the Kimi Code home directory itself (for example ~/.kimi-code
+	// or an isolated KIMI_CODE_HOME); the local sign-in is read directly from
+	// <KimiHome>/credentials/kimi-code.json.
+	KimiHome string
+	// HomeDir is the user's home; kept for callers/tests that pass a parent home
+	// directory containing .kimi-code/credentials/kimi-code.json.
 	HomeDir string
 	// ManualKey, when set, is offered as a second source. The host does not set
 	// it today; the reader supports it so the panel never has to invent a second
@@ -130,6 +135,7 @@ type codeReading struct {
 type CodeUsage struct {
 	mu        sync.Mutex
 	refreshMu sync.Mutex
+	kimiHome  string
 	homeDir   string
 	manualKey func() string
 	client    *http.Client
@@ -149,6 +155,7 @@ type CodeUsage struct {
 // NewCodeUsage builds the reader.
 func NewCodeUsage(options CodeUsageOptions) *CodeUsage {
 	reader := &CodeUsage{
+		kimiHome:     options.KimiHome,
 		homeDir:      options.HomeDir,
 		manualKey:    options.ManualKey,
 		client:       options.HTTPClient,
@@ -187,14 +194,16 @@ func readSecret(key string) (string, bool) {
 // localCredential reads this machine's Kimi Code sign-in. The token is used for
 // one request and is never returned, logged or stored by this package.
 func (c *CodeUsage) localCredential() (string, bool) {
-	home := c.homeDir
-	if home == "" {
-		home, _ = os.UserHomeDir()
-	}
-	if home == "" {
+	var credPath string
+	switch {
+	case strings.TrimSpace(c.kimiHome) != "":
+		credPath = filepath.Join(strings.TrimSpace(c.kimiHome), "credentials", "kimi-code.json")
+	case strings.TrimSpace(c.homeDir) != "":
+		credPath = filepath.Join(strings.TrimSpace(c.homeDir), filepath.FromSlash(localCredentialRel))
+	default:
 		return "", false
 	}
-	raw, err := os.ReadFile(filepath.Join(home, filepath.FromSlash(localCredentialRel)))
+	raw, err := os.ReadFile(credPath)
 	if err != nil {
 		return "", false
 	}

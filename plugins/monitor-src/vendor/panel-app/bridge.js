@@ -372,10 +372,11 @@ function handleQuota(msg) {
     updateBalance(msg.extraUsage);
     return;
   }
-  if ('wallet' in quota) {
+  if ('wallet' in quota || ('wallet' in msg && msg.wallet !== undefined)) {
+    const wallet = 'wallet' in quota ? quota.wallet : msg.wallet;
     const snapshotAt = Date.parse(msg.walletFetchedAt || '') || 0;
     if (!liveBalanceAt || snapshotAt > liveBalanceAt) {
-      updateBalance(quota.wallet, msg.walletFetchedAt);
+      updateBalance(wallet, msg.walletFetchedAt);
     }
   }
 }

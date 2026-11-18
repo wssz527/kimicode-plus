@@ -356,3 +356,410 @@ test("datasource skips cache.sessions seeding and schedules cooldown follow-up a
     globalThis.clearTimeout = origClearTimeout;
   }
 });
+
+test("quota.balances flows through datasource -> bridge -> render.js into DOM (5h/week, wallet balance, external rows & mini polling)", async () => {
+  type MiniNode = {
+    tag: string;
+    attrs: Record<string, string>;
+    children: MiniNode[];
+    parent: MiniNode | null;
+    style: Record<string, string>;
+    dataset: Record<string, string>;
+    hidden: boolean;
+    id: string;
+    className: string;
+    classList: {
+      add(...cls: string[]): void;
+      remove(...cls: string[]): void;
+      toggle(cls: string, force?: boolean): boolean;
+      contains(cls: string): boolean;
+    };
+    innerHTML: string;
+    textContent: string;
+    append(...nodes: any[]): void;
+    appendChild(node: any): any;
+    replaceChildren(...nodes: any[]): void;
+    prepend(...nodes: any[]): void;
+    insertBefore(node: any, ref?: any): any;
+    remove(): void;
+    addEventListener(): void;
+    removeEventListener(): void;
+    setAttribute(k: string, v: string): void;
+    getAttribute(k: string): string | null;
+    removeAttribute(k: string): void;
+    querySelector(sel: string): MiniNode | null;
+    querySelectorAll(sel: string): MiniNode[];
+    closest(sel: string): MiniNode | null;
+    getClientRects(): any[];
+    getBoundingClientRect(): any;
+    offsetHeight: number;
+    offsetWidth: number;
+    isConnected: boolean;
+    firstElementChild: MiniNode | null;
+    nextElementSibling: MiniNode | null;
+    parentElement: MiniNode | null;
+    childNodes: MiniNode[];
+    attachShadow(): MiniNode;
+  };
+
+  const makeNode = (tag = "div", attrs: Record<string, string> = {}): MiniNode => {
+    let htmlText = "";
+    let rawText = "";
+    const node: MiniNode = {
+      tag: tag.toLowerCase(),
+      attrs: { ...attrs },
+      children: [],
+      parent: null,
+      style: {},
+      dataset: {},
+      hidden: false,
+      get id() { return node.attrs.id || ""; },
+      set id(v: string) { node.attrs.id = v; },
+      get className() { return node.attrs.class || ""; },
+      set className(v: string) { node.attrs.class = String(v); },
+      classList: {
+        add(...cls: string[]) {
+          const set = new Set((node.attrs.class || "").split(/\s+/).filter(Boolean));
+          for (const c of cls) if (c) set.add(c);
+          node.attrs.class = [...set].join(" ");
+        },
+        remove(...cls: string[]) {
+          const rm = new Set(cls);
+          node.attrs.class = (node.attrs.class || "").split(/\s+/).filter((c) => c && !rm.has(c)).join(" ");
+        },
+        toggle(cls: string, force?: boolean) {
+          const has = node.classList.contains(cls);
+          const next = force === undefined ? !has : Boolean(force);
+          if (next) node.classList.add(cls);
+          else node.classList.remove(cls);
+          return next;
+        },
+        contains(cls: string) {
+          return (node.attrs.class || "").split(/\s+/).includes(cls);
+        },
+      },
+      get innerHTML() { return htmlText; },
+      set innerHTML(markup: string) {
+        htmlText = String(markup ?? "");
+        node.children = parseHtmlFragment(htmlText, node);
+      },
+      get textContent() {
+        if (node.children.length === 0) return rawText;
+        return rawText + node.children.map((c) => c.textContent).join("");
+      },
+      set textContent(v: string) {
+        rawText = String(v ?? "");
+        node.children = [];
+        htmlText = rawText;
+      },
+      append(...nodes: any[]) {
+        for (const child of nodes) {
+          if (child && typeof child === "object" && "tag" in child) {
+            child.parent = node;
+            node.children.push(child);
+          }
+        }
+      },
+      appendChild(child: any) { node.append(child); return child; },
+      replaceChildren(...nodes: any[]) { node.children = []; node.append(...nodes); },
+      prepend(...nodes: any[]) {
+        for (const child of [...nodes].reverse()) {
+          if (child && typeof child === "object" && "tag" in child) {
+            child.parent = node;
+            node.children.unshift(child);
+          }
+        }
+      },
+      insertBefore(child: any) { node.append(child); return child; },
+      remove() {
+        if (!node.parent) return;
+        const idx = node.parent.children.indexOf(node);
+        if (idx >= 0) node.parent.children.splice(idx, 1);
+        node.parent = null;
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      setAttribute(k: string, v: string) {
+        node.attrs[k] = String(v);
+        if (k.startsWith("data-")) node.dataset[k.slice(5)] = String(v);
+      },
+      getAttribute(k: string) { return k in node.attrs ? node.attrs[k] : null; },
+      removeAttribute(k: string) { delete node.attrs[k]; },
+      querySelector(sel: string) { return node.querySelectorAll(sel)[0] ?? null; },
+      querySelectorAll(sel: string) {
+        const parts = sel.split(",").map((s) => s.trim()).filter(Boolean);
+        const matchesSingle = (el: MiniNode, single: string) => {
+          const idMatch = single.match(/#([A-Za-z0-9_-]+)/);
+          if (idMatch && el.id !== idMatch[1]) return false;
+          for (const cls of single.matchAll(/\.([A-Za-z0-9_-]+)/g)) {
+            if (!el.classList.contains(cls[1])) return false;
+          }
+          for (const attr of single.matchAll(/\[([^\]=]+)(?:="([^"]*)")?\]/g)) {
+            if (!(attr[1] in el.attrs)) return false;
+            if (attr[2] !== undefined && el.attrs[attr[1]] !== attr[2]) return false;
+          }
+          return true;
+        };
+        const out: MiniNode[] = [];
+        const walk = (cur: MiniNode) => {
+          for (const child of cur.children) {
+            if (parts.some((p) => matchesSingle(child, p))) out.push(child);
+            walk(child);
+          }
+        };
+        walk(node);
+        return out;
+      },
+      closest(sel: string) {
+        let cur: MiniNode | null = node;
+        while (cur) {
+          if (sel.startsWith(".") && cur.classList.contains(sel.slice(1))) return cur;
+          if (sel.startsWith("#") && cur.id === sel.slice(1)) return cur;
+          cur = cur.parent;
+        }
+        return null;
+      },
+      getClientRects: () => [],
+      getBoundingClientRect: () => ({ top: 0, left: 0, width: 0, height: 0, bottom: 0, right: 0 }),
+      offsetHeight: 0,
+      offsetWidth: 0,
+      isConnected: true,
+      get firstElementChild() { return node.children[0] ?? null; },
+      get nextElementSibling() { return null; },
+      get parentElement() { return node.parent; },
+      get childNodes() { return node.children; },
+      attachShadow: () => makeNode("shadow"),
+    };
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k.startsWith("data-")) node.dataset[k.slice(5)] = v;
+    }
+    return node;
+  };
+
+  const parseHtmlFragment = (markup: string, parent: MiniNode): MiniNode[] => {
+    const roots: MiniNode[] = [];
+    const stack: MiniNode[] = [parent];
+    const tokenRe = /<(\/?)([a-zA-Z0-9-]+)([^>]*)>|([^<]+)/g;
+    for (const m of markup.matchAll(tokenRe)) {
+      if (m[4] !== undefined) {
+        const text = m[4].trim();
+        if (text && stack.length > 1) stack[stack.length - 1].textContent += m[4];
+        continue;
+      }
+      const closing = m[1] === "/";
+      const tag = m[2].toLowerCase();
+      const attrRaw = m[3] || "";
+      if (closing) {
+        while (stack.length > 1) {
+          const top = stack.pop()!;
+          if (top.tag === tag) break;
+        }
+        continue;
+      }
+      const attrs: Record<string, string> = {};
+      for (const am of attrRaw.matchAll(/([a-zA-Z0-9_:-]+)(?:="([^"]*)")?/g)) {
+        if (am[1] === "/") continue;
+        attrs[am[1]] = am[2] ?? "";
+      }
+      const el = makeNode(tag, attrs);
+      const cur = stack[stack.length - 1];
+      el.parent = cur;
+      if (cur === parent) roots.push(el);
+      else cur.children.push(el);
+      if (!attrRaw.trim().endsWith("/") && tag !== "path" && tag !== "br" && tag !== "img") {
+        stack.push(el);
+      }
+    }
+    return roots;
+  };
+
+  const origGetById = runtime.document.getElementById;
+  const origQuerySelector = runtime.document.querySelector;
+  const origQuerySelectorAll = runtime.document.querySelectorAll;
+  const origCreateElement = runtime.document.createElement;
+  const origRive = runtime.rive;
+  const origHTMLCanvasElement = runtime.HTMLCanvasElement;
+  const origSetInterval = runtime.setInterval;
+  const origClearInterval = runtime.clearInterval;
+  const intervals = new Set<number>();
+  let nextInterval = 1;
+
+  const docRoot = makeNode("div");
+  runtime.document.createElement = (tag: string) => makeNode(tag);
+  runtime.document.getElementById = (id: string) => docRoot.querySelector(`#${id}`);
+  runtime.document.querySelector = (sel: string) => docRoot.querySelector(sel);
+  runtime.document.querySelectorAll = (sel: string) => docRoot.querySelectorAll(sel);
+  runtime.setInterval = () => nextInterval++;
+  runtime.clearInterval = (id: number) => { intervals.delete(id); };
+  runtime.HTMLCanvasElement = class {};
+  runtime.rive = {
+    RuntimeLoader: { setWasmUrl() {}, setWasmFallbackUrl() {} },
+    Fit: { Contain: "contain" },
+    Alignment: { Center: "center" },
+    Rive: class {
+      cleanup() {}
+      stop() {}
+      play() {}
+      startRendering() {}
+      stopRendering() {}
+    },
+  };
+
+  const reset5h = new Date(Date.now() + 2 * 3600_000 + 30 * 60_000).toISOString();
+  const resetWeek = new Date(Date.now() + 3 * 24 * 3600_000 + 5 * 3600_000).toISOString();
+  const observedAt = "2026-11-18T08:00:00Z";
+  const quotaPayload = {
+    schemaVersion: 1,
+    cards: [
+      {
+        providerId: "ds-1",
+        providerName: "DeepSeek",
+        accountTag: "a1b2",
+        status: "ok",
+        observedAt,
+        consoleUrl: "https://platform.deepseek.com/top_up",
+        records: [{ kind: "api_balance", unit: "CNY", remaining: 20.5 }],
+      },
+      {
+        providerId: "bm-1",
+        providerName: "智谱 BigModel",
+        accountTag: "c3d4",
+        status: "ok",
+        observedAt,
+        consoleUrl: "https://bigmodel.cn/usercenter/apikeys",
+        records: [{ kind: "coding_plan", windowLabel: "5h", used: 35, limit: 100 }],
+      },
+    ],
+    kimiCode: {
+      status: "ok",
+      observedAt,
+      windows: [
+        { key: "limit_5h", usedRatio: 0.44, resetAt: reset5h },
+        { key: "limit_7d", usedRatio: 0.25, resetAt: resetWeek },
+      ],
+      wallet: { balanceCents: 1975, totalCents: 2500, currency: "CNY" },
+    },
+  };
+
+  try {
+    const mod = await import(`${moduleUrl}#e2e-quota`);
+
+    // 1) Full mode: pet.stat=balance + external=full -> renders 5h/week, ¥19.75, DeepSeek & BigModel rows with data-url
+    const mountFull = makeNode("div");
+    docRoot.replaceChildren(mountFull);
+    const fullStore = new Map<string, unknown>([
+      ["kimi-statusbar.config", {
+        ...defaults(),
+        modules: {
+          ...defaults().modules,
+          pet: { ...defaults().modules.pet, stat: "balance" },
+          external: { ...defaults().modules.external, show: "full" },
+        },
+      }],
+    ]);
+    const fullDisposers: Array<() => void> = [];
+    const fullActions: string[] = [];
+    try {
+      await mod.activate({
+        log() {},
+        storage: {
+          list: async () => [...fullStore.keys()],
+          get: async (k: string) => fullStore.get(k),
+          set: async (k: string, v: unknown) => { fullStore.set(k, v); },
+          delete: async (k: string) => { fullStore.delete(k); },
+        },
+        core: {
+          request: async (action: string) => {
+            fullActions.push(action);
+            if (action === "quota.balances") return quotaPayload;
+            return null;
+          },
+        },
+        events: { on: () => ({ dispose() {} }) },
+        ui: {
+          mount(_slot: string, fn: (el: any) => () => void) {
+            const unmount = fn(mountFull);
+            return { dispose: unmount };
+          },
+        },
+        onDispose(fn: () => void) { fullDisposers.push(fn); },
+        activeSessionId: () => "",
+      });
+      await new Promise((r) => setTimeout(r, 30));
+
+      assert.ok(fullActions.includes("quota.balances"), "full mode polls quota.balances");
+      assert.equal(docRoot.querySelector("#ksb-5h-pct")?.textContent, "44%");
+      assert.equal(docRoot.querySelector("#ksb-week-pct")?.textContent, "25%");
+      assert.match(docRoot.querySelector("#ksb-5h-reset")?.textContent || "", /\d+h/);
+      assert.match(docRoot.querySelector("#ksb-week-reset")?.textContent || "", /\d+d/);
+      assert.equal(docRoot.querySelector("#ksb-pet-total-text")?.textContent, "¥19.75");
+
+      const extHtml = docRoot.querySelector("#ksb-external-list")?.innerHTML || "";
+      assert.match(extHtml, /DeepSeek/);
+      assert.match(extHtml, /¥20\.50/);
+      assert.match(extHtml, /data-url="https:\/\/platform\.deepseek\.com\/top_up"/);
+      assert.match(extHtml, /智谱 BigModel/);
+      assert.match(extHtml, /35\.0%/);
+      assert.match(extHtml, /data-url="https:\/\/bigmodel\.cn\/usercenter\/apikeys"/);
+    } finally {
+      for (const fn of fullDisposers.reverse()) fn();
+    }
+
+    // 2) Mini mode with external.show="full" and pet/header stat="daily": must NOT poll quota.balances
+    const mountMini = makeNode("div");
+    docRoot.replaceChildren(mountMini);
+    const miniStore = new Map<string, unknown>([
+      ["kimi-statusbar.mini", "1"],
+      ["kimi-statusbar.config", {
+        ...defaults(),
+        modules: {
+          ...defaults().modules,
+          header: { ...defaults().modules.header, stat: "daily" },
+          pet: { ...defaults().modules.pet, stat: "daily" },
+          external: { ...defaults().modules.external, show: "full" },
+        },
+      }],
+    ]);
+    const miniDisposers: Array<() => void> = [];
+    const miniActions: string[] = [];
+    try {
+      await mod.activate({
+        log() {},
+        storage: {
+          list: async () => [...miniStore.keys()],
+          get: async (k: string) => miniStore.get(k),
+          set: async (k: string, v: unknown) => { miniStore.set(k, v); },
+          delete: async (k: string) => { miniStore.delete(k); },
+        },
+        core: {
+          request: async (action: string) => {
+            miniActions.push(action);
+            return null;
+          },
+        },
+        events: { on: () => ({ dispose() {} }) },
+        ui: {
+          mount(_slot: string, fn: (el: any) => () => void) {
+            const unmount = fn(mountMini);
+            return { dispose: unmount };
+          },
+        },
+        onDispose(fn: () => void) { miniDisposers.push(fn); },
+        activeSessionId: () => "",
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      assert.ok(!miniActions.includes("quota.balances"), "mini mode with external hidden from mini must not poll quota.balances");
+    } finally {
+      for (const fn of miniDisposers.reverse()) fn();
+    }
+  } finally {
+    runtime.document.getElementById = origGetById;
+    runtime.document.querySelector = origQuerySelector;
+    runtime.document.querySelectorAll = origQuerySelectorAll;
+    runtime.document.createElement = origCreateElement;
+    runtime.rive = origRive;
+    runtime.HTMLCanvasElement = origHTMLCanvasElement;
+    runtime.setInterval = origSetInterval;
+    runtime.clearInterval = origClearInterval;
+  }
+});

@@ -189,16 +189,16 @@ function quotaFromBalances(state) {
     else if (key.includes("month")) quota.limitMonth = entry;
   }
   const wallet = code?.wallet;
-  const message = { quota };
+  let walletFetchedAt = "";
   if (wallet && num(wallet.balanceCents) != null) {
-    message.wallet = {
+    quota.wallet = {
       balanceCents: num(wallet.balanceCents),
       totalCents: num(wallet.totalCents),
       currency: wallet.currency || "CNY"
     };
-    message.walletFetchedAt = code?.observedAt || "";
+    walletFetchedAt = code?.observedAt || "";
   }
-  return message;
+  return { quota, walletFetchedAt };
 }
 
 /** 官方额度状态 -> 面板顶部状态灯。UNKNOWN 保持 idle 而不是报警：
@@ -320,8 +320,8 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
     }
     if (balances) {
       const quota = quotaFromBalances(balances);
-      if (Object.keys(quota.quota).length || quota.wallet) {
-        send({ v: 1, type: "quota", quota: quota.quota, wallet: quota.wallet || undefined, walletFetchedAt: quota.walletFetchedAt });
+      if (Object.keys(quota.quota).length) {
+        send({ v: 1, type: "quota", quota: quota.quota, walletFetchedAt: quota.walletFetchedAt || undefined });
       }
       const external = externalFromBalances(balances);
       if (external.providers.length || external.unsupported.length) {
@@ -392,8 +392,8 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
       void request("quota.balances", { refresh: true }).then((balances) => {
         if (disposed || !balances) return;
         const quota = quotaFromBalances(balances);
-        if (Object.keys(quota.quota).length || quota.wallet) {
-          send({ v: 1, type: "quota", quota: quota.quota, wallet: quota.wallet || undefined, walletFetchedAt: quota.walletFetchedAt });
+        if (Object.keys(quota.quota).length) {
+          send({ v: 1, type: "quota", quota: quota.quota, walletFetchedAt: quota.walletFetchedAt || undefined });
         }
         const external = externalFromBalances(balances);
         if (external.providers.length || external.unsupported.length) {
