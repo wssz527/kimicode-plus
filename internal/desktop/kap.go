@@ -370,7 +370,24 @@ func (k *KAPClient) Sessions(ctx context.Context) ([]NativeSession, error) {
 	return items, nil
 }
 
-func (k *KAPClient) Models(ctx context.Context) ([]map[string]string, error) {
+// NativeModel is one entry of the official model catalog. It carries the fields
+// the pickers display (provider, capabilities, reasoning efforts), so a caller
+// never has to re-read /config to describe a model the user is choosing.
+type NativeModel struct {
+	ID              string   `json:"id"`
+	Provider        string   `json:"provider"`
+	Model           string   `json:"model"`
+	Name            string   `json:"name"`
+	MaxContextSize  int64    `json:"max_context_size,omitempty"`
+	Capabilities    []string `json:"capabilities,omitempty"`
+	SupportEfforts  []string `json:"support_efforts,omitempty"`
+	AdaptiveThinking bool    `json:"adaptive_thinking,omitempty"`
+}
+
+// Models reads the official catalog. The config map is keyed by the
+// provider-qualified name, and a model entry may either repeat that prefix in
+// its own `model` field or carry the bare id; both forms collapse to one key.
+func (k *KAPClient) Models(ctx context.Context) ([]NativeModel, error) {
 	raw, err := k.Request(ctx, http.MethodGet, "/config", nil)
 	if err != nil {
 		return nil, err
@@ -380,21 +397,99 @@ func (k *KAPClient) Models(ctx context.Context) ([]map[string]string, error) {
 		return nil, err
 	}
 	models, _ := config["models"].(map[string]any)
-	items := []map[string]string{}
+	items := []NativeModel{}
 	for id, raw := range models {
-		name := id
-		if value, ok := raw.(map[string]any); ok {
-			for _, key := range []string{"display_name", "displayName", "name"} {
-				if candidate, ok := value[key].(string); ok && candidate != "" {
-					name = candidate
-					break
+		provider, model := splitModelKey(id)
+		if provider == "" {
+			// An older config can key a model by its bare id. The entry itself may
+			// still name the provider.
+			provider, model = "", id
+		}
+		item := NativeModel{ID: id, Provider: provider, Model: model, Name: id}
+		value, ok := raw.(map[string]any)
+		if !ok {
+			items = append(items, item)
+			continue
+		}
+		if entryProvider, entryModel := modelStrings(value); entryProvider != "" || entryModel != "" {
+			if entryProvider != "" {
+				item.Provider = entryProvider
+			}
+			if entryModel != "" {
+				item.Model = modelPart(entryModel)
+				// The catalog key is authoritative: a stale entry must not make one
+				// model appear under two names.
+				if provider != "" && item.ID == provider+"/"+entryModel {
+					item.ID = provider + "/" + item.Model
 				}
 			}
 		}
-		items = append(items, map[string]string{"id": id, "name": name})
+		for _, key := range []string{"display_name", "displayName", "name"} {
+			if candidate, ok := value[key].(string); ok && candidate != "" {
+				item.Name = candidate
+				break
+			}
+		}
+		item.MaxContextSize = intField(value, "max_context_size", "maxContextSize")
+		item.Capabilities = stringList(value["capabilities"])
+		item.SupportEfforts = stringList(value["support_efforts"], value["supportEfforts"])
+		item.AdaptiveThinking = value["adaptive_thinking"] == true || value["adaptiveThinking"] == true
+		items = append(items, item)
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i]["name"] < items[j]["name"] })
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Name != items[j].Name {
+			return items[i].Name < items[j].Name
+		}
+		return items[i].ID < items[j].ID
+	})
 	return items, nil
+}
+
+// modelPart drops a provider prefix the entry repeated in its own model field.
+func modelPart(value string) string {
+	if index := strings.Index(value, "/"); index > 0 && index < len(value)-1 {
+		return value[index+1:]
+	}
+	return value
+}
+
+func modelStrings(entry map[string]any) (string, string) {
+	provider, _ := entry["provider"].(string)
+	model, _ := entry["model"].(string)
+	return strings.TrimSpace(provider), strings.TrimSpace(model)
+}
+
+func intField(entry map[string]any, keys ...string) int64 {
+	for _, key := range keys {
+		switch value := entry[key].(type) {
+		case float64:
+			return int64(value)
+		case int64:
+			return value
+		case int:
+			return int64(value)
+		}
+	}
+	return 0
+}
+
+func stringList(values ...any) []string {
+	out := []string{}
+	for _, raw := range values {
+		items, ok := raw.([]any)
+		if !ok {
+			continue
+		}
+		for _, item := range items {
+			if value, ok := item.(string); ok {
+				out = append(out, value)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return out
 }
 
 func (k *KAPClient) websocketURL() (string, string, error) {

@@ -41,6 +41,7 @@ async function installNativeRenderer(options) {
     sessionRelease: null,
     sessionSidebarRelease: null,
     picker: null,
+    providerEnhance: null,
     settingsDialog: null,
     settingsList: null,
     settingsBody: null,
@@ -204,18 +205,29 @@ async function installNativeRenderer(options) {
     const host = makeHost(() => deactivateSettings());
     state.settingsHandle = mount(element, 'settings', host);
   }
-  async function openSettings() {
+  async function openSettings(tab) {
     if (!document.querySelector('.settings-dialog')) {
       const button = document.querySelector('button.side-footer-settings');
       if (!button) throw new Error('官方设置入口未就绪');
       button.click();
     }
+    const findOfficialTab = label => [...(state.settingsList?.querySelectorAll('button.tab[role="tab"]') || [])]
+      .find(item => item !== state.settingsButton && item.textContent.includes(label));
     const deadline = Date.now() + 10000;
-    while (!state.settingsBody || !state.settingsButton) {
+    while (!state.settingsBody || !state.settingsButton || (tab === 'providers' && !findOfficialTab('模型供应商'))) {
       syncSettingsTab();
-      if (state.settingsBody && state.settingsButton) break;
+      if (state.settingsBody && state.settingsButton && (tab !== 'providers' || findOfficialTab('模型供应商'))) break;
       if (Date.now() >= deadline) throw new Error('官方设置对话框契约未就绪');
       await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    if (tab === 'providers') {
+      if (state.settingsActive) deactivateSettings();
+      const providerTab = findOfficialTab('模型供应商');
+      if (!providerTab) throw new Error('官方模型供应商标签未找到');
+      providerTab.click();
+      providerTab.classList.add('on');
+      providerTab.setAttribute('aria-selected', 'true');
+      return;
     }
     await activateSettings();
   }
@@ -557,6 +569,8 @@ async function installNativeRenderer(options) {
     state.pluginSidebarNav.clear();
     lastOverlayPayload = '';
     if (!options.popout) void transport.request('host.syncOverlayEntries', { entries: [] }).catch(() => {});
+    state.providerEnhance?.remove();
+    state.providerEnhance = null;
     nativeStyle.remove();
     URL.revokeObjectURL(moduleURL);
     delete window.__ekdNativeUI;
@@ -570,7 +584,11 @@ async function installNativeRenderer(options) {
   };
   const settingsTabClick = event => {
     const tab = event.target.closest('.settings-tab-list button.tab[role="tab"]');
-    if (tab && tab !== state.settingsButton && state.settingsActive) deactivateSettings();
+    if (tab && tab !== state.settingsButton && state.settingsActive) {
+      deactivateSettings();
+      tab.classList.add('on');
+      tab.setAttribute('aria-selected', 'true');
+    }
   };
   const settingsScroll = event => {
     if (!state.settingsActive || event.target !== state.settingsBody) return;
@@ -589,16 +607,15 @@ async function installNativeRenderer(options) {
     state.popoutRoot.style.cssText = 'height:100vh;min-height:0;overflow:hidden';
     document.body.replaceChildren(state.popoutRoot);
     window.__ekdNativeUI = publishNativeUI();
-  } else if (options.surface === 'settings' || options.surface === 'management') {
+  } else if (options.surface === 'settings') {
     document.documentElement.dataset.colorScheme = options.theme || 'dark';
-    const title = options.surface === 'settings' ? 'KimiCode+ 设置' : 'KimiCode+ 管理';
-    document.title = title;
+    document.title = 'KimiCode+ 设置';
     document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:var(--color-bg,#121212);color:var(--color-text,#eee)';
     const element = document.createElement('div');
     element.style.cssText = 'height:100vh;min-height:0';
     document.body.replaceChildren(element);
     const host = makeHost(() => { void transport.request('window.close'); });
-    mount(element, options.surface, host, { initialPath: options.initialPath });
+    mount(element, options.surface, host, {});
     window.__ekdNativeUI = publishNativeUI();
     return { status: 'installed', surface: options.surface };
   }
@@ -1054,7 +1071,7 @@ async function installNativeRenderer(options) {
       pickSession: exclude => pickSession(exclude),
       openOfficial: id => openOfficial(id),
       activateSession: id => activateSession(id),
-      openSettings: () => openSettings(),
+      openSettings: tab => openSettings(tab),
       invokeEntry: action => invokeEntryPlan(action),
       get plugins() {
         const runtime = state.plugins;
@@ -1343,6 +1360,12 @@ async function installNativeRenderer(options) {
 
   state.syncPlugins = syncPlugins;
   state.mountPluginSettings = mountPluginSettings;
+  // The provider page enhancement lives in its own file; this is the only hook
+  // renderer.js keeps into it, so a parallel change to the entry injection never
+  // has to touch it. It belongs to the official window only: the settings
+  // surface has no provider page.
+  state.providerEnhance = options.surface === 'host' ? createProviderEnhance({ request: transport.request }) : null;
+  state.providerEnhance?.install();
   void syncPlugins();
   // Plugin state changes come from outside this renderer (the settings page is a
   // separate window), so the host re-reads the list whenever the surface becomes

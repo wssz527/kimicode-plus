@@ -74,147 +74,6 @@ export interface Settings {
   modules: Record<string, boolean>;
 }
 
-export interface Provider {
-  id: string;
-  name: string;
-  protocol: string;
-  baseUrl: string;
-  secretRef?: string | null;
-  preset?: boolean;
-  createdAt?: string;
-}
-
-export interface ProviderPreset {
-  id: string;
-  name: string;
-  protocol?: string;
-  baseUrl?: string;
-  note?: string;
-  official?: boolean;
-}
-
-export interface ProviderFieldChange {
-  field: string;
-  before: unknown;
-  after: unknown;
-}
-
-export interface ProviderSnapshot {
-  providerId: string;
-  before: Provider | null;
-  after: Provider;
-  fields: ProviderFieldChange[];
-}
-
-export interface ProviderUpdateResult {
-  revision: number;
-  changeId: number;
-  provider: Provider;
-  snapshot: ProviderSnapshot;
-}
-
-export type CapabilitySource = "manual" | "official" | "registry" | "modelsdev" | "UNKNOWN";
-
-export interface CapabilityField {
-  value: number | boolean | null;
-  source: CapabilitySource;
-  fetchedAt: string | null;
-  updatedAt?: string | null;
-  sourceUrl?: string | null;
-}
-
-export type CapabilityMap = Record<string, CapabilityField>;
-
-export interface ModelRecord {
-  providerId: string;
-  id: string;
-  name: string;
-  displayName?: string;
-  capabilities: CapabilityMap;
-  autoName?: string;
-  manualName?: string | null;
-  autoCapabilities?: CapabilityMap;
-}
-
-export interface FieldChange {
-  field: string;
-  before: CapabilityField;
-  after: CapabilityField;
-}
-
-export interface PreviewChange {
-  providerId: string;
-  id: string;
-  name: string;
-  state: string;
-  fields: FieldChange[];
-  before?: ModelRecord;
-  after: ModelRecord;
-}
-
-export interface ChangeSummary {
-  created: number;
-  updated: number;
-  unchanged: number;
-}
-
-export interface ModelPreview {
-  revision: number;
-  changes: PreviewChange[];
-  summary: ChangeSummary;
-}
-
-export interface ModelImportResult {
-  revision: number;
-  changeId: number;
-  imported: number;
-  created?: number;
-  updated?: number;
-  unchanged?: number;
-}
-
-export interface ModelOverrideResult {
-  revision: number;
-  changeId: number;
-  model: ModelRecord;
-  field: string;
-  before: CapabilityField;
-  after: CapabilityField;
-}
-
-export interface ModelChangeSnapshot {
-  id: number;
-  kind: string;
-  baseRevision: number;
-  revision: number;
-  createdAt: string;
-  summary: string;
-  rolledBack: boolean;
-  rollbackRevision?: number;
-}
-
-export interface RegistrySnapshot { revision: number; provider?: Provider; model?: ModelRecord }
-export interface RollbackPreview { revision: number; detail: { models: unknown[]; providers: unknown[] }; conflicts: string[] }
-
-export interface RollbackResult {
-  revision: number;
-  rollbackChangeId: number;
-  restored: number;
-  deleted: number;
-  restoredProviders: number;
-  deletedProviders: number;
-}
-
-export interface ModelsDevResult {
-  preview: boolean;
-  revision: number;
-  changes?: PreviewChange[];
-  summary: ChangeSummary;
-  import?: ModelImportResult;
-}
-
-export interface PublicCatalogStatus {source:string;state:string;retrievedAt:string;checkedAt:string;etag:string;lastModified:string;sha256:string;bytes:number;providers:{id:string;name:string;models:number}[];lastError:string}
-
 export interface UsagePrice {
   input: number | null;
   output: number | null;
@@ -504,7 +363,6 @@ let sessionExpiresAt: string | null = null;
 let sessionPermissions: string[] = [];
 let authStatus: AuthSnapshot["status"] = "unpaired";
 let authMessage: string | null = null;
-let registryRevision: number | null = null;
 const authListeners = new Set<() => void>();
 
 let authSnapshot: AuthSnapshot = { status: "unpaired", permissions: [], expiresAt: null, message: null };
@@ -532,20 +390,12 @@ export function hasPermission(permission: string): boolean {
   return sessionPermissions.includes(permission);
 }
 
-export function noteRegistryRevision(value: unknown): void {
-  if (typeof value === "number" && Number.isFinite(value) && value >= 0) registryRevision = value;
-}
-
-export function knownRegistryRevision(): number | null {
-  return registryRevision;
-}
 
 export function clearSession(message: string | null = null): void {
   coreTransport = null;
   sessionToken = null;
   sessionPermissions = [];
   sessionExpiresAt = null;
-  registryRevision = null;
   authStatus = "unpaired";
   authMessage = message;
   publishAuth();
@@ -652,7 +502,6 @@ export function connectHostTransport(transport: CoreTransport | null, permission
   coreTransport = transport;
   sessionExpiresAt = null;
   authMessage = null;
-  registryRevision = null;
   sessionPermissions = permissions;
   authStatus = transport ? "paired" : "unpaired";
   publishAuth();
@@ -671,7 +520,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   signal?.addEventListener("abort", abortFromCaller, { once: true });
   try {
     const headers: Record<string, string> = { Accept: "application/json", ...extraHeaders };
-    if (body !== undefined) headers["Content-Type"] = "application/json";
+    if (body !== undefined || (method !== "GET" && !binaryBody)) headers["Content-Type"] = "application/json";
     if(binaryBody) headers["Content-Type"]="application/octet-stream";
     if (!anonymous && sessionToken) headers.Authorization = `Bearer ${sessionToken}`;
     let response: Response;
@@ -740,98 +589,6 @@ export const api = {
   settings: {
     get: () => request<Settings>("/settings"),
     put: (settings: Settings) => request<Settings>("/settings", { method: "PUT", body: settings }),
-  },
-  registry: { snapshot: (providerId?: string, id?: string) => request<RegistrySnapshot>("/registry/snapshot", { query: { providerId, id } }) },
-  providers: {
-    list: async (offset = 0, limit = DEFAULT_LIMIT) =>
-      asList<Provider>(await request<unknown>("/providers", { query: pageQuery(offset, limit) })),
-    create: (body: { id: string; name: string; protocol: string; baseUrl: string; secretRef?: string }) =>
-      request<Provider>("/providers", { method: "POST", body }),
-    update: async (
-      id: string,
-      body: { name: string; protocol: string; baseUrl: string; secretRef?: string | null },
-      revision: number,
-    ) => {
-      const result = await request<ProviderUpdateResult>(`/providers/${encodeURIComponent(id)}`, {
-        method: "PUT",
-        body: { ...body, revision },
-      });
-      noteRegistryRevision(result.revision);
-      return result;
-    },
-    presets: async () => asList<ProviderPreset>(await request<unknown>("/provider-presets")),
-  },
-  models: {
-    catalog:()=>request<PublicCatalogStatus>("/models/catalog"),
-    refreshCatalog:()=>request<PublicCatalogStatus>("/models/catalog/refresh",{method:"POST",body:{}}),
-    catalogImport:(payload:{sourceProvider:string;targetProvider:string;preview:boolean;revision:number;catalogHash?:string})=>request<(ModelPreview & {catalogHash:string}) | ModelImportResult>("/models/catalog/import",{method:"POST",body:payload}),
-    list: async (offset = 0, limit = DEFAULT_LIMIT) =>
-      asList<ModelRecord>(await request<unknown>("/models", { query: pageQuery(offset, limit) })),
-    discovery: async (providerId: string) => {
-      const result = await request<unknown>("/models/discovery", { method: "POST", body: { providerId } });
-      if (Array.isArray(result)) return result as ModelRecord[];
-      if (result && typeof result === "object") {
-        const record = result as { records?: unknown; items?: unknown };
-        if (Array.isArray(record.records)) return record.records as ModelRecord[];
-        if (Array.isArray(record.items)) return record.items as ModelRecord[];
-      }
-      return [];
-    },
-    preview: async (records: ModelRecord[]) => {
-      const result = await request<ModelPreview>("/models/preview", {
-        method: "POST",
-        body: { records },
-      });
-      noteRegistryRevision(result.revision);
-      return result;
-    },
-    // revision 必须来自本次预览；缓存值可能已被同页其他写入推进。
-    import: async (records: ModelRecord[], revision: number) => {
-      const result = await request<ModelImportResult>("/models/import", {
-        method: "POST",
-        body: { records, revision },
-      });
-      noteRegistryRevision(result.revision);
-      return result;
-    },
-    override: async (payload: {
-      providerId: string;
-      id: string;
-      field: string;
-      value: number | boolean | null;
-      revision: number;
-    }) => {
-      const revision = payload.revision;
-      const result = await request<ModelOverrideResult>("/models/override", {
-        method: "POST",
-        body: { ...payload, revision },
-      });
-      noteRegistryRevision(result.revision);
-      return result;
-    },
-    revision: () => freshRevision(),
-    changes: async (offset = 0, limit = DEFAULT_LIMIT) =>
-      asList<ModelChangeSnapshot>(await request<unknown>("/model-changes", { query: pageQuery(offset, limit) })),
-    rollbackPreview: (changeId: number) => request<RollbackPreview>(`/model-changes/${changeId}/preview`),
-    metadata: (payload: {providerId: string; id: string; field: string; value?: string; restoreAutomatic?: boolean; revision: number}) => request<ModelOverrideResult>("/models/metadata",{method:"POST",body:payload}),
-    rollback: async (changeId: number, revision: number) => {
-      const rev = revision;
-      const result = await request<RollbackResult>(`/model-changes/${changeId}/rollback`, {
-        method: "POST",
-        body: { revision: rev },
-      });
-      noteRegistryRevision(result.revision);
-      return result;
-    },
-    // 预览和导入都绑定调用方传入的 revision，避免使用被后续写入覆盖的缓存值。
-    modelsdev: async (catalog: unknown, options: { preview: boolean; revision: number }) => {
-      const result = await request<ModelsDevResult>("/models/modelsdev", {
-        method: "POST",
-        body: { catalog, revision: options.revision, preview: options.preview },
-      });
-      noteRegistryRevision(result.revision);
-      return result;
-    },
   },
   gateways: async () => asList<Gateway>(await request<unknown>("/gateways")),
   usage: {
@@ -941,8 +698,3 @@ function randomKey(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
-async function freshRevision(): Promise<number> {
-  const snapshot = await api.registry.snapshot();
-  noteRegistryRevision(snapshot.revision);
-  return snapshot.revision;
-}

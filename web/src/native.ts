@@ -352,18 +352,6 @@ export interface NativeHooks {
   activeSession: () => string;
   close: () => void;
   pickSession?: (exclude: string[]) => Promise<string>;
-  openManagement?: (path: ManagementPath) => Promise<void>;
-}
-
-/**
- * The management window is a separate BrowserWindow, so its routes are a fixed
- * set. Plugins are not here: they are managed inside the settings dialog, which
- * ships the same PluginSettings component. The bridge rejects anything else.
- */
-export const managementPaths = ["/models", "/credentials"] as const;
-export type ManagementPath = typeof managementPaths[number];
-export function isManagementPath(value: string): value is ManagementPath {
-  return (managementPaths as readonly string[]).includes(value);
 }
 export interface NativeTransport {
   request: <T = unknown>(action: string, payload?: Record<string, unknown>) => Promise<T>;
@@ -379,8 +367,7 @@ export interface NativeHost {
   browserBounds: (bounds: { visible: boolean; x?: number; y?: number; width?: number; height?: number }) => Promise<void>;
   extractBrowser: (mode?: "plan" | "exec") => Promise<string>;
   ensureWidth: (width: number) => Promise<void>;
-  openSettings: () => Promise<void>;
-  openManagement: (path: ManagementPath) => Promise<void>;
+  openSettings: (tab?: string) => Promise<void>;
   pickSession: (exclude: string[]) => Promise<string>;
   close: () => void;
 }
@@ -527,11 +514,7 @@ export function createNativeHost(transport: NativeTransport, hooks: NativeHooks,
     browserBounds: async bounds => { await transport.request("host.browserBounds", bounds); },
     extractBrowser: async (mode = "plan") => transport.request<string>("host.extractBrowser", { mode }),
     ensureWidth: async width => { await transport.request("window.ensureWidth", { width }); },
-    openSettings: async () => { await transport.request("window.openSettings"); },
-    openManagement: async path => {
-      if (!isManagementPath(path)) throw new Error("管理窗口只打开模型与凭据页");
-      await transport.request("window.openManagement", { path });
-    },
+    openSettings: async (tab?: string) => { await transport.request("window.openSettings", tab ? { tab } : {}); },
     pickSession: hooks.pickSession ?? (async exclude => transport.request<string>("host.pickSession", { exclude })),
     close: () => {
       if (disposed) return;
@@ -570,6 +553,7 @@ export function createCoreTransport(host: NativeHost) {
     new Headers(init.headers).forEach((value, key) => { headers[key] = value; });
     const result = await host.request<CoreFetchResult>("core.fetch", { path, method: init.method ?? "GET", headers, bodyBase64: body });
     const bytes = result.bodyBase64 ? Uint8Array.from(atob(result.bodyBase64), char => char.charCodeAt(0)) : new Uint8Array();
-    return new Response(bytes, { status: result.status, headers: result.headers });
+    const nullBody = result.status === 204 || result.status === 205 || result.status === 304;
+    return new Response(nullBody || bytes.length === 0 ? null : bytes, { status: result.status, headers: result.headers });
   };
 }

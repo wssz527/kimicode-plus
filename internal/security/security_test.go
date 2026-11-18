@@ -62,6 +62,15 @@ func TestProtectedLoopbackAndResourceScopes(t *testing.T) {
 	if w.Header().Get("Referrer-Policy") != "no-referrer" {
 		t.Fatal("referrer protection missing")
 	}
+	// Bodyless DELETE carries no JSON payload, so it must not require Content-Type.
+	delReq := httptest.NewRequest(http.MethodDelete, "http://"+g.host+"/enhance/v1/credentials/translator", nil)
+	delReq.Host = g.host
+	delReq.Header.Set("Authorization", "Bearer "+g.pairing)
+	delW := httptest.NewRecorder()
+	h.ServeHTTP(delW, delReq)
+	if delW.Code != 204 {
+		t.Fatalf("bodyless DELETE got %d: %s", delW.Code, delW.Body.String())
+	}
 }
 func TestNativeActionPermissionsFollowIntent(t *testing.T) {
 	for action, expected := range map[string]string{

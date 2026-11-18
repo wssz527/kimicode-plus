@@ -18,6 +18,18 @@ var bootstrapSource string
 //go:embed assets/renderer.js
 var rendererSource string
 
+// providerEnhanceSource is concatenated in front of rendererSource, so the
+// enhancement ships as one injected script without extra host plumbing. Keeping
+// it in its own file is what lets a parallel change to the entry injection edit
+// renderer.js without touching the provider page work.
+//
+//go:embed assets/provider_enhance.js
+var providerEnhanceSource string
+
+// rendererBundle wraps both scripts in a single function expression because
+// bootstrap.js evaluates `'(' + options.rendererSource + ')(config)'`.
+var rendererBundle = "function(options) {\n" + providerEnhanceSource + "\n" + rendererSource + "\nreturn installNativeRenderer(options);\n}"
+
 type AttachOptions struct {
 	// Profile narrows discovery to one isolated instance launched with this
 	// --user-data-dir. An empty profile accepts the single running instance, which
@@ -170,7 +182,7 @@ func AttachNative(ctx context.Context, options AttachOptions) (*AttachResult, er
 	config := map[string]any{
 		"coreURL": options.CoreURL, "pairingToken": options.PairingToken,
 		"expectedApp": contract.AppVersion, "expectedElectron": contract.Electron,
-		"moduleSource": string(moduleSource), "cssSource": string(cssSource), "rendererSource": rendererSource,
+		"moduleSource": string(moduleSource), "cssSource": string(cssSource), "rendererSource": rendererBundle,
 	}
 	encoded, err := json.Marshal(config)
 	if err != nil {

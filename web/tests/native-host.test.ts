@@ -56,6 +56,17 @@ test("core transport preserves unicode JSON and returns a real Response", async 
   assert.equal("authorization" in seen!.payload.headers, false);
 });
 
+test("core transport constructs valid Response for HTTP 204 empty bodies", async () => {
+  const host = createNativeHost({
+    request: async <T = unknown>(): Promise<T> =>
+      ({ status: 204, headers: [["Content-Type", "application/json"]], bodyBase64: "" }) as T,
+  }, { activeSession: () => "", close: () => {} });
+  const transport = createCoreTransport(host);
+  const response = await transport("/enhance/v1/credentials/translator", { method: "DELETE" });
+  assert.equal(response.status, 204);
+  assert.equal(await response.text(), "");
+});
+
 test("planner state refill accepts current revision and rejects stale running snapshots", () => {
   const base = { id: "p", title: "规划", model: "m", options: { context: false, skills: false, tools: false, readOnly: true }, messages: [], status: "idle" as const, revision: 3 };
   assert.equal(preferPlannerThread(null, base), true);

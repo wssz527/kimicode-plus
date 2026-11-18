@@ -5,7 +5,6 @@ import { PairingScreen } from "./PairingScreen";
 import { Spinner } from "./components/ui";
 import { navigate, usePathname } from "./routes";
 import { OverviewPage } from "./pages/OverviewPage";
-import { ModelsPage } from "./pages/ModelsPage";
 import { UsagePage } from "./pages/UsagePage";
 import { ChatPage } from "./pages/ChatPage";
 import { HandoffPage } from "./pages/HandoffPage";
@@ -19,7 +18,6 @@ import "./styles/theme.css";
 import { HomePage } from "./pages/HomePage";
 import { WorkspacePage } from "./pages/WorkspacePage";
 import { BrowserPage } from "./pages/BrowserPage";
-import { CredentialsPage } from "./pages/CredentialsPage";
 import { diagnosticMode } from "./host";
 import { NativeSettings } from "./components/NativeSettings";
 
@@ -43,8 +41,6 @@ function Booting() {
 function RoutedApp() {
   const pathname = usePathname();
   switch (pathname) {
-    case "/models":
-      return <ModelsPage />;
     case "/usage":
       return <UsagePage />;
     case "/chat":
@@ -61,8 +57,6 @@ function RoutedApp() {
       return <WorkspacePage />;
     case "/browser":
       return <BrowserPage />;
-    case "/credentials":
-      return <CredentialsPage />;
     case "/":
       return diagnosticMode() ? <OverviewPage /> : <HomePage />;
     default:

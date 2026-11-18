@@ -576,17 +576,17 @@ export function normalizeModelItems(result) {
 }
 
 /**
- * Local planner runs against KimiCode+'s registry gateway (`planner.models`),
- * not the official client's KAP catalog (`models.list`). When `models.list` was
- * checked first, an isolated or custom-provider setup hid all imported gateway
- * models behind an empty official catalog.
+ * Local planner models come from the official catalog (`models.list`), the same
+ * source the subagent pool and handoff read. `planner.models` is kept as a
+ * fallback for a core that predates that change; on this core both answer the
+ * same provider-qualified keys.
  */
 export async function loadPlannerModels({ planner, models } = {}) {
-  if (planner && typeof planner.models === "function") {
-    return normalizeModelItems(await planner.models());
-  }
   if (models && typeof models.list === "function") {
     return normalizeModelItems(await models.list());
+  }
+  if (planner && typeof planner.models === "function") {
+    return normalizeModelItems(await planner.models());
   }
   return [];
 }

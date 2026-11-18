@@ -2,42 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   commitNumberField,
-  createNativeHost,
   configMaxSteps,
   configSection,
   configTimeoutMinutes,
-  isManagementPath,
-  managementPaths,
   readAddonFeatures,
 } from "../src/native.js";
-
-test("management paths are exactly the two routes the window can render", () => {
-  assert.deepEqual([...managementPaths], ["/models", "/credentials"]);
-  for (const path of managementPaths) assert.equal(isManagementPath(path), true, path);
-  for (const path of ["/", "/settings", "/models/", "/models/../credentials", "models", "/native-settings", "/plugins", "/plugins?x=1", ""]) {
-    assert.equal(isManagementPath(path), false, path);
-  }
-});
-
-test("openManagement sends only a whitelisted path and refuses the rest", async () => {
-  const calls: { action: string; payload?: Record<string, unknown> }[] = [];
-  const host = createNativeHost(
-    {
-      request: async <T = unknown>(action: string, payload?: Record<string, unknown>): Promise<T> => {
-        calls.push({ action, payload });
-        return {} as T;
-      },
-    },
-    { activeSession: () => "", close: () => {} },
-  );
-  await host.openManagement("/credentials");
-  assert.deepEqual(calls, [{ action: "window.openManagement", payload: { path: "/credentials" } }]);
-  for (const rejected of ["/settings", "/plugins"]) {
-    await assert.rejects(() => host.openManagement(rejected as never), /管理窗口只打开/);
-  }
-  assert.equal(calls.length, 1, "a rejected path must not reach the bridge");
-  host.close();
-});
 
 test("a number field accepts zero for the step limit and rejects negatives", () => {
   // 0 is the documented "no limit" value for loop_control.maxStepsPerTurn.

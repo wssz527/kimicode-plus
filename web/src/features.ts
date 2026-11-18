@@ -10,7 +10,6 @@ export const features = {
   lock: () => coreRequest("/credentials/lock", { method: "POST", body: {} }),
   saveSecret: (ref: string, value: string) => coreRequest("/credentials", { method: "PUT", body: { ref, value } }),
   deleteSecret: (ref: string) => coreRequest(`/credentials/${ref.split("/").map(encodeURIComponent).join("/")}`, { method: "DELETE" }),
-  discover: (id: string) => coreRequest<{ records: import("./api").ModelRecord[] }>(`/providers/${encodeURIComponent(id)}/discover`, { method: "POST", body: {} }),
   sessions: () => coreRequest<{ items: WorkspaceSession[] }>("/workspace/sessions"),
   saveSession: (s: WorkspaceSession) => coreRequest<WorkspaceSession>(`/workspace/sessions/${encodeURIComponent(s.id)}`, { method: "PUT", body: s }),
   compaction: () => coreRequest<{ policies: Policy[]; evaluations: { session: WorkspaceSession; policy: Policy; due: boolean; state: string; reason: string }[] }>("/workspace/compaction"),

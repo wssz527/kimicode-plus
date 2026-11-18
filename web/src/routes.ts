@@ -18,13 +18,6 @@ export const ROUTES: RouteDefinition[] = [
     summary: "核心状态、任务流与模块健康",
   },
   {
-    path: "/models",
-    label: "供应商与模型",
-    shortLabel: "模型",
-    icon: "models",
-    summary: "目录来源、逐字段覆盖与回滚",
-  },
-  {
     path: "/usage",
     label: "用量",
     shortLabel: "用量",
@@ -62,7 +55,6 @@ export const ROUTES: RouteDefinition[] = [
   { path: "/native-settings", label: "执行配置", shortLabel: "执行配置", icon: "settings", summary: "工具、子代理模型与时限、步数和权限护栏" },
   { path: "/workspace", label: "会话与执行策略", shortLabel: "会话", icon: "handoff", summary: "会话引用、Worktree、布局与空闲策略" },
   { path: "/browser", label: "浏览器会话", shortLabel: "浏览器", icon: "chat", summary: "隔离数据迁移与网站操作权限" },
-  { path: "/credentials", label: "凭据库", shortLabel: "凭据", icon: "settings", summary: "加密保存供应商密钥，按需解锁" },
 ];
 
 export function routeForPath(pathname: string): RouteDefinition {

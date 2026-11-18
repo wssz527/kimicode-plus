@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -117,13 +118,8 @@ func TestProviderChatVaultAndLocalFeatures(t *testing.T) {
 				}
 			}))
 			defer remote.Close()
-			require(call("POST", "/providers", map[string]any{"id": protocol, "name": protocol, "protocol": protocol, "baseUrl": remote.URL, "secretRef": "provider/demo"}, ""), 201)
-			w := call("POST", "/providers/"+protocol+"/discover", map[string]any{}, "")
-			require(w, 200)
-			if strings.Contains(w.Body.String(), `"mock":true`) || !strings.Contains(w.Body.String(), "synthetic") {
-				t.Fatal(w.Body.String())
-			}
-			w = call("POST", "/chat/threads", map[string]any{"title": "protocol thread", "sourceId": "custom-model", "model": "synthetic", "providerId": protocol, "projectId": "isolated-project"}, "")
+			seedProviderRow(t, db, protocol, protocol, remote.URL, "provider/demo")
+			w := call("POST", "/chat/threads", map[string]any{"title": "protocol thread", "sourceId": "custom-model", "model": "synthetic", "providerId": protocol, "projectId": "isolated-project"}, "")
 			require(w, 201)
 			var thread struct {
 				ID string `json:"id"`
@@ -156,7 +152,7 @@ func TestProviderChatVaultAndLocalFeatures(t *testing.T) {
 		var calls atomic.Int32
 		remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); fmt.Fprint(w, `{}`) }))
 		defer remote.Close()
-		require(call("POST", "/providers", map[string]any{"id": "empty", "name": "empty", "protocol": "openai", "baseUrl": remote.URL}, ""), 201)
+		seedProviderRow(t, db, "empty", "openai", remote.URL, "")
 		w := call("POST", "/chat/threads", map[string]any{"title": "unknown", "sourceId": "custom-model", "model": "synthetic", "providerId": "empty"}, "")
 		require(w, 201)
 		var thread struct {
@@ -252,5 +248,19 @@ func TestProviderChatVaultAndLocalFeatures(t *testing.T) {
 	require(w, 200)
 	if !strings.Contains(w.Body.String(), `"unlocked":false`) {
 		t.Fatal("vault not locked on restart")
+	}
+}
+
+// seedProviderRow writes what the removed provider registry page used to create.
+// The provider tables are still the source the chat runtime reads.
+func seedProviderRow(t *testing.T, db *sql.DB, id, protocol, baseURL, secretRef string) {
+	t.Helper()
+	var ref any
+	if secretRef != "" {
+		ref = secretRef
+	}
+	if _, err := db.Exec(`INSERT INTO registry_providers(id,name,protocol,base_url,secret_ref,created_at) VALUES(?,?,?,?,?,?)`,
+		id, id, protocol, baseURL, ref, "2026-11-18T00:00:00Z"); err != nil {
+		t.Fatalf("seed provider %s: %v", id, err)
 	}
 }

@@ -113,10 +113,14 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 			app.modules = append(app.modules, Module{id, "READY", ""})
 		}
 	}
+	// Only the table migration is left. provider, gateway and the planner read
+	// registry_providers/registry_models directly, while the HTTP surface that
+	// served the separate model page is gone: models are configured on the
+	// official provider form.
 	add("registry", func() error {
 		s, e := registry.New(db)
 		if e == nil {
-			s.Register(mux)
+			s.RegisterGateways(mux)
 		}
 		return e
 	})

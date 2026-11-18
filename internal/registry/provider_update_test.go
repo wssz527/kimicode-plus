@@ -2,7 +2,6 @@ package registry
 
 import (
 	"context"
-	"net/http"
 	"testing"
 )
 
@@ -177,88 +176,5 @@ func TestProviderUpdateRollbackRestoresPreviousConfiguration(t *testing.T) {
 	}
 	if provider.SecretRef == nil || *provider.SecretRef != "keychain://p" {
 		t.Fatalf("restored secretRef = %v", provider.SecretRef)
-	}
-}
-
-func TestHTTPProviderUpdate(t *testing.T) {
-	_, mux := newMux(t)
-	status, _ := call(t, mux, "POST", "/enhance/v1/models/modelsdev", map[string]any{
-		"catalog": ModelsDevCatalog{
-			Source:      "https://models.dev/api.json",
-			RetrievedAt: "2026-11-10T08:12:17Z",
-			Providers: map[string]modelsDevProvider{
-				"acme": {ID: "acme", Models: map[string]modelsDevModel{"m": {ID: "m"}}},
-			},
-		},
-		"revision": 0,
-	})
-	if status != http.StatusOK {
-		t.Fatalf("modelsdev import status = %d", status)
-	}
-	status, modelsBefore := call(t, mux, "GET", "/enhance/v1/models", nil)
-	if status != http.StatusOK || modelsBefore["total"].(float64) != 1 {
-		t.Fatalf("models before = %d %+v", status, modelsBefore)
-	}
-	status, missing := call(t, mux, "PUT", "/enhance/v1/providers/acme", map[string]any{"name": "Acme", "protocol": "openai", "baseUrl": "https://api.acme.example/v1"})
-	if status != http.StatusBadRequest || missing["error"].(map[string]any)["code"] != "MISSING_REVISION" {
-		t.Fatalf("missing revision = %d %+v", status, missing)
-	}
-	status, preview := call(t, mux, "POST", "/enhance/v1/models/preview", map[string]any{"records": []any{
-		map[string]any{"providerId": "acme", "id": "m", "capabilities": map[string]any{}},
-	}})
-	if status != http.StatusOK {
-		t.Fatalf("preview = %d %+v", status, preview)
-	}
-	rev := preview["revision"].(float64)
-	status, updated := call(t, mux, "PUT", "/enhance/v1/providers/acme", map[string]any{
-		"name": "Acme Prod", "protocol": "openai", "baseUrl": "https://api.acme.example/v1", "revision": rev,
-	})
-	if status != http.StatusOK {
-		t.Fatalf("update = %d %+v", status, updated)
-	}
-	provider := updated["provider"].(map[string]any)
-	if provider["name"] != "Acme Prod" || provider["baseUrl"] != "https://api.acme.example/v1" {
-		t.Fatalf("provider = %+v", provider)
-	}
-	if provider["id"] != "acme" {
-		t.Fatalf("provider id changed: %+v", provider)
-	}
-	snapshot := updated["snapshot"].(map[string]any)
-	if snapshot["before"].(map[string]any)["baseUrl"] != "urn:unconfigured" {
-		t.Fatalf("snapshot before = %+v", snapshot["before"])
-	}
-	if len(snapshot["fields"].([]any)) == 0 {
-		t.Fatalf("snapshot diff empty = %+v", snapshot)
-	}
-	status, stale := call(t, mux, "PUT", "/enhance/v1/providers/acme", map[string]any{
-		"name": "Again", "protocol": "openai", "baseUrl": "https://api2.acme.example/v1", "revision": rev,
-	})
-	if status != http.StatusConflict || stale["error"].(map[string]any)["code"] != "STALE_REVISION" {
-		t.Fatalf("stale update = %d %+v", status, stale)
-	}
-	status, providers := call(t, mux, "GET", "/enhance/v1/providers", nil)
-	if status != http.StatusOK || providers["total"].(float64) != 1 {
-		t.Fatalf("providers = %d %+v", status, providers)
-	}
-	only := providers["items"].([]any)[0].(map[string]any)
-	if only["name"] != "Acme Prod" {
-		t.Fatalf("providers = %+v", only)
-	}
-	status, modelsAfter := call(t, mux, "GET", "/enhance/v1/models", nil)
-	if status != http.StatusOK || modelsAfter["total"].(float64) != modelsBefore["total"].(float64) {
-		t.Fatalf("models lost after provider update: %+v", modelsAfter)
-	}
-	status, changes := call(t, mux, "GET", "/enhance/v1/model-changes", nil)
-	if status != http.StatusOK {
-		t.Fatalf("changes = %d", status)
-	}
-	foundProviderChange := false
-	for _, raw := range changes["items"].([]any) {
-		if raw.(map[string]any)["kind"] == "provider" {
-			foundProviderChange = true
-		}
-	}
-	if !foundProviderChange {
-		t.Fatalf("provider change missing from snapshots: %+v", changes["items"])
 	}
 }

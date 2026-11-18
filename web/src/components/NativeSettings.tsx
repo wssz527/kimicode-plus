@@ -5,6 +5,8 @@ import { Badge, ErrorNotice, Spinner } from "./ui";
 import "../styles/workbench.css";
 import "../styles/native-settings.css";
 import { errorText } from "./workbench/pieces";
+import { ModelSelect } from "./ModelSelect";
+import { fetchModelOptions, type ModelOption } from "../lib/models";
 
 type Timing = "now" | "derive" | "turn";
 
@@ -211,39 +213,6 @@ function NumberField({
   );
 }
 
-function ModelSelect({
-  aliases,
-  value,
-  onChange,
-}: {
-  aliases: string[];
-  value: string;
-  onChange: (next: string) => void;
-}) {
-  if (aliases.length === 0) {
-    return (
-      <input
-        className="wb-input"
-        aria-label="模型"
-        value={value}
-        placeholder="模型别名"
-        onChange={(event) => onChange(event.target.value)}
-      />
-    );
-  }
-  const options = value && !aliases.includes(value) ? [...aliases, value] : aliases;
-  return (
-    <select className="wb-select" aria-label="模型" value={value} onChange={(event) => onChange(event.target.value)}>
-      {value === "" ? <option value="">选择模型</option> : null}
-      {options.map((alias) => (
-        <option key={alias} value={alias}>
-          {alias}
-        </option>
-      ))}
-    </select>
-  );
-}
-
 export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}) {
   const host = useHost();
   const [config, setConfig] = useState<Dic | null>(null);
@@ -289,7 +258,19 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
     };
   }, [host]);
 
-  const aliases = useMemo(() => Object.keys(asConfigObject(configField(config, ["models"])) ?? {}), [config]);
+  // The pool is chosen from the official catalog, the same list handoff and the
+  // chat page read. Keys are provider-qualified, so a bare alias can never be
+  // written into secondary_model.
+  const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
+  const [modelOptionsError, setModelOptionsError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!host) return;
+    let alive = true;
+    fetchModelOptions(host.request)
+      .then((next) => { if (alive) { setModelOptions(next); setModelOptionsError(null); } })
+      .catch((cause) => { if (alive) setModelOptionsError(errorText(cause)); });
+    return () => { alive = false; };
+  }, [host]);
 
   const poolKeys = useMemo(
     () => pool.entries.map((entry) => entry.key.trim()).filter(Boolean),
@@ -520,7 +501,23 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
           </div>
 
           {pool.entries.length === 0 ? (
-            <p className="ns-empty-line">还没有池内模型，保存后子代理跟随调用方的模型。</p>
+            modelOptions.length === 0 ? (
+              <div className="ns-empty-line">
+                <p>还没有可选的模型，请先在 Kimi Code 设置 → 供应商中添加。</p>
+                {modelOptionsError ? <p>读取失败：{modelOptionsError}</p> : null}
+                {host ? (
+                  <button
+                    type="button"
+                    className="wb-btn is-quiet is-compact"
+                    onClick={() => { void host.openSettings("providers").catch((cause: unknown) => setModelOptionsError(errorText(cause))); }}
+                  >
+                    打开官方供应商页
+                  </button>
+                ) : null}
+              </div>
+            ) : (
+              <p className="ns-empty-line">还没有池内模型，保存后子代理跟随调用方的模型。</p>
+            )
           ) : (
             <>
               <div className="ns-pool-headrow" aria-hidden="true">
@@ -543,7 +540,7 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
                     </label>
                     <div className="ns-pool-model">
                       <ModelSelect
-                        aliases={aliases}
+                        options={modelOptions}
                         value={entry.key}
                         onChange={(key) =>
                           setPool((current) => ({

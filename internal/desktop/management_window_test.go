@@ -5,103 +5,58 @@ import (
 	"testing"
 )
 
-// The management window is a second BrowserWindow with its own bridge key. The
-// route list is the only thing standing between a surface request and an
-// arbitrary path inside a privileged window, so it is checked both as a literal
-// list and as the guard that rejects everything else.
-func TestBootstrapRestrictsManagementRoutes(t *testing.T) {
-	for _, wanted := range []string{
-		"const managementPaths = ['/models', '/credentials'];",
-		"if (typeof value !== 'string' || !managementPaths.includes(value)) throw new Error('管理窗口路径不被允许');",
-		"case 'window.openManagement': return openWindow('management', { path: managementPath(payload.path) });",
+// The management window and its two pages are gone. Models are configured on the
+// official provider form and credentials belong to the plugin that asks for
+// them, so no privileged window may still be reachable from the bridge.
+func TestBootstrapDroppedTheManagementWindow(t *testing.T) {
+	for _, removed := range []string{
+		"window.openManagement",
+		"managementPaths",
+		"managementPath(",
+		"management initialPath",
 	} {
-		if !strings.Contains(bootstrapSource, wanted) {
-			t.Fatalf("bootstrap.js lost the management route guard: %s", wanted)
+		if strings.Contains(bootstrapSource, removed) {
+			t.Fatalf("bootstrap.js still carries the removed management window: %s", removed)
 		}
 	}
-	// Plugins are managed inside the settings dialog, so the window must not
-	// expose a plugin route at all.
-	if strings.Contains(bootstrapSource, "'/plugins'") {
-		t.Fatal("bootstrap.js still exposes a plugin route to the management window")
-	}
+	// The plugin window keeps working, and it is now the only popout surface.
 	for _, wanted := range []string{
-		"case 'window.openSettings': return wc.executeJavaScript('window.__ekdNativeUI.openSettings()');",
+		"case 'plugin.window.open': {",
 		"return openWindow('plugin:' + answer.pluginId,",
-	} {
-		if !strings.Contains(bootstrapSource, wanted) {
-			t.Fatalf("bootstrap.js changed an existing window action: %s", wanted)
-		}
-	}
-}
-
-// The management window renders the injected surface on about:blank and holds a
-// bridge key, so it must not be able to navigate anywhere else, open a window or
-// expose devtools. Each guard is pinned by the literal that implements it.
-func TestBootstrapKeepsManagementWindowContained(t *testing.T) {
-	for _, wanted := range []string{
+		"await bindRenderer(win.webContents, 'plugin',",
 		"webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, devTools: false },",
 		"win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));",
-		"win.webContents.on('will-navigate', (event, url) => {",
-		"if (url !== 'about:blank') event.preventDefault();",
-		"await win.loadURL('about:blank');",
 	} {
 		if !strings.Contains(bootstrapSource, wanted) {
-			t.Fatalf("bootstrap.js lost a management window containment guard: %s", wanted)
-		}
-	}
-	// The navigation listener must sit before the renderer is bound, so a page
-	// cannot start loading while the guard is still missing.
-	guard := strings.Index(bootstrapSource, "win.webContents.on('will-navigate', (event, url) => {")
-	bind := strings.Index(bootstrapSource, "if (management) await bindRenderer(win.webContents, 'management'")
-	if guard < 0 || bind < 0 || guard > bind {
-		t.Fatal("the will-navigate guard must be installed before the management renderer is bound")
-	}
-}
-
-// A management window is wider than a plugin window so a model table fits, and it
-// keeps its own title. Both windows take a fresh bridge key per WebContents.
-func TestBootstrapSizesManagementWindowSeparately(t *testing.T) {
-	for _, wanted := range []string{
-		"title: management ? 'KimiCode+ 管理' : 'KimiCode+ 插件',",
-		"width: previous?.width || (management ? 1080 : 640),",
-		"height: previous?.height || (management ? 760 : 840),",
-		"minWidth: management ? 720 : 400, minHeight: management ? 520 : 500,",
-		"const key = crypto.randomBytes(32).toString('base64url');",
-	} {
-		if !strings.Contains(bootstrapSource, wanted) {
-			t.Fatalf("bootstrap.js lost window sizing or key isolation: %s", wanted)
+			t.Fatalf("bootstrap.js lost a plugin window guard: %s", wanted)
 		}
 	}
 }
 
-// Re-opening on a different route must replace the bound renderer, otherwise the
-// old page keeps a key that was issued for the old route.
-func TestBootstrapRebindsManagementOnRouteChange(t *testing.T) {
-	wanted := "if (kind === 'management' && source.path) {"
-	if !strings.Contains(bootstrapSource, wanted) {
-		t.Fatalf("bootstrap.js no longer rebinds a management window on route change")
+// The renderer mounted a management surface with its own title. With the window
+// gone, only the settings surface may render into a popout body.
+func TestRendererMountsOnlyTheSettingsSurface(t *testing.T) {
+	if strings.Contains(rendererSource, "'management'") {
+		t.Fatal("renderer.js still handles the removed management surface")
 	}
-	start := strings.Index(bootstrapSource, wanted)
-	end := strings.Index(bootstrapSource[start:], "\n    }")
-	if end < 0 {
-		t.Fatal("management rebind block is not terminated")
-	}
-	block := bootstrapSource[start : start+end]
-	if !strings.Contains(block, "await bindRenderer(existing.webContents, 'management',") {
-		t.Fatalf("management route change does not rebind the renderer: %s", block)
-	}
-}
-
-// The management surface renders its own window chrome, so the renderer must
-// pass the start path through instead of falling back to the planner surface.
-func TestRendererMountsManagementSurface(t *testing.T) {
 	for _, wanted := range []string{
-		"options.surface === 'settings' || options.surface === 'management'",
-		"mount(element, options.surface, host, { initialPath: options.initialPath });",
-		"const title = options.surface === 'settings' ? 'KimiCode+ 设置' : 'KimiCode+ 管理';",
+		"} else if (options.surface === 'settings') {",
+		"document.title = 'KimiCode+ 设置';",
 	} {
 		if !strings.Contains(rendererSource, wanted) {
-			t.Fatalf("renderer.js lost the management mount: %s", wanted)
+			t.Fatalf("renderer.js lost the settings surface mount: %s", wanted)
 		}
+	}
+}
+
+// The provider page enhancement runs in the official window only; a settings
+// popout has no provider page to decorate.
+func TestProviderEnhanceInstallsOnTheOfficialSurfaceOnly(t *testing.T) {
+	wanted := "state.providerEnhance = options.surface === 'host' ? createProviderEnhance({ request: transport.request }) : null;"
+	if !strings.Contains(rendererSource, wanted) {
+		t.Fatalf("renderer.js lost the provider enhancement hook: %s", wanted)
+	}
+	if !strings.HasPrefix(rendererBundle, "function(options) {\n") || !strings.Contains(rendererBundle, "return installNativeRenderer(options);") {
+		t.Fatalf("rendererBundle must wrap providerEnhanceSource and rendererSource in one function expression")
 	}
 }
