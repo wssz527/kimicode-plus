@@ -359,6 +359,8 @@ async function installNativeRenderer(options) {
     .pt-body[data-ekdp-panel]>.ekdp-panel-host[hidden]{display:none!important}
     .ekdp-panel-host{display:flex;flex:1;flex-direction:column;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden}
     .ekdp-main-split{display:flex;flex:1 1 auto;min-width:0;min-height:0;width:100%;overflow:hidden}
+    .ekdp-main-split[data-ekdp-mode="page"]>.ekdp-main-native,.ekdp-main-split[data-ekdp-mode="page"]>.ekdp-main-splitter{display:none!important}
+    .ekdp-main-split[data-ekdp-mode="page"]>.ekdp-main-pane{flex:1 1 auto;width:100%}
     .ekdp-main-native{display:flex;flex:1 1 auto;flex-direction:column;min-width:0;min-height:0}
     .ekdp-main-pane{display:flex;flex:0 0 auto;flex-direction:column;min-width:0;min-height:0}
     .ekdp-main-splitter{flex:0 0 5px;cursor:col-resize;background:var(--color-line,#8884);opacity:.55;touch-action:none}
@@ -556,6 +558,7 @@ async function installNativeRenderer(options) {
     state.plugins = null;
     delete window.__ekdPlugins;
     document.removeEventListener('click', nativeTabClick, true);
+    document.removeEventListener('click', sidebarResetClick, true);
     document.removeEventListener('click', settingsTabClick, true);
     document.removeEventListener('scroll', settingsScroll, true);
     clearTimeout(state.settingsScrollTimer);
@@ -581,6 +584,15 @@ async function installNativeRenderer(options) {
     if (!clickedNative) return;
     if (clickedNative.classList?.contains('ptb-tab') && event.target.closest('.ptb-x')) return;
     if (state.activePluginPanel) deactivatePluginPanel(state.activePluginPanel, false);
+  };
+  const sidebarResetClick = event => {
+    const newChat = event.target.closest('button.btn-new-chat:not([data-ekd-sidebar-nav])');
+    const sessionRow = event.target.closest('[data-session-id]');
+    const clickedSession = sessionRow && !event.target.closest('[data-session-id] button:not(.row)');
+    if (!newChat && !clickedSession) return;
+    for (const handle of [...state.pluginMainAreas.values()]) {
+      if (handle.mode === 'page') handle.dispose();
+    }
   };
   const settingsTabClick = event => {
     const tab = event.target.closest('.settings-tab-list button.tab[role="tab"]');
@@ -620,6 +632,7 @@ async function installNativeRenderer(options) {
     return { status: 'installed', surface: options.surface };
   }
   document.addEventListener('click', nativeTabClick, true);
+  document.addEventListener('click', sidebarResetClick, true);
   publishNativeUI();
   await refreshFeatures();
   if (state.removed) return { status: 'removed', surface: 'host', domRevision: 1 };
@@ -631,6 +644,9 @@ async function installNativeRenderer(options) {
     if (id === previousSession) return;
     previousSession = id;
     if (!id && state.sessionHandle) closeSessions();
+    for (const handle of [...state.pluginMainAreas.values()]) {
+      if (handle.mode === 'page') handle.dispose();
+    }
     window.dispatchEvent(new CustomEvent('ekd:active-session', { detail: id }));
   }, { detached: true, flush: 'sync' });
   ensure();
@@ -763,103 +779,31 @@ async function installNativeRenderer(options) {
   function mountMainArea(pluginId, definition) {
     const container = document.querySelector(".composer")?.closest(".chat-main") || document.querySelector(".chat")?.closest(".chat-main");
     if (!container) throw new Error("主聊天区契约未就绪");
-    const row = document.createElement("div");
-    row.className = "ekdp-main-split";
-    row.dataset.ekdpPlugin = pluginId;
-    const native = document.createElement("div");
-    native.className = "ekdp-main-native";
-    const splitter = document.createElement("div");
-    splitter.className = "ekdp-main-splitter";
-    splitter.setAttribute("role", "separator");
-    splitter.setAttribute("aria-orientation", "vertical");
-    splitter.setAttribute("aria-label", "调整同屏宽度");
-    splitter.tabIndex = 0;
-    const pane = document.createElement("div");
-    pane.className = "ekdp-main-pane";
-    pane.dataset.ekdpPlugin = pluginId;
-    for (const child of [...container.childNodes]) native.append(child);
-    row.append(native, splitter, pane);
-    container.append(row);
-    container.dataset.ekdpSplit = pluginId;
-    const min = Math.max(280, Number(definition?.minWidth) || 360);
-    const max = Math.max(min, Number(definition?.maxWidth) || 900);
-    let width = Math.min(max, Math.max(min, Number(definition?.width) || 420));
-    const apply = () => {
-      container.style.display = "flex";
-      container.style.flexDirection = "column";
-      native.style.flex = "1 1 auto";
-      native.style.minWidth = "0";
-      native.style.minHeight = "0";
-      native.style.display = "flex";
-      native.style.flexDirection = "column";
-      pane.style.flex = "0 0 auto";
-      pane.style.width = width + "px";
-      pane.style.minWidth = "0";
-      pane.style.minHeight = "0";
-      pane.style.display = "flex";
-      pane.style.flexDirection = "column";
-    };
-    apply();
-    let dragging = null;
-    const onPointerMove = event => {
-      if (!dragging) return;
-      const next = dragging.startWidth - (event.clientX - dragging.startX);
-      width = Math.min(max, Math.max(min, next));
-      apply();
-    };
-    const stopDrag = () => {
-      dragging = null;
-      splitter.classList.remove("dragging");
-      window.removeEventListener("pointermove", onPointerMove, true);
-      window.removeEventListener("pointerup", stopDrag, true);
-    };
-    splitter.addEventListener("pointerdown", event => {
-      event.preventDefault();
-      dragging = { startX: event.clientX, startWidth: width };
-      splitter.classList.add("dragging");
-      window.addEventListener("pointermove", onPointerMove, true);
-      window.addEventListener("pointerup", stopDrag, true);
+    const handle = module.mountMainAreaSurface({
+      document,
+      container,
+      pluginId,
+      definition,
+      window,
     });
-    splitter.addEventListener("keydown", event => {
-      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-      event.preventDefault();
-      width = Math.min(max, Math.max(min, width + (event.key === "ArrowLeft" ? 24 : -24)));
-      apply();
-    });
-    const mountScope = localScope();
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      stopDrag();
-      mountScope.dispose();
-      for (const child of [...native.childNodes]) container.append(child);
-      row.remove();
-      container.style.removeProperty("display");
-      container.style.removeProperty("flex-direction");
-      delete container.dataset.ekdpSplit;
-    };
-    try {
-      mountScope.add(definition.render(pane));
-    } catch (error) {
-      release();
-      throw error;
-    }
+    const release = handle.dispose;
     return {
-      setWidth(px) {
-        width = Math.min(max, Math.max(min, Number(px) || width));
-        apply();
-      },
-      width: () => width,
+      mode: definition?.mode === "page" ? "page" : "split",
+      setWidth: handle.setWidth,
+      width: handle.width,
       dispose: release,
     };
   }
 
   const pluginMainAreaHost = {
     mount(pluginId, definition) {
-      // A plugin has one main area; asking twice replaces it instead of stacking
-      // two panes the user cannot tell apart.
-      state.pluginMainAreas.get(pluginId)?.dispose();
+      // A plugin has one main area, and page mode owns the full chat column, so
+      // replace any matching or page-mode mount rather than stacking wrappers.
+      for (const [otherId, otherHandle] of [...state.pluginMainAreas]) {
+        if (otherId === pluginId || otherHandle.mode === "page" || definition?.mode === "page") {
+          otherHandle.dispose();
+        }
+      }
       const handle = mountMainArea(pluginId, definition);
       state.pluginMainAreas.set(pluginId, handle);
       const release = handle.dispose.bind(handle);

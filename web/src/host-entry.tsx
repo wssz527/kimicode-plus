@@ -16,8 +16,8 @@ export { createCoreTransport, createEventChannel, createNativeHost };
 // The plugin runtime has exactly one implementation, exported here so the
 // renderer loads it instead of shipping a copy.
 export { createPluginRuntime } from "./plugin-runtime/runtime";
-export { createEntryMountManager } from "./plugin-runtime/entries";
-export type { EntryMountManager, EntryPlan, SidebarNavPlan } from "./plugin-runtime/entries";
+export { createEntryMountManager, mountMainAreaSurface } from "./plugin-runtime/entries";
+export type { EntryMountManager, EntryPlan, MainAreaMountOptions, SidebarNavPlan } from "./plugin-runtime/entries";
 export { loadModule as loadPluginModule, entryPath as pluginEntryPath } from "./plugin-runtime/loader";
 export type { ActivePlugin, PluginRuntime } from "./plugin-runtime/runtime";
 import "./styles/workbench.css";

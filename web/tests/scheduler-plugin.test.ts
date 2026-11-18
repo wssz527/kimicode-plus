@@ -14,6 +14,7 @@ interface SchedulerModule {
   effortOptionsForModel(model: unknown): { value: string; label: string }[];
   keepAliveStatusText(task: unknown): string;
   defaultDraft(prefill?: Record<string, unknown>): Record<string, unknown>;
+  switchScheduleKind(draft: Record<string, unknown>, nextKind: string): Record<string, unknown>;
   buildScheduleRule(draft: Record<string, unknown>): Record<string, unknown>;
   activate(ctx: unknown): Promise<{ status: string }>;
 }
@@ -235,4 +236,70 @@ test("scheduler activate registers sidebarNav, rightPanel, entry, and cleans up 
   for (const fn of cleanupCallbacks) fn();
   assert.equal(disposed, true);
   assert.ok(calls.includes("events:dispose:schedule"));
+});
+
+test("times schedule keeps weekdays empty by default and switches cleanly with weekly", () => {
+  const timesDraft = scheduler.defaultDraft({ schedule: { kind: "times", times: ["08:30", "17:45"] } });
+  assert.deepEqual(timesDraft.weekdays, []);
+  assert.deepEqual(scheduler.buildScheduleRule(timesDraft), {
+    kind: "times",
+    times: ["08:30", "17:45"],
+  });
+
+  // Switching times -> weekly applies default [1], and switching back to times does not keep [1].
+  scheduler.switchScheduleKind(timesDraft, "weekly");
+  assert.deepEqual(timesDraft.weekdays, [1]);
+  scheduler.switchScheduleKind(timesDraft, "times");
+  assert.deepEqual(timesDraft.weekdays, []);
+
+  // Starting from weekly default [1] and switching to times does not force [1] into times.
+  const weeklyDraft = scheduler.defaultDraft({ schedule: { kind: "weekly" } });
+  assert.deepEqual(weeklyDraft.weekdays, [1]);
+  scheduler.switchScheduleKind(weeklyDraft, "times");
+  assert.deepEqual(weeklyDraft.weekdays, []);
+  scheduler.switchScheduleKind(weeklyDraft, "weekly");
+  assert.deepEqual(weeklyDraft.weekdays, [1]);
+
+  // Explicit weekdays in times are preserved across switches.
+  const customTimes = scheduler.defaultDraft({ schedule: { kind: "times", times: ["09:00"], weekdays: [2, 4] } });
+  scheduler.switchScheduleKind(customTimes, "weekly");
+  assert.deepEqual(customTimes.weekdays, [2, 4]);
+  scheduler.switchScheduleKind(customTimes, "times");
+  assert.deepEqual(customTimes.weekdays, [2, 4]);
+});
+
+test("scheduler opens mainArea in page mode and exposes back-to-chat exit", async () => {
+  const mountDefs: Array<{ mode?: string }> = [];
+  let mainDisposed = 0;
+  let sidebarOpen: (() => void) | undefined;
+  const ctx = {
+    core: { request: async () => ({ items: [] }) },
+    events: { on: () => ({ dispose: () => {} }) },
+    sidebarNav: {
+      add: (def: { open: () => void }) => {
+        sidebarOpen = def.open;
+        return { dispose: () => {} };
+      },
+    },
+    mainArea: {
+      mount: (def: { mode?: string }) => {
+        mountDefs.push({ mode: def.mode });
+        return {
+          setWidth: () => {},
+          width: () => 460,
+          dispose: () => { mainDisposed += 1; },
+        };
+      },
+    },
+    sessions: { activeId: () => "", open: async () => {} },
+    models: { list: async () => [] },
+    onDispose: () => {},
+  };
+
+  await scheduler.activate(ctx);
+  assert.ok(sidebarOpen);
+  sidebarOpen!();
+  assert.deepEqual(mountDefs, [{ mode: "page" }]);
+  assert.equal(rendererSource.includes("返回聊天"), true);
+  assert.equal(mainDisposed, 0);
 });

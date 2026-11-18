@@ -26,7 +26,9 @@ export interface SidebarNavDefinition {
 
 export interface MainAreaDefinition {
   render(element: HTMLElement): Cleanup | void;
-  /** Initial split width in CSS pixels for the plugin's own side. */
+  /** "split" places the pane beside the native chat view; "page" replaces the main area while mounted. */
+  mode?: "split" | "page";
+  /** Initial split width in CSS pixels for the plugin's own side (split mode only). */
   width?: number;
   minWidth?: number;
   maxWidth?: number;

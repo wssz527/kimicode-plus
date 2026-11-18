@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createEntryMountManager, type EntryPlan, type SidebarNavPlan } from "../src/plugin-runtime/entries.js";
+import { createEntryMountManager, mountMainAreaSurface, type EntryPlan, type SidebarNavPlan } from "../src/plugin-runtime/entries.js";
 import { createPluginRuntime } from "../src/plugin-runtime/runtime.js";
 import { FakeDocument, FakeElement } from "./helpers/fake-dom.js";
 
@@ -272,4 +272,91 @@ test("the runtime only exposes sidebarNav with the ui:sidebar-nav grant and disp
   runtime.deactivate("test.official");
   assert.deepEqual(rows, []);
   runtime.dispose();
+});
+
+test("mountMainAreaSurface supports split default and page full-area mode with clean disposal", () => {
+  const doc = new FakeDocument();
+  const chatMain = doc.createElement("div");
+  chatMain.className = "chat-main";
+  const nativeChat = doc.createElement("div");
+  nativeChat.className = "chat";
+  const composer = doc.createElement("div");
+  composer.className = "composer";
+  chatMain.append(nativeChat, composer);
+  doc.body.append(chatMain);
+
+  let splitCleaned = false;
+  const splitHandle = mountMainAreaSurface({
+    document: doc as unknown as Document,
+    container: chatMain as unknown as HTMLElement,
+    pluginId: "test.split",
+    definition: {
+      width: 440,
+      render: pane => {
+        const marker = doc.createElement("div");
+        marker.className = "plugin-split-view";
+        (pane as unknown as FakeElement).append(marker);
+        return () => { splitCleaned = true; };
+      },
+    },
+  });
+
+  const splitRow = chatMain.querySelector(".ekdp-main-split")!;
+  assert.equal(splitRow.dataset.ekdpMode, "split");
+  assert.equal(chatMain.dataset.ekdpSplit, "test.split");
+  const nativeWrap = splitRow.querySelector(".ekdp-main-native")!;
+  const splitter = splitRow.querySelector(".ekdp-main-splitter")!;
+  const splitPane = splitRow.querySelector(".ekdp-main-pane")!;
+  assert.equal(nativeWrap.hidden, false);
+  assert.equal(splitter.hidden, false);
+  assert.deepEqual(nativeWrap.children, [nativeChat, composer]);
+  assert.equal(splitPane.style.width, "440px");
+  splitHandle.setWidth(520);
+  assert.equal(splitHandle.width(), 520);
+  assert.equal(splitPane.style.width, "520px");
+
+  splitHandle.dispose();
+  assert.equal(splitCleaned, true);
+  assert.deepEqual(chatMain.children, [nativeChat, composer]);
+  assert.equal(chatMain.dataset.ekdpSplit, "");
+  assert.equal(chatMain.style.display, undefined);
+
+  let pageCleaned = false;
+  const pageHandle = mountMainAreaSurface({
+    document: doc as unknown as Document,
+    container: chatMain as unknown as HTMLElement,
+    pluginId: "test.page",
+    definition: {
+      mode: "page",
+      render: pane => {
+        const marker = doc.createElement("div");
+        marker.className = "plugin-page-view";
+        (pane as unknown as FakeElement).append(marker);
+        return () => { pageCleaned = true; };
+      },
+    },
+  });
+
+  const pageRow = chatMain.querySelector(".ekdp-main-split")!;
+  assert.equal(pageRow.dataset.ekdpMode, "page");
+  assert.equal(chatMain.dataset.ekdpPage, "test.page");
+  assert.equal(chatMain.dataset.ekdpSplit, "");
+  const pageNative = pageRow.querySelector(".ekdp-main-native")!;
+  const pageSplitter = pageRow.querySelector(".ekdp-main-splitter")!;
+  const pagePane = pageRow.querySelector(".ekdp-main-pane")!;
+  assert.equal(pageNative.hidden, true);
+  assert.equal(pageNative.style.display, "none");
+  assert.equal(pageSplitter.hidden, true);
+  assert.equal(pageSplitter.style.display, "none");
+  assert.equal(pagePane.style.width, "100%");
+  assert.equal(pagePane.style.flex, "1 1 auto");
+
+  pageHandle.setWidth(300);
+  assert.equal(pagePane.style.width, "100%");
+
+  pageHandle.dispose();
+  assert.equal(pageCleaned, true);
+  assert.deepEqual(chatMain.children, [nativeChat, composer]);
+  assert.equal(chatMain.dataset.ekdpPage, "");
+  assert.equal(chatMain.style.display, undefined);
 });

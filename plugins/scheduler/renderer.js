@@ -118,6 +118,9 @@ export function defaultDraft(prefill = {}) {
   const yyyy = today.getFullYear();
   const mm = String(today.getMonth() + 1).padStart(2, "0");
   const dd = String(today.getDate()).padStart(2, "0");
+  const scheduleKind = prefill.schedule?.kind || "daily";
+  const hasExplicitWeekdays = Array.isArray(prefill.schedule?.weekdays);
+  const weekdaysAutoDefault = !hasExplicitWeekdays && scheduleKind === "weekly";
   return {
     id: prefill.id || "",
     name: prefill.name || "",
@@ -130,11 +133,16 @@ export function defaultDraft(prefill = {}) {
     permissionMode: prefill.permissionMode || "manual",
     missedPolicy: prefill.missedPolicy || "catchup",
     enabled: prefill.enabled !== undefined ? Boolean(prefill.enabled) : true,
-    scheduleKind: prefill.schedule?.kind || "daily",
+    scheduleKind,
     date: prefill.schedule?.date || `${yyyy}-${mm}-${dd}`,
     time: prefill.schedule?.time || "09:00",
     minute: typeof prefill.schedule?.minute === "number" ? prefill.schedule.minute : 0,
-    weekdays: Array.isArray(prefill.schedule?.weekdays) ? [...prefill.schedule.weekdays] : [1],
+    weekdays: hasExplicitWeekdays
+      ? [...prefill.schedule.weekdays]
+      : weekdaysAutoDefault
+        ? [1]
+        : [],
+    weekdaysAutoDefault,
     daysText: Array.isArray(prefill.schedule?.daysOfMonth) && prefill.schedule.daysOfMonth.length
       ? prefill.schedule.daysOfMonth.join(",")
       : "1",
@@ -148,6 +156,20 @@ export function defaultDraft(prefill = {}) {
     startDate: prefill.schedule?.startDate || "",
     endDate: prefill.schedule?.endDate || "",
   };
+}
+
+export function switchScheduleKind(draft, nextKind) {
+  draft.scheduleKind = nextKind;
+  if (nextKind === "weekly") {
+    if (!Array.isArray(draft.weekdays) || draft.weekdays.length === 0) {
+      draft.weekdays = [1];
+      draft.weekdaysAutoDefault = true;
+    }
+  } else if (draft.weekdaysAutoDefault) {
+    draft.weekdays = [];
+    draft.weekdaysAutoDefault = false;
+  }
+  return draft;
 }
 
 export function buildScheduleRule(draft) {
@@ -645,6 +667,20 @@ export async function activate(ctx) {
     void refreshAll();
   });
 
+  function closeMainArea() {
+    if (!mainHandle) return;
+    const handle = mainHandle;
+    mainHandle = null;
+    handle.dispose();
+  }
+
+  const onActiveSessionChange = () => {
+    closeMainArea();
+  };
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("ekd:active-session", onActiveSessionChange);
+  }
+
   function closeDialog() {
     if (dialogEl) {
       try {
@@ -832,7 +868,7 @@ export async function activate(ctx) {
 
       const kindSelect = el(doc, "select", {
         class: "ekd-sd-select",
-        onChange: e => { draft.scheduleKind = e.target.value; renderDialog(); },
+        onChange: e => { switchScheduleKind(draft, e.target.value); renderDialog(); },
       }, [
         el(doc, "option", { value: "daily", text: "每天一次（默认）" }),
         el(doc, "option", { value: "weekdays", text: "每个工作日（周一至周五）" }),
@@ -876,6 +912,7 @@ export async function activate(ctx) {
             text: wd.label,
             "aria-pressed": active ? "true" : "false",
             onClick: () => {
+              draft.weekdaysAutoDefault = false;
               if (active) draft.weekdays = draft.weekdays.filter(v => v !== wd.value);
               else draft.weekdays = [...draft.weekdays, wd.value];
               renderDialog();
@@ -931,6 +968,7 @@ export async function activate(ctx) {
             text: wd.label,
             "aria-pressed": active ? "true" : "false",
             onClick: () => {
+              draft.weekdaysAutoDefault = false;
               if (active) draft.weekdays = draft.weekdays.filter(v => v !== wd.value);
               else draft.weekdays = [...draft.weekdays, wd.value];
               renderDialog();
@@ -1228,6 +1266,7 @@ export async function activate(ctx) {
             if (run.unread) {
               await ctx.core.request("schedule.markRead", { id: run.id, read: true });
             }
+            closeMainArea();
             await ctx.sessions?.open(run.sessionId);
             await refreshAll();
           } catch (error) {
@@ -1291,12 +1330,9 @@ export async function activate(ctx) {
           el(doc, "button", {
             type: "button",
             class: "sched-btn quiet",
-            "aria-label": "关闭定时任务视图",
-            text: "关闭",
-            onClick: () => {
-              mainHandle?.dispose();
-              mainHandle = null;
-            },
+            "aria-label": "返回聊天",
+            text: "返回聊天",
+            onClick: closeMainArea,
           }),
         ]),
       ]);
@@ -1437,14 +1473,15 @@ export async function activate(ctx) {
     }
     if (!mainHandle) {
       mainHandle = ctx.mainArea.mount({
-        width: 460,
-        minWidth: 360,
-        maxWidth: 820,
+        mode: "page",
         render: element => {
           const cleanup = renderMainArea(element);
           state.mainHostEl = element;
           return () => {
-            if (state.mainHostEl === element) state.mainHostEl = null;
+            if (state.mainHostEl === element) {
+              state.mainHostEl = null;
+              mainHandle = null;
+            }
             cleanup();
           };
         },
@@ -1578,12 +1615,14 @@ export async function activate(ctx) {
 
   ctx.onDispose(() => {
     disposed = true;
+    if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
+      window.removeEventListener("ekd:active-session", onActiveSessionChange);
+    }
     unsubSchedule.dispose();
     closeDialog();
     dialogStyleEl?.remove();
     dialogStyleEl = null;
-    mainHandle?.dispose();
-    mainHandle = null;
+    closeMainArea();
     panelHandle?.dispose();
     panelHandle = null;
     listeners.clear();

@@ -772,7 +772,7 @@ func (e *Engine) executeRun(ctx context.Context, task Task, run RunRecord) {
 }
 
 func (e *Engine) waitForSessionIdle(ctx context.Context, task Task, run *RunRecord) (bool, error) {
-	deadline := time.Now().Add(e.busyWaitTimeout)
+	deadline := e.now().Add(e.busyWaitTimeout)
 	waitedNotice := false
 	for {
 		sess, err := e.exec.GetSession(ctx, task.SessionID)
@@ -792,7 +792,7 @@ func (e *Engine) waitForSessionIdle(ctx context.Context, task Task, run *RunReco
 			_ = e.store.UpdateRun(context.Background(), *run)
 			e.publishScheduleUpdate(task.PluginID, "run.waiting", run.ID)
 		}
-		if time.Now().After(deadline) {
+		if e.now().After(deadline) {
 			return false, nil
 		}
 		select {
@@ -837,7 +837,7 @@ func (e *Engine) observeTurnOutcome(ctx context.Context, sessionID string, prevT
 			var latestErr string
 			if tErr == nil && len(turns) > 0 {
 				last := turns[len(turns)-1]
-				if len(turns) > prevTurnCount || (last.TurnID != "" && last.TurnID != prevLastTurnID) || last.HasAssistantMsg {
+				if len(turns) > prevTurnCount || (last.TurnID != "" && last.TurnID != prevLastTurnID) || (prevTurnCount == 0 && last.HasAssistantMsg) {
 					newTurnSeen = true
 				}
 				if last.ErrorMessage != "" && (newTurnSeen || sawBusy) {

@@ -496,3 +496,73 @@ func TestEngineBoundSessionBusyWaitAndApprovalIronRule(t *testing.T) {
 		t.Fatalf("expected 0 unread after markAllRead, got %d", unread)
 	}
 }
+
+func TestEngineBoundSessionDoesNotEarlyCompleteOnPriorAssistantMsg(t *testing.T) {
+	db := openTestDB(t)
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newFakeExecutor()
+	base.sessions["s_prior"] = SessionInfo{ID: "s_prior", Title: "已有回复会话", CWD: t.TempDir(), Busy: false, PendingInteraction: "none"}
+	base.turns["s_prior"] = []TurnInfo{{TurnID: "turn_prev", HasAssistantMsg: true}}
+
+	var polls atomic.Int32
+	exec := &delayedTurnExecutor{
+		fakeExecutor: base,
+		onGetSession: func(id string) {
+			if id != "s_prior" || len(base.sentPrompts) == 0 {
+				return
+			}
+			n := polls.Add(1)
+			// Poll 1: simulate KAP still reporting idle with only the prior turn.
+			// Poll 2+: session transitions to busy + new turn waiting for approval.
+			if n >= 2 {
+				base.mu.Lock()
+				base.sessions[id] = SessionInfo{ID: id, Title: "已有回复会话", Busy: true, PendingInteraction: "approval"}
+				base.turns[id] = []TurnInfo{
+					{TurnID: "turn_prev", HasAssistantMsg: true},
+					{TurnID: "turn_new", HasApproval: true, ApprovalTitle: "Bash"},
+				}
+				base.mu.Unlock()
+			}
+		},
+	}
+
+	engine, err := NewEngine(store, exec, WithPollInterval(10*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	task, err := engine.SaveTask(context.Background(), "kimicode-plus.scheduler", SaveTaskInput{
+		Name: "二次追问审批拦截", Prompt: "run bash", Mode: ModeBoundSession, SessionID: "s_prior",
+		PermissionMode: "manual", Schedule: ScheduleRule{Kind: "daily", Time: "09:00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.RunNow(context.Background(), "kimicode-plus.scheduler", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool {
+		runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+		return len(runs) == 1 && runs[0].Status != RunQueued && runs[0].Status != RunRunning
+	})
+	runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+	if runs[0].Status != RunAwaitingApproval {
+		t.Fatalf("expected awaiting_approval instead of early completion on prior assistant turn, got %+v", runs[0])
+	}
+}
+
+type delayedTurnExecutor struct {
+	*fakeExecutor
+	onGetSession func(id string)
+}
+
+func (d *delayedTurnExecutor) GetSession(ctx context.Context, id string) (SessionInfo, error) {
+	if d.onGetSession != nil {
+		d.onGetSession(id)
+	}
+	return d.fakeExecutor.GetSession(ctx, id)
+}
