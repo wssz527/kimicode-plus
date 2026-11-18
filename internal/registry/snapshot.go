@@ -3,12 +3,9 @@ package registry
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
-	"net/http"
 	"strings"
 	"time"
 
-	"enhancedkimi/internal/httpx"
 	"enhancedkimi/internal/storage"
 )
 
@@ -54,14 +51,6 @@ func (s *Service) Snapshot(ctx context.Context, providerID, modelID string) (Sna
 	return out, err
 }
 
-func (s *Service) handleSnapshot(w http.ResponseWriter, r *http.Request) {
-	out, err := s.Snapshot(r.Context(), r.URL.Query().Get("providerId"), r.URL.Query().Get("id"))
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	httpx.JSON(w, 200, out)
-}
 
 func (s *Service) editMetadata(ctx context.Context, providerID, modelID, field string, value any, restore bool, revision int64) (OverrideResult, error) {
 	if err := validateIdentity(providerID, modelID); err != nil {
@@ -138,29 +127,6 @@ func (s *Service) editMetadata(ctx context.Context, providerID, modelID, field s
 	return out, err
 }
 
-func (s *Service) handleMetadataEdit(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ProviderID string `json:"providerId"`
-		ID         string `json:"id"`
-		Field      string `json:"field"`
-		Value      any    `json:"value"`
-		Restore    bool   `json:"restoreAutomatic"`
-		Revision   *int64 `json:"revision"`
-	}
-	if !httpx.Decode(w, r, &req) {
-		return
-	}
-	if req.Revision == nil {
-		fail(w, badRequest("MISSING_REVISION", "必须提供编辑基线"))
-		return
-	}
-	out, err := s.editMetadata(r.Context(), req.ProviderID, req.ID, req.Field, req.Value, req.Restore, *req.Revision)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	httpx.JSON(w, 200, out)
-}
 
 type RollbackPreview struct {
 	Revision  int64             `json:"revision"`
@@ -168,61 +134,3 @@ type RollbackPreview struct {
 	Conflicts []string          `json:"conflicts"`
 }
 
-func (s *Service) handleRollbackPreview(w http.ResponseWriter, r *http.Request) {
-	id, err := parseID(r.PathValue("id"))
-	if err != nil {
-		fail(w, err)
-		return
-	}
-
-	before, err := s.Snapshot(r.Context(), "", "")
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	detail, err := s.ChangeDetail(r.Context(), id)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	conflicts := []string{}
-	for _, m := range detail.Models {
-		records, err := s.loadModels(s.db, []modelKey{{m.ProviderID, m.ID}})
-		if err != nil {
-			fail(w, err)
-			return
-		}
-		var expected *modelRecord
-		if m.After != nil {
-			raw, _ := json.Marshal(*m.After)
-			expected, err = decodeModel(raw)
-			if err != nil {
-				fail(w, err)
-				return
-			}
-		}
-		if !recordEqual(records[modelKey{m.ProviderID, m.ID}], expected) {
-			conflicts = append(conflicts, m.ProviderID+"/"+m.ID+": 模型有后续修改")
-		}
-	}
-	for _, p := range detail.Providers {
-		conflicted, err := s.providerRollbackConflict(s.db, p)
-		if err != nil {
-			fail(w, err)
-			return
-		}
-		if conflicted {
-			conflicts = append(conflicts, p.ProviderID+": 供应商有后续修改或模型引用")
-		}
-	}
-	after, err := s.Snapshot(r.Context(), "", "")
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	if after.Revision != before.Revision {
-		fail(w, conflict("STALE_REVISION", "预览期间配置变化，请重新预览"))
-		return
-	}
-	httpx.JSON(w, 200, RollbackPreview{before.Revision, detail, conflicts})
-}

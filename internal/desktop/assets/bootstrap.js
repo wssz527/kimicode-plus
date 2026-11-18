@@ -175,38 +175,21 @@ async function installNativeBootstrap(options) {
     if (text.length > 200000) throw new Error('站点适配器返回值超过 200000 字符');
     return JSON.parse(text);
   }
-  // The management window reuses the core.fetch channel, so its routes are a
-  // fixed set: a caller cannot point it at anything the settings sheet does not
-  // offer, and the renderer never receives the core bearer token. Plugins are
-  // deliberately absent: they are managed inside the settings dialog itself.
-  const managementPaths = ['/models', '/credentials'];
-  function managementPath(value) {
-    if (typeof value !== 'string' || !managementPaths.includes(value)) throw new Error('管理窗口路径不被允许');
-    return value;
-  }
   async function openWindow(kind, source = {}) {
     const existing = state.windows.get(kind);
     if (existing && !existing.isDestroyed()) {
       existing.show(); existing.focus();
-      if (kind === 'management' && source.path) {
-        // Rebinding gives the window a fresh bridge key bound to the new route;
-        // the old key stops working before the new renderer starts. The theme is
-        // re-read so a rebind cannot fall back to a stale colour scheme.
-        const theme = await wc.executeJavaScript('document.documentElement.dataset.colorScheme||"dark"');
-        await bindRenderer(existing.webContents, 'management', { popout: true, theme, initialPath: managementPath(source.path) });
-      }
       return { focused: true };
     }
     const theme = await wc.executeJavaScript('document.documentElement.dataset.colorScheme||"dark"');
     const previous = state.bounds.get(kind);
-    const management = kind === 'management';
     const plugin = kind.startsWith('plugin:');
     const win = new BrowserWindow({
-      title: management ? 'KimiCode+ 管理' : 'KimiCode+ 插件',
-      width: previous?.width || (management ? 1080 : 640),
-      height: previous?.height || (management ? 760 : 840),
+      title: 'KimiCode+ 插件',
+      width: previous?.width || 640,
+      height: previous?.height || 840,
       x: previous?.x, y: previous?.y,
-      minWidth: management ? 720 : 400, minHeight: management ? 520 : 500,
+      minWidth: 400, minHeight: 500,
       show: false, autoHideMenuBar: true, backgroundColor: theme === 'dark' ? '#121212' : '#ffffff',
       webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, devTools: false },
     });
@@ -237,8 +220,7 @@ async function installNativeBootstrap(options) {
       if (url !== 'about:blank') event.preventDefault();
     });
     await win.loadURL('about:blank');
-    if (management) await bindRenderer(win.webContents, 'management', { popout: true, theme, initialPath: managementPath(source.path) });
-    else await bindRenderer(win.webContents, 'plugin', { popout: true, theme, pluginId: source.pluginId, sourceSessionId: source.sourceSessionId || '' });
+    await bindRenderer(win.webContents, 'plugin', { popout: true, theme, pluginId: source.pluginId, sourceSessionId: source.sourceSessionId || '' });
     win.show(); win.focus();
     return { opened: true };
   }
@@ -272,13 +254,12 @@ async function installNativeBootstrap(options) {
         const result = Buffer.from(await response.arrayBuffer()).toString('base64');
         return { status: response.status, headers: [['Content-Type', response.headers.get('content-type') || 'application/json']], bodyBase64: result };
       }
-      case 'window.openSettings': return wc.executeJavaScript('window.__ekdNativeUI.openSettings()');
+      case 'window.openSettings': return wc.executeJavaScript('window.__ekdNativeUI.openSettings(' + JSON.stringify(typeof payload.tab === 'string' ? payload.tab : '') + ')');
       case 'plugin.window.open': {
         const answer = await corePluginAction('ui.popout', payload.token, {});
         if (typeof answer?.pluginId !== 'string' || !/^[a-z0-9][a-z0-9.-]{0,63}$/.test(answer.pluginId)) throw new Error('核心返回的插件窗口归属无效');
         return openWindow('plugin:' + answer.pluginId, { pluginId: answer.pluginId, sourceSessionId: typeof payload.sourceSessionId === 'string' ? payload.sourceSessionId : '' });
       }
-      case 'window.openManagement': return openWindow('management', { path: managementPath(payload.path) });
       case 'window.close': BrowserWindow.fromWebContents(target)?.close(); return {};
       case 'window.ensureWidth': {
         const win = BrowserWindow.fromWebContents(target);

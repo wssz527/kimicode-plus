@@ -26,7 +26,6 @@ import (
 type PlannerActions interface {
 	PlannerAction(context.Context, string, json.RawMessage) (any, error)
 	PlannerThreads(context.Context) (any, error)
-	PlannerModels(context.Context) (any, error)
 }
 
 // AddonFeatureState are the optional surfaces kept out of the core product.
@@ -232,29 +231,32 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		}
 		return planner.PlannerAction(ctx, strings.TrimPrefix(action, "planner.service."), payload)
 	}
-	// Thread and model discovery is read-only and has no plugin-visible meaning
-	// behind the frozen built-in planner, so it is answered here before the
-	// feature flag is consulted. It must come before the generic `planner.` branch
-	// below, which would otherwise demand that flag and never reach these cases.
-	if action == "planner.threads" || action == "planner.models" {
+	// Model discovery is the official catalog, not planner state, so it answers
+	// even when the built-in planner is closed and always matches what the
+	// subagent pool and handoff offer.
+	if action == "planner.models" {
+		models, err := s.kap.Models(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"items": models}, nil
+	}
+	// Thread discovery is read-only and has no plugin-visible meaning behind the
+	// frozen built-in planner, so it is answered before the feature flag is
+	// consulted. It must come before the generic `planner.` branch below, which
+	// would otherwise demand that flag and never reach this case.
+	if action == "planner.threads" {
 		s.mu.Lock()
 		planner := s.planner
 		s.mu.Unlock()
 		if planner == nil {
 			return nil, errors.New("规划模块尚未启用")
 		}
-		if action == "planner.threads" {
-			threads, err := planner.PlannerThreads(ctx)
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{"items": threads}, nil
-		}
-		models, err := planner.PlannerModels(ctx)
+		threads, err := planner.PlannerThreads(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"items": models}, nil
+		return map[string]any{"items": threads}, nil
 	}
 	if strings.HasPrefix(action, "planner.") {
 		features, err := s.addonFeatures(ctx)
@@ -385,6 +387,8 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		}
 		raw, err := s.kap.Request(ctx, http.MethodPost, "/config", patch)
 		return rawAsAny(raw), err
+	case "providers.updateModel":
+		return s.updateProviderModel(ctx, input)
 	case "managed.usage":
 		raw, err := s.kap.Request(ctx, http.MethodGet, "/oauth/usage", nil)
 		return rawAsAny(raw), err
@@ -471,13 +475,8 @@ func (s *NativeService) bootstrap(ctx context.Context) (map[string]any, error) {
 	planner := s.planner
 	s.mu.Unlock()
 	threads := any([]any{})
-	modelList := any(models)
 	if planner != nil && features.Planner {
 		threads, err = planner.PlannerThreads(ctx)
-		if err != nil {
-			return nil, err
-		}
-		modelList, err = planner.PlannerModels(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -486,7 +485,9 @@ func (s *NativeService) bootstrap(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"cwd": s.cwd, "models": modelList, "nativeModels": models, "threads": threads, "sessions": sessions, "recovery": recovery.Recovery, "features": features}, nil
+	// models is the single catalog every picker reads: the official list, whose
+	// keys are provider-qualified and match secondary_model.
+	return map[string]any{"cwd": s.cwd, "models": models, "nativeModels": models, "threads": threads, "sessions": sessions, "recovery": recovery.Recovery, "features": features}, nil
 }
 
 func (s *NativeService) nativeTurns(ctx context.Context, id string, count int) ([]NativeTurn, error) {
@@ -1151,7 +1152,7 @@ func (s *NativeService) handoffNewSession(ctx context.Context, input map[string]
 		}
 		known := false
 		for _, item := range catalog {
-			if item["id"] == model {
+			if item.ID == model {
 				known = true
 				break
 			}

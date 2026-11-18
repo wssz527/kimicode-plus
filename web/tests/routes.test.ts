@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  ROUTES,
   normalizePathname,
   notifyPathnameChange,
   pathnameSnapshot,
@@ -15,11 +16,19 @@ test("normalizePathname strips trailing slashes but keeps the root", () => {
 });
 
 test("routeForPath resolves every known page and falls back to overview", () => {
-  for (const path of ["/", "/models", "/usage", "/chat", "/handoff", "/plugins", "/settings"]) {
+  for (const path of ["/", "/usage", "/chat", "/handoff", "/plugins", "/settings", "/native-settings", "/workspace", "/browser"]) {
     assert.equal(routeForPath(path).path, path);
   }
   assert.equal(routeForPath("/unknown").path, "/");
   assert.equal(routeForPath("/usage/").path, "/usage");
+});
+
+test("the removed standalone pages have no route left", () => {
+  // Models are edited on the official provider form and credentials belong to
+  // the plugin that asks for them, so neither page exists any more.
+  assert.deepEqual(ROUTES.map(route => route.path).filter(path => path === "/models" || path === "/credentials"), []);
+  assert.equal(routeForPath("/models").path, "/");
+  assert.equal(routeForPath("/credentials").path, "/");
 });
 
 test("path snapshot is a stable read without a DOM (Node)", () => {

@@ -128,7 +128,9 @@ func TestRealLoopbackCoreLifecycle(t *testing.T) {
 		Token string `json:"sessionToken"`
 	}
 	json.Unmarshal(b, &grant)
-	code, _ = request("GET", "/models", nil, grant.Token)
+	// The quota adapters are the one surface left in the models scope now that
+	// the separate model page is gone.
+	code, _ = request("GET", "/gateways", nil, grant.Token)
 	if code != 200 {
 		t.Fatal("scoped read failed")
 	}

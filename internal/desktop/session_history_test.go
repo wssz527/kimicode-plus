@@ -120,8 +120,8 @@ func TestModelsListReturnsCatalogOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	page := value.(map[string]any)
-	items := page["items"].([]map[string]string)
-	if len(items) != 1 || items[0]["id"] != "kimi-k2" {
+	items := page["items"].([]NativeModel)
+	if len(items) != 1 || items[0].ID != "kimi-k2" {
 		t.Fatalf("models.list = %#v", page)
 	}
 }

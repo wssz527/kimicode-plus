@@ -216,7 +216,8 @@ func (g *Guard) Wrap(next http.Handler) http.Handler {
 			}
 		}
 		binaryUpload := r.Method == "POST" && r.URL.Path == "/enhance/v1/attachments" && r.Header.Get("Content-Type") == "application/octet-stream"
-		if r.Method != "GET" && r.Method != "HEAD" && !binaryUpload && strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]) != "application/json" {
+		emptyDelete := r.Method == "DELETE" && r.ContentLength == 0
+		if r.Method != "GET" && r.Method != "HEAD" && !emptyDelete && !binaryUpload && strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]) != "application/json" {
 			httpx.Fail(w, 415, "CONTENT_TYPE", "请使用 application/json")
 			return
 		}

@@ -3,6 +3,7 @@ import { api, type KctMigrationResult, type PluginActivity, type PluginPreview, 
 import { pluginHostBridge, syncPluginHost } from "../plugin-runtime/host";
 import { Icon } from "./Icon";
 import { ActionButton, Badge, EmptyState, ErrorNotice, Field, InfoNote, Panel, SkeletonRows, StateBadge } from "./ui";
+import { PluginCredentials } from "./PluginCredentials";
 import { PageError } from "../AppShell";
 import { errorMessage, errorRecovery, useAction, useResource } from "../lib/useResource";
 import { fmtDateTime, stateLabel, stateTone } from "../lib/format";
@@ -594,6 +595,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
             ) : null}
             <p className="panel-note">卸载会删除插件文件和它的私有存储。预装插件卸载后不会自动恢复，会以"已卸载"留在列表里，可以从那里恢复。</p>
           </Panel>
+          <PluginCredentials plugin={current} />
           {current.hasSettings && current.enabled ? <PluginSettingsPanel plugin={current} /> : null}
           {current.id === KCT_PLUGIN_ID ? (
             <KctMigrationPanel show={!current.enabled || current.state === "BLOCKED"} />

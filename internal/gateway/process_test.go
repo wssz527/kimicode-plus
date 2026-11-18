@@ -23,6 +23,25 @@ import (
 // TestGatewayThroughRealProcess exercises the shipped binary end to end: a real
 // listener, a real runtime file, a real SQLite database and a synthetic
 // upstream. The gateway is only accepted here if the built process serves it.
+// seedProvider writes the provider and catalog rows the gateway routes on. It
+// runs against the same SQLite file the process opened, before the first
+// completion is sent.
+func seedProvider(t *testing.T, path, id, baseURL, model string) {
+	t.Helper()
+	db, err := storage.Open(path)
+	if err != nil {
+		t.Fatalf("open seeded db: %v", err)
+	}
+	defer db.Close()
+	if _, err = db.Exec(`INSERT INTO registry_providers(id,name,protocol,base_url,secret_ref,created_at) VALUES(?,?,?,?,?,?)`,
+		id, "Synthetic", "openai", baseURL, "provider/synthetic/account", "2026-11-18T00:00:00Z"); err != nil {
+		t.Fatalf("seed provider: %v", err)
+	}
+	if _, err = db.Exec(`INSERT INTO registry_models(provider_id,model_id,display_name) VALUES(?,?,?)`, id, model, "Synthetic"); err != nil {
+		t.Fatalf("seed model: %v", err)
+	}
+}
+
 func TestGatewayThroughRealProcess(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the binary")
@@ -160,26 +179,17 @@ func TestGatewayThroughRealProcess(t *testing.T) {
 		return res, string(data)
 	}
 
-	// Configure a provider, a credential and an imported catalog through the
-	// real enhancement API, exactly as the UI would.
+	// The provider registry page is gone, so a provider and its catalog are no
+	// longer configured over HTTP. The credential still goes through the real
+	// API, and the rows the gateway reads are written the way the registry
+	// migration leaves them.
 	if res, body := call("POST", "/enhance/v1/credentials/unlock", `{"password":"synthetic-gateway-password"}`, pairing); res.StatusCode != 200 {
 		t.Fatalf("unlock %d: %s", res.StatusCode, body)
 	}
 	if res, body := call("PUT", "/enhance/v1/credentials", `{"ref":"provider/synthetic/account","value":"synthetic-upstream-key"}`, pairing); res.StatusCode != 200 {
 		t.Fatalf("credential %d: %s", res.StatusCode, body)
 	}
-	if res, body := call("POST", "/enhance/v1/providers", `{"id":"synthetic","name":"Synthetic","protocol":"openai","baseUrl":"`+upstream.URL+`"}`, pairing); res.StatusCode != 201 {
-		t.Fatalf("provider %d: %s", res.StatusCode, body)
-	}
-	if res, body := call("POST", "/enhance/v1/providers/synthetic/accounts", `{"id":"primary","label":"Primary","secretRef":"provider/synthetic/account"}`, pairing); res.StatusCode != 201 {
-		t.Fatalf("account %d: %s", res.StatusCode, body)
-	}
-	if res, body := call("POST", "/enhance/v1/providers/synthetic/discover", `{}`, pairing); res.StatusCode != 200 {
-		t.Fatalf("discover %d: %s", res.StatusCode, body)
-	}
-	if res, body := call("POST", "/enhance/v1/models/import", `{"records":[{"providerId":"synthetic","id":"synthetic-model","name":"Synthetic"}],"revision":1}`, pairing); res.StatusCode != 200 {
-		t.Fatalf("import %d: %s", res.StatusCode, body)
-	}
+	seedProvider(t, filepath.Join(dataDir, "enhancement.db"), "synthetic", upstream.URL, "synthetic-model")
 
 	// Gateway unauthenticated and authenticated.
 	if res, _ := call("GET", "/v1/models", "", ""); res.StatusCode != 401 {
@@ -192,7 +202,7 @@ func TestGatewayThroughRealProcess(t *testing.T) {
 	if strings.Contains(body, "synthetic-upstream-key") {
 		t.Fatal("models leaked the upstream key")
 	}
-	if res, body := call("GET", "/enhance/v1/gateway", "", pairing); res.StatusCode != 200 || !strings.Contains(body, `"toolCalls":true`) || !strings.Contains(body, `"multiAccount":false`) {
+	if res, body := call("GET", "/enhance/v1/gateway", "", pairing); res.StatusCode != 200 || !strings.Contains(body, `"toolCalls":true`) {
 		t.Fatalf("gateway capabilities %d: %s", res.StatusCode, body)
 	}
 

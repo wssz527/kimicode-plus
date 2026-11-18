@@ -13,7 +13,6 @@ import (
 	"sort"
 	"time"
 
-	"enhancedkimi/internal/httpx"
 )
 
 const PublicCatalogURL = "https://models.dev/api.json"
@@ -220,75 +219,3 @@ func (s *Service) catalogInputs(ctx context.Context, sourceProvider, targetProvi
 	return records, nil
 }
 
-func (s *Service) registerCatalog(mux *http.ServeMux) {
-	mux.HandleFunc("GET /enhance/v1/models/catalog", func(w http.ResponseWriter, r *http.Request) {
-		cached, err := s.cachedCatalog(r.Context())
-		if err != nil {
-			fail(w, err)
-			return
-		}
-		httpx.JSON(w, 200, cached.status)
-	})
-	mux.HandleFunc("POST /enhance/v1/models/catalog/refresh", func(w http.ResponseWriter, r *http.Request) {
-		var body struct{}
-		if !httpx.Decode(w, r, &body) {
-			return
-		}
-		status, err := s.RefreshCatalog(r.Context())
-		if err != nil {
-			httpx.JSON(w, 502, map[string]any{"error": map[string]string{"code": "CATALOG_REFRESH_FAILED", "message": "公共目录刷新失败，旧快照保留；可稍后重试。"}, "catalog": status})
-			return
-		}
-		httpx.JSON(w, 200, status)
-	})
-	mux.HandleFunc("POST /enhance/v1/models/catalog/import", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			SourceProvider string `json:"sourceProvider"`
-			TargetProvider string `json:"targetProvider"`
-			Preview        bool   `json:"preview"`
-			Revision       *int64 `json:"revision"`
-			CatalogHash    string `json:"catalogHash"`
-		}
-		if !httpx.Decode(w, r, &req) {
-			return
-		}
-		if req.Revision == nil {
-			fail(w, badRequest("MISSING_REVISION", "导入须提供预览基线"))
-			return
-		}
-		s.catalogMu.Lock()
-		defer s.catalogMu.Unlock()
-		cached, err := s.cachedCatalog(r.Context())
-		if err != nil {
-			fail(w, err)
-			return
-		}
-		if !req.Preview && req.CatalogHash != cached.status.SHA256 {
-			fail(w, conflict("CATALOG_CHANGED", "公共目录已变化，请重新预览"))
-			return
-		}
-		records, err := s.catalogInputs(r.Context(), req.SourceProvider, req.TargetProvider)
-		if err != nil {
-			fail(w, err)
-			return
-		}
-		if req.Preview {
-			out, err := s.Preview(r.Context(), records)
-			if err != nil {
-				fail(w, err)
-				return
-			}
-			httpx.JSON(w, 200, struct {
-				PreviewResult
-				CatalogHash string `json:"catalogHash"`
-			}{out, cached.status.SHA256})
-		} else {
-			out, err := s.Import(r.Context(), records, *req.Revision, "public-modelsdev")
-			if err != nil {
-				fail(w, err)
-				return
-			}
-			httpx.JSON(w, 200, out)
-		}
-	})
-}

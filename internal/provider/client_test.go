@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -72,12 +71,10 @@ func TestCatalogTimeoutReturnsStructuredResponseWithoutPartialResults(t *testing
 	if models, err := client.Models(context.Background(), "synthetic"); !errors.Is(err, context.DeadlineExceeded) || models != nil {
 		t.Fatalf("timeout returned partial results %+v: %v", models, err)
 	}
+	// The discovery route went with the model page; the catalog read itself is
+	// still the one the planner and the gateway resolve models through.
 	calls = 0
-	mux := http.NewServeMux()
-	client.Register(mux)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest("POST", "/enhance/v1/providers/synthetic/discover", strings.NewReader(`{}`)))
-	if w.Code != 504 || !strings.Contains(w.Body.String(), "DISCOVERY_TIMEOUT") || strings.Contains(w.Body.String(), `"records"`) {
-		t.Fatalf("timeout HTTP %d: %s", w.Code, w.Body.String())
+	if _, err := client.Models(context.Background(), "synthetic"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second timeout = %v", err)
 	}
 }

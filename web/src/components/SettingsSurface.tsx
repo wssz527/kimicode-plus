@@ -5,7 +5,7 @@ import { CacheSettings } from "./CacheSettings";
 import { PluginSettings } from "./PluginSettings";
 import { errorText } from "./workbench/pieces";
 import { NativeSettings } from "./NativeSettings";
-import { Badge, ErrorNotice, Spinner } from "./ui";
+import { Badge, Spinner } from "./ui";
 import { addonFeatureKeys, readAddonFeatures, writeAddonFeatures, type AddonFeatures, type NativeHost } from "../native";
 import "../styles/native-settings-surface.css";
 
@@ -18,17 +18,13 @@ const SECTIONS = [
 ] as const;
 type SectionId = typeof SECTIONS[number]["id"];
 
-const MANAGEMENT_PATHS = ["/models", "/credentials"] as const;
-type ManagementPath = typeof MANAGEMENT_PATHS[number];
-
 /**
- * The settings sheet is one list of real destinations. Models and credentials
- * open the management window: rendering those pages inside the official dialog
- * put a second navigation and a wide table into a 560px column.
+ * The settings sheet is one list of real destinations. Models are configured on
+ * the official provider form and credentials belong to the plugin that asks for
+ * them, so every row opens a section inside this sheet.
  */
 export function SettingsWindow({ host }: { host: NativeHost }) {
   const [openId, setOpenId] = useState<SectionId | null>(null);
-  const [managementError, setManagementError] = useState<string | null>(null);
   const returnTo = useRef<SectionId | null>(null);
   const backRef = useRef<HTMLButtonElement>(null);
   const rows = useRef(new Map<SectionId, HTMLButtonElement>());
@@ -38,14 +34,8 @@ export function SettingsWindow({ host }: { host: NativeHost }) {
     else if (returnTo.current) rows.current.get(returnTo.current)?.focus();
   }, [openId]);
 
-  function openManagement(path: ManagementPath) {
-    setManagementError(null);
-    host.openManagement(path).catch((cause: unknown) => setManagementError(errorText(cause)));
-  }
-
   if (!openId) {
     return <div className="ekds">
-      {managementError ? <ErrorNotice title="管理窗口没有打开" message={managementError} recovery="确认宿主仍是支持的版本后重试。" /> : null}
       <div className="ekds-group" role="group" aria-label="KimiCode+ 设置">
         {SECTIONS.map(item => <button
           key={item.id}
@@ -57,17 +47,6 @@ export function SettingsWindow({ host }: { host: NativeHost }) {
           <span className="ekds-row-label"><strong>{item.label}</strong><small>{item.hint}</small></span>
           <Icon name="arrowRight" size={15} className="ekds-chevron" />
         </button>)}
-        <button
-          type="button"
-          className="ekds-row ekds-row-button"
-          onClick={() => openManagement("/models")}
-        >
-          <span className="ekds-row-label"><strong>模型、供应商与凭据</strong><small>在独立管理窗口里编辑目录与加密密钥</small></span>
-          <span className="ekds-row-tail">
-            <span className="ekds-row-aside">独立窗口</span>
-            <Icon name="arrowUpRight" size={15} className="ekds-chevron" />
-          </span>
-        </button>
       </div>
     </div>;
   }

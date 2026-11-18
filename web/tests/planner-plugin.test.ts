@@ -1816,7 +1816,7 @@ test("createViewLauncher coalesces concurrent opens and navigates directly after
   assert.deepEqual(retryNavs, ["https://chatgpt.com/"]);
 });
 
-test("local planner loads registry models via planner.models and handoff picks only official models", async () => {
+test("local planner reads the official catalog first and handoff picks only listed models", async () => {
   const { loadPlannerModels, pickHandoffModel } = planner as unknown as {
     loadPlannerModels(deps?: {
       planner?: { models?: () => Promise<Array<{ id: string; name?: string }>> };
@@ -1825,20 +1825,21 @@ test("local planner loads registry models via planner.models and handoff picks o
     pickHandoffModel(localModel: string, handoffModels?: Array<{ id: string; name?: string }>): string;
   };
 
-  let kapCalls = 0;
+  // Both sources are asked through the same shape; the official catalog wins so
+  // the planner, the subagent pool and handoff cannot drift apart.
+  let fallbackCalls = 0;
   const loaded = await loadPlannerModels({
-    planner: { models: async () => [{ id: "synthetic-planner", name: "synthetic-planner" }] },
-    models: {
-      list: async () => {
-        kapCalls += 1;
-        return [];
-      },
-    },
+    planner: { models: async () => { fallbackCalls += 1; return [{ id: "legacy-planner" }]; } },
+    models: { list: async () => [{ id: "kimi-k2", name: "Kimi K2" }] },
   });
-  assert.equal(kapCalls, 0);
-  assert.deepEqual(loaded, [{ id: "synthetic-planner", name: "synthetic-planner" }]);
+  assert.equal(fallbackCalls, 0);
+  assert.deepEqual(loaded, [{ id: "kimi-k2", name: "Kimi K2" }]);
 
-  assert.equal(pickHandoffModel("synthetic-planner", []), "");
-  assert.equal(pickHandoffModel("synthetic-planner", [{ id: "kimi-k2", name: "Kimi K2" }]), "");
+  // A core without the catalog still resolves models through the planner.
+  const fallback = await loadPlannerModels({ planner: { models: async () => [{ id: "legacy-planner" }] } });
+  assert.deepEqual(fallback, [{ id: "legacy-planner", name: "legacy-planner" }]);
+
+  assert.equal(pickHandoffModel("legacy-planner", []), "");
+  assert.equal(pickHandoffModel("legacy-planner", [{ id: "kimi-k2", name: "Kimi K2" }]), "");
   assert.equal(pickHandoffModel("kimi-k2", [{ id: "kimi-k2", name: "Kimi K2" }]), "kimi-k2");
 });

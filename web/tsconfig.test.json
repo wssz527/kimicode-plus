@@ -23,7 +23,8 @@
     "tests",
     "src/lib/contract.ts",
     "src/lib/format.ts",
-    "src/lib/modelsdev.ts",
+    "src/lib/models.ts",
+    "src/lib/pluginCredentials.ts",
     "src/lib/usage.ts",
     "src/plugin-runtime",
     "../adapters"
