@@ -26,7 +26,9 @@ export interface SidebarNavDefinition {
 
 export interface MainAreaDefinition {
   render(element: HTMLElement): Cleanup | void;
-  /** Initial split width in CSS pixels for the plugin's own side. */
+  /** "split" places the pane beside the native chat view; "page" replaces the main area while mounted. */
+  mode?: "split" | "page";
+  /** Initial split width in CSS pixels for the plugin's own side (split mode only). */
   width?: number;
   minWidth?: number;
   maxWidth?: number;
@@ -300,6 +302,7 @@ export interface PluginContext {
     approve(input: { id: string; interactionId: string; value: unknown }): Promise<unknown>;
     abort(id: string): Promise<unknown>;
     open(id: string): Promise<void>;
+    activeId?(): string;
     history(input: { id: string; beforeOrdinal?: number; pageSize?: number; agentId?: string }): Promise<SessionHistoryPage>;
     /**
      * Holds one reference to a session's event stream; every call needs exactly
@@ -343,7 +346,18 @@ export interface PluginContext {
     preview(input: HandoffInput): Promise<HandoffPreview>;
     commit(input: HandoffInput): Promise<HandoffResult>;
   };
-  models?: { list(): Promise<Array<{ id: string; name: string }>> };
+  models?: {
+    list(): Promise<Array<{
+      id: string;
+      name: string;
+      provider?: string;
+      model?: string;
+      capabilities?: string[];
+      support_efforts?: string[];
+      adaptive_thinking?: boolean;
+      max_context_size?: number;
+    }>>;
+  };
   commands?: {
     /**
      * Registers a command. `run` is the body this plugin's own renderer executes

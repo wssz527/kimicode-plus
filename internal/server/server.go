@@ -24,6 +24,7 @@ import (
 	"enhancedkimi/internal/plugins"
 	"enhancedkimi/internal/provider"
 	"enhancedkimi/internal/registry"
+	"enhancedkimi/internal/scheduler"
 	"enhancedkimi/internal/security"
 	"enhancedkimi/internal/usage"
 	"enhancedkimi/internal/webassets"
@@ -59,6 +60,7 @@ type App struct {
 	started       time.Time
 	gateway       *gateway.Gateway
 	planner       *chat.PlannerService
+	scheduler     *scheduler.Engine
 	kctMigration  *kctmigration.Service
 	gatewayErr    string
 	gatewayBase   string
@@ -259,18 +261,63 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 				} else {
 					nativeService.UsePlanner(planner)
 					app.planner = planner
-					// A plugin that is disabled must not keep a planner thread it
-					// started streaming. The hook is attached here because this is
-					// the first point where both the plugin host and the planner
-					// exist.
-					if app.pluginManager != nil {
-						app.pluginManager.UseStopPluginWork(func(ctx context.Context, id string) error {
-							_, stopErr := planner.StopPluginThreads(ctx, id)
-							return stopErr
-						})
-					}
 					app.modules = append(app.modules, Module{"planner", "READY", "持久化流式规划、工作区工具与逐次审批"})
 				}
+			}
+			schedulerStore, schedStoreErr := scheduler.NewStore(db)
+			if schedStoreErr != nil {
+				app.modules = append(app.modules, Module{"scheduler", "FAULTED", "定时任务存储初始化失败，其余模块仍可使用"})
+			} else {
+				recordActivity := func(ctx context.Context, pluginID, detail string) {
+					if app.pluginManager != nil {
+						app.pluginManager.RecordActivity(ctx, pluginID, plugins.ActivitySession, detail)
+					}
+				}
+				schedEngine, schedErr := scheduler.NewEngine(
+					schedulerStore,
+					nativeService.NewSchedulerExecutor(recordActivity),
+					scheduler.WithDefaultCWD(native.CWD),
+					scheduler.WithPluginEnabled(func(pluginID string) bool {
+						if cfg.Safe() || app.pluginManager == nil {
+							return false
+						}
+						p, ok := app.pluginManager.Get(pluginID)
+						return ok && p.Enabled
+					}),
+				)
+				if schedErr != nil {
+					app.modules = append(app.modules, Module{"scheduler", "FAULTED", "定时任务调度初始化失败，其余模块仍可使用"})
+				} else {
+					nativeService.UseScheduler(schedEngine)
+					app.scheduler = schedEngine
+					schedEngine.Start()
+					app.modules = append(app.modules, Module{"scheduler", "READY", "本地持久化定时任务与无人值守调度引擎"})
+				}
+			}
+			if app.pluginManager != nil {
+				app.pluginManager.UseStopPluginWork(func(ctx context.Context, id string) error {
+					var errs []error
+					if app.planner != nil {
+						if _, stopErr := app.planner.StopPluginThreads(ctx, id); stopErr != nil {
+							errs = append(errs, stopErr)
+						}
+					}
+					if app.scheduler != nil {
+						if stopErr := app.scheduler.StopPlugin(ctx, id); stopErr != nil {
+							errs = append(errs, stopErr)
+						}
+					}
+					return errors.Join(errs...)
+				})
+				app.pluginManager.UseOnUninstall(func(ctx context.Context, id string, deleteData bool) error {
+					if app.scheduler == nil {
+						return nil
+					}
+					if deleteData {
+						return app.scheduler.DeletePluginData(ctx, id)
+					}
+					return app.scheduler.StopPlugin(ctx, id)
+				})
 			}
 			app.modules = append(app.modules, Module{"native-host", "READY", "官方会话适配与版本化 RPC 动作层"})
 		}
@@ -359,6 +406,9 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 	return app, nil
 }
 func (a *App) Close() error {
+	if a.scheduler != nil {
+		a.scheduler.Close()
+	}
 	if a.planner != nil {
 		a.planner.Close()
 	}

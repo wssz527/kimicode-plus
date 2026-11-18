@@ -86,7 +86,7 @@ v2 能力由构建时机制授权：`plugins/registry.go` 对每个嵌入插件�
 |---|---|---|
 | `ui:entry` | 一种"可打开标签类型"：会话信息「可打开」分组、右侧面板空白列表和 `+` 菜单的三处入口。按容器幂等注入，官方重渲染后自动补回 | 运行时 `ctx.entry.add({ id, title, icon, open })`，无独立动作 |
 | `ui:sidebar-nav` | 官方左侧栏「新建会话」下方的一行入口，结构和样式复制官方侧栏行；点击行为由插件决定（通常是打开 `ui:main-area` 页面） | 运行时 `ctx.sidebarNav.add({ id, title, icon, open })`，无独立动作 |
-| `ui:main-area` | 主聊天区右侧分栏，可拖动分隔条调整原生视图宽度 | 运行时 `ctx.mainArea.mount()` |
+| `ui:main-area` | 主聊天区右侧分栏（`mode: "split"`，可拖动分隔条）或占满整个主聊天区（`mode: "page"`，退出后恢复原生视图） | 运行时 `ctx.mainArea.mount()` |
 | `ui:right-panel` | 右侧面板动态标签页，带关闭键，宽度沿用官方侧边聊天；可弹出独立插件窗口 | 运行时 `ctx.rightPanel.mount()`、`ctx.window.popout()`；`ui.popout` |
 | `ui:layout` | 按引用计数收起左侧栏，全部释放后恢复原状 | 运行时 `ctx.layout.acquireSidebarCollapse()` |
 | `sessions:approve` | 处理会话审批/提问 | `sessions.approve` → 原生 `session.reply` |
@@ -224,7 +224,7 @@ interface PluginContext {
   // v2：以下字段只在授予对应能力时出现，未授权时为 undefined。
   entry?: { add(definition: { id: string; title: string; icon?: string; open(): void | Promise<void> }): Disposable };
   sidebarNav?: { add(definition: { id: string; title: string; icon?: string; open(): void | Promise<void> }): Disposable };
-  mainArea?: { mount(definition: { render(el: HTMLElement): Cleanup | void; width?: number; minWidth?: number; maxWidth?: number }): { setWidth(px: number): void; width(): number; dispose(): void } };
+  mainArea?: { mount(definition: { render(el: HTMLElement): Cleanup | void; mode?: "split" | "page"; width?: number; minWidth?: number; maxWidth?: number }): { setWidth(px: number): void; width(): number; dispose(): void } };
   rightPanel?: { mount(definition: { title: string; render(el: HTMLElement): Cleanup | void }): { open(): void; close(): void; readonly open_: boolean; dispose(): void } };
   window?: { popout(): Promise<void>; close(): Promise<void> };
   layout?: { acquireSidebarCollapse(): Disposable };

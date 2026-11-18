@@ -17,10 +17,13 @@ export class FakeElement {
   id = "";
   textContent = "";
   innerHTML = "";
+  hidden = false;
+  tabIndex = 0;
   ownerDocument: FakeDocument | null = null;
   parentElement: FakeElement | null = null;
   children: FakeElement[] = [];
   isConnected = false;
+  style: Record<string, string> & { removeProperty: (name: string) => void };
   private classes = new Set<string>();
   private attributes = new Map<string, string>();
   private listeners = new Map<string, Array<(event: FakeEvent) => void>>();
@@ -28,6 +31,18 @@ export class FakeElement {
   constructor(tagName = "div", className = "") {
     this.tagName = tagName.toUpperCase();
     this.className = className;
+    const styleMap: Record<string, string> = {};
+    this.style = Object.assign(styleMap, {
+      removeProperty: (name: string) => {
+        const camel = name.replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase());
+        delete styleMap[name];
+        delete styleMap[camel];
+      },
+    }) as Record<string, string> & { removeProperty: (name: string) => void };
+  }
+
+  get childNodes(): FakeElement[] {
+    return this.children;
   }
 
   get className(): string {
@@ -117,11 +132,20 @@ export class FakeElement {
 
   append(...nodes: FakeElement[]): void {
     for (const node of nodes) {
+      if (node.parentElement) {
+        const index = node.parentElement.children.indexOf(node);
+        if (index >= 0) node.parentElement.children.splice(index, 1);
+      }
       node.parentElement = this;
       node.ownerDocument = this.ownerDocument;
       this.children.push(node);
       node.setConnected(this.isConnected);
     }
+  }
+
+  replaceChildren(...nodes: FakeElement[]): void {
+    for (const child of [...this.children]) child.remove();
+    this.append(...nodes);
   }
 
   insertAdjacentElement(position: "afterend" | "beforebegin" | "afterbegin" | "beforeend", element: FakeElement): FakeElement | null {
@@ -253,6 +277,10 @@ export class FakeDocument {
     const element = new FakeElement(tag);
     element.ownerDocument = this;
     return element;
+  }
+
+  createElementNS(_namespace: string, tag: string): FakeElement {
+    return this.createElement(tag);
   }
 
   querySelector(selector: string): FakeElement | null {

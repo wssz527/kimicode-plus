@@ -7,5 +7,5 @@ import "embed"
 // <dataDir>/plugins/<id> on first run. A plugin the user uninstalled stays
 // uninstalled: the release step checks its tombstone first.
 //
-//go:embed all:kct all:monitor all:planner
+//go:embed all:kct all:monitor all:planner all:scheduler
 var bundled embed.FS

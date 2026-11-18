@@ -28,6 +28,10 @@ type PlannerActions interface {
 	PlannerThreads(context.Context) (any, error)
 }
 
+type SchedulerActions interface {
+	SchedulerAction(ctx context.Context, pluginID, action string, payload json.RawMessage) (any, error)
+}
+
 // AddonFeatureState are the optional surfaces kept out of the core product.
 // Both default to false: an unset or unreadable row never enables an addon.
 type AddonFeatureState struct {
@@ -86,6 +90,7 @@ type NativeService struct {
 	verifyWindow time.Duration
 	verifyPoll   time.Duration
 	planner      PlannerActions
+	scheduler    SchedulerActions
 	attach       AttachConfig
 }
 
@@ -188,6 +193,12 @@ func (s *NativeService) UsePlanner(planner PlannerActions) {
 	s.mu.Unlock()
 }
 
+func (s *NativeService) UseScheduler(scheduler SchedulerActions) {
+	s.mu.Lock()
+	s.scheduler = scheduler
+	s.mu.Unlock()
+}
+
 func (s *NativeService) Events() *EventBus { return s.bus }
 
 func (s *NativeService) Register(mux *http.ServeMux) {
@@ -218,6 +229,24 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		if err := json.Unmarshal(payload, &input); err != nil {
 			return nil, errors.New("动作参数必须是对象")
 		}
+	}
+	if strings.HasPrefix(action, "schedule.") {
+		s.mu.Lock()
+		scheduler := s.scheduler
+		s.mu.Unlock()
+		if scheduler == nil {
+			return nil, errors.New("定时任务调度引擎尚未启用")
+		}
+		pluginOwner := stringInput(input, "pluginOwner")
+		if pluginOwner == "" {
+			return nil, errors.New("缺少插件身份标识")
+		}
+		delete(input, "pluginOwner")
+		cleaned, err := json.Marshal(input)
+		if err != nil {
+			return nil, err
+		}
+		return scheduler.SchedulerAction(ctx, pluginOwner, action, cleaned)
 	}
 	if strings.HasPrefix(action, "planner.service.") {
 		// The v2 plugin path to the local planner. It deliberately skips the old
@@ -1044,6 +1073,9 @@ func (s *NativeService) sendPrompt(ctx context.Context, input map[string]any) (a
 	}
 	if model := stringInput(input, "model"); model != "" {
 		body["model"] = model
+	}
+	if thinking := stringInput(input, "thinking"); thinking != "" {
+		body["thinking"] = thinking
 	}
 	s.touchSession(id)
 	raw, err := s.kap.Request(ctx, http.MethodPost, "/sessions/"+id+"/prompts", body)

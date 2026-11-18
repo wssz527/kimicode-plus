@@ -14,6 +14,8 @@
  * what keeps a disabled plugin from leaving an observer behind.
  */
 
+import type { Cleanup, MainAreaDefinition, MainAreaHandle } from "./context.js";
+
 export interface EntryPlan {
   /** Stable action id; `plugin:<pluginId>:<entryId>` for plugin entries. */
   action: string;
@@ -126,7 +128,9 @@ function setIcon(element: Element, icon: string | undefined): void {
   svg.setAttribute("stroke-width", "1.6");
   svg.setAttribute("stroke-linecap", "round");
   svg.setAttribute("stroke-linejoin", "round");
-  svg.innerHTML = '<path d="' + icon + '"></path>';
+  const path = element.ownerDocument.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", icon);
+  svg.replaceChildren(path);
 }
 
 function removeShortcuts(element: Element): void {
@@ -328,5 +332,161 @@ export function createEntryMountManager(options: EntryMountManagerOptions): Entr
         observers: 0,
       };
     },
+  };
+}
+
+export interface MainAreaMountOptions {
+  document: Document;
+  container: HTMLElement;
+  pluginId: string;
+  definition: MainAreaDefinition;
+  window?: Window | null;
+}
+
+function runCleanup(cleanup: Cleanup | void): void {
+  if (!cleanup) return;
+  try {
+    if (typeof cleanup === "function") cleanup();
+    else cleanup.dispose();
+  } catch {
+    // a failing teardown must not strand DOM restoration
+  }
+}
+
+export function mountMainAreaSurface(options: MainAreaMountOptions): MainAreaHandle {
+  const { document, container, pluginId, definition } = options;
+  const hostWindow = options.window ?? null;
+  const mode = definition?.mode === "page" ? "page" : "split";
+
+  const row = document.createElement("div");
+  row.className = "ekdp-main-split";
+  row.dataset.ekdpPlugin = pluginId;
+  row.dataset.ekdpMode = mode;
+
+  const native = document.createElement("div");
+  native.className = "ekdp-main-native";
+
+  const splitter = document.createElement("div");
+  splitter.className = "ekdp-main-splitter";
+  splitter.setAttribute("role", "separator");
+  splitter.setAttribute("aria-orientation", "vertical");
+  splitter.setAttribute("aria-label", "调整同屏宽度");
+  splitter.tabIndex = 0;
+
+  const pane = document.createElement("div");
+  pane.className = "ekdp-main-pane";
+  pane.dataset.ekdpPlugin = pluginId;
+
+  for (const child of Array.from(container.childNodes)) native.append(child);
+  row.append(native, splitter, pane);
+  container.append(row);
+
+  const min = Math.max(280, Number(definition?.minWidth) || 360);
+  const max = Math.max(min, Number(definition?.maxWidth) || 900);
+  let width = Math.min(max, Math.max(min, Number(definition?.width) || 420));
+
+  const apply = () => {
+    container.style.display = "flex";
+    container.style.flexDirection = "column";
+    pane.style.minWidth = "0";
+    pane.style.minHeight = "0";
+    pane.style.display = "flex";
+    pane.style.flexDirection = "column";
+    if (mode === "page") {
+      container.dataset.ekdpPage = pluginId;
+      delete container.dataset.ekdpSplit;
+      native.hidden = true;
+      native.style.display = "none";
+      splitter.hidden = true;
+      splitter.style.display = "none";
+      pane.style.flex = "1 1 auto";
+      pane.style.width = "100%";
+      return;
+    }
+    container.dataset.ekdpSplit = pluginId;
+    delete container.dataset.ekdpPage;
+    native.hidden = false;
+    native.style.flex = "1 1 auto";
+    native.style.minWidth = "0";
+    native.style.minHeight = "0";
+    native.style.display = "flex";
+    native.style.flexDirection = "column";
+    splitter.hidden = false;
+    splitter.style.removeProperty("display");
+    pane.style.flex = "0 0 auto";
+    pane.style.width = width + "px";
+  };
+  apply();
+
+  let dragging: { startX: number; startWidth: number } | null = null;
+  const onPointerMove = (event: PointerEvent) => {
+    if (!dragging) return;
+    const next = dragging.startWidth - (event.clientX - dragging.startX);
+    width = Math.min(max, Math.max(min, next));
+    apply();
+  };
+  const stopDrag = () => {
+    dragging = null;
+    splitter.classList.remove("dragging");
+    if (hostWindow) {
+      hostWindow.removeEventListener("pointermove", onPointerMove, true);
+      hostWindow.removeEventListener("pointerup", stopDrag, true);
+    }
+  };
+  const onPointerDown = (event: PointerEvent) => {
+    if (mode === "page") return;
+    event.preventDefault();
+    dragging = { startX: event.clientX, startWidth: width };
+    splitter.classList.add("dragging");
+    if (hostWindow) {
+      hostWindow.addEventListener("pointermove", onPointerMove, true);
+      hostWindow.addEventListener("pointerup", stopDrag, true);
+    }
+  };
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (mode === "page") return;
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    width = Math.min(max, Math.max(min, width + (event.key === "ArrowLeft" ? 24 : -24)));
+    apply();
+  };
+  if (mode === "split") {
+    splitter.addEventListener("pointerdown", onPointerDown as EventListener);
+    splitter.addEventListener("keydown", onKeyDown as EventListener);
+  }
+
+  let released = false;
+  let renderCleanup: Cleanup | void;
+  const release = () => {
+    if (released) return;
+    released = true;
+    stopDrag();
+    if (mode === "split") {
+      splitter.removeEventListener("pointerdown", onPointerDown as EventListener);
+      splitter.removeEventListener("keydown", onKeyDown as EventListener);
+    }
+    runCleanup(renderCleanup);
+    for (const child of Array.from(native.childNodes)) container.append(child);
+    row.remove();
+    container.style.removeProperty("display");
+    container.style.removeProperty("flex-direction");
+    delete container.dataset.ekdpSplit;
+    delete container.dataset.ekdpPage;
+  };
+  try {
+    renderCleanup = definition.render(pane);
+  } catch (error) {
+    release();
+    throw error;
+  }
+
+  return {
+    setWidth(px: number) {
+      if (mode === "page") return;
+      width = Math.min(max, Math.max(min, Number(px) || width));
+      apply();
+    },
+    width: () => width,
+    dispose: release,
   };
 }

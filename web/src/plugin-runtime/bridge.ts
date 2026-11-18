@@ -89,6 +89,16 @@ const ACTION_CAPABILITY: Record<string, string> = {
   "commands.unregister": "commands",
   "commands.list": "commands",
   "commands.invoke": "commands",
+  "schedule.status": "schedule:manage",
+  "schedule.list": "schedule:manage",
+  "schedule.save": "schedule:manage",
+  "schedule.delete": "schedule:manage",
+  "schedule.toggle": "schedule:manage",
+  "schedule.runNow": "schedule:manage",
+  "schedule.runs": "schedule:manage",
+  "schedule.markRead": "schedule:manage",
+  "schedule.markAllRead": "schedule:manage",
+  "schedule.prefs": "schedule:manage",
 };
 
 export function createBridge(options: BridgeOptions): Bridge {

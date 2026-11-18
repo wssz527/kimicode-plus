@@ -43,6 +43,7 @@ const (
 	CapHandoff         = "handoff"
 	CapModelsReadV2    = "models:read"
 	CapCommands        = "commands"
+	CapScheduleManage  = "schedule:manage"
 )
 
 // privilegedCapabilities is the closed set of v2 high-privilege capabilities.
@@ -52,6 +53,7 @@ var privilegedCapabilities = []string{
 	CapUIEntry, CapUISidebarNav, CapUIMainArea, CapUIRightPanel, CapUILayout,
 	CapSessionsApprove, CapSessionsAbort, CapSessionsHistory,
 	CapAttachments, CapBrowserView, CapPlannerRun, CapHandoff, CapModelsReadV2, CapCommands,
+	CapScheduleManage,
 }
 
 // RequiresPrivilege reports whether a capability belongs to the v2 set that is
@@ -316,6 +318,16 @@ var actionCapability = map[string]string{
 	"commands.invoke":      CapCommands,
 	"commands.unregister":  CapCommands,
 	"commands.list":        CapCommands,
+	"schedule.status":      CapScheduleManage,
+	"schedule.list":        CapScheduleManage,
+	"schedule.save":        CapScheduleManage,
+	"schedule.delete":      CapScheduleManage,
+	"schedule.toggle":      CapScheduleManage,
+	"schedule.runNow":      CapScheduleManage,
+	"schedule.runs":        CapScheduleManage,
+	"schedule.markRead":    CapScheduleManage,
+	"schedule.markAllRead": CapScheduleManage,
+	"schedule.prefs":       CapScheduleManage,
 }
 
 // eventScopeCapability maps an event scope to the capability that reveals it.
@@ -324,6 +336,7 @@ var actionCapability = map[string]string{
 var eventScopeCapability = map[string]string{
 	"cache":      CapMetricsRead,
 	"automation": CapMetricsRead,
+	"schedule":   CapScheduleManage,
 }
 
 // EventScopeAllowed reports whether a plugin may subscribe to one event scope.

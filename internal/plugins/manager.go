@@ -227,6 +227,7 @@ type Manager struct {
 	// outside this package (a planner thread, for instance). It is a function so
 	// the plugin host does not have to import the engine it is stopping.
 	stopPluginWork func(ctx context.Context, id string) error
+	onUninstall    func(ctx context.Context, id string, deleteData bool) error
 	onChange       func()
 
 	mu      sync.Mutex
@@ -319,6 +320,24 @@ func (m *Manager) UseOnChange(fn func()) {
 	m.mu.Lock()
 	m.onChange = fn
 	m.mu.Unlock()
+}
+
+// UseOnUninstall registers a hook invoked when a plugin is uninstalled.
+func (m *Manager) UseOnUninstall(fn func(ctx context.Context, id string, deleteData bool) error) {
+	m.mu.Lock()
+	m.onUninstall = fn
+	m.mu.Unlock()
+}
+
+// RecordActivity appends an audited plugin activity row for host-driven actions.
+func (m *Manager) RecordActivity(ctx context.Context, pluginID, kind, detail string) {
+	if pluginID == "" {
+		return
+	}
+	if kind == "" {
+		kind = ActivitySession
+	}
+	_ = recordActivity(ctx, m.db, pluginID, kind, detail, m.now())
 }
 
 func (m *Manager) notifyChange() {
@@ -871,6 +890,10 @@ func (m *Manager) Disable(ctx context.Context, id string) error {
 // tombstone so the bundled copy is not released again. The tombstone is what
 // makes "uninstall" a decision rather than a temporary deletion.
 func (m *Manager) Uninstall(ctx context.Context, id string) error {
+	return m.UninstallWithOptions(ctx, id, false)
+}
+
+func (m *Manager) UninstallWithOptions(ctx context.Context, id string, deleteData bool) error {
 	m.mu.Lock()
 	item, ok := m.entries[id]
 	if !ok {
@@ -880,6 +903,7 @@ func (m *Manager) Uninstall(ctx context.Context, id string) error {
 	dir := item.dir
 	now := m.now()
 	name, version, source := item.manifest.Name, item.manifest.Version, item.source
+	onUninstall := m.onUninstall
 	// Stop first, remove second. A file or row failure below leaves the plugin
 	// installed but stopped, never running with a token that outlives the
 	// uninstall decision the user just made.
@@ -897,6 +921,11 @@ func (m *Manager) Uninstall(ctx context.Context, id string) error {
 	}
 	if err := m.stopWork(ctx, id); err != nil {
 		_ = recordActivity(ctx, m.db, id, ActivityDisable, "卸载前已停止插件，但后台任务未能全部结束："+err.Error(), now)
+	}
+	if onUninstall != nil {
+		if err := onUninstall(ctx, id, deleteData); err != nil {
+			_ = recordActivity(ctx, m.db, id, ActivityUninstall, "卸载时外部数据清理未完全成功："+err.Error(), now)
+		}
 	}
 	// Staged bytes are part of the running instance: nothing can release a batch
 	// once the plugin is gone, and the TTL sweep only runs when the plugin stages
@@ -1294,7 +1323,14 @@ func (m *Manager) handleDisable(w http.ResponseWriter, r *http.Request) {
 
 func (m *Manager) handleUninstall(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("id"))
-	if err := m.Uninstall(r.Context(), id); err != nil {
+	var body struct {
+		DeleteData          bool `json:"deleteData"`
+		DeleteSchedulerData bool `json:"deleteSchedulerData"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	if err := m.UninstallWithOptions(r.Context(), id, body.DeleteData || body.DeleteSchedulerData); err != nil {
 		fail(w, err)
 		return
 	}
