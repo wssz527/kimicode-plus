@@ -1,0 +1,332 @@
+/**
+ * Native entry injection for plugin `ui:entry` and `ui:sidebar-nav` grants.
+ *
+ * The official client builds its session-info "available" list, the right-panel
+ * empty state, the `+` menu and the sidebar rows from its own components. An
+ * injected row is therefore a clone of a real official row, so it carries the
+ * exact structure, scoped `data-v-*` attributes and class names the official CSS
+ * targets. Nothing here invents a second visual language.
+ *
+ * Reconciliation is per container and idempotent: every sync keeps at most one
+ * node per action in each container, recreates a node the official renderer
+ * removed, and drops nodes whose plan disappeared. The host owns the single
+ * MutationObserver and calls `sync()`; this module never installs one, which is
+ * what keeps a disabled plugin from leaving an observer behind.
+ */
+
+export interface EntryPlan {
+  /** Stable action id; `plugin:<pluginId>:<entryId>` for plugin entries. */
+  action: string;
+  title: string;
+  /** Single SVG path (`d`) drawn in the official icon slot. */
+  icon?: string;
+  pluginId?: string;
+  open(): void | Promise<void>;
+}
+
+export interface SidebarNavPlan {
+  action: string;
+  title: string;
+  icon?: string;
+  pluginId?: string;
+  open(): void | Promise<void>;
+}
+
+export interface EntryMountManagerOptions {
+  document: Document;
+  /** The official right-panel open path (the panel store's `showPanel`). */
+  openPanel?: () => void;
+  /** Called for an entry whose `open()` throws. `null` is a built-in entry. */
+  onError?: (pluginId: string | null, error: unknown) => void;
+}
+
+export interface EntryMountManager {
+  sync(entries: EntryPlan[], navs?: SidebarNavPlan[]): void;
+  remove(action: string): void;
+  dispose(): void;
+  stats(): { entries: number; navs: number; observers: number };
+}
+
+// The three documented plugin entry surfaces plus the real 1.3.7 `+` menu. The
+// `pl` launcher is the empty right-panel page; `panel-add-menu` is the dropdown
+// the `+` button opens. Both are kept because the acceptance plan names the
+// launcher and the live client renders both at different moments.
+function entryContainers(document: Document): Element[] {
+  const seen = new Set<Element>();
+  const containers: Element[] = [];
+  const add = (container: Element) => {
+    if (seen.has(container)) return;
+    seen.add(container);
+    containers.push(container);
+  };
+  // `SessionInfoTabs` renders two sections (opened / available); only the
+  // section that carries `.sit-available` buttons is a plugin target. The class
+  // lives on the buttons, not on the section, so the section is resolved by
+  // content instead of assuming a class name the official client does not use.
+  for (const section of Array.from(document.querySelectorAll("aside.session-info .sit-section"))) {
+    if (section.querySelector(".sit-available")) add(section);
+  }
+  for (const sit of Array.from(document.querySelectorAll(".pt-body .sit"))) {
+    const sections = Array.from(sit.querySelectorAll(".sit-section")).filter(section => section.querySelector(".sit-available"));
+    if (sections.length > 0) sections.forEach(add);
+    else add(sit);
+  }
+  for (const launcher of Array.from(document.querySelectorAll(".pt-body .pl"))) add(launcher);
+  for (const menu of Array.from(document.querySelectorAll(".panel-add-menu"))) add(menu);
+  return containers;
+}
+
+const ENTRY_ATTRIBUTE = "data-ekd-entry";
+const NAV_ATTRIBUTE = "data-ekd-sidebar-nav";
+const ICON_PATH = /^[MmLlHhVvCcSsQqTtAaZz0-9eE ,.+-]+$/;
+
+function byClass(node: Element, name: string): boolean {
+  return node.classList.contains(name);
+}
+
+function officialEntries(container: Element): Element[] {
+  return Array.from(container.querySelectorAll("button")).filter(button => {
+    if (button.hasAttribute(ENTRY_ATTRIBUTE)) return false;
+    if (byClass(button, "sit-more") || byClass(button, "sit-opened")) return false;
+    return byClass(button, "sit-link") || byClass(button, "ui-menu-item");
+  });
+}
+
+function labelSlot(element: Element): Element | null {
+  const spans = Array.from(element.querySelectorAll("span")).filter(span =>
+    !span.classList.contains("ui-kbd") && !span.classList.contains("ptb-kbd") && !span.classList.contains("pl-kbd"));
+  return spans.find(span => span.classList.contains("sit-name")) ?? spans[0] ?? null;
+}
+
+/** Replaces the official label without disturbing the cloned icon. */
+function setLabel(document: Document, element: Element, title: string): void {
+  const slot = labelSlot(element);
+  if (slot) {
+    slot.textContent = title;
+    return;
+  }
+  // A menu item renders its label as a direct text node. Keep the icon element,
+  // drop the old text and append a span so the new label is addressable too.
+  const icon = element.querySelector("svg");
+  element.textContent = "";
+  if (icon) element.append(icon);
+  const span = document.createElement("span");
+  span.className = "sit-name";
+  span.textContent = title;
+  element.append(span);
+}
+
+function setIcon(element: Element, icon: string | undefined): void {
+  if (!icon || !ICON_PATH.test(icon)) return;
+  const svg = element.querySelector("svg");
+  if (!svg) return;
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.6");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.innerHTML = '<path d="' + icon + '"></path>';
+}
+
+function removeShortcuts(element: Element): void {
+  for (const shortcut of Array.from(element.querySelectorAll(".ui-kbd, .ptb-kbd, .pl-kbd"))) shortcut.remove();
+}
+
+function prepareClonedButton(template: Element): HTMLElement {
+  const button = template.cloneNode(true) as HTMLElement;
+  button.removeAttribute("disabled");
+  button.removeAttribute("aria-disabled");
+  button.removeAttribute("aria-current");
+  button.removeAttribute("aria-expanded");
+  button.removeAttribute("aria-haspopup");
+  button.removeAttribute("data-state");
+  button.setAttribute("type", "button");
+  button.setAttribute("tabindex", "0");
+  removeShortcuts(button);
+  return button;
+}
+
+export function createEntryMountManager(options: EntryMountManagerOptions): EntryMountManager {
+  const { document } = options;
+  let disposed = false;
+  const listeners = new Map<Element, (event: Event) => void>();
+
+  function report(pluginId: string | null, error: unknown): void {
+    try {
+      options.onError?.(pluginId, error);
+    } catch {
+      // Reporting a failure must not break reconciliation.
+    }
+  }
+
+  function invoke(plan: EntryPlan | SidebarNavPlan, element: Element): void {
+    const fromSessionInfo = element.closest("aside.session-info") !== null;
+    void Promise.resolve()
+      .then(() => {
+        if (fromSessionInfo) options.openPanel?.();
+        return plan.open();
+      })
+      .catch(error => report(plan.pluginId ?? null, error));
+  }
+
+  function bind(element: HTMLElement, plan: EntryPlan | SidebarNavPlan): void {
+    const listener = (event: Event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      invoke(plan, element);
+    };
+    element.addEventListener("click", listener);
+    listeners.set(element, listener);
+  }
+
+  function unbind(element: Element): void {
+    const listener = listeners.get(element);
+    if (!listener) return;
+    (element as HTMLElement).removeEventListener("click", listener);
+    listeners.delete(element);
+  }
+
+  function makeEntry(template: Element, plan: EntryPlan): HTMLElement {
+    const button = prepareClonedButton(template);
+    button.classList.add("ekd-native-entry");
+    button.dataset.ekdEntry = plan.action;
+    setIcon(button, plan.icon);
+    setLabel(document, button, plan.title);
+    button.setAttribute("title", plan.title);
+    button.setAttribute("aria-label", plan.title);
+    bind(button, plan);
+    return button;
+  }
+
+  function makeNav(template: Element, plan: SidebarNavPlan): HTMLElement {
+    const button = prepareClonedButton(template);
+    button.classList.add("ekd-sidebar-nav");
+    button.dataset.ekdSidebarNav = plan.action;
+    setIcon(button, plan.icon);
+    setLabel(document, button, plan.title);
+    button.setAttribute("title", plan.title);
+    button.setAttribute("aria-label", plan.title);
+    bind(button, plan);
+    return button;
+  }
+
+  function syncEntries(entries: EntryPlan[]): Set<Element> {
+    const live = new Set<Element>();
+    const plans = entries.filter(plan => plan
+      && typeof plan.action === "string" && plan.action !== ""
+      && typeof plan.title === "string" && plan.title.trim() !== ""
+      && typeof plan.open === "function");
+    for (const container of entryContainers(document)) {
+      const officials = officialEntries(container);
+      if (officials.length === 0) continue;
+      const template = officials[0]!;
+      let anchor: Element = officials[officials.length - 1]!;
+      for (const plan of plans) {
+        const matches = Array.from(container.querySelectorAll("[" + ENTRY_ATTRIBUTE + "]"))
+          .filter(node => node.getAttribute(ENTRY_ATTRIBUTE) === plan.action);
+        let entry: Element | null = matches[0] ?? null;
+        for (const extra of matches.slice(1)) {
+          unbind(extra);
+          extra.remove();
+        }
+        if (entry && entry.previousElementSibling !== anchor) {
+          unbind(entry);
+          entry.remove();
+          entry = null;
+        }
+        if (!entry) {
+          entry = makeEntry(template, plan);
+          if (anchor.isConnected) anchor.insertAdjacentElement("afterend", entry);
+          else container.append(entry);
+        }
+        anchor = entry;
+        live.add(entry);
+      }
+    }
+    return live;
+  }
+
+  function syncNavs(navs: SidebarNavPlan[]): Set<Element> {
+    const live = new Set<Element>();
+    const plans = navs.filter(plan => plan
+      && typeof plan.action === "string" && plan.action !== ""
+      && typeof plan.title === "string" && plan.title.trim() !== ""
+      && typeof plan.open === "function");
+    for (const native of Array.from(document.querySelectorAll("button.btn-new-chat"))) {
+      const container = native.parentElement;
+      if (!container) continue;
+      if (native.hasAttribute(ENTRY_ATTRIBUTE) || native.hasAttribute(NAV_ATTRIBUTE)) continue;
+      let anchor: Element = native;
+      for (const plan of plans) {
+        const matches = Array.from(container.querySelectorAll("[" + NAV_ATTRIBUTE + "]"))
+          .filter(node => node.getAttribute(NAV_ATTRIBUTE) === plan.action);
+        let nav: Element | null = matches[0] ?? null;
+        for (const extra of matches.slice(1)) {
+          unbind(extra);
+          extra.remove();
+        }
+        if (nav && nav.previousElementSibling !== anchor) {
+          unbind(nav);
+          nav.remove();
+          nav = null;
+        }
+        if (!nav) {
+          nav = makeNav(native, plan);
+          anchor.insertAdjacentElement("afterend", nav);
+        }
+        anchor = nav;
+        live.add(nav);
+      }
+    }
+    return live;
+  }
+
+  function sweep(attribute: string, live: Set<Element>): void {
+    for (const node of Array.from(document.querySelectorAll("[" + attribute + "]"))) {
+      if (live.has(node)) continue;
+      unbind(node);
+      node.remove();
+    }
+  }
+
+  return {
+    sync(entries, navs = []) {
+      if (disposed) return;
+      const liveEntries = syncEntries(entries);
+      sweep(ENTRY_ATTRIBUTE, liveEntries);
+      const liveNavs = syncNavs(navs);
+      sweep(NAV_ATTRIBUTE, liveNavs);
+    },
+    remove(action) {
+      for (const node of Array.from(document.querySelectorAll("[" + ENTRY_ATTRIBUTE + "]"))
+        .filter(item => item.getAttribute(ENTRY_ATTRIBUTE) === action)) {
+        unbind(node);
+        node.remove();
+      }
+      for (const node of Array.from(document.querySelectorAll("[" + NAV_ATTRIBUTE + "]"))
+        .filter(item => item.getAttribute(NAV_ATTRIBUTE) === action)) {
+        unbind(node);
+        node.remove();
+      }
+    },
+    dispose() {
+      disposed = true;
+      for (const node of Array.from(document.querySelectorAll("[" + ENTRY_ATTRIBUTE + "],[" + NAV_ATTRIBUTE + "]"))) {
+        unbind(node);
+        node.remove();
+      }
+      listeners.clear();
+    },
+    stats() {
+      return {
+        entries: document.querySelectorAll("[" + ENTRY_ATTRIBUTE + "]").length,
+        navs: document.querySelectorAll("[" + NAV_ATTRIBUTE + "]").length,
+        // Reconciliation runs on the host's single MutationObserver. Keeping this
+        // at zero is what the toggle test asserts after twenty enable/disable
+        // cycles: a disabled plugin must not leave an observer of its own.
+        observers: 0,
+      };
+    },
+  };
+}

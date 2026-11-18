@@ -16,11 +16,14 @@ export class FakeElement {
   tagName: string;
   id = "";
   textContent = "";
+  innerHTML = "";
+  ownerDocument: FakeDocument | null = null;
   parentElement: FakeElement | null = null;
   children: FakeElement[] = [];
   isConnected = false;
   private classes = new Set<string>();
   private attributes = new Map<string, string>();
+  private listeners = new Map<string, Array<(event: FakeEvent) => void>>();
 
   constructor(tagName = "div", className = "") {
     this.tagName = tagName.toUpperCase();
@@ -51,7 +54,49 @@ export class FakeElement {
         else classes.delete(name);
         return next;
       },
+      get length() {
+        return classes.size;
+      },
+      item: (index: number) => [...classes][index] ?? null,
+      [Symbol.iterator]: () => classes[Symbol.iterator](),
     };
+  }
+
+  get dataset(): Record<string, string> {
+    const element = this;
+    return new Proxy({} as Record<string, string>, {
+      get: (_target, key) => element.getAttribute(`data-${kebab(String(key))}`) ?? "",
+      set: (_target, key, value) => {
+        element.setAttribute(`data-${kebab(String(key))}`, String(value));
+        return true;
+      },
+      deleteProperty: (_target, key) => {
+        element.removeAttribute(`data-${kebab(String(key))}`);
+        return true;
+      },
+    });
+  }
+
+  get firstElementChild(): FakeElement | null {
+    return this.children[0] ?? null;
+  }
+
+  get lastElementChild(): FakeElement | null {
+    return this.children[this.children.length - 1] ?? null;
+  }
+
+  get previousElementSibling(): FakeElement | null {
+    const parent = this.parentElement;
+    if (!parent) return null;
+    const index = parent.children.indexOf(this);
+    return index > 0 ? parent.children[index - 1]! : null;
+  }
+
+  get nextElementSibling(): FakeElement | null {
+    const parent = this.parentElement;
+    if (!parent) return null;
+    const index = parent.children.indexOf(this);
+    return index >= 0 && index < parent.children.length - 1 ? parent.children[index + 1]! : null;
   }
 
   getAttribute(name: string): string | null {
@@ -73,9 +118,65 @@ export class FakeElement {
   append(...nodes: FakeElement[]): void {
     for (const node of nodes) {
       node.parentElement = this;
+      node.ownerDocument = this.ownerDocument;
       this.children.push(node);
       node.setConnected(this.isConnected);
     }
+  }
+
+  insertAdjacentElement(position: "afterend" | "beforebegin" | "afterbegin" | "beforeend", element: FakeElement): FakeElement | null {
+    const parent = this.parentElement;
+    if (!parent) return null;
+    const index = parent.children.indexOf(this);
+    if (position === "afterend") parent.children.splice(index + 1, 0, element);
+    else if (position === "beforebegin") parent.children.splice(index, 0, element);
+    else if (position === "afterbegin") this.children.unshift(element);
+    else this.children.push(element);
+    element.parentElement = position === "afterbegin" || position === "beforeend" ? this : parent;
+    element.ownerDocument = this.ownerDocument;
+    element.setConnected((element.parentElement ?? this).isConnected);
+    return element;
+  }
+
+  cloneNode(deep = false): FakeElement {
+    const clone = new FakeElement(this.tagName);
+    for (const name of this.classes) clone.classList.add(name);
+    for (const [name, value] of this.attributes) clone.setAttribute(name, value);
+    clone.textContent = this.textContent;
+    clone.innerHTML = this.innerHTML;
+    clone.ownerDocument = this.ownerDocument;
+    if (deep) for (const child of this.children) clone.append(child.cloneNode(true));
+    return clone;
+  }
+
+  addEventListener(type: string, listener: (event: FakeEvent) => void): void {
+    const list = this.listeners.get(type) ?? [];
+    list.push(listener);
+    this.listeners.set(type, list);
+  }
+
+  removeEventListener(type: string, listener: (event: FakeEvent) => void): void {
+    const list = this.listeners.get(type);
+    if (!list) return;
+    const index = list.indexOf(listener);
+    if (index >= 0) list.splice(index, 1);
+    if (list.length === 0) this.listeners.delete(type);
+  }
+
+  listenerCount(type = "click"): number {
+    return this.listeners.get(type)?.length ?? 0;
+  }
+
+  dispatchEvent(event: FakeEvent): boolean {
+    for (const listener of [...(this.listeners.get(event.type) ?? [])]) {
+      if (!event.target) event.target = this;
+      listener(event);
+    }
+    return true;
+  }
+
+  click(): void {
+    this.dispatchEvent({ type: "click", target: this, preventDefault: () => {}, stopPropagation: () => {} });
   }
 
   setConnected(value: boolean): void {
@@ -112,7 +213,7 @@ export class FakeElement {
   }
 
   matches(selector: string): boolean {
-    return splitSelector(selector).some(part => matchesCompound(this, part));
+    return splitSelector(selector).some(part => matchesChain(this, part));
   }
 
   querySelectorAll(selector: string): FakeElement[] {
@@ -132,16 +233,26 @@ export class FakeElement {
   }
 }
 
+export interface FakeEvent {
+  type: string;
+  target?: FakeElement;
+  preventDefault: () => void;
+  stopPropagation: () => void;
+}
+
 export class FakeDocument {
   body = new FakeElement("body");
   documentElement = new FakeElement("html");
 
   constructor() {
+    this.body.ownerDocument = this;
     this.body.setConnected(true);
   }
 
   createElement(tag: string): FakeElement {
-    return new FakeElement(tag);
+    const element = new FakeElement(tag);
+    element.ownerDocument = this;
+    return element;
   }
 
   querySelector(selector: string): FakeElement | null {
@@ -205,8 +316,27 @@ function splitSelector(selector: string): string[] {
   return parts;
 }
 
+function kebab(name: string): string {
+  return name.replace(/[A-Z]/g, letter => "-" + letter.toLowerCase());
+}
+
+function matchesChain(element: FakeElement, part: string): boolean {
+  const compounds = part.split(/\s+/).filter(Boolean);
+  if (compounds.length === 0) throw new Error(`unsupported selector: ${part}`);
+  const last = compounds[compounds.length - 1]!;
+  if (!matchesCompound(element, last)) return false;
+  let current: FakeElement | null = element;
+  for (let index = compounds.length - 2; index >= 0; index -= 1) {
+    const ancestorSelector = compounds[index]!;
+    current = current.parentElement;
+    while (current && !matchesCompound(current, ancestorSelector)) current = current.parentElement;
+    if (!current) return false;
+  }
+  return true;
+}
+
 function matchesCompound(element: FakeElement, part: string): boolean {
-  if (/[\s>+~]/.test(part)) throw new Error(`unsupported selector: ${part}`);
+  if (/[>+~]/.test(part)) throw new Error(`unsupported selector: ${part}`);
   const tokens = part.match(/^[a-zA-Z][a-zA-Z0-9-]*|\.[A-Za-z0-9_-]+|\[[A-Za-z0-9_-]+\]|#[A-Za-z0-9_-]+/g) ?? [];
   if (!tokens.length) throw new Error(`unsupported selector: ${part}`);
   for (const token of tokens) {

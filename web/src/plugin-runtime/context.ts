@@ -4,16 +4,24 @@
 
 export type SlotName = "sidebar" | "settings" | "thinking" | "message";
 
-/** Host surfaces that exist only for the v2 privileged capabilities. */
+/** One openable tab type. The same definition is injected into the session-info
+ * "available" group, the right-panel empty list and the `+` menu. */
 export interface EntryDefinition {
   /** Stable id inside the plugin; registering twice with one id replaces it. */
   id: string;
-  label: string;
-  /** Optional one-line description shown in the host menu. */
-  title?: string;
-  run(): void | Promise<void>;
-  /** Whether the official tab bar shows a matching dynamic tab. */
-  tab?: boolean;
+  /** Label shown in every official row this entry is cloned into. */
+  title: string;
+  /** Single SVG path (`d`, viewBox 0 0 24 24) drawn in the official icon slot. */
+  icon?: string;
+  open(): void | Promise<void>;
+}
+
+/** One row under the official "new chat" button. Requires ui:sidebar-nav. */
+export interface SidebarNavDefinition {
+  id: string;
+  title: string;
+  icon?: string;
+  open(): void | Promise<void>;
 }
 
 export interface MainAreaDefinition {
@@ -141,6 +149,10 @@ export interface CommandInfo {
  */
 export interface EntryMountHost {
   register(pluginId: string, definition: EntryDefinition): Disposable;
+}
+
+export interface SidebarNavHost {
+  register(pluginId: string, definition: SidebarNavDefinition): Disposable;
 }
 
 export interface MainAreaHost {
@@ -274,8 +286,10 @@ export interface PluginContext {
   onDispose(cleanup: () => void): void;
 
   // --- API v2, privileged -------------------------------------------------
-  /** Right-panel "openable" list and `+` menu entry. Requires ui:entry. */
+  /** Right-panel "openable" list, empty right-panel list and `+` menu entry. Requires ui:entry. */
   entry?: { add(definition: EntryDefinition): Disposable };
+  /** A row under the official sidebar "new chat" button. Requires ui:sidebar-nav. */
+  sidebarNav?: { add(definition: SidebarNavDefinition): Disposable };
   /** A container beside the native chat view, with a resizable split. */
   mainArea?: { mount(definition: MainAreaDefinition): MainAreaHandle };
   /** A dynamic right-panel tab with a close button. */
