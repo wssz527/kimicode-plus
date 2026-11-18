@@ -1344,6 +1344,12 @@ async function installNativeRenderer(options) {
   // surface has no provider page.
   state.providerEnhance = options.surface === 'host' ? createProviderEnhance({ request: transport.request }) : null;
   state.providerEnhance?.install();
+  // Features and plugin lifecycle events drive syncPlugins() immediately, so
+  // enable/disable takes effect on the next frame without waiting for window focus.
+  const pluginEventHost = makeHost(() => {});
+  const unsubFeatures = pluginEventHost.subscribe('features', () => { void syncPlugins(); });
+  const unsubPlugins = pluginEventHost.subscribe('plugins', () => { void syncPlugins(); });
+  state.unsubscribePlugins = () => { unsubFeatures(); unsubPlugins(); };
   void syncPlugins();
   // Plugin state changes come from outside this renderer (the settings page is a
   // separate window), so the host re-reads the list whenever the surface becomes
@@ -1351,11 +1357,5 @@ async function installNativeRenderer(options) {
   function pluginRefresh() { void syncPlugins(); }
   document.addEventListener('visibilitychange', pluginRefresh);
   window.addEventListener('focus', pluginRefresh);
-  // Features and plugin lifecycle events drive syncPlugins() immediately, so
-  // enable/disable takes effect on the next frame without waiting for window focus.
-  const pluginEventHost = makeHost(() => {});
-  const unsubFeatures = pluginEventHost.subscribe('features', () => { void syncPlugins(); });
-  const unsubPlugins = pluginEventHost.subscribe('plugins', () => { void syncPlugins(); });
-  state.unsubscribePlugins = () => { unsubFeatures(); unsubPlugins(); };
   return { status: 'installed', surface: 'host', domRevision: 1 };
 }

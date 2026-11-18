@@ -151,3 +151,45 @@ test("events.poll is the only poll action a surface performs", async () => {
   const actions = new Set(calls.map(call => call.action));
   assert.deepEqual([...actions], ["events.poll"]);
 });
+
+test("subscribing a new scope while a long-poll is in flight supersedes the narrow poll without dropping events", async () => {
+  let releaseNarrowPoll: () => void = () => {};
+  const pollPayloads: { after: number; scopes: string[]; waitMs: number }[] = [];
+  const { transport } = transportWith(async (_action, payload) => {
+    const req = payload as { after: number; scopes: string[]; waitMs: number };
+    pollPayloads.push({ after: req.after, scopes: [...req.scopes], waitMs: req.waitMs });
+    if (pollPayloads.length === 1) {
+      return { events: [], next: 4 };
+    }
+    if (pollPayloads.length === 2) {
+      await new Promise<void>(resolve => { releaseNarrowPoll = resolve; });
+      // Simulates EventBus.Poll advancing next=5 past a plugins event while only features was in scopes.
+      return { events: [], next: 5 };
+    }
+    if (pollPayloads.length === 3) {
+      return { events: [{ sequence: 5, scope: "plugins", value: { id: "planner", enabled: false } }], next: 5 };
+    }
+    return { events: [], next: 5 };
+  });
+
+  const channel = createEventChannel(transport);
+  const offFeatures = channel.subscribe("features", () => {});
+  while (pollPayloads.length < 2) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.deepEqual(pollPayloads[0], { after: -1, scopes: ["features"], waitMs: 0 });
+  assert.deepEqual(pollPayloads[1], { after: 4, scopes: ["features"], waitMs: 8000 });
+
+  const received: unknown[] = [];
+  const offPlugins = channel.subscribe("plugins", value => received.push(value));
+  await new Promise(resolve => setTimeout(resolve, 10));
+  releaseNarrowPoll?.();
+  const deadline = Date.now() + 500;
+  while (received.length === 0 && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+
+  assert.deepEqual(pollPayloads[2], { after: 4, scopes: ["features", "plugins"], waitMs: 8000 });
+  assert.deepEqual(received, [{ id: "planner", enabled: false }]);
+  offFeatures();
+  offPlugins();
+  channel.close();
+});

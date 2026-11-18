@@ -108,6 +108,7 @@ def verify_plugins(core, results, folder):
     assert bundled in items, items
     assert items[bundled]['source'] == 'BUNDLED' and items[bundled]['enabled'] is False
     assert items['kimicode-plus.planner']['enabled'] is False
+    assert items['kimicode-plus.scheduler']['enabled'] is False
     results.append('bundled plugins are released on first run without example-hello and start disabled')
 
     enabled_plugins = []
@@ -182,30 +183,12 @@ def verify_plugin_safe_mode(core, results, bundled, token):
 
 
 def verify_registry_usage(core, results):
-    core.request('/providers', {'id': 'kimi', 'name': 'Kimi synthetic', 'protocol': 'openai', 'baseUrl': 'https://api.moonshot.cn/v1'}, expected=201)
-    discovery = core.request('/models/discovery', {'providerId': 'kimi'})
-    assert discovery['mock'] is True and discovery['external'] is False
-    records = discovery['records']
-    preview = core.request('/models/preview', {'records': records})
-    imported = core.request('/models/import', {'records': records, 'revision': preview['revision']})
-    core.request('/models/import', {'records': records, 'revision': preview['revision']}, expected=409)
-    model_id = records[0]['id']
-    overridden = core.request('/models/override', {'providerId': 'kimi', 'id': model_id, 'field': 'context', 'value': None, 'revision': imported['revision']})
-    model = next(v for v in core.request('/models')['items'] if v['id'] == model_id and v['providerId'] == 'kimi')
-    assert model['capabilities']['context']['value'] is None
-    assert model['capabilities']['context']['source'] == 'manual'
-    rolled = core.request('/model-changes/' + str(overridden['changeId']) + '/rollback', {'revision': overridden['revision']})
-    edited = core.request('/providers/kimi', {'name': 'Kimi configured synthetic', 'protocol': 'openai', 'baseUrl': 'https://example.invalid/v1', 'secretRef': None, 'revision': rolled['revision']}, method='PUT')
-    assert edited['provider']['baseUrl'] == 'https://example.invalid/v1'
-    core.request('/model-changes/' + str(edited['changeId']) + '/rollback', {'revision': edited['revision']})
-    results.append('local model discovery, persisted import, field UNKNOWN override, CAS and configuration rollback')
-    catalog = {'retrieved_at': '2026-11-10T08:00:00Z', 'source': 'https://models.dev/api.json', 'providers': {'synthetic-provider': {'id': 'synthetic-provider', 'name': 'Synthetic metadata', 'models': {'synthetic-model': {'id': 'synthetic-model', 'limit': {'context': 8192, 'output': 1024}, 'tool_call': True}}}}}
-    preview = core.request('/models/modelsdev', {'catalog': catalog, 'preview': True})
-    core.request('/models/modelsdev', {'catalog': catalog, 'revision': preview['revision']})
-    metadata = next(v for v in core.request('/models')['items'] if v['providerId'] == 'synthetic-provider')
-    assert metadata['capabilities']['context']['source'] == 'modelsdev'
-    assert metadata['capabilities']['vision']['value'] is None
-    results.append('saved metadata catalog import with provenance and unobserved vision remaining UNKNOWN')
+    core.request('/models', expected=404)
+    core.request('/providers', {'id': 'kimi', 'name': 'Kimi synthetic', 'protocol': 'openai', 'baseUrl': 'https://api.moonshot.cn/v1'}, expected=404)
+    core.request('/models/preview', {'records': []}, expected=404)
+    core.request('/model-changes', expected=404)
+    assert len(core.request('/gateways')['items']) > 0
+    results.append('standalone model and provider HTTP routes are removed while gateway metadata remains available')
     core.request('/usage/demo', {})
     first = core.request('/usage/summary')
     core.request('/usage/demo', {})
@@ -230,7 +213,7 @@ def verify_registry_usage(core, results):
     assert all(v['remaining'] is None for v in core.request('/quotas')['items'])
     results.append('usage deduplication, retry distinction, partial-known totals and four separate ledgers')
     core.request('/adapter', {'mode': 'UNAVAILABLE'}, method='PUT')
-    assert core.request('/models')['total'] >= len(records)
+    assert len(core.request('/gateways')['items']) > 0
     assert core.request('/usage/summary')['requests'] == 6
     core.request('/adapter', {'mode': 'AVAILABLE'}, method='PUT')
-    results.append('model and usage history remain usable when the Desktop adapter is unavailable')
+    results.append('gateway and usage history remain usable when the Desktop adapter is unavailable')

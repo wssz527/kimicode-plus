@@ -431,7 +431,11 @@ export interface EventChannel {
 export function createEventChannel(transport: NativeTransport, retryMs = 1500): EventChannel {
   const listeners = new Map<string, Set<Listener>>();
   let cursor = -1;
+  let primed = false;
   let polling = false;
+  let scheduled = false;
+  let activeGen = 0;
+  let inFlightScopes: ReadonlySet<string> | null = null;
   let disposed = false;
   let wake: (() => void) | null = null;
 
@@ -444,17 +448,23 @@ export function createEventChannel(transport: NativeTransport, retryMs = 1500): 
     return [...listeners.keys()].filter(scope => scope !== "native:error" && (listeners.get(scope)?.size ?? 0) > 0);
   }
 
-  async function poll() {
-    if (polling || disposed) return;
+  async function poll(gen: number) {
     polling = true;
     try {
-      while (!disposed) {
+      while (!disposed && gen === activeGen) {
         const scopes = nextScopes();
         if (!scopes.length) break;
+        inFlightScopes = new Set(scopes);
+        const initial = !primed && cursor < 0;
         const started = Date.now();
         try {
-          const page = await transport.request<EventPage>("events.poll", { after: cursor, scopes, waitMs: 8000 });
-          if (disposed) return;
+          const page = await transport.request<EventPage>("events.poll", {
+            after: cursor,
+            scopes,
+            waitMs: initial ? 0 : 8000,
+          });
+          if (disposed || gen !== activeGen) return;
+          primed = true;
           cursor = page.next;
           if (page.reset && page.events.length) cursor = page.events[page.events.length - 1]!.sequence;
           for (const event of page.events) {
@@ -462,17 +472,40 @@ export function createEventChannel(transport: NativeTransport, retryMs = 1500): 
           }
           // The server long-polls, so an immediate empty answer means the wait
           // was cut short. Yielding keeps a broken hop from spinning the loop.
-          if (!page.events.length && Date.now() - started < 50) await sleep(50);
+          if (!initial && !page.events.length && Date.now() - started < 50) await sleep(50);
         } catch (cause) {
-          if (disposed) return;
+          if (disposed || gen !== activeGen) return;
           notifyError(cause);
           await new Promise<void>(resolve => { wake = resolve; setTimeout(resolve, retryMs); });
-          wake = null;
+          if (gen === activeGen) wake = null;
         }
       }
     } finally {
-      polling = false;
+      if (gen === activeGen) {
+        polling = false;
+        inFlightScopes = null;
+      }
     }
+  }
+
+  function ensurePolling() {
+    if (scheduled || disposed) return;
+    scheduled = true;
+    queueMicrotask(() => {
+      scheduled = false;
+      if (disposed) return;
+      const scopes = nextScopes();
+      if (!scopes.length) return;
+      if (!polling) {
+        void poll(++activeGen);
+        return;
+      }
+      if (inFlightScopes && scopes.some(scope => !inFlightScopes!.has(scope))) {
+        wake?.();
+        wake = null;
+        void poll(++activeGen);
+      }
+    });
   }
 
   return {
@@ -483,7 +516,7 @@ export function createEventChannel(transport: NativeTransport, retryMs = 1500): 
         listeners.set(scope, group);
       }
       group.add(listener);
-      if (scope !== "native:error") void poll();
+      if (scope !== "native:error") ensurePolling();
       return () => {
         const current = listeners.get(scope);
         current?.delete(listener);
@@ -493,6 +526,8 @@ export function createEventChannel(transport: NativeTransport, retryMs = 1500): 
     close() {
       if (disposed) return;
       disposed = true;
+      activeGen += 1;
+      inFlightScopes = null;
       listeners.clear();
       wake?.();
     },

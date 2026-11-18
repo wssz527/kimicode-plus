@@ -1,9 +1,9 @@
 {
   "id": "kimicode-plus.monitor",
   "name": "Monitor",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "apiVersion": 1,
-  "description": "缓存与额度侧边栏：2x2 指标、趋势柱图、等待中的后台子代理、迷你模式。数据全部来自本机缓存指标接口。",
+  "description": "复刻自 kimi-code-monitor 桌面版的模块化侧边栏：Rive 蓝球形象、5h 与每周额度条、加油包与外部供应商余额、每日用量与会话逐轮统计、三区拖拽与迷你模式。",
   "author": "KimiCode+",
   "license": "MIT",
   "hostVersions": ["1.*"],

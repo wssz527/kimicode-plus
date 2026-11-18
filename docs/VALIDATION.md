@@ -1,6 +1,21 @@
 # 功能与验证记录
 
-改动保存在当前 Git 工作树，未推送或发布。验收使用本项目 `work/` 下的隔离数据目录和独立宿主 profile。当前范围为核心 M0–M6、插件接口 v2（A1）和规划插件（A3）。多屏会话插件 A2 延期。
+改动保存在当前 Git 工作树，未推送或发布。验收使用本项目 `work/` 下的隔离数据目录和独立宿主 profile。当前范围为核心 M0–M6、插件接口 v2（A1）、规划插件（A3）及修正轮（R0–R4）。多屏会话插件 A2 延期。
+
+## 修正轮 R0–R4 合并与隔离宿主验收（2026-11-18）
+
+最终候选在 macOS ARM64 的隔离 Kimi Code 1.3.7 / Electron 45.1.0 上完成 R0–R4 全链路回归与截图读回核验。预装插件为 `kimicode-plus.monitor@1.1.0`、`kimicode-plus.planner@1.0.3`、`kimicode-plus.kct@1.0.2`、`kimicode-plus.scheduler@1.0.0`（均默认关闭，`example-hello` 仅作仓库模板保留、不再预装）。`dist/enhanced-kimi`（`darwin/arm64`，18,453,106 字节）与四个隔离验收目录中的二进制 SHA-256 均为 `9813494d92c2ef535f48afbd6fe2de7248db84b167054c38d7efb439c7e07455`；`dist/THIRD_PARTY_NOTICES.txt` SHA-256 为 `4522b8803fa328fa014c371a5f63701e555a87647ae2a3f543ba98990d4f0233`。
+
+| 检查 | 结果与证据 |
+|---|---|
+| 标准命令与构建 | 22 个生产 Go 包 `go vet` 与 `go test -race` 全部通过；前端 `npm run typecheck` 与 258/258 单元测试通过；`scripts/build.sh` 与 `scripts/crossbuild.sh` 生成五平台产物，`python3 scripts/acceptance.py --binary dist/enhanced-kimi` 27/27 通过。 |
+| 主会话回归修复 | 递增 `planner`（`1.0.2 -> 1.0.3`）与 `monitor`（`1.0.1 -> 1.1.0`）版本号，修复存量数据目录升级时跳过文件替换及官方摘要失配问题；修复 `web/src/native.ts` `createEventChannel` 在长轮询挂起期间新增订阅作用域的 8 秒盲区与丢事件竞态，并补充双端回归单测。 |
+| R1 入口挂载与平滑升级 | 隔离环境启用插件：`kimicode-plus.planner`（测试结束停用）。保留存量 `1.0.2`/`1.0.1` 目录直接启动完成平滑升级，10 步实机检查全通：停用态零残留，运行期启用 115 ms 内同步注入“会话信息 → 可打开”、右侧空白面板列表与 `+` `browser-overlay` 菜单，窄窗 `<960px` 浮动模式点击正常，停用 108 ms 内彻底移除（`work/correction-20261118/r1-stage/r1-acceptance-report.json`）。 |
+| R2 模型能力、子代理池与凭据 | 隔离环境启用插件：无。官方“模型供应商”模型行打开“能力与限制”修改图片/工具能力、思考模式三段、自适应思考、最大输出 32K 与推理强度，保存读回并保留原密钥，重启宿主后持久生效；子代理池下拉从官方目录读取并写回 `secondary_model`；插件详情页凭据添加、替换、删除且零明文回显；独立 `/models`、`/credentials` 页面与管理窗口跳转行已移除（`work/correction-20261118/r2-stage/r2-acceptance-report.json`）。 |
+| R3 余额数据层与 Monitor 复刻 | 隔离环境启用插件：`kimicode-plus.monitor`（测试结束停用）。上游桌面版模块化面板、Rive 蓝球形象三态（空闲呼吸/思考计时/调用计时）、长按三区拖拽排序与迷你模式全部通过；5h（56%）与每周（44%）额度条、加油包（`¥19.75`）及外部账户（DeepSeek `¥20.50`、智谱 BigModel `35.0%`）正常渲染，读取失败不显示为 0，7 项密钥泄露审计均为 `false`（`work/correction-20261118/r3-stage/r3-acceptance-report.json`）。 |
+| R4 定时任务调度与插件 | 隔离环境启用插件：`kimicode-plus.scheduler`。默认停用零注入，启用后挂载左侧栏“新建会话”下方与会话信息入口，主聊天区 `mode: "page"` 全屏任务页与返回聊天切换正常；每分钟测试模式自动触发新建会话、绑定会话忙碌等待完成、无人值守审批不自动批准（标记“等待批准”并增加未读计数）、停用清理及卸载保留/删除数据均验证通过（`work/correction-20261118/r4-stage/r4-acceptance-report.json`）。 |
+
+深浅色对比截图已在主会话读回核验。本轮所有模型回合均使用隔离环境的本地合成服务，未操作日常客户端实例、未调用真实付费模型推理、未验证五站真实登录态或非 macOS ARM64 原生运行。
 
 ## 1.3.7 兼容与规划返修（2026-11-18）
 

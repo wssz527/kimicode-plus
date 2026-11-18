@@ -61,7 +61,7 @@ KimiCode+ 支持本地受信插件。插件是运行在宿主渲染进程里的 
 
 | 能力 | 提供内容 |
 |---|---|
-| `metrics:read` | `cache.summary`、`cache.sessions`、`cache.history`、`cache.retention`、`cache.receipts`，以及 `cache`/`automation` 事件订阅。 |
+| `metrics:read` | `cache.summary`、`cache.sessions`、`cache.history`、`cache.turns`、`cache.retention`、`cache.receipts`、`quota.balances`，以及 `cache`/`automation`/`activity` 事件订阅。 |
 | `sessions:read` | `sessions.list`、`sessions.view`，以及 `session:<id>` 事件订阅。 |
 | `sessions:send` | `sessions.send`、`sessions.create`。每次发送写入活动记录。 |
 | `config:read` | `config.get`。 |
@@ -97,7 +97,8 @@ v2 能力由构建时机制授权：`plugins/registry.go` 对每个嵌入插件�
 | `browser:view` | 创建、导航、后退、前进、刷新、显隐、销毁隔离网页视图；读选区/正文；执行站点适配器；在系统浏览器打开当前页 | `browser.open/navigate/back/forward/reload/bounds/visible/extract/adapter/openExternal/close` |
 | `planner:run` | 本地规划引擎：线程、模型、流式、审批 | `planner.*` |
 | `handoff` | 交接预览与提交（新/已有会话，普通/Plan/Tower） | `handoff.preview`、`handoff.commit` |
-| `models:read` | 可用模型列表 | `models.list` |
+| `models:read` | 可用模型列表（含供应商、能力、自适应思考、上下文/输出上限与推理强度） | `models.list` |
+| `schedule:manage` | 核心持久化定时任务引擎：任务增删改停、立即运行、运行记录与未读状态 | `schedule.status/list/save/delete/toggle/runNow/runs/markRead/markAllRead/prefs` |
 | `commands` | 插件命令注册与跨插件调用 | `commands.register/unregister/list/invoke` |
 
 约束：
@@ -327,7 +328,7 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 - 主机必须在清单里逐个列出。URL 不能内嵌凭据。
 - 不跟随重定向。3xx 会连同 `redirectTo` 一起返回，需要时由插件显式重试，目标主机同样要过白名单。
 - 响应体上限 8 MiB，请求体上限 1 MiB，`Set-Cookie` 会被剥掉。
-- 凭据明文只在 Go 侧读取一次并拼进出站请求头；返回值、活动记录和错误文案都不含明文。凭据库锁定时返回 `PLUGIN_CREDENTIAL_LOCKED`（HTTP 423），需要先在凭据页解锁。
+- 凭据明文只在 Go 侧读取一次并拼进出站请求头；返回值、活动记录和错误文案都不含明文。凭据库锁定时返回 `PLUGIN_CREDENTIAL_LOCKED`（HTTP 423），需要先在插件详情页的凭据区域（或核心凭据接口）解锁并配置。
 
 ## 生命周期
 
@@ -342,8 +343,8 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 
 - 安装后插件**保持停用**，确认能力后再启用。
 - 停用、卸载、安全模式、核心关闭都会立即撤销身份令牌。
-- 卸载会删除插件文件与私有存储，并写下墓碑记录：**预装插件被卸载后不会自动恢复**。
-- 预装插件在首次运行或升级时释放到 `<dataDir>/plugins/<id>/`，已存在且未卸载的不会被覆盖，所以手工修改不会被冲掉。
+- 卸载会删除插件文件与私有存储，并写下墓碑记录：**预装插件被卸载后不会自动恢复**（可通过 `restore` 接口显式恢复）。
+- 预装插件在首次运行时释放到 `<dataDir>/plugins/<id>/`；已存在且未卸载的目录在版本相同或更新时保持不变（手工修改不会被每次启动冲掉），当二进制内嵌版本严格高于已安装版本时会自动平滑升级文件，同时保留原有授权、启用意图和私有存储。
 - 插件异常（清单损坏、入口缺失）会被标记为 `CORRUPT` 并记录活动；**不会删除用户文件**。
 
 ## HTTP 接口
@@ -393,21 +394,24 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 
 ### Monitor（`kimicode-plus.monitor`）
 
-`plugins/monitor/` 是核心侧栏缓存组件的正式实现；核心不再有任何 Monitor 界面或私有动作（计划 D5、D10）。
+`plugins/monitor/` 按上游 `bfjnbvf/kimi-code-monitor@1d529f0b` 桌面客户端版复刻界面、Rive 蓝球形象与交互（构建源码位于 `plugins/monitor-src/`），数据全部来自核心插件接口；核心不再有任何内置 Monitor 界面或私有动作。
 
 | 项 | 实际内容 |
 |---|---|
-| 能力 | `metrics:read`、`ui:sidebar`、`ui:settings`、`storage`。**不申请** `sessions:read`：它只读指标，不读会话正文。 |
-| 数据 | 仅 `ctx.core.request`：`cache.summary`（今日/近 1 小时、按模型、速度、额度）、`cache.sessions`、`cache.history`（24h/7d/30d）、`cache.receipts`。与设置里的“缓存与额度”页同一时刻同源。 |
-| 未知 | `NOT_REPORTED`、`null`、`UNKNOWN` 一律显示为 `--`／“未上报”，从不补零；额度按 `quota.value.quota.usages` 读 `usedRatio`，实际 0% 仍是 0%。 |
-| 子代理 | `cache.sessions` 只提供会话级的 `openBackground`（未返回的后台子代理数）与 `blocked`。插件按会话列出等待中的计数，并明确说明拿不到逐个代理的名称；不虚构代理行或 token。 |
-| 刷新 | 订阅 `cache`／`automation` 事件触发，10 秒合并窗口 + 60 秒兜底；手动刷新会开新一代，旧响应不会覆盖新结果。 |
-| 设置 | 默认迷你、是否显示 Kimi 形象、默认统计窗口；全部经 `ctx.storage` 持久化，重启后恢复。侧栏与设置子页通过同一个 `ctx` 上的命名空间通道同步，无需重新启用插件。 |
-| 样式 | 单文件内的 `<style>` 注入挂载元素的 shadow root，容器完全透明，颜色全部取自宿主 `--color-*`/`--ink*` 变量，`color-mix` 派生次级色；无网络请求、无全局 observer、无私有存储。 |
+| 能力 | `metrics:read`、`ui:sidebar`、`ui:settings`、`storage`。**不申请** `sessions:read`：它只读指标与生命周期状态，不读会话正文。 |
+| 数据 | `cache.summary`、`cache.history`（24h/7d/30d，含主/子代理分桶）、`cache.turns`（本会话逐轮 step 去重统计与全宽折线）、`quota.balances`（Kimi Code 5h/每周额度、加油包与官方已配置供应商的外部余额），以及 `activity` 作用域的回合/工具状态。 |
+| 未知与容错 | `NOT_REPORTED`、`null`、`UNKNOWN` 显示为 `--`，读取失败绝不产生 `0`，外部余额失败时仅沿用同一身份上一次有效读数并标注状态；所有供应商密钥仅在 Go 端用于请求头，不进入渲染进程、存储或日志。 |
+| 模块与交互 | 长按进入三区编辑（隐藏 / 展开 / 固定区）、区内拖拽排序与半宽/全宽混排、模块 `≡` 菜单、迷你模式与可选侧栏整理（默认关闭），全部经 `ctx.storage` 持久化。余额模块仅在可见时按 60 秒轮询，收起即停。 |
+| 版权与声明 | `plugins/monitor/LICENSE` 与 `NOTICE` 随包交付上游 MIT 全文、Rive 官方形象说明及 Kimi Work+ 余额模块来源，并纳入 `scripts/notices.py`。 |
 
-`plugins/monitor/LICENSE` 随包交付上游 `bfjnbvf/kimi-code-monitor@1d529f0b` 的 MIT 全文与归属；`plugin.json` 的 `upstream` 字段与 `scripts/notices.py` 使用同一来源。Kimi 形象是插件自绘的几何图形，不使用官方商标素材，也不联网下载。
+停用 Monitor 后，核心的“缓存与额度”页数据不受影响，侧栏恢复为纯官方样式、零残留节点与定时器。
 
-停用 Monitor 后，核心的“缓存与额度”页数据不受影响，侧栏恢复为纯官方样式：插件只拥有自己的挂载节点，不由核心代管。
+### 定时任务（`kimicode-plus.scheduler`）
+
+`plugins/scheduler/` 为预装、默认关闭的官方 v2 功能插件，调度引擎持久化在核心 `internal/scheduler`。
+
+- 入口与页面：`ui:sidebar-nav` 在左侧栏“新建会话”下方注入“定时任务”，点击在主聊天区（`ui:main-area` `mode: "page"`）打开任务与运行记录页；`ui:entry` 在会话信息与右侧面板提供当前会话绑定的任务视图。
+- 调度与安全：支持单次、预设、每日多时刻和自定义间隔/周几，错过运行默认合并补跑一次（可改为跳过）；支持新开会话与绑定会话投递；无人值守出现审批请求时不自动批准，标记为“等待批准”并保留未读提醒；卸载时可选择保留或一并删除已创建的任务数据。
 
 ## 示例
 

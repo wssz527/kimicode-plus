@@ -193,3 +193,106 @@ func TestExampleHelloRemovedFromBundledKeepsExistingInstallAndRefusesRestore(t *
 		t.Fatalf("restore should fail with PLUGIN_NOT_BUNDLED, got %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestBundledUpgradeRefreshesFilesPreservesStorageAndKeepsOfficialV2Grants(t *testing.T) {
+	ctx := context.Background()
+	bundled, err := bundle.BundledPlugins()
+	if err != nil {
+		t.Fatalf("bundled plugins: %v", err)
+	}
+
+	root := t.TempDir()
+	db, err := storage.Open(filepath.Join(root, "plugins.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	oldPlannerManifest := strings.Replace(string(bundled["kimicode-plus.planner"]["plugin.json"]), `"version": "1.0.3"`, `"version": "1.0.2"`, 1)
+	if oldPlannerManifest == string(bundled["kimicode-plus.planner"]["plugin.json"]) {
+		t.Fatal("expected planner bundled version to be 1.0.3")
+	}
+	oldMonitorManifest := strings.Replace(string(bundled["kimicode-plus.monitor"]["plugin.json"]), `"version": "1.1.0"`, `"version": "1.0.1"`, 1)
+	if oldMonitorManifest == string(bundled["kimicode-plus.monitor"]["plugin.json"]) {
+		t.Fatal("expected monitor bundled version to be 1.1.0")
+	}
+
+	legacySet := map[string]map[string][]byte{
+		"kimicode-plus.planner": {
+			"plugin.json": []byte(oldPlannerManifest),
+			"renderer.js": []byte("export async function activate() { return 'legacy-1.0.2'; }\n"),
+			"LICENSE":     bundled["kimicode-plus.planner"]["LICENSE"],
+		},
+		"kimicode-plus.monitor": {
+			"plugin.json": []byte(oldMonitorManifest),
+			"renderer.js": []byte("export async function activate() { return 'legacy-1.0.1'; }\n"),
+			"settings.js": []byte("export async function activate() {}\n"),
+			"LICENSE":     bundled["kimicode-plus.monitor"]["LICENSE"],
+		},
+	}
+
+	prev, err := New(db, func() bool { return false }, WithDataDir(root), WithBundled(func() (map[string]map[string][]byte, error) {
+		return legacySet, nil
+	}), WithOfficial(func() (map[string]string, error) {
+		return map[string]string{
+			"kimicode-plus.planner": ContentDigest(legacySet["kimicode-plus.planner"]),
+			"kimicode-plus.monitor": ContentDigest(legacySet["kimicode-plus.monitor"]),
+		}, nil
+	}))
+	if err != nil {
+		t.Fatalf("legacy manager: %v", err)
+	}
+	if err := prev.ReleaseBundled(ctx, legacySet); err != nil {
+		t.Fatalf("release legacy set: %v", err)
+	}
+	if err := prev.SetPluginStorage(ctx, "kimicode-plus.planner", "lastSite", []byte(`"www.kimi.com"`)); err != nil {
+		t.Fatalf("seed planner storage: %v", err)
+	}
+	prev.Close()
+
+	cur, err := New(db, func() bool { return false }, WithDataDir(root), WithBundled(bundle.BundledPlugins), WithOfficial(bundle.OfficialDigests))
+	if err != nil {
+		t.Fatalf("upgraded manager: %v", err)
+	}
+	defer cur.Close()
+	if err := cur.ReleaseBundled(ctx, bundled); err != nil {
+		t.Fatalf("upgrade release: %v", err)
+	}
+
+	for _, id := range []string{"kimicode-plus.planner", "kimicode-plus.monitor"} {
+		diskBytes, readErr := os.ReadFile(filepath.Join(root, "plugins", id, "renderer.js"))
+		if readErr != nil {
+			t.Fatalf("read upgraded %s renderer.js: %v", id, readErr)
+		}
+		if string(diskBytes) != string(bundled[id]["renderer.js"]) {
+			t.Fatalf("%s renderer.js on disk was not updated to bundled bytes", id)
+		}
+	}
+
+	enabledPlanner, err := cur.Enable(ctx, "kimicode-plus.planner")
+	if err != nil {
+		t.Fatalf("enable upgraded planner: %v", err)
+	}
+	if !enabledPlanner.Official || enabledPlanner.Version != "1.0.3" {
+		t.Fatalf("planner = %+v, want official v1.0.3", enabledPlanner)
+	}
+	capSet := map[string]bool{}
+	for _, capName := range enabledPlanner.Capabilities {
+		capSet[capName] = true
+	}
+	for _, wantCap := range []string{CapUIEntry, CapUIRightPanel, CapPlannerRun} {
+		if !capSet[wantCap] {
+			t.Fatalf("upgraded planner lost privileged capability %s; have %v", wantCap, enabledPlanner.Capabilities)
+		}
+	}
+
+	monitorItem, ok := cur.Get("kimicode-plus.monitor")
+	if !ok || !monitorItem.Official || monitorItem.Version != "1.1.0" {
+		t.Fatalf("monitor = %+v (ok=%v), want official v1.1.0", monitorItem, ok)
+	}
+
+	storedSite, found, err := cur.PluginStorage(ctx, "kimicode-plus.planner", "lastSite")
+	if err != nil || !found || string(storedSite) != `"www.kimi.com"` {
+		t.Fatalf("planner storage after upgrade = %q (found=%v, err=%v)", string(storedSite), found, err)
+	}
+}

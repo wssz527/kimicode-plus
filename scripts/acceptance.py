@@ -110,9 +110,9 @@ def run(binary):
             assert records[recovery['thirdId']]['state'] == 'DELIVERED'
             assert records[recovery['id']]['state'] == 'UNKNOWN'
             core.request('/tasks', {'intent': 'release-empty:1', 'task': recovery['task'], 'confirmed': True}, expected=409)
-            assert core.request('/models')['total'] > 0
+            assert len(core.request('/gateways')['items']) > 0
             assert core.request('/usage/summary')['requests'] == 6
-            results.append('SQLite models, usage, chat, delivered/unknown outbox and safe mode recover after restart')
+            results.append('SQLite usage, chat, delivered/unknown outbox and safe mode recover after restart')
             settings = core.request('/settings')
             settings['safeMode'] = False
             core.request('/settings', settings, method='PUT')

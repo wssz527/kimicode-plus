@@ -12,12 +12,15 @@ web/
   src/App.tsx           路由分发与配对闸门
   src/AppShell.tsx      224px 侧栏、顶栏、窄屏导航
   src/PairingScreen.tsx 配对页与失败恢复
-  src/pages/*.tsx       七个页面
-  src/native.ts         原生 Host、按 scope 事件订阅、Core transport
-  src/host-entry.tsx   独立 mountEnhancement 与原生 mountSurface
-  src/components/Surfaces.tsx 规划 surface、共享 bootstrap、设置/Monitor 导出
-  src/components/SettingsSurface.tsx 官方设置内的单层列表与子页
-  src/components/MonitorSurface.tsx 侧栏紧凑指标与折叠详情
+  src/pages/*.tsx       独立管理页页面（总览、用量、聊天、任务交接、插件、设置等；独立模型页与凭据页已移除）
+  src/native.ts         原生 Host、按 scope 共享事件通道（含微任务合并与新增作用域即时补齐）、Core transport
+  src/host-entry.tsx    独立 mountEnhancement、原生 mountSurface 与插件运行时导出
+  src/components/Surfaces.tsx 共享 bootstrap、设置与会话导出
+  src/components/SettingsSurface.tsx 官方设置内的单层五项列表与子页
+  src/components/NativeSettings.tsx Kimi Code 原生配置与官方模型目录下拉的子代理模型池
+  src/components/ModelSelect.tsx 统一模型选择组件（子代理池、聊天与插件共用）
+  src/components/PluginSettings.tsx 插件列表、详情、启停安装与插件凭据入口
+  src/components/PluginCredentials.tsx 插件申请凭据的添加、替换与删除面板（不回显明文）
   src/components/SessionGrid.tsx 最多三个同屏会话
   src/components/workbench/ 规划、网页与会话组件
   src/components/       图标与共享 UI 原语
@@ -69,35 +72,28 @@ ENHANCE_DEV_TARGET=http://127.0.0.1:8899 npm run dev       # 覆盖目标
 
 原生功能边界：统一规划入口默认网页，来源、地址与配置放菜单；本地规划有流式、停止、预设、工具审批和交接，网页只提取增强自建页面的选区/正文并交接 Code，不是网站内自动聊天。菜单、设置及会话选择弹层出现时隐藏网页子视图。多会话最多三个，同一入口逐次追加；主窗格跟随官方侧栏，已显示会话交换而不重复，`SessionInputProvider` 以 session ID 保存草稿、模型、模式、权限和附件，切换位置不丢状态。消息复用 Markdown 渲染、时间、复制与引用回复；附件加号调用系统文件选择，文件通过真实 KAP prompt 发送。
 
-设置首页为单层 5 项列表加一条独立管理窗口跳转行，子页带返回，嵌入官方设置对话框的 KimiCode+ 标签，位于“已归档”前；不再保留七分类、嵌套胶囊或 `.ekds-embed` 硬嵌页面。`CacheSettings`、浏览器权限复用已有 `Toggle`，缓存保存后读回再更新草稿基线。opaque origin 的请求 ID 使用随机回退；缓存、布局、权限和原生配置的实机流程已通过。
+设置首页为单层 5 项列表（缓存与额度、Kimi Code 配置、插件、附加功能、状态与诊断），子页带返回，嵌入官方设置对话框的 KimiCode+ 标签，位于“已归档”前；已移除独立管理窗口跳转行、七分类、嵌套胶囊与 `.ekds-embed` 硬嵌页面。官方“模型供应商”模型行通过 `internal/desktop/assets/provider_enhance.js` 注入“能力与限制”弹层补齐图片/视频/工具能力、思考模式三段、自适应思考、上下文/最大输出长度与推理强度；凭据增改删嵌入申请该凭据的插件详情页（`PluginCredentials.tsx`）。`CacheSettings`、浏览器权限复用已有 `Toggle`，缓存保存后读回再更新草稿基线。opaque origin 的请求 ID 使用随机回退；缓存、布局、权限、供应商能力补齐和子代理模型池的实机流程已通过。
 
-原生视觉沿用官方右侧面板、主聊天区和侧栏结构，不再使用常驻工作台外壳、会话选择栏或空闲状态带。renderer 通过容器属性与 CSS 持续隐藏 Vue 动态重建的官方子节点，原生工具/标签切换时释放。多会话底部恢复面板复用 `RecoveryPanel`，支持手动监听、立即检查和停止监听；自动化总开关位于“缓存与额度”，三项均默认关闭。Monitor 使用紧凑默认态，详情折叠，缺少输入/输出/速度/缓存命中样本时显示 `--`；回执单独呈现，不作为命中率。界面参考固定 MIT 上游版本，许可随构建交付，但不运行上游采集器。
+原生视觉沿用官方右侧面板、主聊天区和侧栏结构，不再使用常驻工作台外壳、会话选择栏或空闲状态带。renderer 通过容器属性与 CSS 持续隐藏 Vue 动态重建的官方子节点，原生工具/标签切换时释放。插件 `ui:entry` 同时注入官方“会话信息 → 可打开”、右侧空白面板列表与 `+` `browser-overlay` 菜单，`ui:sidebar-nav` 注入左侧栏“新建会话”下方；`Monitor`（`plugins/monitor/`）按上游桌面客户端版复刻模块化面板、Rive 蓝球形象与三区拖拽，并展示 Kimi Code 额度、加油包与外部供应商余额。多会话底部恢复面板复用 `RecoveryPanel`，支持手动监听、立即检查和停止监听；自动化总开关位于“缓存与额度”，三项均默认关闭。
 
 ## 页面
 
 | 页面 | 路径 | 主要接口 |
 | --- | --- | --- |
 | 总览 | `/` | health、tasks、usage/summary、plugins、quotas、gateways |
-| 供应商与模型 | `/models` | providers（含 PUT 更新）、provider-presets、models（offset/limit 分页）、discovery、preview、import、override、modelsdev、model-changes、rollback |
 | 用量 | `/usage` | usage、usage/summary、usage/demo、quotas、gateways |
-| 聊天 | `/chat` | chat/sources、chat/threads、chat/threads/{id}/messages |
+| 聊天 | `/chat` | chat/sources、chat/threads、chat/threads/{id}/messages、desktop/actions/models.list |
 | 任务交接 | `/handoff` | sessions、tasks/preview、tasks、tasks/{id}/reconcile |
-| 插件 | `/plugins` | plugins、plugins/{id} |
+| 插件 | `/plugins` | plugins、plugins/{id}、credentials（插件详情内嵌） |
 | 设置 | `/settings` | settings、chat/sources、health |
 
-独立管理页的七个主页面全部调用真实 Go API，没有前端写死的业务数据；只有明确标注为 Mock 的部分（合成站点夹具、旧交接来源夹具、Mock 适配器）是本地构造。原生规划与 KAP 会话走独立真实路径。用量页面没有本地示例事件。
+独立管理页的六个主页面全部调用真实 Go API（原独立 `/models` 与 `/credentials` 页面及路由已按修正轮 R2 移除），没有前端写死的业务数据；只有明确标注为 Mock 的部分（合成站点夹具、旧交接来源夹具、Mock 适配器）是本地构造。原生规划、定时任务与 KAP 会话走独立真实路径。用量页面没有本地示例事件。
 
 导航使用 `useSyncExternalStore` 订阅 `window.location`：内部 `navigate()` 会显式通知订阅者，浏览器前进/后退由 `popstate` 驱动，因此 URL、页面与标题始终同步。没有引入路由库。
 
 ## 关键交互
 
-**模型目录**：供应商表单带预设，可新建；每个已有供应商都能编辑名称、协议、Base URL 与 secretRef 引用（ID 不可改）。保存发送 `PUT /providers/{id}`，携带当前 registry revision，冲突显示 `STALE_REVISION` 提示；`secretRef` 未编辑时原样回传引用，页面从不读取真实密钥。目录导入会自动产生 `urn:unconfigured` 占位供应商，用编辑表单即可改成真实地址。
-
-模型列表按 `?offset&limit` 真正分页（每页 100），标题显示真实 `total` 与当前页范围；供应商筛选与搜索只作用于当前页，界面会明确说明。本地 Mock 发现 → 预览 → 导入，导入必须显式传本次 `preview.revision`；models.dev 同样先预览并绑定该次 revision，不会回退到全局缓存值。
-
-差异展示**只渲染核心 `/models/preview`（以及 models.dev 预览）返回的 `changes[].fields`**：每项显示 `before/after` 的值与 `source`，state 为 created/updated，`changes` 为空时显示“无有效变更”。前端不重算来源优先级、不把批次未包含的模型标成删除，也不推断覆盖结果——Go 的导入是 upsert 且 manual 优先。`web/src/lib/previewChanges.ts` 只做展示格式转换。
-
-逐字段覆盖支持 number / boolean / null，null 表示手动 UNKNOWN；变更快照可用 revision 回滚，已回滚的按钮禁用；回滚或供应商保存后同时刷新供应商、模型与快照。
+**供应商模型能力与子代理池（原生增强）**：在官方设置“模型供应商”模型行点击“能力与限制”，先经 `provider.get` 读取完整供应商配置，仅修改目标模型的能力、思考模式三段（不支持 / 可开关 / 始终开启）、自适应思考、上下文长度、最大输出长度与推理强度后整体写回（保留原密钥不回传明文），再次读回核对一致才提示已保存。子代理模型池从 `models.list` 读取官方已配置模型目录并展示供应商与能力摘要，不再提供手填模型键输入框；已保存但当前目录缺失的模型保留显示并标注提示。
 
 **用量**：读数和展示全部来自核心。顶部读数用 `headlineFromSummary` 直接取 `/usage/summary`：`known=0` 显示 UNKNOWN（绝不以 0 代替），全部事件已知时显示精确值（0 也是有效值），只有部分已知才显示“≥ 部分和”。本地事件列表只代表当前页，不参与全历史合计。`estimate` 是对象，`partialKnown` 是 `{sum,known,total,complete}`。
 

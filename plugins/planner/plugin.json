@@ -1,7 +1,7 @@
 {
   "id": "kimicode-plus.planner",
   "name": "规划",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "apiVersion": 2,
   "description": "右侧面板里的规划：网页来源直接打开 Kimi、DeepSeek、Gemini、Claude、ChatGPT 并解析对话，本地来源使用核心规划引擎，结果经可编辑预览交接给 Code 会话。",
   "author": "KimiCode+",
