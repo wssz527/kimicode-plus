@@ -300,10 +300,10 @@ await ctx.core.request("credentials.delete", { name: "translator" });
 - 停用时按相反顺序释放：先跑 `activate` 返回的清理和各个 `Disposable`，再移除分栏容器、右面板标签与入口按钮，最后撤销身份令牌。已实测停用后页面与启用前逐项一致（分栏、面板、侧栏折叠、入口都不残留）。
 - `ctx.planner.threads()` / `ctx.planner.models()` 是只读发现，不受设置里旧的「规划」附加功能开关影响；该开关只管冻结的内置规划界面。其余 `planner.*` 动作同样走插件自己的授权，不读写那套界面状态。
 - 规划线程归属创建它的插件。`planner.configure/send/retry/stop/approve/delete` 只对**同一插件**创建的线程生效；拿其他插件的线程 ID 调用会返回「规划线程不属于该插件」，内置线程（`pluginOwner` 为空）同样如此。`planner.get`/`threads`/`models` 不受此限制，插件仍能看到列表里的每个线程。
-- `ctx.entry` 注册的是一个"可打开标签类型"，同一份定义注入会话信息的「可打开」分组（`.sit-available`）和右侧面板的可打开列表（`.pt-body .pl`）。入口行是从官方同行克隆的，所以图标尺寸、间距、悬停和焦点样式与官方一致；`icon` 是画进官方图标槽的单条 SVG path（`viewBox="0 0 24 24"`），不传则保留官方模板图标。
-- 1.3.7 里右侧面板只有 `.pl` 这一处列表：标签为空时它就是空白页，有标签时它是 `+` 打开的命令面板。计划里写的 `.pt-body .sit` 和 `.panel-add-menu` 在本版 DOM 中不存在，代码保留这两条兼容分支，只在官方真的把列表渲染进主文档时生效。`+` 的下拉本身由独立的 `browser-overlay.html` 渲染，条目来自官方面板自己的标签类型表而不是主文档 DOM，因此克隆行进不去；这是官方结构限制，不是注入遗漏。
+- `ctx.entry` 注册的是一个"可打开标签类型"，同一份定义注入三处：会话信息的「可打开」分组（`.sit-available`）、右侧面板的可打开列表（`.pt-body .pl`），以及右侧面板标签栏的 `+` 下拉菜单（在 1.3.7 中经主进程 `browser-overlay` IPC 同步并补齐图标）。入口行与官方同行保持一致；`icon` 是画进官方图标槽的单条 SVG path（`viewBox="0 0 24 24"`），不传则保留官方模板图标。
+- 1.3.7 里右侧面板主文档列表只有 `.pt-body .pl`（计划里写的 `.pt-body .sit` 和 `.panel-add-menu` 保留兼容分支）；`+` 下拉本身由独立的 `browser-overlay.html` 渲染，由宿主引导脚本在主进程拦截 `kimi:browser-overlay-open` / `kimi:browser-overlay-rendered` / `kimi:browser-overlay-activate` 同步条目与点击调用。
 - 从会话信息点击插件入口时，宿主先走官方打开右侧面板的路径，再打开插件标签；会话信息按官方逻辑自动隐藏。右侧面板里的入口只打开标签，不会重复开面板。
-- 入口按容器幂等：每处容器最多一行同一个 `action`，官方重渲染后自动补回。停止插件后三处入口在下一帧内消失，不需要刷新。
+- 入口按容器幂等：每处容器最多一行同一个 `action`，官方重渲染后自动补回。运行中启停插件通过核心 `"plugins"` 事件实时推送，三处入口在下一帧内出现或消失，不需要刷新或等待窗口聚焦。
 - 官方的「已打开标签页」分组只渲染官方 `panelTabs`，插件标签不在那个数组里，也没有官方 `type` 注册项，因此无法合法注入；插件标签在右侧面板自己的标签栏里显示与关闭。原因记在 `work/correction-20261118/r1-notes.md`。
 - `ctx.sidebarNav` 在官方左侧栏「新建会话」下方插入一行，克隆官方 `.btn-new-chat` 行，点击行为由插件决定（通常是打开 `ui:main-area` 页面）。同样按容器幂等、停用即移除。
 - 同一个 `viewId` 重复 `browser.open` 只会保留一个网页视图；不同插件即使使用相同 `viewId` 也互不可见。
