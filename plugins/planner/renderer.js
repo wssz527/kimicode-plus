@@ -9,6 +9,10 @@
 
 export const PLUGIN_ID = "kimicode-plus.planner";
 
+// Official rows are cloned, so the entry carries only the path drawn into the
+// official icon slot. The compass is the planner's own mark.
+export const PLANNER_ENTRY_ICON = "M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17Zm3.5 5-2 5-5 2 2-5 5-2Z";
+
 export const MAX_SITES = 12;
 export const MAX_MESSAGES = 80;
 export const MAX_MESSAGE_CHARS = 6000;
@@ -2964,9 +2968,9 @@ export async function activate(ctx) {
   if (ctx.entry) {
     ctx.entry.add({
       id: "planner",
-      label: "规划",
-      title: "网页或本地规划，并交接给 Code 会话",
-      run: () => {
+      title: "规划",
+      icon: PLANNER_ENTRY_ICON,
+      open: () => {
         if (!panelHandle) {
           setStatus("右侧面板尚未就绪，请稍后再试。", true);
           return;

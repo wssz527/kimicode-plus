@@ -30,6 +30,7 @@ const (
 	// compiled into this binary. They are listed separately so the v1 consent
 	// path and the v2 privilege gate cannot drift apart.
 	CapUIEntry         = "ui:entry"
+	CapUISidebarNav    = "ui:sidebar-nav"
 	CapUIMainArea      = "ui:main-area"
 	CapUIRightPanel    = "ui:right-panel"
 	CapUILayout        = "ui:layout"
@@ -48,7 +49,7 @@ const (
 // Membership is what the core checks at grant and action time; a name that is
 // not here is an ordinary v1 capability and keeps its old consent path.
 var privilegedCapabilities = []string{
-	CapUIEntry, CapUIMainArea, CapUIRightPanel, CapUILayout,
+	CapUIEntry, CapUISidebarNav, CapUIMainArea, CapUIRightPanel, CapUILayout,
 	CapSessionsApprove, CapSessionsAbort, CapSessionsHistory,
 	CapAttachments, CapBrowserView, CapPlannerRun, CapHandoff, CapModelsReadV2, CapCommands,
 }

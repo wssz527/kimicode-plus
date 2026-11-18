@@ -31,7 +31,7 @@ async function installNativeRenderer(options) {
     channel,
     features: { multiSession: false },
     handles: new Set(),
-    entries: new Set(),
+    entryMount: null,
     sidebarRefs: 0,
     sidebarCollapsed: null,
     observer: null,
@@ -51,6 +51,7 @@ async function installNativeRenderer(options) {
     settingsRelease: null,
     removed: false,
     pluginEntries: new Map(),
+    pluginSidebarNav: new Map(),
     pluginPanels: new Map(),
     pluginMainAreas: new Map(),
     activePluginPanel: null,
@@ -272,7 +273,7 @@ async function installNativeRenderer(options) {
     });
     const archived = [...list.querySelectorAll('button.tab')].find(tab => tab.textContent.includes('已归档'));
     list.insertBefore(button, archived || null);
-    replaceIcon(button, 'settings');
+    replaceIcon(button);
     state.settingsButton = button;
     if (state.settingsActive) markSettingsActive();
   }
@@ -358,7 +359,6 @@ async function installNativeRenderer(options) {
        a block body; both resolve against the body's definite height. */
     .ekd-settings-mount{display:block;width:100%;min-width:0;min-height:0;flex:1 1 auto;max-height:100%;box-sizing:border-box;overflow-y:auto;overscroll-behavior:contain}
     .ekd-native-entry{position:relative}
-    .ekd-native-entry[data-error="true"]{color:var(--red,#ff8a8c)}
     .ekd-session-picker{width:min(520px,calc(100vw - 40px));max-height:min(680px,calc(100vh - 60px));padding:0;border:1px solid var(--color-line,#8884);border-radius:8px;background:var(--color-bg,#121212);color:var(--color-text,#eee);font:13px/1.5 var(--font-ui,system-ui);box-shadow:0 16px 50px rgba(0,0,0,.24)}
     .ekd-session-picker::backdrop{background:rgba(0,0,0,.36)}
     .ekd-picker-head{display:flex;gap:16px;padding:18px 18px 12px;border-bottom:1px solid var(--color-line,#8883)}
@@ -376,79 +376,98 @@ async function installNativeRenderer(options) {
     @media(prefers-reduced-motion:reduce){.ekd-session-picker{scroll-behavior:auto}}
   `;
   document.head.append(nativeStyle);
-  function replaceIcon(button, kind) {
-    const paths = {
-      planner: '<circle cx="12" cy="12" r="8.5"/><path d="m15.5 8.5-2 5-5 2 2-5 5-2Z"/>',
-      split: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/>',
-      settings: '<path d="m12 3 2.5 5 5.5 1-4 4 .8 5.5L12 16l-4.8 2.5L8 13 4 9l5.5-1L12 3Z"/>',
-    };
-    const resolved = paths[kind]
-      ? kind
-      : kind.endsWith(':planner')
-        ? 'planner'
-        : (kind.endsWith(':split') || kind.endsWith(':add') || kind.includes('multi-session'))
-          ? 'split'
-          : '';
+  // Entry rows are cloned from official rows by the host module. The module owns
+  // only reconciliation; this renderer keeps the single MutationObserver and asks
+  // for a sync from `ensure()`.
+  state.entryMount = module.createEntryMountManager({
+    document,
+    openPanel: () => panelContract()?.showPanel?.(),
+    onError: (pluginId, error) => {
+      if (pluginId) { noteFault(pluginId, error); return; }
+      if (error?.message !== '已取消选择') console.warn('native entry failed', error?.message || error);
+    },
+  });
+  const SETTINGS_ICON = 'm12 3 2.5 5 5.5 1-4 4 .8 5.5L12 16l-4.8 2.5L8 13 4 9l5.5-1L12 3Z';
+  function replaceIcon(button) {
     const existing = button.querySelector('svg');
-    if (!existing || !resolved) return;
+    if (!existing) return;
     existing.setAttribute('viewBox', '0 0 24 24');
     existing.setAttribute('fill', 'none');
     existing.setAttribute('stroke', 'currentColor');
     existing.setAttribute('stroke-width', '1.6');
     existing.setAttribute('stroke-linecap', 'round');
     existing.setAttribute('stroke-linejoin', 'round');
-    existing.innerHTML = paths[resolved];
+    existing.innerHTML = '<path d="' + SETTINGS_ICON + '"></path>';
   }
-  function setEntryLabel(button, text) {
-    const label = button.querySelector('.sit-name, :scope > span:not(.ui-kbd)');
-    if (label) label.textContent = text;
-    else {
-      const node = [...button.childNodes].find(item => item.nodeType === Node.TEXT_NODE && item.textContent.includes('侧边聊天'));
-      if (node) node.textContent = ' ' + text + ' ';
-    }
-    for (const shortcut of button.querySelectorAll('.ui-kbd')) shortcut.remove();
-  }
-  function makeEntry(text, action, after, template) {
-    const button = template.cloneNode(true);
-    button.type = 'button';
-    button.classList.add('ekd-native-entry');
-    button.dataset.ekdEntry = action;
-    replaceIcon(button, action);
-    setEntryLabel(button, text);
-    button.addEventListener('click', async () => {
-      try {
-        if (action === 'split') {
-          if (state.sessionHandle) window.dispatchEvent(new CustomEvent('ekd:add-session'));
-          else { const id = await pickSession([activeSession()]); if (id) await mountSessions([id]); }
+  // The built-in same-screen entry is the only entry this file still owns. Plugin
+  // entries arrive as definitions from their own code, so disabling a plugin
+  // removes both the plan and the row without a hardcoded planner surface here.
+  const ENTRY_ICONS = {
+    split: 'M4 6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z M12 4v16',
+  };
+  function builtinEntryPlans() {
+    if (!state.features.multiSession) return [];
+    return [{
+      action: 'split',
+      title: '添加同屏会话',
+      icon: ENTRY_ICONS.split,
+      async open() {
+        if (state.sessionHandle) window.dispatchEvent(new CustomEvent('ekd:add-session'));
+        else {
+          const id = await pickSession([activeSession()]);
+          if (id) await mountSessions([id]);
         }
-      } catch (error) {
-        if (error?.message !== '已取消选择') {
-          button.title = error?.message || String(error);
-          button.dataset.error = 'true';
-          setTimeout(() => { delete button.dataset.error; button.title = ''; }, 5000);
-        }
-      }
-    });
-    after.insertAdjacentElement('afterend', button);
-    state.entries.add(button);
-    return button;
+      },
+    }];
   }
-  function addonEntryPlan() {
-    const plan = [];
-    if (state.features.multiSession) plan.push({ action: 'split', label: '添加同屏会话' });
-    // Plugin entries follow the frozen built-ins. The action name carries the
-    // plugin and entry id, so the per-container duplicate guard stays exact and
-    // two plugins may publish the same visible label without colliding.
-    for (const [key, entry] of state.pluginEntries) {
-      plan.push({ action: 'plugin:' + key, label: entry.definition.label, plugin: entry.pluginId, definition: entry.definition });
-    }
-    return plan;
+  function pluginEntryPlans() {
+    return [...state.pluginEntries].map(([key, entry]) => ({
+      action: 'plugin:' + key,
+      title: entry.definition.title,
+      icon: entry.definition.icon,
+      pluginId: entry.pluginId,
+      open: () => entry.definition.open(),
+    }));
+  }
+  function sidebarNavPlans() {
+    return [...state.pluginSidebarNav].map(([key, entry]) => ({
+      action: 'sidebar:' + key,
+      title: entry.definition.title,
+      icon: entry.definition.icon,
+      pluginId: entry.pluginId,
+      open: () => entry.definition.open(),
+    }));
+  }
+  let lastOverlayPayload = '';
+  function allEntryPlans() {
+    return [...builtinEntryPlans(), ...pluginEntryPlans()];
+  }
+  function syncOverlayEntries(entries) {
+    if (options.popout) return;
+    const next = entries.map(entry => ({ action: entry.action, title: entry.title, icon: entry.icon || '' }));
+    const encoded = JSON.stringify(next);
+    if (encoded === lastOverlayPayload) return;
+    lastOverlayPayload = encoded;
+    void transport.request('host.syncOverlayEntries', { entries: next }).catch(() => {});
+  }
+  function invokeEntryPlan(action) {
+    const plan = allEntryPlans().find(item => item.action === action);
+    if (!plan) return false;
+    void Promise.resolve()
+      .then(() => plan.open())
+      .catch(error => {
+        if (plan.pluginId) { noteFault(plan.pluginId, error); return; }
+        if (error?.message !== '已取消选择') console.warn('native entry failed', error?.message || error);
+      });
+    return true;
+  }
+  function syncEntryMount() {
+    const entries = allEntryPlans();
+    state.entryMount?.sync(entries, sidebarNavPlans());
+    syncOverlayEntries(entries);
   }
   function removeEntry(action) {
-    for (const element of [...state.entries]) {
-      if (element.dataset?.ekdEntry === action) { element.remove(); state.entries.delete(element); }
-    }
-    for (const element of [...state.entries]) if (!element.isConnected) state.entries.delete(element);
+    state.entryMount?.remove(action);
   }
   function applyFeatures(next, initial) {
     const previous = state.features;
@@ -466,47 +485,12 @@ async function installNativeRenderer(options) {
       applyFeatures(null, true);
     }
   }
-  // Entry injection is per container. Each visible host menu container (the
-  // empty-panel `.sit` list and the `+` dropdown `.pl`) is checked on its own, so
-  // a container that the host re-rendered gets its entry back without a stale
-  // module-level reference deciding whether it "already exists".
-  function entryContainers() {
-    const containers = [];
-    for (const list of document.querySelectorAll('.pt-body .sit, .pt-body .pl')) containers.push(list);
-    return containers;
-  }
-  function sideChatIn(container) {
-    return [...container.querySelectorAll('button.sit-link, button.ui-menu-item')].find(button =>
-      button.querySelector('.sit-name')?.textContent.trim() === '侧边聊天'
-      || [...button.childNodes].some(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim() === '侧边聊天')) || null;
-  }
+  // The official host re-renders its lists on its own schedule. The entry mount
+  // reconciles every container on each sync, so a re-rendered session-info group
+  // gets its plugin row back without a stale module-level reference deciding
+  // whether it "already exists".
   function syncNativeEntries() {
-    const live = new Set();
-    const addonEntries = addonEntryPlan();
-    for (const container of entryContainers()) {
-      const anchorHost = sideChatIn(container);
-      if (!anchorHost) continue;
-      let anchor = anchorHost;
-      for (const { action, label, plugin, definition } of addonEntries) {
-        // Duplicate guard lives inside this container: exactly one entry with
-        // this action may exist here, and a re-rendered anchor gets a new entry.
-        const existing = [...container.querySelectorAll(`button.ekd-native-entry[data-ekd-entry="${action}"]`)];
-        let entry = existing[0];
-        for (const extra of existing.slice(1)) { extra.remove(); live.delete(extra); }
-        if (!entry || entry.previousElementSibling !== anchor) {
-          entry?.remove();
-          entry = makeEntry(label, action, anchor, anchorHost);
-          if (plugin && definition) entry.addEventListener('click', () => runPluginEntry(plugin, definition));
-        }
-        anchor = entry;
-        live.add(entry);
-      }
-    }
-    // Entries whose host container went away are dropped from the registry.
-    for (const entry of [...state.entries]) {
-      if (entry.classList?.contains('ekd-native-entry') && !live.has(entry)) state.entries.delete(entry);
-    }
-    for (const element of live) state.entries.add(element);
+    syncEntryMount();
     // The sidebar cache widget used to be mounted here. It is now the preinstalled
     // Monitor plugin, which mounts through the plugin runtime's own sidebar slot,
     // so this file owns no cache surface and no private channel for one.
@@ -568,7 +552,11 @@ async function installNativeRenderer(options) {
     detachSettings();
     closeSessions();
     for (const handle of [...state.handles]) unmountHandle(handle);
-    for (const element of state.entries) element.remove();
+    state.entryMount?.dispose();
+    state.entryMount = null;
+    state.pluginSidebarNav.clear();
+    lastOverlayPayload = '';
+    if (!options.popout) void transport.request('host.syncOverlayEntries', { entries: [] }).catch(() => {});
     nativeStyle.remove();
     URL.revokeObjectURL(moduleURL);
     delete window.__ekdNativeUI;
@@ -709,10 +697,10 @@ async function installNativeRenderer(options) {
 
   const pluginEntryHost = {
     register(pluginId, definition) {
-      if (!definition || typeof definition.id !== "string" || !definition.id || typeof definition.run !== "function") {
-        throw new Error("插件入口必须提供 id 和 run()");
+      if (!definition || typeof definition.id !== "string" || !definition.id || typeof definition.open !== "function") {
+        throw new Error("插件入口必须提供 id 和 open()");
       }
-      if (typeof definition.label !== "string" || !definition.label.trim()) throw new Error("插件入口必须有标签");
+      if (typeof definition.title !== "string" || !definition.title.trim()) throw new Error("插件入口必须有 title");
       const key = pluginId + ":" + definition.id;
       state.pluginEntries.set(key, { pluginId, definition });
       syncNativeEntries();
@@ -727,10 +715,26 @@ async function installNativeRenderer(options) {
       } };
     },
   };
+  const pluginSidebarNavHost = {
+    register(pluginId, definition) {
+      if (!definition || typeof definition.id !== "string" || !definition.id || typeof definition.open !== "function") {
+        throw new Error("侧栏入口必须提供 id 和 open()");
+      }
+      if (typeof definition.title !== "string" || !definition.title.trim()) throw new Error("侧栏入口必须有 title");
+      const key = pluginId + ":" + definition.id;
+      state.pluginSidebarNav.set(key, { pluginId, definition });
+      syncNativeEntries();
+      return { dispose: () => {
+        state.pluginSidebarNav.delete(key);
+        removeEntry('sidebar:' + key);
+        syncNativeEntries();
+      } };
+    },
+  };
 
   function runPluginEntry(pluginId, definition) {
     Promise.resolve()
-      .then(() => definition.run())
+      .then(() => definition.open())
       .catch(error => {
         noteFault(pluginId, Object.assign(error instanceof Error ? error : new Error(String(error)), { code: "PLUGIN_ENTRY_FAILED" }));
       });
@@ -1051,6 +1055,7 @@ async function installNativeRenderer(options) {
       openOfficial: id => openOfficial(id),
       activateSession: id => activateSession(id),
       openSettings: () => openSettings(),
+      invokeEntry: action => invokeEntryPlan(action),
       get plugins() {
         const runtime = state.plugins;
         if (!runtime) return null;
@@ -1261,6 +1266,7 @@ async function installNativeRenderer(options) {
         instanceId: options.instanceId,
         onError: (id, error) => noteFault(id, error),
         entryHost: pluginEntryHost,
+        sidebarNavHost: pluginSidebarNavHost,
         mainAreaHost: pluginMainAreaHost,
         rightPanelHost: pluginRightPanelHost,
         layoutHost: options.surface === 'plugin' ? { acquireSidebarCollapse: () => ({ dispose: () => {} }) } : pluginLayoutHost,
@@ -1344,8 +1350,11 @@ async function installNativeRenderer(options) {
   function pluginRefresh() { void syncPlugins(); }
   document.addEventListener('visibilitychange', pluginRefresh);
   window.addEventListener('focus', pluginRefresh);
-  // Features carry the enable/disable decisions this App made; the same event
-  // also refreshes the plugin list so the page and the DOM agree.
-  state.unsubscribePlugins = makeHost(() => {}).subscribe('features', () => { void syncPlugins(); });
+  // Features and plugin lifecycle events drive syncPlugins() immediately, so
+  // enable/disable takes effect on the next frame without waiting for window focus.
+  const pluginEventHost = makeHost(() => {});
+  const unsubFeatures = pluginEventHost.subscribe('features', () => { void syncPlugins(); });
+  const unsubPlugins = pluginEventHost.subscribe('plugins', () => { void syncPlugins(); });
+  state.unsubscribePlugins = () => { unsubFeatures(); unsubPlugins(); };
   return { status: 'installed', surface: 'host', domRevision: 1 };
 }

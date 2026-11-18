@@ -244,6 +244,9 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 			app.native = nativeService
 			if app.pluginManager != nil {
 				app.pluginManager.UseCore(pluginCore{service: nativeService})
+				app.pluginManager.UseOnChange(func() {
+					nativeService.Events().Publish("plugins", map[string]any{"at": time.Now().UTC().Format(time.RFC3339Nano)})
+				})
 			}
 			if chatReady && app.gateway != nil {
 				planner, plannerErr := chat.NewPlanner(db, app.gateway, native.CWD, nativeService.Events())

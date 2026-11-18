@@ -14,6 +14,7 @@ import {
   type PlannerThread,
   type RightPanelHost,
   type SessionHistoryPage,
+  type SidebarNavHost,
   type PluginContext,
   type PluginIdentity,
   type PluginModule,
@@ -52,6 +53,7 @@ export interface RuntimeOptions {
    * tests and in a plain browser preview.
    */
   entryHost?: EntryMountHost;
+  sidebarNavHost?: SidebarNavHost;
   mainAreaHost?: MainAreaHost;
   rightPanelHost?: RightPanelHost;
   layoutHost?: LayoutHost;
@@ -530,6 +532,15 @@ export function createPluginRuntime(options: RuntimeOptions) {
         ? {
           add(definition) {
             const handle = options.entryHost!.register(id, definition);
+            scope.add(handle);
+            return handle;
+          },
+        }
+        : undefined,
+      sidebarNav: granted.includes("ui:sidebar-nav") && options.sidebarNavHost
+        ? {
+          add(definition) {
+            const handle = options.sidebarNavHost!.register(id, definition);
             scope.add(handle);
             return handle;
           },

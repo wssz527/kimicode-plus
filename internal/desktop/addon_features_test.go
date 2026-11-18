@@ -206,7 +206,8 @@ func TestRendererFreezesAddonEntries(t *testing.T) {
 		}
 	}
 	for _, wanted := range []string{
-		"if (state.features.multiSession) plan.push({ action: 'split', label: '添加同屏会话' })",
+		"if (!state.features.multiSession) return [];",
+		"title: '添加同屏会话',",
 		"if (state.sessionContainer) closeSessions();",
 		"state.unsubscribeFeatures = makeHost(() => {}).subscribe('features'",
 	} {

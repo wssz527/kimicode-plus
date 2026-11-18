@@ -81,7 +81,11 @@ func TestPluginRightPanelTabIsDynamicAndPreservesOfficialWidth(t *testing.T) {
 		`tabs.insertBefore(entry.wrapper, dragFill || null);`,
 		"entry.opened = false;",
 		"entry.wrapper.remove();",
-		"kind.endsWith(':planner')",
+		// The plugin's own icon reaches the host as a definition field. A hardcoded
+		// planner branch here would keep showing a planner mark after the plugin is
+		// disabled, which is exactly what this round removes.
+		"icon: entry.definition.icon,",
+		"icon: ENTRY_ICONS.split,",
 	} {
 		if !strings.Contains(rendererSource, wanted) {
 			t.Fatalf("renderer.js missing right-panel dynamic tab or icon behavior: %s", wanted)

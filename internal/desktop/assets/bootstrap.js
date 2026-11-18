@@ -1,6 +1,6 @@
 async function installNativeBootstrap(options) {
   const req = typeof require === 'function' ? require : process.mainModule.require.bind(process.mainModule);
-  const { webContents, BrowserWindow, WebContentsView, session, app, dialog, shell } = req('electron');
+  const { webContents, BrowserWindow, WebContentsView, session, app, dialog, shell, ipcMain } = req('electron');
   const http = req('node:http');
   const crypto = req('node:crypto');
   if (app.getVersion() !== options.expectedApp || process.versions.electron !== options.expectedElectron) throw new Error('宿主版本在接入时发生变化');
@@ -14,7 +14,7 @@ async function installNativeBootstrap(options) {
   const pair = await pairResponse.json();
   if (!pairResponse.ok) throw new Error(pair?.error?.message || '增强核心配对失败');
   let coreToken = pair.sessionToken;
-  const state = { channels: new Map(), windows: new Map(), views: new Map(), pluginViews: new Map(), pluginViewTokens: new Map(), pluginViewOwners: new Map(), pluginViewQueues: new Map(), pluginCommands: new Map(), bounds: new Map(), browserWindow: null, server: null, cleanup: null };
+  const state = { channels: new Map(), windows: new Map(), views: new Map(), pluginViews: new Map(), pluginViewTokens: new Map(), pluginViewOwners: new Map(), pluginViewQueues: new Map(), pluginCommands: new Map(), bounds: new Map(), browserWindow: null, server: null, cleanup: null, overlayEntries: [], activeOverlayMenu: null };
   globalThis.__ekdNative = state;
   const browserSession = session.fromPartition('persist:ekd-native-browser');
   function json(response, status, value, origin) {
@@ -290,6 +290,18 @@ async function installNativeBootstrap(options) {
       case 'host.openSession': return wc.executeJavaScript('window.__ekdNativeUI.openOfficial(' + JSON.stringify(payload.id) + ')');
       case 'host.pickSession': return wc.executeJavaScript('window.__ekdNativeUI.pickSession(' + JSON.stringify(payload.exclude || []) + ')');
       case 'host.activateSession': return wc.executeJavaScript('window.__ekdNativeUI.activateSession(' + JSON.stringify(payload.id) + ')');
+      case 'host.syncOverlayEntries': {
+        if (target !== wc) return {};
+        state.overlayEntries = sanitizeOverlayEntries(payload.entries);
+        if (state.activeOverlayMenu) {
+          const ov = webContents.getAllWebContents().find(item => !item.isDestroyed() && item.getURL().includes('browser-overlay'));
+          if (ov) {
+            const activeActions = state.overlayEntries.map(entry => entry.action);
+            void ov.executeJavaScript('(() => { const keep = ' + JSON.stringify(activeActions) + '; for (const row of document.querySelectorAll(".overlay-menu-row[data-ekd-entry]")) { if (!keep.includes(row.dataset.ekdEntry)) row.closest(".overlay-menu-row-group")?.remove(); } })()').catch(() => {});
+          }
+        }
+        return { count: state.overlayEntries.length };
+      }
       case 'host.pickFiles': {
         const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(target), { title: '添加附件', properties: ['openFile', 'multiSelections'] });
         return result.canceled ? [] : result.filePaths.map(path => ({ path, name: req('node:path').basename(path) }));
@@ -540,6 +552,83 @@ async function installNativeBootstrap(options) {
     }
     void originalHandler(request, response);
   });
+  const OVERLAY_ICON_PATH = /^[MmLlHhVvCcSsQqTtAaZz0-9eE ,.+-]+$/;
+  const PANEL_ADD_ITEM_IDS = new Set(['diff', 'browser', 'term', 'files', 'btw', 'inspector']);
+  function sanitizeOverlayEntries(list) {
+    if (!Array.isArray(list)) return [];
+    const out = [];
+    for (const item of list.slice(0, 16)) {
+      if (!item || typeof item.action !== 'string' || !item.action || item.action.length > 128) continue;
+      if (typeof item.title !== 'string' || !item.title.trim() || item.title.length > 80) continue;
+      const icon = typeof item.icon === 'string' && OVERLAY_ICON_PATH.test(item.icon) ? item.icon : '';
+      out.push({ action: item.action, title: item.title.trim(), icon });
+    }
+    return out;
+  }
+  function isPanelAddMenuPayload(payload) {
+    if (!payload || payload.placement !== 'bottom-end' || payload.width !== 220 || !Array.isArray(payload.items) || payload.items.length === 0) return false;
+    return payload.items.every(item => item && typeof item.id === 'string' && PANEL_ADD_ITEM_IDS.has(item.id));
+  }
+  function patchOverlayIcons(ov, menu) {
+    if (!ov || ov.isDestroyed() || !menu?.entries?.length) return;
+    const expr = `(() => {
+      const rows = [...document.querySelectorAll('.browser-overlay-list .overlay-menu-row')];
+      const entries = ${JSON.stringify(menu.entries)};
+      const start = ${Number(menu.officialCount)};
+      for (let i = 0; i < entries.length; i++) {
+        const row = rows[start + i];
+        const entry = entries[i];
+        if (!row || !entry) continue;
+        row.dataset.ekdEntry = entry.action;
+        const svg = row.querySelector('.overlay-menu-icon svg');
+        if (svg && entry.icon) {
+          svg.setAttribute('viewBox', '0 0 24 24');
+          svg.setAttribute('fill', 'none');
+          svg.setAttribute('stroke', 'currentColor');
+          svg.setAttribute('stroke-width', '1.6');
+          svg.setAttribute('stroke-linecap', 'round');
+          svg.setAttribute('stroke-linejoin', 'round');
+          svg.innerHTML = '<path d="' + entry.icon + '"></path>';
+        }
+      }
+      return rows.length;
+    })()`;
+    void ov.executeJavaScript(expr).catch(() => {});
+  }
+  const onOverlayOpen = (event, payload) => {
+    if (event.sender !== wc || !state.overlayEntries.length || !isPanelAddMenuPayload(payload)) {
+      if (event.sender === wc) state.activeOverlayMenu = null;
+      return;
+    }
+    const officialCount = payload.items.length;
+    const entries = state.overlayEntries.slice();
+    state.activeOverlayMenu = { menuId: payload.menuId, officialCount, entries };
+    for (const entry of entries) {
+      payload.items.push({ kind: 'item', id: 'ekd:' + entry.action, label: entry.title, icon: 'message' });
+    }
+  };
+  const onOverlayRendered = (event) => {
+    if (!state.activeOverlayMenu || !event?.sender || event.sender.isDestroyed()) return;
+    if (!String(event.sender.getURL?.() || '').includes('browser-overlay')) return;
+    patchOverlayIcons(event.sender, state.activeOverlayMenu);
+  };
+  const onOverlayActivate = (event, payload) => {
+    if (!payload || typeof payload.itemId !== 'string' || !payload.itemId.startsWith('ekd:')) return;
+    const action = payload.itemId.slice(4);
+    const known = state.overlayEntries.some(entry => entry.action === action)
+      || state.activeOverlayMenu?.entries?.some(entry => entry.action === action);
+    state.activeOverlayMenu = null;
+    if (!known || wc.isDestroyed()) return;
+    void wc.executeJavaScript('window.__ekdNativeUI?.invokeEntry?.(' + JSON.stringify(action) + ')').catch(() => {});
+  };
+  const onOverlayClosed = () => { state.activeOverlayMenu = null; };
+  if (ipcMain && typeof ipcMain.prependListener === 'function') {
+    ipcMain.prependListener('kimi:browser-overlay-open', onOverlayOpen);
+    ipcMain.on('kimi:browser-overlay-rendered', onOverlayRendered);
+    ipcMain.prependListener('kimi:browser-overlay-activate', onOverlayActivate);
+    ipcMain.on('kimi:browser-overlay-hidden', onOverlayClosed);
+    ipcMain.on('kimi:browser-overlay-dismiss', onOverlayClosed);
+  }
   state.server = server;
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   state.endpoint = 'http://127.0.0.1:' + server.address().port;
@@ -551,6 +640,15 @@ async function installNativeBootstrap(options) {
     if (state.cleaned) return;
     state.cleaned = true;
     coreToken = '';
+    if (ipcMain && typeof ipcMain.removeListener === 'function') {
+      ipcMain.removeListener('kimi:browser-overlay-open', onOverlayOpen);
+      ipcMain.removeListener('kimi:browser-overlay-rendered', onOverlayRendered);
+      ipcMain.removeListener('kimi:browser-overlay-activate', onOverlayActivate);
+      ipcMain.removeListener('kimi:browser-overlay-hidden', onOverlayClosed);
+      ipcMain.removeListener('kimi:browser-overlay-dismiss', onOverlayClosed);
+    }
+    state.overlayEntries = [];
+    state.activeOverlayMenu = null;
     if (state.reload) wc.removeListener('did-finish-load', state.reload);
     for (const win of state.windows.values()) if (!win.isDestroyed()) win.destroy();
     state.windows.clear();

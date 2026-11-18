@@ -679,7 +679,7 @@ test("deactivating a plugin releases every v2 surface it mounted", async () => {
   await runtime.activate(
     {
       activate: context => {
-        context.entry!.add({ id: "open", label: "打开", run: () => {} });
+        context.entry!.add({ id: "open", title: "打开", open: () => {} });
         context.mainArea!.mount({ render: () => {} });
         context.rightPanel!.mount({ title: "面板", render: () => {} });
         context.layout!.acquireSidebarCollapse();
@@ -708,11 +708,11 @@ test("deactivating one plugin leaves another plugin's v2 surfaces alone", async 
   const runtime = createPluginRuntime({ slots: {}, request: async () => ({ value: {} }), ...fake.hosts });
   const grant = ["ui:entry", "ui:main-area"];
   await runtime.activate(
-    { activate: context => { context.entry!.add({ id: "a", label: "A", run: () => {} }); context.mainArea!.mount({ render: () => {} }); } },
+    { activate: context => { context.entry!.add({ id: "a", title: "A", open: () => {} }); context.mainArea!.mount({ render: () => {} }); } },
     { id: "plugin.one", version: "2.0.0", granted: grant, token: "t1" },
   );
   await runtime.activate(
-    { activate: context => { context.entry!.add({ id: "b", label: "B", run: () => {} }); context.mainArea!.mount({ render: () => {} }); } },
+    { activate: context => { context.entry!.add({ id: "b", title: "B", open: () => {} }); context.mainArea!.mount({ render: () => {} }); } },
     { id: "plugin.two", version: "2.0.0", granted: grant, token: "t2" },
   );
   runtime.deactivate("plugin.one");
