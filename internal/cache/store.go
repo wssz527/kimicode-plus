@@ -150,6 +150,10 @@ func (s *Store) beginScan(now time.Time, force bool) (string, bool) {
 func (s *Store) Scan(ctx context.Context, now time.Time, force bool) (ScanResult, error) {
 	home, ok := s.beginScan(now, force)
 	if !ok {
+		// Another caller may still be scanning records and committing steps to SQLite;
+		// wait for scanMu so parallel cache.* readers see the committed rows.
+		s.scanMu.Lock()
+		s.scanMu.Unlock()
 		return ScanResult{Skipped: true}, nil
 	}
 	// Two concurrent scans would both read the same offsets and both insert the same

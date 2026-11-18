@@ -106,6 +106,20 @@ func (s *NativeService) cacheHistory(ctx context.Context, now time.Time, span st
 	return store.History(ctx, now, span)
 }
 
+// cacheTurns answers `cache.turns`: the newest completed steps of one session,
+// which the panel draws as a per-turn line. It rescans first for the same reason
+// the other cache reads do: a step written after the last tick must still appear.
+func (s *NativeService) cacheTurns(ctx context.Context, now time.Time, sessionID string, limit int, before time.Time) ([]cache.TurnStep, error) {
+	store, err := s.cacheStore()
+	if err != nil {
+		return nil, err
+	}
+	if _, err = store.Scan(ctx, now, false); err != nil {
+		return nil, err
+	}
+	return store.TurnSteps(ctx, sessionID, limit, before)
+}
+
 func (s *NativeService) cacheRetention(ctx context.Context, now time.Time) (cache.Retention, error) {
 	store, err := s.cacheStore()
 	if err != nil {

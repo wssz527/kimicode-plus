@@ -29,17 +29,22 @@ func NewEventBus() *EventBus {
 	return &EventBus{notify: make(chan struct{})}
 }
 
-func (b *EventBus) Publish(scope string, value any) {
+// Publish appends one event and returns its sequence. Existing callers use it as
+// a statement, so the return value is optional; an activity event that must name
+// its own sequence uses it.
+func (b *EventBus) Publish(scope string, value any) int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.next++
-	b.events = append(b.events, Event{Sequence: b.next, Scope: scope, Value: value})
+	sequence := b.next
+	b.events = append(b.events, Event{Sequence: sequence, Scope: scope, Value: value})
 	if len(b.events) > 2000 {
 		copy(b.events, b.events[len(b.events)-2000:])
 		b.events = b.events[:2000]
 	}
 	close(b.notify)
 	b.notify = make(chan struct{})
+	return sequence
 }
 
 func (b *EventBus) Poll(ctx context.Context, after int64, scopes []string, wait time.Duration) EventPage {

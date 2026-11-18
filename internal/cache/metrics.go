@@ -93,9 +93,10 @@ type SessionRow struct {
 
 // HistoryPoint is one bucket of cache.history.
 type HistoryPoint struct {
-	Bucket string `json:"bucket"`
-	Totals Totals `json:"totals"`
-	Speed  Speed  `json:"speed"`
+	Bucket string  `json:"bucket"`
+	Totals Totals  `json:"totals"`
+	Sub    *Totals `json:"sub,omitempty"`
+	Speed  Speed   `json:"speed"`
 }
 
 // History answers cache.history.
@@ -473,20 +474,21 @@ func (s *Store) History(ctx context.Context, now time.Time, span string) (Histor
 		}
 		cursor = cursor.Add(step)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT time,input_cache_read,input_cache_creation,input_other,output,decode_ms FROM cache_steps WHERE time>=? ORDER BY time ASC`, storage.SortableTime(from))
+	rows, err := s.db.QueryContext(ctx, `SELECT time,agent,input_cache_read,input_cache_creation,input_other,output,decode_ms FROM cache_steps WHERE time>=? ORDER BY time ASC`, storage.SortableTime(from))
 	if err != nil {
 		return History{}, err
 	}
 	defer rows.Close()
 	type acc struct {
 		totals rowTotals
+		sub    rowTotals
 		speed  speedAggregate
 	}
 	byBucket := map[string]*acc{}
 	for rows.Next() {
-		var at string
+		var at, agent string
 		var read, creation, other, output, decode int64
-		if err = rows.Scan(&at, &read, &creation, &other, &output, &decode); err != nil {
+		if err = rows.Scan(&at, &agent, &read, &creation, &other, &output, &decode); err != nil {
 			return History{}, err
 		}
 		parsed := parseTime(at)
@@ -507,6 +509,13 @@ func (s *Store) History(ctx context.Context, now time.Time, span string) (Histor
 		entry.totals.creation += creation
 		entry.totals.other += other
 		entry.totals.output += output
+		if agent != "" && agent != "main" {
+			entry.sub.steps++
+			entry.sub.read += read
+			entry.sub.creation += creation
+			entry.sub.other += other
+			entry.sub.output += output
+		}
 		entry.speed.add(Step{Output: output, DecodeMS: decode})
 	}
 	if err = rows.Err(); err != nil {
@@ -519,6 +528,10 @@ func (s *Store) History(ctx context.Context, now time.Time, span string) (Histor
 		point := *buckets[label]
 		if entry, exists := byBucket[label]; exists {
 			point.Totals = entry.totals.totals()
+			if entry.sub.steps > 0 {
+				sub := entry.sub.totals()
+				point.Sub = &sub
+			}
 			point.Speed = entry.speed.speed()
 			overall.steps += entry.totals.steps
 			overall.read += entry.totals.read

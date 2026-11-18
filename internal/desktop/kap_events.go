@@ -27,6 +27,7 @@ type NativeItem struct {
 	Name          string             `json:"name"`
 	Stage         string             `json:"stage"`
 	Status        string             `json:"status"`
+	Outcome       string             `json:"outcome"`
 	InteractionID string             `json:"interaction_id"`
 	Input         any                `json:"input"`
 	InputText     string             `json:"input_text"`

@@ -253,6 +253,12 @@ export interface ProxyRequestInit {
 export interface PluginContext {
   plugin: PluginIdentity;
   core: { request<T = unknown>(action: string, params?: unknown): Promise<T> };
+  /**
+   * The session the host currently shows, or "" when it has none. Only the id is
+   * exposed: counters are read through metrics:read, and the transcript still
+   * requires sessions:read. Use it to pick which session's metrics to ask for.
+   */
+  activeSessionId(): string;
   events: { on(name: string, listener: (payload: unknown) => void): Disposable };
   ui: {
     mount(slot: SlotName, render: (element: HTMLElement) => Cleanup | void): Disposable;

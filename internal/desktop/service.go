@@ -88,6 +88,9 @@ type NativeService struct {
 	verifyPoll   time.Duration
 	planner      PlannerActions
 	attach       AttachConfig
+	// quota is the balance layer. It owns no timer: a plugin asks for a refresh and
+	// that is the only thing that makes a request.
+	quota *quotaService
 }
 
 const addonFeaturesKey = "features"
@@ -154,6 +157,7 @@ func NewNativeService(db *sql.DB, kap *KAPClient, cwd string, safe func() bool) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	service := &NativeService{db: db, kap: kap, bus: NewEventBus(), cwd: cwd, safe: safe, ctx: ctx, cancel: cancel, cache: map[string]cachedSession{}}
+	service.quota = newQuotaService(service)
 	if _, err := db.ExecContext(ctx, `UPDATE automation_intents SET state='unknown',result='核心重启后无法确认原请求结果，不会自动重发',updated_at=? WHERE state IN ('pending','acknowledged')`, storage.SortableTime(time.Now().UTC())); err != nil {
 		cancel()
 		return nil, err
@@ -406,6 +410,17 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.cacheRetention(ctx, time.Now().UTC())
 	case "cache.receipts":
 		return s.cacheReceipts(ctx, parseCacheLimit(input))
+	case "cache.turns":
+		before := time.Time{}
+		if value := stringInput(input, "before"); value != "" {
+			if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+				before = parsed
+			}
+		}
+		return s.cacheTurns(ctx, time.Now().UTC(), stringInput(input, "id"), parseCacheLimit(input), before)
+	case "quota.balances":
+		refresh, _ := input["refresh"].(bool)
+		return s.quota.balances(ctx, refresh)
 	case "automation.get":
 		return s.automationSettings(ctx)
 	case "automation.set":
@@ -865,7 +880,11 @@ func turnApprovals(turns []NativeTurn) []NativeApproval {
 }
 
 func (s *NativeService) applyFrame(frame NativeFrame) {
-	if frame.SessionID == "" || frame.AgentID != "" && frame.AgentID != "main" {
+	if frame.SessionID == "" {
+		return
+	}
+	if frame.AgentID != "" && frame.AgentID != "main" {
+		s.publishActivity(frame)
 		return
 	}
 	s.mu.Lock()
@@ -968,6 +987,10 @@ func (s *NativeService) applyFrame(frame NativeFrame) {
 	if ok {
 		s.bus.Publish("session:"+frame.SessionID, sessionViewFromCache(cache))
 	}
+	// A counters-only stream for the Monitor panel. It is published outside the
+	// lock above because the panel must not be able to keep the session cache
+	// locked while it renders.
+	s.publishActivity(frame)
 }
 
 func (s *NativeService) createSession(ctx context.Context, input map[string]any) (NativeSession, error) {

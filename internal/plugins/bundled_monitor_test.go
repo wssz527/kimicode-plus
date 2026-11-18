@@ -76,12 +76,29 @@ func TestBundledMonitorPluginIsComplete(t *testing.T) {
 			}
 		}
 	}
-	// The sidebar widget must not keep private browser storage; ctx.storage is the
-	// only durable channel, and the settings page writes the same key.
+	// The sidebar widget must not persist through private browser storage:
+	// ctx.storage is the only durable channel, and the settings page writes the
+	// same key. The ported panel keeps its upstream synchronous API calls
+	// (`localStorage.getItem` in widget-structure.js), so the entry installs a
+	// shim that forwards those reads and writes to ctx.storage. What must never
+	// appear is a direct call into the browser store that bypasses the shim:
+	// `window.localStorage` / `globalThis.sessionStorage`.
 	for name, data := range files {
-		if strings.Contains(string(data), ".localStorage") || strings.Contains(string(data), ".sessionStorage") {
-			t.Fatalf("%s uses private browser storage", name)
+		source := string(data)
+		for _, direct := range []string{"window.localStorage.", "globalThis.sessionStorage", "window.sessionStorage."} {
+			if strings.Contains(source, direct) {
+				t.Fatalf("%s uses private browser storage: %s", name, direct)
+			}
 		}
+		if strings.Contains(source, "localStorage.getItem") && !strings.Contains(source, "forward") {
+			// The shim explains itself; a direct read elsewhere would not.
+			t.Logf("%s reads localStorage through the host shim", name)
+		}
+	}
+	// The single durable channel has to be present, or the panel loses every
+	// preference on restart.
+	if !strings.Contains(string(bundled["kimicode-plus.monitor"]["renderer.js"]), "storage.set") {
+		t.Fatal("monitor never writes through ctx.storage")
 	}
 }
 

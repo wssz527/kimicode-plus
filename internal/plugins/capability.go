@@ -260,6 +260,8 @@ var actionCapability = map[string]string{
 	"cache.summary":    CapMetricsRead,
 	"cache.sessions":   CapMetricsRead,
 	"cache.history":    CapMetricsRead,
+	"cache.turns":      CapMetricsRead,
+	"quota.balances":   CapMetricsRead,
 	"cache.retention":  CapMetricsRead,
 	"cache.receipts":   CapMetricsRead,
 	"sessions.list":    CapSessionsRead,
@@ -323,6 +325,11 @@ var actionCapability = map[string]string{
 var eventScopeCapability = map[string]string{
 	"cache":      CapMetricsRead,
 	"automation": CapMetricsRead,
+	// activity carries counters only (turn and tool lifecycle), never message
+	// text or tool input/output. It is deliberately separate from
+	// "session:<id>": a panel that renders numbers must not be handed the
+	// transcript stream it would need sessions:read to receive.
+	"activity": CapMetricsRead,
 }
 
 // EventScopeAllowed reports whether a plugin may subscribe to one event scope.

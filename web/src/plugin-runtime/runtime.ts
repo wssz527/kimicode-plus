@@ -133,7 +133,12 @@ export function createPluginRuntime(options: RuntimeOptions) {
    * here even if a future core starts publishing it.
    */
   function eventScopeGranted(granted: string[], scope: string): boolean {
-    if (scope === "cache" || scope === "automation") return granted.includes("metrics:read");
+    // `activity` is the counters-only stream (turn and tool lifecycle) published
+    // by the core: it never carries message text, so it sits with metrics:read
+    // rather than sessions:read.
+    if (scope === "cache" || scope === "automation" || scope === "activity") {
+      return granted.includes("metrics:read");
+    }
     if (scope.startsWith("session:")) return granted.includes("sessions:read");
     if (scope.startsWith("planner:")) return granted.includes("planner:run");
     return false;
@@ -453,6 +458,10 @@ export function createPluginRuntime(options: RuntimeOptions) {
     return {
       plugin: identity,
       core: { request: (action, params) => bridge.call(action, params) },
+      // The host's own idea of the focused session. It is an id, not a stream and
+      // not a transcript: a sidebar panel needs to know which session's counters
+      // to read, and reading those still goes through metrics:read.
+      activeSessionId: () => options.activeSession?.() || "",
       events: {
         on(name, listener) {
           // The same scope-to-capability table the core applies decides this
