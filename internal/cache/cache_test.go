@@ -447,6 +447,14 @@ func TestRetentionBuckets(t *testing.T) {
 		plainLine(usageRecord("synthetic/r", miss, "turn", start.Add(21*time.Minute))),
 		plainLine(stepEnd("uuid-r3", "0", 3, miss, 500, 1200, "end_turn", start.Add(21*time.Minute))),
 	)
+	writeWire(t, home, "session_retention_other", "main",
+		plainLine(usageRecord("synthetic/a", hit, "turn", start)),
+		plainLine(stepEnd("uuid-r4", "0", 1, hit, 500, 1200, "end_turn", start)),
+		plainLine(usageRecord("synthetic/b", hit, "turn", start.Add(time.Minute))),
+		plainLine(stepEnd("uuid-r5", "0", 2, hit, 500, 1200, "end_turn", start.Add(time.Minute))),
+		plainLine(usageRecord("synthetic/b", miss, "turn", start.Add(4*time.Minute))),
+		plainLine(stepEnd("uuid-r6", "0", 3, miss, 500, 1200, "end_turn", start.Add(4*time.Minute))),
+	)
 	store := newTestStore(t, home)
 	if _, err := store.Scan(context.Background(), start.Add(time.Hour), true); err != nil {
 		t.Fatal(err)
@@ -463,8 +471,17 @@ func TestRetentionBuckets(t *testing.T) {
 		byLabel[bucket.Label] = bucket
 	}
 	first := byLabel["0–2 分钟"]
-	if first.Samples != 1 || first.HitRate == nil || first.Reported != Reported {
+	if first.Samples != 2 || first.HitRate == nil || first.Reported != Reported {
 		t.Fatalf("0-2 bucket = %+v", first)
+	}
+	if len(retention.ByModel) != 2 || retention.ByModel[0].Model != "synthetic/b" || retention.ByModel[1].Model != "synthetic/r" {
+		t.Fatalf("unexpected retention models: %+v", retention.ByModel)
+	}
+	if buckets := retention.ByModel[0].IdleBuckets; buckets[0].Samples != 0 || buckets[1].Samples != 1 || buckets[1].Reported != NotReported {
+		t.Fatalf("switching models must not count as that model's retention sample: %+v", buckets)
+	}
+	if buckets := retention.ByModel[1].IdleBuckets; buckets[0].Samples != 1 || buckets[0].HitRate == nil || *buckets[0].HitRate != 0.6 {
+		t.Fatalf("other model polluted same-model samples: %+v", buckets)
 	}
 	if got := *first.HitRate; got < 0.5999 || got > 0.6001 {
 		t.Fatalf("0-2 hit rate = %.4f, want 0.6", got)

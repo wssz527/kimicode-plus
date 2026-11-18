@@ -59,9 +59,17 @@ for file in sorted((ROOT / 'web/public/fonts').glob('OFL-*.txt')):
 # Plugins are shipped inside the binary, so their licenses belong in the same
 # notice file. Each bundled plugin directory must carry a LICENSE; a plugin
 # without one is a packaging error, not a reason to silently omit it.
-for plugin in sorted((ROOT / 'plugins').iterdir()):
-    if not plugin.is_dir() or plugin.name.startswith('.'):
-        continue
+embed_text = (ROOT / 'plugins' / 'embed.go').read_text(encoding='utf-8')
+bundled_dirs = []
+for line in embed_text.splitlines():
+    stripped = line.strip()
+    if stripped.startswith('//go:embed '):
+        for token in stripped.removeprefix('//go:embed ').split():
+            bundled_dirs.append(token.removeprefix('all:'))
+for name in sorted(bundled_dirs):
+    plugin = ROOT / 'plugins' / name
+    if not plugin.is_dir():
+        raise SystemExit('Missing bundled plugin directory: ' + name)
     license_file = plugin / 'LICENSE'
     if not license_file.is_file():
         raise SystemExit('Missing plugin license: ' + plugin.name)

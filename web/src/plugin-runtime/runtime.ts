@@ -59,6 +59,7 @@ export interface RuntimeOptions {
   /** File picker for `attachments.pick`. Absent means the core dialog is used. */
   pickFiles?: () => Promise<Array<{ path: string; name: string }>>;
   openSession?: (id: string) => Promise<void>;
+  activeSession?: () => string;
   windowHost?: { popout(pluginId: string): Promise<void>; close(): Promise<void> };
   commandHost?: {
     register(pluginId: string, name: string): Promise<unknown>;
@@ -190,7 +191,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
 
     const browserV2 = granted.includes("browser:view") ? createBrowserApi(id, granted, scope) : undefined;
     const instanceId = options.instanceId ?? globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-    const plannerV2 = granted.includes("planner:run") ? createPlannerApi(bridge) : undefined;
+    const plannerV2 = granted.includes("planner:run") ? createPlannerApi(bridge, options.activeSession) : undefined;
     const handoffV2 = granted.includes("handoff")
       ? {
         async preview(input: { targetId?: string; text: string; mode?: string }): Promise<HandoffPreview> {
@@ -370,7 +371,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
       };
     }
 
-    function createPlannerApi(call: typeof bridge) {
+    function createPlannerApi(call: typeof bridge, activeSession?: () => string) {
       const map = <T>(thread: T) => thread;
       return {
         async threads() {
@@ -394,7 +395,8 @@ export function createPluginRuntime(options: RuntimeOptions) {
           return call.call<PlannerThread>("planner.rename", { id: threadId, title });
         },
         async send(threadId: string, text: string, sourceSessionId?: string) {
-          return call.call<PlannerThread>("planner.send", { id: threadId, text, sourceSessionId });
+          const resolved = sourceSessionId ?? (activeSession?.() || undefined);
+          return call.call<PlannerThread>("planner.send", { id: threadId, text, sourceSessionId: resolved });
         },
         async retry(threadId: string, revision: number) {
           return call.call<PlannerThread>("planner.retry", { id: threadId, revision });

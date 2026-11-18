@@ -475,9 +475,6 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
         <span className="wb-mark" aria-hidden="true" />
         <h1>原生设置</h1>
         <div className="wb-head-actions">
-          <button type="button" className="wb-icon-btn" title="弹出独立窗口" onClick={() => void host.popout()}>
-            <Icon name="external" size={15} />
-          </button>
           <button type="button" className="wb-icon-btn" title="关闭" onClick={() => host.close()}>
             <Icon name="close" size={15} />
           </button>

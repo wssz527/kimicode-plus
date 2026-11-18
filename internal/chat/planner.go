@@ -380,13 +380,21 @@ func (p *PlannerService) send(state *plannerState, text, sourceSessionID string)
 	if text == "" || len(text) > 32000 {
 		return PlannerThread{}, errors.New("消息为空或超过 32000 字节")
 	}
-	workspace := p.cwd
-	if p.workspace != nil && sourceSessionID != "" {
+	state.mu.Lock()
+	workspace := ""
+	if state.thread.PluginOwner != "" {
+		workspace = state.thread.Workspace
+	}
+	state.mu.Unlock()
+	if workspace == "" && p.workspace != nil && sourceSessionID != "" {
 		resolved, err := p.workspace(context.Background(), sourceSessionID)
 		if err != nil {
 			return PlannerThread{}, errors.New("无法确认当前官方会话的工作区，消息尚未发送")
 		}
 		workspace = resolved
+	}
+	if workspace == "" {
+		workspace = p.cwd
 	}
 	if _, err := plannerPath(workspace, ".", false); err != nil {
 		return PlannerThread{}, errors.New("当前规划工作区不可用，消息尚未发送")
@@ -406,6 +414,10 @@ func (p *PlannerService) send(state *plannerState, text, sourceSessionID string)
 			title = string([]rune(title)[:48]) + "…"
 		}
 		state.thread.Title = title
+	}
+	if state.thread.PluginOwner != "" && state.thread.Workspace != "" && state.thread.Workspace != workspace {
+		state.mu.Unlock()
+		return PlannerThread{}, errors.New("规划工作区已确定，请核对当前线程后再发送")
 	}
 	state.thread.Messages = append(state.thread.Messages, Message{ID: security.Random()[:16], Role: "user", Text: text, At: time.Now().UTC().Format(time.RFC3339Nano)})
 	state.thread.Workspace = workspace

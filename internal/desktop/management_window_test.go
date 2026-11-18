@@ -24,10 +24,9 @@ func TestBootstrapRestrictsManagementRoutes(t *testing.T) {
 	if strings.Contains(bootstrapSource, "'/plugins'") {
 		t.Fatal("bootstrap.js still exposes a plugin route to the management window")
 	}
-	// window.popout and window.openSettings keep their original behaviour.
 	for _, wanted := range []string{
 		"case 'window.openSettings': return wc.executeJavaScript('window.__ekdNativeUI.openSettings()');",
-		"case 'window.popout': return openWindow('planner',",
+		"return openWindow('plugin:' + answer.pluginId,",
 	} {
 		if !strings.Contains(bootstrapSource, wanted) {
 			t.Fatalf("bootstrap.js changed an existing window action: %s", wanted)
@@ -59,11 +58,11 @@ func TestBootstrapKeepsManagementWindowContained(t *testing.T) {
 	}
 }
 
-// A management window is wider than the planner so a model table fits, and it
+// A management window is wider than a plugin window so a model table fits, and it
 // keeps its own title. Both windows take a fresh bridge key per WebContents.
 func TestBootstrapSizesManagementWindowSeparately(t *testing.T) {
 	for _, wanted := range []string{
-		"title: management ? 'KimiCode+ 管理' : 'KimiCode+ 规划',",
+		"title: management ? 'KimiCode+ 管理' : 'KimiCode+ 插件',",
 		"width: previous?.width || (management ? 1080 : 640),",
 		"height: previous?.height || (management ? 760 : 840),",
 		"minWidth: management ? 720 : 400, minHeight: management ? 520 : 500,",
@@ -97,9 +96,9 @@ func TestBootstrapRebindsManagementOnRouteChange(t *testing.T) {
 // pass the start path through instead of falling back to the planner surface.
 func TestRendererMountsManagementSurface(t *testing.T) {
 	for _, wanted := range []string{
-		"options.surface === 'settings' || options.surface === 'management' || options.popout",
-		"if (options.surface === 'management') mount(element, 'management', host, { initialPath: options.initialPath });",
-		"const title = options.surface === 'settings' ? 'KimiCode+ 设置' : options.surface === 'management' ? 'KimiCode+ 管理' : 'KimiCode+ 规划聊天';",
+		"options.surface === 'settings' || options.surface === 'management'",
+		"mount(element, options.surface, host, { initialPath: options.initialPath });",
+		"const title = options.surface === 'settings' ? 'KimiCode+ 设置' : 'KimiCode+ 管理';",
 	} {
 		if !strings.Contains(rendererSource, wanted) {
 			t.Fatalf("renderer.js lost the management mount: %s", wanted)

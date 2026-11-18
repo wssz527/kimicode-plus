@@ -102,13 +102,17 @@ def make_local_plugin(folder, plugin_id, name='Local acceptance plugin', capabil
 
 
 def verify_plugins(core, results, folder):
-    bundled = 'kimicode-plus.example-hello'
+    bundled = 'kimicode-plus.monitor'
     items = {v['id']: v for v in core.request('/plugins')['items']}
+    assert 'kimicode-plus.example-hello' not in items, items
     assert bundled in items, items
     assert items[bundled]['source'] == 'BUNDLED' and items[bundled]['enabled'] is False
-    results.append('bundled plugin is released on first run and starts disabled')
+    assert items['kimicode-plus.planner']['enabled'] is False
+    results.append('bundled plugins are released on first run without example-hello and start disabled')
 
+    enabled_plugins = []
     enabled = core.request('/plugins/' + bundled + '/enable', {})
+    enabled_plugins.append(bundled)
     assert enabled['state'] == 'ENABLED' and enabled['token']
     token = enabled['token']
     assert core.request('/plugins/' + bundled + '/action/runtime.info', {}, headers={'X-Plugin-Token': token})['value']['id'] == bundled
@@ -132,6 +136,7 @@ def verify_plugins(core, results, folder):
     assert installed['id'] == local and installed['source'] == 'LOCAL'
     assert installed['capabilities'] == ['storage', 'ui:sidebar'], installed
     core.request('/plugins/' + local + '/enable', {})
+    enabled_plugins.append(local)
     core.request('/plugins/' + local + '/disable', {})
     core.request('/plugins/' + local + '/uninstall', {})
     assert local not in {v['id'] for v in core.request('/plugins')['items']}
@@ -146,6 +151,7 @@ def verify_plugins(core, results, folder):
     # The capability the user did not confirm is not usable even though the
     # manifest declares it: enabling issues a token, but storage is still denied.
     narrow_token = core.request('/plugins/' + narrow['id'] + '/enable', {})['token']
+    enabled_plugins.append(narrow['id'])
     core.request('/plugins/' + narrow['id'] + '/action/storage.set', {'key': 'k', 'value': 1}, headers={'X-Plugin-Token': narrow_token}, expected=403)
     core.request('/plugins/' + narrow['id'] + '/disable', {})
     core.request('/plugins/' + narrow['id'] + '/uninstall', {})
@@ -159,6 +165,7 @@ def verify_plugins(core, results, folder):
     core.request('/plugins/preview', {'root': escaped}, expected=400)
     results.append('an unknown capability is refused at install time')
 
+    print('本次验收启用的插件:', ', '.join(enabled_plugins))
     # Leave the bundled plugin running: the safe-mode step below asserts that
     # turning safe mode on actually stops it, which requires it to be live.
     return {'bundled': bundled, 'token': token}

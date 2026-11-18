@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { runInNewContext } from "node:vm";
 
 interface Message {
   id: string;
@@ -472,6 +473,7 @@ test("handoff payloads never carry new-session fields to an existing session", (
 
   const existing = handoffInput({ text: "内容", targetId: "s1", mode: "tower", cwd: "/tmp/x", model: "kimi-k2", title: "标题" });
   assert.deepEqual(existing, { text: "内容", mode: "tower", targetId: "s1" });
+  assert.deepEqual(handoffInput({ text: "内容", target: "s1", mode: "normal", cwd: "/tmp/x", model: "kimi-k2", title: "标题" }), { text: "内容", mode: "normal", targetId: "s1" });
   assert.equal("model" in existing, false);
   assert.equal("cwd" in existing, false);
   assert.equal("title" in existing, false);
@@ -481,6 +483,546 @@ test("handoff payloads never carry new-session fields to an existing session", (
   assert.equal(handoffInput({ text: "x" }).mode, "normal");
   // Blank optional fields are omitted rather than sent as empty strings.
   assert.equal("model" in handoffInput({ text: "x", model: "   " }), false);
+});
+
+test("handoff confirmation stays bound to previewed payload and latest request generation", async () => {
+  const ts = (await import("typescript")).default;
+  const root = ts.createSourceFile("renderer.js", rendererSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const wanted = new Set(["handoffInput", "sameHandoffPayload", "errorText", "previewValues", "previewHandoff", "commitHandoff"]);
+  const functions: string[] = [];
+  function visit(node: import("typescript").Node) {
+    if (ts.isFunctionDeclaration(node) && node.name && wanted.has(node.name.text)) {
+      functions.push(node.getText(root).replace(/^export\s+/, ""));
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(root);
+  assert.equal(functions.length, wanted.size, "expected handoff helpers to be defined in renderer.js");
+
+  const bind = new Function(
+    "state",
+    "el",
+    "handoff",
+    "renderPreview",
+    "setStatus",
+    "refreshOpenButton",
+    `${functions.join("\n")}\nreturn { previewHandoff, commitHandoff };`,
+  );
+
+  function createHarness(handoff: {
+    preview: (input: Record<string, string>) => Promise<Record<string, unknown>>;
+    commit: (input: Record<string, string>) => Promise<Record<string, unknown>>;
+  }) {
+    const state: { preview: Record<string, unknown> | null; committed: unknown; previewSeq: number } = {
+      previewSeq: 1,
+      committed: null,
+      preview: {
+        seq: 1,
+        text: "reviewed text",
+        target: "",
+        mode: "normal",
+        cwd: "/reviewed/project",
+        model: "reviewed-model",
+        title: "reviewed title",
+        confirmed: null,
+        confirmedPayload: null,
+      },
+    };
+    const el = {
+      previewText: { value: "reviewed text" },
+      previewTarget: { value: "" },
+      previewMode: { value: "normal" },
+      previewCwd: { value: "/reviewed/project" },
+      previewModel: { value: "reviewed-model" },
+      previewTitle: { value: "reviewed title" },
+    };
+    const api = bind(state, el, handoff, () => {}, () => {}, async () => {}) as {
+      previewHandoff: () => Promise<void>;
+      commitHandoff: () => Promise<void>;
+    };
+    return { state, el, api };
+  }
+
+  // 1. Changing cwd/model/title after preview must block commit without re-preview.
+  const commits1: Record<string, string>[] = [];
+  const h1 = createHarness({
+    preview: async (input) => ({ newSession: true, mode: input.mode, bytes: input.text.length }),
+    commit: async (input) => {
+      commits1.push(input);
+      return { sessionId: "s-new", created: true };
+    },
+  });
+  await h1.api.previewHandoff();
+  assert.ok(h1.state.preview?.confirmed);
+  h1.el.previewCwd.value = "/changed/project";
+  h1.el.previewModel.value = "changed-model";
+  h1.el.previewTitle.value = "changed title";
+  await h1.api.commitHandoff();
+  assert.equal(commits1.length, 0);
+  assert.equal(h1.state.preview?.confirmed, null);
+
+  // 2. Changing target while preview A is in flight must not confirm B.
+  let resolveA!: () => void;
+  const commits2: Record<string, string>[] = [];
+  const h2 = createHarness({
+    preview: (input) =>
+      new Promise((resolve) => {
+        resolveA = () => resolve({ targetId: input.targetId || "", newSession: !input.targetId, mode: input.mode, bytes: input.text.length });
+      }),
+    commit: async (input) => {
+      commits2.push(input);
+      return { sessionId: input.targetId, created: false };
+    },
+  });
+  h2.el.previewTarget.value = "session-A";
+  const pendingA = h2.api.previewHandoff();
+  h2.el.previewTarget.value = "session-B";
+  resolveA();
+  await pendingA;
+  assert.equal(h2.state.preview?.confirmed, null);
+  await h2.api.commitHandoff();
+  assert.equal(commits2.length, 0);
+
+  // 3. Out-of-order responses: B resolves first, stale A resolves second -> B wins, A cannot overwrite.
+  let resolveReqA!: () => void;
+  let resolveReqB!: () => void;
+  const commits3: Record<string, string>[] = [];
+  const h3 = createHarness({
+    preview: (input) =>
+      new Promise((resolve) => {
+        const res = { targetId: input.targetId || "", newSession: false, mode: input.mode, bytes: input.text.length };
+        if (input.targetId === "session-A") resolveReqA = () => resolve(res);
+        else resolveReqB = () => resolve(res);
+      }),
+    commit: async (input) => {
+      commits3.push(input);
+      return { sessionId: input.targetId, created: false };
+    },
+  });
+  h3.el.previewTarget.value = "session-A";
+  const reqA = h3.api.previewHandoff();
+  h3.el.previewTarget.value = "session-B";
+  const reqB = h3.api.previewHandoff();
+  resolveReqB();
+  await reqB;
+  assert.equal((h3.state.preview?.confirmed as { targetId?: string } | null)?.targetId, "session-B");
+  resolveReqA();
+  await reqA;
+  assert.equal((h3.state.preview?.confirmed as { targetId?: string } | null)?.targetId, "session-B");
+  await h3.api.commitHandoff();
+  assert.equal(commits3.length, 1);
+  assert.equal(commits3[0].targetId, "session-B");
+
+  // 4. Closing and reopening preview while a request is in flight discards the stale response.
+  let resolveClosed!: () => void;
+  const h4 = createHarness({
+    preview: () => new Promise((resolve) => { resolveClosed = () => resolve({ newSession: true, mode: "normal", bytes: 10 }); }),
+    commit: async () => ({ sessionId: "x", created: true }),
+  });
+  const reqClosed = h4.api.previewHandoff();
+  h4.state.preview = null;
+  h4.state.previewSeq += 1;
+  h4.state.preview = {
+    seq: h4.state.previewSeq,
+    text: "new draft",
+    target: "",
+    mode: "normal",
+    cwd: "",
+    model: "",
+    title: "",
+    confirmed: null,
+    confirmedPayload: null,
+  };
+  h4.el.previewText.value = "new draft";
+  resolveClosed();
+  await reqClosed;
+  assert.equal(h4.state.preview?.confirmed, null);
+});
+
+test("web fill writes once and rejects a changed URL, composer node, or draft", async () => {
+  const makeComposer = (value = "原草稿") => ({ value, tagName: "TEXTAREA", dispatchEvent() {} });
+  let composer = makeComposer();
+  const location = { href: "https://chatgpt.com/c/one" };
+  const run = runInNewContext(`(${planner.COMPOSER_SOURCE})`, {
+    document: { querySelector: () => composer }, location, crypto, Event, setTimeout,
+  });
+  const selectors = ["textarea"];
+  const read = () => run({ selectors });
+  const write = (ticket: string) => run({ mode: "write", selectors, text: "新内容", ticket });
+  let state = await read();
+  location.href = "https://chatgpt.com/c/two";
+  assert.equal((await write(state.ticket)).reason, "composer-changed");
+  state = await read();
+  composer = makeComposer();
+  assert.equal((await write(state.ticket)).reason, "composer-changed");
+  state = await read();
+  composer.value = "在网页上继续编辑";
+  assert.equal((await write(state.ticket)).reason, "composer-changed");
+  assert.equal(composer.value, "在网页上继续编辑");
+  state = await read();
+  assert.equal((await write(state.ticket)).text, "新内容");
+  assert.equal((await write(state.ticket)).reason, "composer-changed");
+});
+
+test("mounted planner panel invalidates preview confirmation across all 6 fields (input & change) and blocks double commit", async () => {
+  class MiniNode {
+    tagName: string;
+    children: MiniNode[] = [];
+    parentElement: MiniNode | null = null;
+    isConnected = false;
+    hidden = false;
+    disabled = false;
+    checked = false;
+    type = "";
+    placeholder = "";
+    title = "";
+    maxLength = 0;
+    scrollTop = 0;
+    scrollHeight = 100;
+    clientHeight = 100;
+    style: Record<string, string> = {};
+    dataset: Record<string, string> = {};
+    shadowRoot: MiniNode | null = null;
+    private _value = "";
+    private _text = "";
+    private attrs = new Map<string, string>();
+    private classes = new Set<string>();
+    private listeners = new Map<string, Set<(ev: unknown) => void>>();
+
+    constructor(tag: string) {
+      this.tagName = tag.toUpperCase();
+    }
+    get className() { return [...this.classes].join(" "); }
+    set className(v: string) { this.classes = new Set(String(v || "").split(/\s+/).filter(Boolean)); }
+    get classList() {
+      const classes = this.classes;
+      return {
+        add: (c: string) => classes.add(c),
+        remove: (c: string) => classes.delete(c),
+        contains: (c: string) => classes.has(c),
+        toggle: (c: string, force?: boolean) => {
+          const next = force ?? !classes.has(c);
+          if (next) classes.add(c); else classes.delete(c);
+          return next;
+        },
+      };
+    }
+    get value(): string { return this._value; }
+    set value(v: string) {
+      const next = String(v ?? "");
+      if (this.tagName === "SELECT" && this.children.length > 0) {
+        const opts = this.querySelectorAll("option");
+        this._value = opts.some(o => o.value === next) ? next : "";
+      } else {
+        this._value = next;
+      }
+    }
+    get textContent(): string {
+      if (this.children.length === 0) return this._text;
+      return this._text + this.children.map(c => c.textContent).join("");
+    }
+    set textContent(v: string) {
+      this._text = String(v ?? "");
+      if (this.tagName !== "#FRAGMENT" && this.children.length > 0) this.children = [];
+    }
+    setAttribute(k: string, v: string) { this.attrs.set(k, String(v)); }
+    getAttribute(k: string) { return this.attrs.get(k) ?? null; }
+    hasAttribute(k: string) { return this.attrs.has(k); }
+    removeAttribute(k: string) { this.attrs.delete(k); }
+    attachShadow() {
+      this.shadowRoot = new MiniNode("#SHADOW");
+      this.shadowRoot.setConnected(this.isConnected);
+      return this.shadowRoot;
+    }
+    setConnected(val: boolean) {
+      this.isConnected = val;
+      for (const c of this.children) c.setConnected(val);
+      if (this.shadowRoot) this.shadowRoot.setConnected(val);
+    }
+    append(...nodes: MiniNode[]) {
+      for (const n of nodes) {
+        if (!n) continue;
+        if (n.tagName === "#FRAGMENT") {
+          const moved = [...n.children];
+          n.children = [];
+          this.append(...moved);
+          continue;
+        }
+        n.parentElement = this;
+        this.children.push(n);
+        n.setConnected(this.isConnected);
+      }
+    }
+    replaceChildren(...nodes: MiniNode[]) {
+      for (const c of this.children) { c.parentElement = null; c.setConnected(false); }
+      this.children = [];
+      this.append(...nodes);
+    }
+    remove() {
+      if (!this.parentElement) return;
+      const i = this.parentElement.children.indexOf(this);
+      if (i >= 0) this.parentElement.children.splice(i, 1);
+      this.parentElement = null;
+      this.setConnected(false);
+    }
+    addEventListener(type: string, fn: (ev: unknown) => void) {
+      let set = this.listeners.get(type);
+      if (!set) { set = new Set(); this.listeners.set(type, set); }
+      set.add(fn);
+    }
+    removeEventListener(type: string, fn: (ev: unknown) => void) {
+      this.listeners.get(type)?.delete(fn);
+    }
+    dispatchEvent(ev: { type: string }) {
+      const eventObj = {
+        ...ev,
+        type: ev.type,
+        target: this,
+        currentTarget: this,
+        preventDefault() {},
+        stopPropagation() {},
+        composedPath: () => [this],
+      };
+      for (const fn of this.listeners.get(ev.type) || []) fn(eventObj);
+      return true;
+    }
+    click() { this.dispatchEvent({ type: "click" }); }
+    focus() {}
+    contains(other: MiniNode | null): boolean {
+      let cur = other;
+      while (cur) { if (cur === this) return true; cur = cur.parentElement; }
+      return false;
+    }
+    getBoundingClientRect() { return { left: 0, top: 0, width: 420, height: 640 }; }
+    matches(selector: string): boolean {
+      const parts = selector.split(",").map(s => s.trim()).filter(Boolean);
+      return parts.some(part => {
+        if (part.startsWith(".")) return this.classes.has(part.slice(1));
+        const attrMatch = part.match(/^([a-zA-Z0-9-]+)?\[([a-zA-Z0-9_-]+)="([^"]+)"\]$/);
+        if (attrMatch) {
+          const [, tag, attr, val] = attrMatch;
+          if (tag && this.tagName !== tag.toUpperCase()) return false;
+          return this.getAttribute(attr) === val;
+        }
+        return this.tagName === part.toUpperCase();
+      });
+    }
+    closest(selector: string): MiniNode | null {
+      let cur: MiniNode | null = this;
+      while (cur) { if (cur.matches(selector)) return cur; cur = cur.parentElement; }
+      return null;
+    }
+    querySelectorAll(selector: string): MiniNode[] {
+      const out: MiniNode[] = [];
+      const walk = (n: MiniNode) => {
+        for (const c of n.children) {
+          if (c.matches(selector)) out.push(c);
+          walk(c);
+        }
+      };
+      walk(this);
+      return out;
+    }
+    querySelector(selector: string): MiniNode | null {
+      return this.querySelectorAll(selector)[0] ?? null;
+    }
+  }
+
+  const prevDoc = (globalThis as { document?: unknown }).document;
+  const prevWin = (globalThis as { window?: unknown }).window;
+  const body = new MiniNode("body");
+  body.setConnected(true);
+  const fakeDoc = {
+    body,
+    createElement: (tag: string) => new MiniNode(tag),
+    createElementNS: (_ns: string, tag: string) => new MiniNode(tag),
+    createDocumentFragment: () => new MiniNode("#FRAGMENT"),
+    createTextNode: (text: string) => {
+      const n = new MiniNode("#TEXT");
+      n.textContent = text;
+      return n;
+    },
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    querySelector: (sel: string) => body.querySelector(sel),
+    querySelectorAll: (sel: string) => body.querySelectorAll(sel),
+  };
+  const fakeWin = {
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    setTimeout: globalThis.setTimeout.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    requestAnimationFrame: (fn: () => void) => { fn(); return 1; },
+    cancelAnimationFrame: () => {},
+  };
+
+  (globalThis as { document: unknown }).document = fakeDoc;
+  (globalThis as { window: unknown }).window = fakeWin;
+  try {
+    const commits: Array<Record<string, unknown>> = [];
+    let resolveCommit!: (v: Record<string, unknown>) => void;
+    let commitGate: Promise<Record<string, unknown>> | null = null;
+    const host = mockHost();
+    (host.ctx as { core: { request: (a: string, p: unknown) => Promise<unknown> } }).core = {
+      async request(action: string) {
+        if (action === "sessions.list") return { items: [{ id: "s1", title: "会话一", cwd: "/tmp/p" }, { id: "s2", title: "会话二", cwd: "/tmp/p2" }, { id: "s1-inflight", title: "在途会话", cwd: "/tmp/p3" }] };
+        return {};
+      },
+    };
+    (host.ctx as { models: { list: () => Promise<Array<{ id: string; name: string }>> } }).models = {
+      list: async () => [{ id: "kimi-k2", name: "Kimi K2" }, { id: "kimi-k3", name: "Kimi K3" }],
+    };
+    let holdPreview: (() => void) | null = null;
+    (host.ctx as { handoff: { preview: (i: Record<string, unknown>) => Promise<Record<string, unknown>>; commit: (i: Record<string, unknown>) => Promise<Record<string, unknown>> } }).handoff = {
+      preview(input) {
+        const res = {
+          targetId: String(input.targetId || ""),
+          newSession: !input.targetId,
+          mode: String(input.mode || "normal"),
+          bytes: String(input.text || "").length,
+        };
+        if (input.targetId === "s1-inflight") {
+          return new Promise(resolve => { holdPreview = () => resolve(res); });
+        }
+        return Promise.resolve(res);
+      },
+      commit(input) {
+        commits.push(input);
+        if (commitGate) return commitGate;
+        commitGate = new Promise(resolve => { resolveCommit = resolve; });
+        return commitGate;
+      },
+    };
+    await planner.activate(host.ctx);
+    const mountRoot = new MiniNode("div");
+    body.append(mountRoot);
+    (host.panel as unknown as { render: (el: unknown) => () => void }).render(mountRoot);
+    const shadow = mountRoot.children[0]!.shadowRoot!;
+    const pasteBtn = shadow.querySelectorAll("button").find(b => b.textContent === "粘贴内容导入")!;
+    pasteBtn.click();
+    await new Promise(r => setTimeout(r, 15));
+
+    const previewRoot = shadow.querySelector(".ekd-preview")!;
+    const textEl = previewRoot.querySelector('textarea[aria-label="交接内容"]')!;
+    const targetEl = previewRoot.querySelector('select[aria-label="交接目标"]')!;
+    const modeEl = previewRoot.querySelector('select[aria-label="交接模式"]')!;
+    const cwdEl = previewRoot.querySelector('input[aria-label="新会话工作目录"]')!;
+    const titleEl = previewRoot.querySelector('input[aria-label="新会话标题"]')!;
+    const modelEl = previewRoot.querySelector('select[aria-label="新会话模型"]')!;
+    const previewBtn = previewRoot.querySelectorAll("button").find(b => b.textContent === "预览")!;
+    const commitBtn = previewRoot.querySelectorAll("button").find(b => b.textContent === "交接" || b.textContent === "创建会话并交接" || b.textContent === "交接到已有会话")!;
+
+    const confirmFresh = async () => {
+      previewBtn.click();
+      await new Promise(r => setTimeout(r, 10));
+      assert.equal(commitBtn.hidden, false, "commit button must appear after preview");
+      assert.equal(commitBtn.disabled, false, "commit button must be enabled after preview");
+    };
+
+    textEl.value = "initial handoff";
+    textEl.dispatchEvent({ type: "input" });
+    await confirmFresh();
+    assert.equal(commitBtn.textContent, "创建会话并交接");
+
+    // Every one of the 6 fields must invalidate confirmation immediately on DOM edit,
+    // including change events on text/cwd/title (not only input events).
+    const checks: Array<{ name: string; node: MiniNode; mutate: () => void; event: string }> = [
+      { name: "text:input", node: textEl, mutate: () => { textEl.value = "edited by input"; }, event: "input" },
+      { name: "text:change", node: textEl, mutate: () => { textEl.value = "edited by change"; }, event: "change" },
+      { name: "cwd:input", node: cwdEl, mutate: () => { cwdEl.value = "/tmp/input-dir"; }, event: "input" },
+      { name: "cwd:change", node: cwdEl, mutate: () => { cwdEl.value = "/tmp/changed"; }, event: "change" },
+      { name: "title:input", node: titleEl, mutate: () => { titleEl.value = "Input Title"; }, event: "input" },
+      { name: "title:change", node: titleEl, mutate: () => { titleEl.value = "New Title"; }, event: "change" },
+      { name: "model:change", node: modelEl, mutate: () => { modelEl.value = "kimi-k3"; }, event: "change" },
+      { name: "mode:change", node: modeEl, mutate: () => { modeEl.value = "plan"; }, event: "change" },
+      { name: "target:change", node: targetEl, mutate: () => { targetEl.value = "s1"; }, event: "change" },
+    ];
+    for (const check of checks) {
+      await confirmFresh();
+      check.mutate();
+      check.node.dispatchEvent({ type: check.event });
+      assert.equal(commitBtn.hidden, true, `${check.name} must hide commit button until re-previewed`);
+      assert.equal(commitBtn.disabled, true, `${check.name} must disable commit button until re-previewed`);
+    }
+
+    // Confirm for s1, then trigger two concurrent commit clicks: only one commit request may fire.
+    await confirmFresh();
+    assert.equal(commitBtn.textContent, "交接到已有会话");
+    commitBtn.click();
+    commitBtn.click();
+    assert.equal(commits.length, 1, "concurrent clicks must not issue duplicate handoff.commit calls");
+    assert.equal(commitBtn.disabled, true);
+    assert.equal(commitBtn.textContent, "交接中…");
+    resolveCommit({ sessionId: "s1", created: false });
+    await new Promise(r => setTimeout(r, 10));
+    assert.equal(commits.length, 1);
+    assert.equal(previewRoot.querySelectorAll(".ekd-msg")[0]?.hidden, false);
+    assert.equal(commitBtn.hidden, true, "successful handoff must consume confirmation");
+    commitBtn.click();
+    assert.equal(commits.length, 1, "success must prevent resubmitting the same payload");
+
+    // Changing a field after a completed commit clears the previous commit receipt too.
+    targetEl.value = "s1-inflight";
+    targetEl.dispatchEvent({ type: "change" });
+    assert.equal(previewRoot.querySelectorAll(".ekd-msg")[0]?.hidden, true);
+    previewBtn.click();
+    assert.equal(previewBtn.disabled, true);
+    targetEl.value = "s2";
+    targetEl.dispatchEvent({ type: "change" });
+    assert.equal(previewBtn.disabled, false);
+    if (holdPreview) (holdPreview as () => void)();
+    await new Promise(r => setTimeout(r, 10));
+    assert.equal(commitBtn.hidden, true);
+    assert.equal(commitBtn.disabled, true);
+
+    // Backing out while commit is pending prevents stale commit from leaking into a newly opened preview.
+    const backBtn = previewRoot.querySelectorAll("button").find(b => b.textContent === "返回")!;
+    commitGate = null;
+    targetEl.value = "s2";
+    targetEl.dispatchEvent({ type: "change" });
+    await confirmFresh();
+    commitBtn.click();
+    assert.equal(commits.length, 2);
+    backBtn.click();
+    pasteBtn.click();
+    await new Promise(r => setTimeout(r, 10));
+    resolveCommit({ sessionId: "s2", created: false });
+    await new Promise(r => setTimeout(r, 10));
+    assert.equal(previewRoot.querySelectorAll(".ekd-msg")[0]?.hidden ?? true, true);
+
+    backBtn.click();
+    shadow.querySelectorAll("button").find(b => b.textContent === "本地")!.click();
+    const localDraft = shadow.querySelector('textarea[aria-label="规划内容"]')!;
+    const sendBtn = shadow.querySelectorAll("button").find(b => b.textContent === "发送")!;
+    const api = (host.ctx as { planner: { create: (input: unknown) => Promise<unknown> } }).planner;
+    const originalCreate = api.create;
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>(resolve => { releaseCreate = resolve; });
+    api.create = async input => {
+      await createGate;
+      return originalCreate(input);
+    };
+    localDraft.value = "只发送一次";
+    localDraft.dispatchEvent({ type: "input" });
+    sendBtn.click();
+    sendBtn.click();
+    localDraft.value = "保留这份新草稿";
+    localDraft.dispatchEvent({ type: "input" });
+    releaseCreate();
+    await new Promise(r => setTimeout(r, 10));
+    assert.equal(host.plannerCalls.filter(call => call.action === "create").length, 1);
+    assert.deepEqual(host.plannerCalls.filter(call => call.action === "send").map(call => call.args[1]), ["只发送一次"]);
+    assert.equal(localDraft.value, "保留这份新草稿");
+    shadow.querySelector('button[aria-label="更多"]')!.click();
+    await new Promise(r => setTimeout(r, 10));
+    assert.equal(host.plannerCalls.filter(call => call.action === "threads").length, 1);
+    assert.ok(shadow.querySelectorAll("button").some(button => button.textContent === "未命名规划"));
+  } finally {
+    if (prevDoc === undefined) delete (globalThis as { document?: unknown }).document;
+    else (globalThis as { document?: unknown }).document = prevDoc;
+    if (prevWin === undefined) delete (globalThis as { window?: unknown }).window;
+    else (globalThis as { window?: unknown }).window = prevWin;
+  }
 });
 
 test("a committed session opens same-screen with A2, and through sessions.open without it", async () => {
@@ -1101,10 +1643,13 @@ test("typing in the preview does not rewrite the textarea value", () => {
   const syncBlock = source.slice(syncStart, source.indexOf("// --- skeleton", syncStart));
   assert.ok(structureBlock.includes("el.previewText.value = preview.text"));
   assert.ok(syncBlock.length > 0);
-  assert.equal(syncBlock.includes("el.previewText"), false, "the control sync must not touch the textarea");
-  // The typing handler calls the control sync, not the full render.
-  const handler = source.slice(source.indexOf('el.previewText.addEventListener("input"'), source.indexOf('el.previewTarget = document.createElement("select")'));
-  assert.ok(handler.includes("syncPreviewControls"));
+  assert.doesNotMatch(syncBlock, /el\.previewText\.value\s*=/, "control updates must not rewrite the typed value");
+  // The typing handler invalidates through syncPreviewControls, not the full render.
+  const invalidateBlock = source.slice(source.indexOf("function invalidatePreviewConfirmation()"), source.indexOf("function bindPreviewField("));
+  assert.ok(invalidateBlock.includes("syncPreviewControls"));
+  assert.equal(invalidateBlock.includes("renderPreview()"), false);
+  const handler = source.slice(source.indexOf("bindPreviewField(el.previewText"), source.indexOf('el.previewTarget = document.createElement("select")'));
+  assert.ok(handler.length > 0);
   assert.equal(handler.includes("renderPreview()"), false);
 });
 
@@ -1192,4 +1737,108 @@ test("planner menu wires summary/diff fill, aria-expanded sync, navigation liste
   assert.ok(source.includes("flushDrafts()"));
   assert.ok(source.includes(".ekd-code button{position:absolute;right:4px;top:4px"));
   assert.ok(source.includes(".ekd-msg:hover .ekd-msg-head time,.ekd-msg:focus-within .ekd-msg-head time{opacity:1}"));
+});
+
+test("createViewLauncher coalesces concurrent opens and navigates directly after default open failure", async () => {
+  const { createViewLauncher } = planner as unknown as {
+    createViewLauncher(options: {
+      open: (url: string) => Promise<{ url: string; navigate: (next: string) => Promise<void> } | null>;
+      defaultUrl: () => string;
+      onOpen?: (view: unknown, url: string) => void;
+      onError?: (error: unknown) => void;
+    }): {
+      view: unknown;
+      pending: boolean;
+      autoFailed: boolean;
+      ensure: (targetUrl?: string) => Promise<unknown>;
+      openTo: (rawUrl: string) => Promise<unknown>;
+    };
+  };
+
+  // Concurrent ensure() calls share a single browser.open invocation.
+  let resolveOpen!: (value: { url: string; navigate: (next: string) => Promise<void> }) => void;
+  const openCalls: string[] = [];
+  const navCalls: string[] = [];
+  const launcher = createViewLauncher({
+    defaultUrl: () => "https://www.kimi.com",
+    open: url => {
+      openCalls.push(url);
+      return new Promise(resolve => {
+        resolveOpen = resolve;
+      });
+    },
+  });
+  const first = launcher.ensure();
+  const second = launcher.ensure();
+  assert.equal(launcher.pending, true);
+  assert.deepEqual(openCalls, ["https://www.kimi.com/"]);
+  resolveOpen({
+    url: "https://www.kimi.com/",
+    navigate: async next => {
+      navCalls.push(next);
+    },
+  });
+  const [v1, v2] = await Promise.all([first, second]);
+  assert.equal(v1, v2);
+  assert.equal(launcher.pending, false);
+  assert.deepEqual(navCalls, []);
+
+  // After a default-URL open failure, openTo(url) opens the requested URL
+  // directly rather than retrying the dead default URL.
+  const retryOpens: string[] = [];
+  const retryNavs: string[] = [];
+  const errors: unknown[] = [];
+  const recovering = createViewLauncher({
+    defaultUrl: () => "https://www.kimi.com",
+    open: async url => {
+      retryOpens.push(url);
+      if (url.includes("kimi.com")) throw new Error("ERR_FAILED (-2)");
+      return {
+        url,
+        navigate: async next => {
+          retryNavs.push(next);
+        },
+      };
+    },
+    onError: err => errors.push(err),
+  });
+  assert.equal(await recovering.ensure(), null);
+  assert.equal(recovering.autoFailed, true);
+  assert.equal(errors.length, 1);
+
+  const opened = await recovering.openTo("http://127.0.0.1:4321/");
+  assert.ok(opened);
+  assert.equal(recovering.autoFailed, false);
+  assert.deepEqual(retryOpens, ["https://www.kimi.com/", "http://127.0.0.1:4321/"]);
+  assert.deepEqual(retryNavs, []);
+
+  await recovering.openTo("https://chatgpt.com");
+  assert.deepEqual(retryNavs, ["https://chatgpt.com/"]);
+});
+
+test("local planner loads registry models via planner.models and handoff picks only official models", async () => {
+  const { loadPlannerModels, pickHandoffModel } = planner as unknown as {
+    loadPlannerModels(deps?: {
+      planner?: { models?: () => Promise<Array<{ id: string; name?: string }>> };
+      models?: { list?: () => Promise<Array<{ id: string; name?: string }>> };
+    }): Promise<Array<{ id: string; name: string }>>;
+    pickHandoffModel(localModel: string, handoffModels?: Array<{ id: string; name?: string }>): string;
+  };
+
+  let kapCalls = 0;
+  const loaded = await loadPlannerModels({
+    planner: { models: async () => [{ id: "synthetic-planner", name: "synthetic-planner" }] },
+    models: {
+      list: async () => {
+        kapCalls += 1;
+        return [];
+      },
+    },
+  });
+  assert.equal(kapCalls, 0);
+  assert.deepEqual(loaded, [{ id: "synthetic-planner", name: "synthetic-planner" }]);
+
+  assert.equal(pickHandoffModel("synthetic-planner", []), "");
+  assert.equal(pickHandoffModel("synthetic-planner", [{ id: "kimi-k2", name: "Kimi K2" }]), "");
+  assert.equal(pickHandoffModel("kimi-k2", [{ id: "kimi-k2", name: "Kimi K2" }]), "kimi-k2");
 });

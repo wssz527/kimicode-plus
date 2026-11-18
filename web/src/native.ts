@@ -122,6 +122,7 @@ export interface CacheRetentionBucket {
 
 export interface CacheRetention {
   idleBuckets: CacheRetentionBucket[];
+  byModel?: { model: string; idleBuckets: CacheRetentionBucket[] }[];
   note: string;
 }
 
@@ -350,7 +351,6 @@ export interface NativeHooks {
   onAddSession?: (listener: () => void) => () => void;
   activeSession: () => string;
   close: () => void;
-  popout?: (source?: "local" | "web") => Promise<void>;
   pickSession?: (exclude: string[]) => Promise<string>;
   openManagement?: (path: ManagementPath) => Promise<void>;
 }
@@ -379,7 +379,6 @@ export interface NativeHost {
   browserBounds: (bounds: { visible: boolean; x?: number; y?: number; width?: number; height?: number }) => Promise<void>;
   extractBrowser: (mode?: "plan" | "exec") => Promise<string>;
   ensureWidth: (width: number) => Promise<void>;
-  popout: (source?: "local" | "web") => Promise<void>;
   openSettings: () => Promise<void>;
   openManagement: (path: ManagementPath) => Promise<void>;
   pickSession: (exclude: string[]) => Promise<string>;
@@ -528,7 +527,6 @@ export function createNativeHost(transport: NativeTransport, hooks: NativeHooks,
     browserBounds: async bounds => { await transport.request("host.browserBounds", bounds); },
     extractBrowser: async (mode = "plan") => transport.request<string>("host.extractBrowser", { mode }),
     ensureWidth: async width => { await transport.request("window.ensureWidth", { width }); },
-    popout: hooks.popout ?? (async source => { await transport.request("window.popout", { surface: "planner", initialSource: source ?? "web" }); }),
     openSettings: async () => { await transport.request("window.openSettings"); },
     openManagement: async path => {
       if (!isManagementPath(path)) throw new Error("管理窗口只打开模型与凭据页");

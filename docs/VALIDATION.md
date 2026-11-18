@@ -1,6 +1,63 @@
 # 功能与验证记录
 
-改动保存在当前 Git 工作树，未新建发布提交或上传文件。独立数据位于相邻 `../work/` 的隔离目录，不修改官方程序包或开发主实例。
+改动保存在当前 Git 工作树，未推送或发布。验收使用本项目 `work/` 下的隔离数据目录和独立宿主 profile。当前范围为核心 M0–M6、插件接口 v2（A1）和规划插件（A3）。多屏会话插件 A2 延期。
+
+## 1.3.7 兼容与规划返修（2026-11-18）
+
+最终候选在 macOS ARM64 的隔离 Kimi Code 1.3.7 / Electron 45.1.0 上通过版本、DOM 和运行时检查。预装规划升级为 1.0.2，仍默认关闭。`dist/enhanced-kimi` 与隔离验收副本的 SHA-256 为 `75122812c3a34fb4031c5d9f0b8fa39b859bbc8dfb5c14f2a0dee5dfe8984b79`。
+
+| 检查 | 结果 |
+|---|---|
+| 标准命令 | `make check`、`make test`、`make build` 通过，前端 247/247 |
+| 二进制 | `python3 scripts/acceptance.py --binary ./dist/enhanced-kimi` 通过，28/28。`make crossbuild` 生成五个架构产物，原生运行验收覆盖 macOS ARM64。 |
+| A3 隔离宿主 | 本地流程 14/14。实际右栏指针拖拽从 719px 调到 607px，关闭规划后恢复官方标签。新建规划后可从历史重新打开原线程。新旧 Code 会话均收到交接文本。 |
+| 发送与回填回归 | 异步发送仅创建一次，保留后续编辑的草稿。交接成功会消费确认。回填的合成 DOM 用例覆盖页面切换、输入框替换、草稿变化和写入后读回。 |
+| 插件与视图清理 | Monitor 与规划共用一条事件轮询，原生子视图跨窗独立，并发打开复用同一视图，停用时中断加载并释放资源。 |
+| 缓存观察 | 保活关闭时可在原生设置切换模型。合成样本分别显示 60% 和 25%，各 1 次，见 `cache-selection-report.json`。分模型只纳入同一会话连续使用同一已知模型的主代理请求。真实收益仍需有无保活对照。 |
+
+隔离证据见 `work/acceptance-137-final-J2YjUV/` 下的 `a3-acceptance-report.json`、`host-regression-report.json`、`view-lifecycle-report.json` 和深浅色截图。五站均可导航，Claude 进入安全验证页，DeepSeek 显示环境提示。五站登录后的提取、交接和回填仍待人工验收。真实付费模型的保活收益与日常实例也仍待验证。
+
+## 上一候选验收（1.3.5，2026-11-18）
+
+范围：核心 M0–M6、插件接口 v2（A1）和规划插件 A3；A2 多屏会话插件延期。规划预装版本为 1.0.1，默认关闭。旧内置规划入口、面板、弹窗动作和演示工作台已移除，旧多屏路径及其数据保留。`Makefile` 与 README 的生产检查范围统一为 `./cmd/... ./internal/...`。
+
+| 检查 | 当前结果 | 证据 |
+|---|---|---|
+| 标准检查 | `make check`、`make test` 通过；前端 246/246，无跳过 | 生产 Go 测试、vet、TypeScript 与现有前端测试 |
+| 并发检查 | desktop、plugins 的 race 检查通过 | `go test -race ./internal/desktop ./internal/plugins` |
+| 构建与二进制 | 完整构建通过，二进制验收 28/28 | `scripts/build.sh`、`scripts/acceptance.py` |
+| 平台构建 | macOS ARM64/Intel、Windows x64/ARM64、Linux x64 均编译成功 | `scripts/crossbuild.sh`；仅 macOS ARM64 原生运行 |
+| A3 完整宿主流程 | 14/14 本地阶段通过 | `work/a3-stage-final/a3-acceptance-report.json` |
+| 交接确认 | 6 类字段变化立即清除确认；预览在途切换目标、乱序响应和重复提交均受控 | 前端回归、A3 第 10 阶段的实际界面与合成官方请求 |
+| 交接生效模型 | 新旧会话均实际收到文本，原有会话模型保持 synthetic-official | A3 报告 `checks.handoff` 与合成官方请求记录 |
+| 慢加载关闭 | 关闭立即中断归属当前令牌、实例和窗口的视图，不再等待页面响应；同一视图并发打开不重复创建 | `work/a3-stage-final/view-lifecycle-report.json`；修复前复现保留在 `view-lifecycle-before-fix.json` |
+| 相邻宿主回归 | 设置六行导航、仅保留会话并排旧开关、Monitor 与规划共存一条事件轮询、同 viewId 跨窗隔离及停用后零节点/轮询/侧栏占用均通过 | `work/a3-stage-final/host-regression-report.json` |
+| 视觉 | 官方侧边聊天已实际打开；规划本地深浅色与网页子视图截图已读回 | A3 报告 `screenshots`；主 WebContents 不包含子视图，二者分别取证 |
+| 依赖审计 | 生产依赖 0 项；开发依赖链 4 项 high 告警 | `npm audit --omit=dev`、`npm audit`，见下方限制 |
+
+最终 macOS ARM64 二进制 `dist/enhanced-kimi` 与宿主验收副本的 SHA-256 均为 `09bb001f193580008f29bc7b1c1c64d321f4738db1c5edf5b8f0142fe4db9457`。A3 报告同时记录规划源码、清单、宿主注入源码和 host bundle 的 SHA-256。
+
+核心缓存、KCT 和 M6 未被本轮重写，复用未受影响的阶段证据：`work/kct-stage-acceptance/evidence/core-coexist.json`、`kct-lifecycle.json`，`work/m6-stage-acceptance/evidence/m6-config.json`、`m6-restart.json`，以及 `work/a1-stage/evidence/` 中对应权限、归属、附件和清理记录。这些历史证据不冒充对当前候选重新执行的完整实机测试。
+
+### 五站实际状态
+
+| 网站 | 可见网页视图打开 | 登录后提取 / 交接 / 回填 |
+|---|---|---|
+| Kimi | 已打开，显示登录入口 | 未验证，需用户登录 |
+| DeepSeek | 已打开至 sign_in，页面还提示使用环境异常 | 未验证，需用户登录并确认站点环境要求 |
+| Gemini | 已打开，显示登录入口 | 未验证，需用户登录 |
+| Claude | 已打开新对话页，隔离 profile 未确认登录 | 未验证，需用户登录 |
+| ChatGPT | 已打开，显示登录入口 | 未验证，需用户登录 |
+
+五站适配器有合成 DOM 单测；本地合成网页已验证选区提取、编辑预览与真实 KAP 交接。它们不代表五站真实账号全流程通过。程序不会绕过验证码，不在网站内自动发送。
+
+### 剩余边界
+
+真实付费模型、真实账号自动保活/压缩/恢复、其他平台原生运行、系统文件选择窗口 GUI 点选、签名公证与完整窗口合成截图仍未验收。合成上游的缓存 verified 回执只证明归属判定，不能证明延长真实缓存 TTL。A2 插件按用户决定延期。
+
+开发工具链告警均追溯到 [picomatch 正则拒绝服务](https://github.com/advisories/GHSA-fc5q-39xc-vjpf)，涉及 picomatch、fdir、tinyglobby 和 Vite 的依赖传播。当前 npm 的自动修复建议包含 Vite 主版本回退，本轮未修改锁文件或执行强制回退。该问题保留为构建环境的已知依赖风险，生产依赖审计结果为 0。
+
+验收期间一次测试 Skill 路径配置错误、一次 inspector 首次读取超时均保留了失败报告。修正夹具及确认宿主就绪后，同一最终构建完成了上述验收；没有通过删断言或把外部未验项目改成通过来收口。
 
 ## 缓存与额度（M2，2026-11-16）
 
@@ -51,7 +108,7 @@
 
 方法论修正：最初通过改写 `config.toml` 指向合成上游，上游收到 0 个请求——宿主只在启动时读配置。必须用官方 `/config` 热改才能验证。
 
-## 当前原生聚合验收（2026-11-16）
+## 历史原生聚合验收（2026-11-16，插件化前）
 
 | 范围 | 当前结果 | 证据与限制 |
 |---|---|---|
@@ -166,6 +223,6 @@ macOS 26.6.2 / Apple Silicon，Go 1.27.3。五个新独立数据库；进程启�
 
 原始轮次：work/performance-0.2.0.json、work/measure-0.2.0.log。
 
-## 当前未完成项
+## 历史基线的未完成项（0.2.0）
 
 真实付费模型、真实网站内对话/上传、系统文件选择窗口 GUI 点选、真实账号自动保活/压缩/恢复、真实速度与完整缓存观测、登录态恢复、其他平台原生运行、签名公证及完整窗口合成截图仍未验收。旧通用 Outbox 仍是 Mock；真实 KAP 文本交接与本机文件发送、三会话、内嵌设置与受控调度已通过各自范围，但不能替代真实账号或全平台验收。`go test ./...` 还会扫描 `work/review-0.1.1/return/evidence/` 中依赖旧私有测试函数的孤立探针，因此生产测试必须显式限定 `./cmd/... ./internal/...`；该历史证据包不属于产品包，未修改或删除。

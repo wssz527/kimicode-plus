@@ -203,6 +203,7 @@ type HostContract struct {
 var SupportedHosts = []HostContract{
 	{AppVersion: "1.3.4", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1},
 	{AppVersion: "1.3.5", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1},
+	{AppVersion: "1.3.7", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1},
 }
 
 type HostIdentity struct {

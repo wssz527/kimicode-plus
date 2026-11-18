@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"enhancedkimi/internal/storage"
@@ -122,7 +123,13 @@ type RetentionBucket struct {
 // not turn into a countdown (plan D4).
 type Retention struct {
 	IdleBuckets []RetentionBucket `json:"idleBuckets"`
+	ByModel     []ModelRetention  `json:"byModel,omitempty"`
 	Note        string            `json:"note"`
+}
+
+type ModelRetention struct {
+	Model       string            `json:"model"`
+	IdleBuckets []RetentionBucket `json:"idleBuckets"`
 }
 
 // retentionBounds are the idle gap buckets from the plan.
@@ -537,65 +544,76 @@ func (s *Store) Retention(ctx context.Context, now time.Time) (Retention, error)
 	if err := s.ready(); err != nil {
 		return Retention{}, err
 	}
-	type bucketAgg struct {
-		read, creation, other, steps int64
-	}
-	aggregates := make([]bucketAgg, len(retentionBounds))
-	rows, err := s.db.QueryContext(ctx, `SELECT session_id,time,input_cache_read,input_cache_creation,input_other FROM cache_steps WHERE agent='main' ORDER BY session_id,time ASC`)
+	aggregates := make([]rowTotals, len(retentionBounds))
+	byModel := make(map[string][]rowTotals)
+	rows, err := s.db.QueryContext(ctx, `SELECT session_id,time,model,input_cache_read,input_cache_creation,input_other FROM cache_steps WHERE agent='main' ORDER BY session_id,time ASC`)
 	if err != nil {
 		return Retention{}, err
 	}
 	defer rows.Close()
-	previous := map[string]time.Time{}
+	var previousSession, previousModel string
+	var previousTime time.Time
 	for rows.Next() {
-		var sessionID, at string
+		var sessionID, at, model string
 		var read, creation, other int64
-		if err = rows.Scan(&sessionID, &at, &read, &creation, &other); err != nil {
+		if err = rows.Scan(&sessionID, &at, &model, &read, &creation, &other); err != nil {
 			return Retention{}, err
 		}
 		parsed := parseTime(at)
 		if parsed.IsZero() {
 			continue
 		}
-		last, seen := previous[sessionID]
-		previous[sessionID] = parsed
-		if !seen {
-			continue
-		}
-		gap := parsed.Sub(last).Milliseconds()
-		if gap < 0 {
-			continue
-		}
-		for index, bound := range retentionBounds {
-			if gap < bound.min {
-				continue
+		if previousSession == sessionID && !previousTime.IsZero() {
+			gap := parsed.Sub(previousTime).Milliseconds()
+			for index, bound := range retentionBounds {
+				if gap < bound.min || (bound.max > 0 && gap >= bound.max) {
+					continue
+				}
+				addRetentionSample(&aggregates[index], read, creation, other)
+				if model != "" && model != ModelUnknown && model == previousModel {
+					if byModel[model] == nil {
+						byModel[model] = make([]rowTotals, len(retentionBounds))
+					}
+					addRetentionSample(&byModel[model][index], read, creation, other)
+				}
+				break
 			}
-			if bound.max > 0 && gap >= bound.max {
-				continue
-			}
-			aggregates[index].steps++
-			aggregates[index].read += read
-			aggregates[index].creation += creation
-			aggregates[index].other += other
-			break
 		}
+		previousSession, previousModel, previousTime = sessionID, model, parsed
 	}
 	if err = rows.Err(); err != nil {
 		return Retention{}, err
 	}
+	models := make([]ModelRetention, 0, len(byModel))
+	for model, totals := range byModel {
+		models = append(models, ModelRetention{Model: model, IdleBuckets: retentionBuckets(totals)})
+	}
+	sort.Slice(models, func(i, j int) bool { return models[i].Model < models[j].Model })
+	return Retention{
+		IdleBuckets: retentionBuckets(aggregates),
+		ByModel:     models,
+		Note:        "按主代理两次请求的间隔统计缓存读取比例。分模型统计只计入同一会话连续使用同一模型的请求。",
+	}, nil
+}
+
+func addRetentionSample(totals *rowTotals, read, creation, other int64) {
+	totals.steps++
+	totals.read += read
+	totals.creation += creation
+	totals.other += other
+}
+
+func retentionBuckets(aggregates []rowTotals) []RetentionBucket {
 	buckets := make([]RetentionBucket, 0, len(retentionBounds))
 	for index, bound := range retentionBounds {
-		totals := rowTotals{steps: aggregates[index].steps, read: aggregates[index].read, creation: aggregates[index].creation, other: aggregates[index].other}
+		totals := aggregates[index]
 		state, rate := reportedOf(totals)
 		buckets = append(buckets, RetentionBucket{
 			Label: bound.label, MinMs: bound.min, MaxMs: bound.max,
 			Samples: int(totals.steps), HitRate: rate, Reported: state,
 		})
 	}
-	return Retention{
-		IdleBuckets: buckets,
-		Note:        "按“距上一次请求的空闲时长”统计每个区间里第一次请求的命中率。真实的缓存保留时长没有公开值，这里只呈现观测结果，不换算成倒计时。",
-	}, nil
+	return buckets
 }
 
 var errInvalidRange = &rangeError{}

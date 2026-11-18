@@ -154,7 +154,18 @@ export const COMPOSER_SOURCE = `async (args) => {
   const node = find();
   if (!node) return { ok: false, reason: 'no-input', text: '' };
   const before = read(node);
-  if (mode === 'read') return { ok: true, text: before, tag: String(node.tagName || '') };
+  const url = String(location.href);
+  const key = Symbol.for('kimicode-plus.planner.composer');
+  if (mode === 'read') {
+    const ticket = crypto.randomUUID();
+    globalThis[key] = { ticket, node, url, before };
+    return { ok: true, text: before, url, ticket, tag: String(node.tagName || '') };
+  }
+  const snapshot = globalThis[key];
+  if (!snapshot || snapshot.ticket !== args.ticket || snapshot.node !== node || snapshot.url !== url || snapshot.before !== before) {
+    return { ok: false, reason: 'composer-changed' };
+  }
+  delete globalThis[key];
   const text = typeof args.text === 'string' ? args.text : '';
   let method = 'value';
   if (typeof node.value === 'string') {
@@ -372,11 +383,12 @@ export function planOptions(preset, custom = {}) {
  * only; an existing target must never carry them, because the core would ignore
  * them but the UI would still imply the existing session was reconfigured.
  */
-export function handoffInput({ text = "", targetId = "", mode = "normal", cwd = "", model = "", title = "" } = {}) {
+export function handoffInput({ text = "", targetId = "", target = "", mode = "normal", cwd = "", model = "", title = "" } = {}) {
   const lines = String(text || "").trim();
   const payload = { text: lines, mode: ["normal", "plan", "tower"].includes(mode) ? mode : "normal" };
-  if (String(targetId || "").trim()) {
-    payload.targetId = String(targetId).trim();
+  const resolvedTarget = String(targetId || target || "").trim();
+  if (resolvedTarget) {
+    payload.targetId = resolvedTarget;
     return payload;
   }
   for (const key of ["cwd", "model", "title"]) {
@@ -384,6 +396,16 @@ export function handoffInput({ text = "", targetId = "", mode = "normal", cwd = 
     if (typeof value === "string" && value.trim()) payload[key] = value.trim();
   }
   return payload;
+}
+
+export function sameHandoffPayload(a, b) {
+  if (!a || !b) return false;
+  return a.text === b.text
+    && (a.targetId || "") === (b.targetId || "")
+    && (a.mode || "normal") === (b.mode || "normal")
+    && (a.cwd || "") === (b.cwd || "")
+    && (a.model || "") === (b.model || "")
+    && (a.title || "") === (b.title || "");
 }
 
 /** Decides what a fill should do before touching the page input. A non-empty
@@ -538,6 +560,37 @@ export function shouldCloseMenuOnInteraction(event, menu, moreBtn) {
 export function draftWith(drafts, source, text) {
   const base = drafts && typeof drafts === "object" ? drafts : { web: "", local: "" };
   return { web: String(base.web || ""), local: String(base.local || ""), [source]: String(text ?? "").slice(0, 24000) };
+}
+
+export function normalizeModelItems(result) {
+  return (Array.isArray(result) ? result : [])
+    .map(item => ({
+      id: String(item?.id || ""),
+      name: String(item?.name || item?.id || ""),
+    }))
+    .filter(item => item.id);
+}
+
+/**
+ * Local planner runs against KimiCode+'s registry gateway (`planner.models`),
+ * not the official client's KAP catalog (`models.list`). When `models.list` was
+ * checked first, an isolated or custom-provider setup hid all imported gateway
+ * models behind an empty official catalog.
+ */
+export async function loadPlannerModels({ planner, models } = {}) {
+  if (planner && typeof planner.models === "function") {
+    return normalizeModelItems(await planner.models());
+  }
+  if (models && typeof models.list === "function") {
+    return normalizeModelItems(await models.list());
+  }
+  return [];
+}
+
+export function pickHandoffModel(localModel, handoffModels = []) {
+  const target = String(localModel || "").trim();
+  if (!target) return "";
+  return Array.isArray(handoffModels) && handoffModels.some(model => model?.id === target) ? target : "";
 }
 
 /**
@@ -724,6 +777,66 @@ export function createBrowserSync(options) {
   };
 }
 
+export function createViewLauncher({ open, defaultUrl, onOpen, onError }) {
+  let view = null;
+  let pending = null;
+  let autoFailed = false;
+
+  async function ensure(targetUrl = "") {
+    if (view) return view;
+    if (pending) {
+      await pending;
+      if (view) return view;
+      if (!targetUrl) return null;
+    }
+    const url = normalizeUrl(targetUrl) || normalizeUrl(defaultUrl?.());
+    if (!url) return null;
+    const attempt = (async () => {
+      try {
+        const opened = await open(url);
+        if (!opened) return null;
+        view = opened;
+        autoFailed = false;
+        onOpen?.(opened, url);
+        return opened;
+      } catch (error) {
+        autoFailed = true;
+        onError?.(error);
+        return null;
+      }
+    })();
+    pending = attempt;
+    try {
+      return await attempt;
+    } finally {
+      if (pending === attempt) pending = null;
+    }
+  }
+
+  async function openTo(rawUrl) {
+    const url = normalizeUrl(rawUrl);
+    if (!url) throw new Error("地址必须是完整的 http 或 https 链接");
+    autoFailed = false;
+    const alreadyOpen = Boolean(view);
+    if (pending) await pending;
+    if (!view) return ensure(url);
+    if (alreadyOpen || normalizeUrl(view.url) !== url) {
+      await view.navigate(url);
+    }
+    return view;
+  }
+
+  return {
+    get view() { return view; },
+    get pending() { return Boolean(pending); },
+    get autoFailed() { return autoFailed; },
+    ensure,
+    openTo,
+    resetAutoFailure() { autoFailed = false; },
+    clear() { view = null; autoFailed = false; },
+  };
+}
+
 export function errorText(error) {
   if (error instanceof Error && error.message) return error.message;
   if (typeof error === "string" && error) return error;
@@ -753,7 +866,7 @@ const STYLE = `
 .ekd-icon{width:26px;padding:2px;display:inline-flex;align-items:center;justify-content:center}
 .ekd-icon svg{width:15px;height:15px;stroke:currentColor;stroke-width:1.7;fill:none;stroke-linecap:round;stroke-linejoin:round}
 .ekd-more{position:relative}
-.ekd-menu{position:absolute;right:0;top:calc(100% + 4px);z-index:20;min-width:236px;max-width:min(320px,90vw);padding:6px;border-radius:10px;background:var(--color-bg,#fff);border:1px solid var(--color-line,color-mix(in srgb,var(--color-text,#1f2328) 18%,transparent));box-shadow:0 10px 24px rgba(0,0,0,.18);display:flex;flex-direction:column;gap:4px}
+.ekd-menu{position:absolute;right:0;top:calc(100% + 4px);z-index:20;min-width:236px;max-width:min(320px,90vw);max-height:calc(100vh - 110px);overflow:auto;overscroll-behavior:contain;padding:6px;border-radius:8px;background:var(--color-bg,#fff);border:1px solid var(--color-line,color-mix(in srgb,var(--color-text,#1f2328) 18%,transparent));box-shadow:0 10px 24px rgba(0,0,0,.18);display:flex;flex-direction:column;gap:4px}
 .ekd-menu label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--color-text-secondary,color-mix(in srgb,var(--color-text,#1f2328) 62%,var(--color-bg,#fff)));padding:4px 6px}
 .ekd-menu input{min-height:28px;border:1px solid var(--color-line,color-mix(in srgb,var(--color-text,#1f2328) 20%,transparent));border-radius:6px;padding:4px 8px;background:var(--color-bg,#fff);min-width:0}
 .ekd-menu .ekd-row{display:flex;gap:4px}
@@ -774,7 +887,9 @@ const STYLE = `
 .ekd-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:12px 14px 20px;display:flex;flex-direction:column;gap:10px}
 .ekd-empty{margin:auto;text-align:center;color:var(--color-text-secondary,color-mix(in srgb,var(--color-text,#1f2328) 62%,var(--color-bg,#fff)));display:flex;flex-direction:column;gap:6px;align-items:center;padding:24px}
 .ekd-msg{display:flex;flex-direction:column;gap:4px;border-radius:8px;padding:8px 10px;background:var(--panel,color-mix(in srgb,var(--color-text,#1f2328) 4%,var(--color-bg,#fff)));border:1px solid transparent;min-width:0}
-.ekd-msg.is-mine{background:var(--soft,color-mix(in srgb,var(--blue,#1783ff) 12%,var(--color-bg,#fff)))}
+.ekd-msg.is-mine{align-self:flex-end;width:fit-content;max-width:86%;background:var(--color-hover,color-mix(in srgb,var(--color-text,#1f2328) 6%,var(--color-bg,#fff)))}
+.ekd-msg:not(.is-mine){background:transparent}
+.ekd-workspace{font-size:12px;color:var(--color-text-secondary,inherit);overflow-wrap:anywhere}
 .ekd-msg.is-pick{border-color:var(--blue,#1783ff)}
 .ekd-msg-head{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--color-text-secondary,color-mix(in srgb,var(--color-text,#1f2328) 62%,var(--color-bg,#fff)));min-width:0}
 .ekd-msg-head .ekd-who{font-weight:600;color:var(--color-text,#1f2328)}
@@ -793,7 +908,7 @@ const STYLE = `
 .ekd-foot{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
 .ekd-foot select{min-height:26px;max-width:46%;border:1px solid var(--color-line,color-mix(in srgb,var(--color-text,#1f2328) 20%,transparent));border-radius:6px;padding:2px 6px;background:var(--color-bg,#fff);min-width:0}
 .ekd-foot .ekd-spacer{flex:1 1 auto}
-.ekd-chip{font-size:11px;padding:1px 7px;border-radius:999px;background:var(--color-hover,rgba(0,0,0,.05));color:var(--color-text-secondary,color-mix(in srgb,var(--color-text,#1f2328) 62%,var(--color-bg,#fff)));white-space:nowrap}
+.ekd-chip{font-size:11px;padding:1px 7px;border-radius:999px;background:var(--color-hover,rgba(0,0,0,.05));color:var(--color-text-secondary,color-mix(in srgb,var(--color-text,#1f2328) 62%,var(--color-bg,#fff)));white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
 .ekd-primary{background:var(--blue,#1783ff)!important;color:#fff!important;padding:4px 12px!important}
 .ekd-primary:hover:not(:disabled){filter:brightness(1.06)}
 .ekd-danger{color:var(--red,var(--danger,#d2352c))!important}
@@ -935,6 +1050,8 @@ export async function activate(ctx) {
     extraction: null,
     selected: new Set(),
     pickOpen: false,
+    previewSeq: 0,
+    previewDraftSeq: 0,
     preview: null,
     committed: null,
     status: "",
@@ -942,6 +1059,8 @@ export async function activate(ctx) {
     busy: "",
     fillMode: "summary",
     pendingFill: null,
+    fillGeneration: 0,
+    fillInFlight: false,
     local: {
       thread: null,
       threads: [],
@@ -950,11 +1069,15 @@ export async function activate(ctx) {
       preset: "review",
       custom: { context: true, skills: false, tools: false },
       busy: false,
+      sending: false,
+      draftRevision: 0,
+      selectionGeneration: 0,
       confirmingDelete: "",
       renamingId: "",
       renameDraft: "",
       renameBusy: false,
     },
+    handoffModels: [],
     sessions: null,
   };
 
@@ -972,6 +1095,34 @@ export async function activate(ctx) {
   let viewNavSubscription = null;
   let previewDraftTimer = null;
   let draftsDirty = false;
+  const viewLauncher = createViewLauncher({
+    defaultUrl: webUrl,
+    open: async targetUrl => {
+      const view = await browser.open("planner-web", targetUrl);
+      if (disposed) {
+        await view.close().catch(() => {});
+        return null;
+      }
+      return view;
+    },
+    onOpen: (view, targetUrl) => {
+      state.view = view;
+      state.viewUrl = view.url || targetUrl;
+      viewNavSubscription?.dispose?.();
+      viewNavSubscription = typeof view.onNavigate === "function"
+        ? view.onNavigate(nextUrl => { syncViewUrl(nextUrl); })
+        : null;
+      if (sync) void sync.dispose().catch(() => {});
+      sync = createBrowserSync({ view, getRect: () => rectOf(el.viewport), isCovered: obscuring });
+      if (el.fallback) el.fallback.hidden = true;
+      if (el.webStatus) el.webStatus.textContent = "";
+      scheduleSync();
+    },
+    onError: error => {
+      showFallback("内嵌网页无法打开：" + errorText(error) + "。可以先在系统浏览器里打开并登录，再用“粘贴内容导入”。");
+      renderToolbar();
+    },
+  });
 
   // --- status --------------------------------------------------------------
   function setStatus(text, isError = false) {
@@ -1075,39 +1226,19 @@ export async function activate(ctx) {
     if (!url || url === state.viewUrl) return false;
     state.viewUrl = url;
     state.lastWebUrl = url;
+    if (state.pendingFill || state.fillInFlight || (el.sessionPicker && !el.sessionPicker.hidden)) resetFillUi();
     void persist(STORAGE_KEYS.lastWeb, url);
     renderToolbar();
     return true;
   }
 
-  async function ensureView() {
-    if (state.view || !browser) return state.view;
+  async function ensureView(initialUrl = "") {
+    if (state.view) return state.view;
     if (!browser) {
       showFallback("当前宿主没有提供网页视图能力（browser:view），无法在内嵌页面里登录。");
       return null;
     }
-    try {
-      const view = await browser.open("planner-web", webUrl());
-      if (disposed) {
-        await view.close().catch(() => {});
-        return null;
-      }
-      state.view = view;
-      state.viewUrl = view.url || webUrl();
-      viewNavSubscription?.dispose?.();
-      viewNavSubscription = typeof view.onNavigate === "function"
-        ? view.onNavigate(nextUrl => { syncViewUrl(nextUrl); })
-        : null;
-      if (sync) void sync.dispose().catch(() => {});
-      sync = createBrowserSync({ view, getRect: () => rectOf(el.viewport), isCovered: obscuring });
-      if (el.fallback) el.fallback.hidden = true;
-      if (el.webState) el.webState.textContent = "";
-      scheduleSync();
-      return view;
-    } catch (error) {
-      showFallback("内嵌网页无法打开：" + errorText(error) + "。可以先在系统浏览器里打开并登录，再用“粘贴内容导入”。");
-      return null;
-    }
+    return viewLauncher.ensure(initialUrl);
   }
 
   function showFallback(text) {
@@ -1122,12 +1253,16 @@ export async function activate(ctx) {
       setStatus("地址必须是完整的 http 或 https 链接", true);
       return;
     }
-    const view = await ensureView();
-    if (!view) return;
+    if (!browser) {
+      showFallback("当前宿主没有提供网页视图能力（browser:view），无法在内嵌页面里登录。");
+      return;
+    }
     state.busy = "navigate";
     renderToolbar();
     try {
-      await view.navigate(url);
+      const view = await viewLauncher.openTo(url);
+      if (!view) return;
+      if (el.fallback) el.fallback.hidden = true;
       state.viewUrl = url;
       state.lastWebUrl = url;
       await persist(STORAGE_KEYS.lastWeb, url);
@@ -1260,6 +1395,7 @@ export async function activate(ctx) {
   }
 
   function resetFillUi() {
+    state.fillGeneration++;
     state.pendingFill = null;
     if (el.fillChoice) {
       el.fillChoice.hidden = true;
@@ -1273,11 +1409,15 @@ export async function activate(ctx) {
   }
 
   async function pickSessionForFill(mode = state.fillMode) {
+    if (state.fillInFlight) return;
+    resetFillUi();
+    const generation = state.fillGeneration;
     state.fillMode = mode === "diff" ? "diff" : "summary";
     setMenuOpen(false);
     setStatus("正在读取 Code 会话列表…");
     try {
       const sessions = await loadSessions(true);
+      if (generation !== state.fillGeneration || state.source !== "web" || !panelVisible()) return;
       if (!sessions.length) {
         setStatus("还没有可用的 Code 会话。", true);
         return;
@@ -1313,6 +1453,7 @@ export async function activate(ctx) {
     el.sessionPicker.replaceChildren(modeRow, node("p", "ekd-note", modeNote), el.sessionPickerList);
     for (const session of sessions) {
       const item = button("", "ekd-item");
+      item.dataset.sessionId = String(session.id);
       const grow = node("span", "ekd-grow", String(session.title || session.id));
       item.append(grow, node("small", "", String(session.cwd || "").split("/").pop() || ""));
       item.addEventListener("click", () => void prepareFill(session, state.fillMode));
@@ -1327,18 +1468,27 @@ export async function activate(ctx) {
   }
 
   async function prepareFill(session, mode = state.fillMode) {
+    if (state.fillInFlight) return;
     const kind = mode === "diff" ? "diff" : "summary";
     el.sessionPicker.hidden = true;
-    state.busy = "fill";
+    state.fillInFlight = true;
     setStatus(kind === "diff" ? "正在读取会话 Diff 与网页输入框…" : "正在读取会话内容与网页输入框…");
+    const generation = state.fillGeneration;
+    const view = state.view;
     try {
-      if (!state.view) {
+      if (!view) {
         setStatus("先打开网页再填入内容", true);
         return;
       }
       const composer = composerFor(state.viewUrl);
       if (!composer) {
         setStatus("当前网站没有输入框适配器，无法安全填入。可以复制后手动粘贴。", true);
+        return;
+      }
+      const reading = await view.adapter(COMPOSER_SOURCE, { mode: "read", selectors: composer.inputs });
+      if (generation !== state.fillGeneration) return;
+      if (!reading?.ok || !reading.ticket || normalizeUrl(reading.url) !== normalizeUrl(state.viewUrl)) {
+        setStatus("未能确认当前网页的输入框。请打开对话页，再选择要填入的会话。", true);
         return;
       }
       let fill = null;
@@ -1363,21 +1513,17 @@ export async function activate(ctx) {
         const view = await ctx.core.request("sessions.view", { id: session.id });
         fill = sessionSummary({ ...view, session: view?.session || session });
       }
-      const reading = await state.view.adapter(COMPOSER_SOURCE, { mode: "read", selectors: composer.inputs });
-      if (!reading?.ok) {
-        setStatus("没有找到网页输入框。请确认页面已打开并停在该网站的对话页。", true);
-        return;
-      }
-      state.pendingFill = { mode: kind, summary: fill, before: String(reading.text || ""), inputs: composer.inputs };
+      if (generation !== state.fillGeneration || state.source !== "web" || !panelVisible()) return;
+      state.pendingFill = { mode: kind, summary: fill, before: String(reading.text || ""), inputs: composer.inputs, ticket: reading.ticket, view };
       if (!state.pendingFill.before.trim()) {
-        await writeFill("write");
+        await writeFill("write", true);
         return;
       }
       renderFillChoice();
     } catch (error) {
-      setStatus("填入失败：" + errorText(error), true);
+      if (generation === state.fillGeneration) setStatus("填入失败：" + errorText(error), true);
     } finally {
-      state.busy = "";
+      state.fillInFlight = false;
       scheduleSync();
     }
   }
@@ -1404,24 +1550,29 @@ export async function activate(ctx) {
     scheduleSync();
   }
 
-  async function writeFill(choice) {
+  async function writeFill(choice, automatic = false) {
     const pending = state.pendingFill;
-    if (!pending || !state.view) return;
+    if (!pending || (state.fillInFlight && !automatic) || pending.view !== state.view || state.source !== "web" || !panelVisible()) return;
     const plan = fillPlan({ before: pending.before, text: pending.summary.text, choice });
     if (!plan.ok) {
       if (plan.needsChoice) renderFillChoice();
       else setStatus(plan.error, true);
       return;
     }
-    state.busy = "fill";
+    state.fillInFlight = true;
     try {
-      const written = await state.view.adapter(COMPOSER_SOURCE, { mode: "write", selectors: pending.inputs, text: plan.text });
+      const written = await pending.view.adapter(COMPOSER_SOURCE, { mode: "write", selectors: pending.inputs, text: plan.text, ticket: pending.ticket });
+      if (state.pendingFill !== pending) return;
       if (!written?.ok) {
-        setStatus("写入网页输入框失败：" + (written?.reason || "页面没有响应"), true);
+        resetFillUi();
+        setStatus(written?.reason === "composer-changed" || written?.reason === "no-input"
+          ? "网页或草稿已变化，未写入。请重新发起回填。"
+          : "未收到网页写入确认，请先检查输入框。", true);
         return;
       }
       const check = verifyDraftFill(plan.text, written.text);
       if (!check.ok) {
+        resetFillUi();
         setStatus("写入后读回的内容与预期不一致（预期 " + check.wanted.length + " 字符，实际 " + check.got.length + " 字符）。没有发送任何内容，请手动核对。", true);
         return;
       }
@@ -1429,9 +1580,12 @@ export async function activate(ctx) {
       const label = pending.mode === "diff" ? "Diff " : "摘要";
       setStatus("已填入 " + pending.summary.text.length + " 个字符并读回校验通过；本插件不会自动发送。" + (pending.summary.truncated ? label + "已按上限截断。" : ""));
     } catch (error) {
-      setStatus("填入失败：" + errorText(error), true);
+      if (state.pendingFill === pending) {
+        resetFillUi();
+        setStatus("未能确认网页写入结果，请先检查输入框。" + errorText(error), true);
+      }
     } finally {
-      state.busy = "";
+      state.fillInFlight = false;
     }
   }
 
@@ -1448,14 +1602,22 @@ export async function activate(ctx) {
   // --- local planner -------------------------------------------------------
   async function loadModels() {
     if (state.local.models.length) return state.local.models;
-    const result = modelsApi ? await modelsApi.list() : planner ? await planner.models() : [];
-    const list = (Array.isArray(result) ? result : []).map(item => ({
-      id: String(item?.id || ""),
-      name: String(item?.name || item?.id || ""),
-    })).filter(item => item.id);
+    const list = await loadPlannerModels({ planner, models: modelsApi });
     state.local.models = list;
     if (!state.local.model) state.local.model = list[0]?.id || "";
     return list;
+  }
+
+  async function loadHandoffModels() {
+    if (state.handoffModels.length) return state.handoffModels;
+    if (!modelsApi || typeof modelsApi.list !== "function") return [];
+    try {
+      const list = normalizeModelItems(await modelsApi.list());
+      state.handoffModels = list;
+      return list;
+    } catch {
+      return [];
+    }
   }
 
   function subscribeThread(threadId) {
@@ -1478,48 +1640,55 @@ export async function activate(ctx) {
   }
 
   async function sendLocal() {
+    if (state.local.sending || state.local.busy) return;
     const text = String(el.draft.value || "").trim();
     if (!text) {
       setStatus("请输入规划内容。", true);
       return;
     }
-    try {
-      await loadModels();
-    } catch (error) {
-      setStatus("读取模型列表失败：" + errorText(error), true);
-      return;
-    }
-    if (!state.local.model) {
-      setStatus("没有可用模型，无法开始本地规划。请先在模型与凭据里配置。", true);
-      return;
-    }
-    if (state.local.thread && (state.local.thread.status === "running" || state.local.thread.status === "quota")) {
+    const status = state.local.thread?.status;
+    if (status === "running" || status === "quota") {
       setStatus("请先停止当前生成或解除额度等待。", true);
       return;
     }
-    state.local.busy = true;
+    const options = planOptions(state.local.preset, state.local.custom);
+    const draftRevision = state.local.draftRevision;
+    state.local.selectionGeneration++;
+    let thread = state.local.thread;
+    state.local.sending = true;
     renderThread();
     try {
-      const options = planOptions(state.local.preset, state.local.custom);
-      let thread = state.local.thread;
+      await loadModels();
+      if (!state.local.model) {
+        setStatus("没有可用模型。请先在模型与凭据里配置，再发送这份草稿。", true);
+        return;
+      }
       if (!thread) {
         thread = await planner.create({ model: state.local.model, options });
+        if (disposed) return;
         state.local.thread = thread;
         subscribeThread(thread.id);
       } else {
-        thread = await planner.configure(thread.id, { model: state.local.model, options });
-        state.local.thread = thread;
+        state.local.thread = await planner.configure(thread.id, { model: state.local.model, options });
       }
-      state.local.thread = await planner.send(thread.id, text);
-      setDraft("local", "");
-      el.draft.value = "";
-      await persist(STORAGE_KEYS.drafts, state.drafts);
+      if (disposed) return;
+      const sent = await planner.send(thread.id, text);
+      if (!disposed && state.local.thread?.id === thread.id && (state.local.thread.revision ?? 0) <= (sent.revision ?? 0)) {
+        state.local.thread = sent;
+      }
+      if (disposed) return;
+      if (state.local.draftRevision === draftRevision) {
+        setDraft("local", "");
+        el.draft.value = "";
+        draftsDirty = true;
+        flushDrafts();
+      }
       setStatus("");
     } catch (error) {
       setStatus(errorText(error), true);
     } finally {
-      state.local.busy = false;
-      renderThread();
+      state.local.sending = false;
+      if (!disposed) renderThread();
     }
   }
 
@@ -1575,9 +1744,13 @@ export async function activate(ctx) {
   }
 
   async function openThread(id) {
+    if (state.local.sending || state.local.busy) return;
+    const generation = ++state.local.selectionGeneration;
     try {
       const thread = await planner.get(id);
+      if (state.local.sending || disposed || generation !== state.local.selectionGeneration) return;
       state.local.thread = thread;
+      state.local.busy = thread.status === "running";
       state.local.confirmingDelete = "";
       setMenuOpen(false);
       subscribeThread(thread.id);
@@ -1636,25 +1809,44 @@ export async function activate(ctx) {
   function openPreview(text, from) {
     state.pickOpen = false;
     state.committed = null;
+    state.previewSeq = (Number(state.previewSeq) || 0) + 1;
+    state.previewDraftSeq = (Number(state.previewDraftSeq) || 0) + 1;
+    const draftId = state.previewDraftSeq;
     state.preview = {
+      draftId,
+      seq: state.previewSeq,
       text: String(text || ""),
       from,
       target: "",
       mode: "normal",
       cwd: "",
-      model: state.local.model || "",
+      model: pickHandoffModel(state.local.model, state.handoffModels),
       title: "",
       confirmed: null,
+      confirmedPayload: null,
     };
     renderPreview();
     applyChrome();
-    void populatePreviewTargets();
+    void populatePreviewTargets(draftId);
+    void populatePreviewModels(draftId);
   }
 
-  async function populatePreviewTargets() {
+  async function populatePreviewModels(draftId = state.preview?.draftId) {
+    if (!el.previewModel) return;
+    const list = await loadHandoffModels();
+    if (!state.preview || (draftId && state.preview.draftId !== draftId)) return;
+    if (!state.preview.model && !state.preview.confirmed && !state.preview.busy && !state.preview.committing) {
+      state.preview.model = pickHandoffModel(state.local.model, list);
+    }
+    renderPreviewModels(state.preview.model, list);
+    syncPreviewControls(state.preview);
+  }
+
+  async function populatePreviewTargets(draftId = state.preview?.draftId) {
     if (!el.previewTarget) return;
     try {
       const sessions = await loadSessions(true);
+      if (!state.preview || (draftId && state.preview.draftId !== draftId)) return;
       const fragment = document.createDocumentFragment();
       const fresh = document.createElement("option");
       fresh.value = "";
@@ -1689,39 +1881,64 @@ export async function activate(ctx) {
     const current = previewValues();
     if (!current) return;
     const payload = handoffInput(current);
+    const nextSeq = Math.max(Number(state.previewSeq) || 0, Number(state.preview?.seq) || 0) + 1;
+    state.previewSeq = nextSeq;
     if (!payload.text) {
-      state.preview = { ...state.preview, ...current, error: "交接内容不能为空" };
+      state.committed = null;
+      state.preview = { ...state.preview, ...current, seq: nextSeq, confirmed: null, confirmedPayload: null, busy: false, error: "交接内容不能为空" };
       renderPreview();
       return;
     }
-    state.preview = { ...state.preview, ...current, error: "", confirmed: null, busy: true };
+    state.committed = null;
+    state.preview = { ...state.preview, ...current, seq: nextSeq, error: "", confirmed: null, confirmedPayload: null, busy: true };
     renderPreview();
     try {
       const confirmed = await handoff.preview(payload);
-      state.preview = { ...state.preview, confirmed, busy: false };
+      if (!state.preview || state.preview.seq !== nextSeq) return;
+      const latest = previewValues();
+      if (!latest || !sameHandoffPayload(handoffInput(latest), payload)) {
+        state.preview = { ...state.preview, ...latest, confirmed: null, confirmedPayload: null, busy: false };
+        renderPreview();
+        return;
+      }
+      state.preview = { ...state.preview, confirmed, confirmedPayload: payload, busy: false };
     } catch (error) {
-      state.preview = { ...state.preview, busy: false, error: errorText(error) };
+      if (!state.preview || state.preview.seq !== nextSeq) return;
+      state.preview = { ...state.preview, confirmed: null, confirmedPayload: null, busy: false, error: errorText(error) };
     }
     renderPreview();
   }
 
   async function commitHandoff() {
+    const preview = state.preview;
+    if (!preview || preview.committing || preview.busy || state.committed) return;
     const current = previewValues();
     if (!current) return;
-    if (!state.preview?.confirmed) {
-      state.preview = { ...state.preview, ...current, error: "请先预览确认内容与目标。" };
+    const payload = handoffInput(current);
+    if (!preview.confirmed || !preview.confirmedPayload || !sameHandoffPayload(preview.confirmedPayload, payload)) {
+      state.preview = {
+        ...preview,
+        ...current,
+        confirmed: null,
+        confirmedPayload: null,
+        error: preview.confirmed ? "交接内容或目标已变更，请重新预览确认。" : "请先预览确认内容与目标。",
+      };
       renderPreview();
       return;
     }
-    state.preview = { ...state.preview, ...current, committing: true, error: "" };
+    const commitDraftId = preview.draftId || 0;
+    state.preview = { ...preview, ...current, committing: true, error: "" };
     renderPreview();
     try {
-      const result = await handoff.commit(handoffInput(current));
-      state.committed = { sessionId: String(result?.sessionId || ""), created: result?.created !== false };
-      state.preview = { ...state.preview, committing: false };
-      setStatus("已交接，会话 " + state.committed.sessionId);
+      const result = await handoff.commit(payload);
+      const sessionId = String(result?.sessionId || "");
+      setStatus("已交接，会话 " + sessionId);
+      if (!state.preview || (commitDraftId && state.preview.draftId !== commitDraftId)) return;
+      state.committed = { sessionId, created: result?.created !== false };
+      state.preview = { ...state.preview, committing: false, confirmed: null, confirmedPayload: null };
       void refreshOpenButton();
     } catch (error) {
+      if (!state.preview || (commitDraftId && state.preview.draftId !== commitDraftId)) return;
       state.preview = { ...state.preview, committing: false, error: errorText(error) };
     }
     renderPreview();
@@ -1836,6 +2053,7 @@ export async function activate(ctx) {
 
   function renderThread() {
     if (!el.threadList) return;
+    const stickToBottom = el.threadScroll && nearBottom(el.threadScroll);
     const thread = state.local.thread;
     el.threadList.replaceChildren();
     if (!thread) {
@@ -1867,10 +2085,16 @@ export async function activate(ctx) {
     }
     if (el.stopBtn) el.stopBtn.hidden = status !== "running";
     if (el.sendBtn) {
-      el.sendBtn.disabled = state.local.busy || status === "running";
-      el.sendBtn.textContent = state.local.busy ? "发送中…" : "发送";
+      el.sendBtn.disabled = state.local.sending || state.local.busy || status === "running";
+      el.sendBtn.textContent = state.local.sending ? "发送中…" : "发送";
     }
     if (el.threadTitle) el.threadTitle.textContent = thread?.title || "新规划";
+    if (el.newThread) el.newThread.disabled = state.local.sending || state.local.busy || status === "running";
+    if (el.workspace) {
+      const workspace = thread?.workspace || "";
+      el.workspace.textContent = workspace || (surface === "popout" ? "首轮使用弹出时的项目目录" : "首轮使用当前项目目录");
+      el.workspace.title = workspace;
+    }
     if (el.modelSelect) {
       el.modelSelect.replaceChildren();
       for (const model of state.local.models) {
@@ -1886,14 +2110,14 @@ export async function activate(ctx) {
         el.modelSelect.append(option);
       }
       el.modelSelect.value = state.local.model;
-      el.modelSelect.disabled = state.local.busy || !state.local.models.length;
+      el.modelSelect.disabled = state.local.sending || state.local.busy || !state.local.models.length;
     }
     if (el.presetSelect) el.presetSelect.value = state.local.preset;
     if (el.customRow) el.customRow.hidden = state.local.preset !== "custom";
     if (el.customContext) el.customContext.checked = state.local.custom.context;
     if (el.customSkills) el.customSkills.checked = state.local.custom.skills;
     if (el.customTools) el.customTools.checked = state.local.custom.tools;
-    if (el.threadScroll && state.local.thread && nearBottom(el.threadScroll)) {
+    if (stickToBottom && state.local.thread) {
       el.threadScroll.scrollTop = el.threadScroll.scrollHeight;
     }
   }
@@ -1957,6 +2181,7 @@ export async function activate(ctx) {
   function approvalCard(approval) {
     const card = node("div", "ekd-msg");
     card.append(node("strong", "", "需要审批：" + (approval.title || "工具写入")));
+    if (state.local.thread?.workspace) card.append(node("div", "ekd-workspace", "工作目录 · " + state.local.thread.workspace));
     if (approval.detail) card.append(node("div", "ekd-msg-text", approval.detail));
     const row = node("div", "ekd-row");
     const allow = button("允许", "ekd-primary");
@@ -2086,6 +2311,28 @@ export async function activate(ctx) {
     if (el.pickGo) el.pickGo.disabled = state.selected.size === 0;
   }
 
+  function renderPreviewModels(selectedModel, list = state.handoffModels) {
+    if (!el.previewModel) return;
+    el.previewModel.replaceChildren();
+    const fallback = document.createElement("option");
+    fallback.value = "";
+    fallback.textContent = "默认（跟随官方客户端）";
+    el.previewModel.append(fallback);
+    for (const model of list) {
+      const option = document.createElement("option");
+      option.value = model.id;
+      option.textContent = model.name;
+      el.previewModel.append(option);
+    }
+    if (selectedModel && !list.some(model => model.id === selectedModel)) {
+      const option = document.createElement("option");
+      option.value = selectedModel;
+      option.textContent = selectedModel;
+      el.previewModel.append(option);
+    }
+    el.previewModel.value = selectedModel || "";
+  }
+
   function renderPreviewStructure(preview) {
     if (!preview || !el.previewPane) return;
     if (el.previewText) el.previewText.value = preview.text;
@@ -2093,22 +2340,7 @@ export async function activate(ctx) {
     if (el.previewTarget) el.previewTarget.value = preview.target;
     if (el.previewCwd) el.previewCwd.value = preview.cwd;
     if (el.previewTitle) el.previewTitle.value = preview.title;
-    if (el.previewModel) {
-      el.previewModel.replaceChildren();
-      for (const model of state.local.models) {
-        const option = document.createElement("option");
-        option.value = model.id;
-        option.textContent = model.name;
-        el.previewModel.append(option);
-      }
-      if (preview.model && !state.local.models.some(model => model.id === preview.model)) {
-        const option = document.createElement("option");
-        option.value = preview.model;
-        option.textContent = preview.model;
-        el.previewModel.append(option);
-      }
-      el.previewModel.value = preview.model;
-    }
+    renderPreviewModels(preview.model, state.handoffModels);
   }
 
   function renderPreview() {
@@ -2129,22 +2361,33 @@ export async function activate(ctx) {
     // The textarea owns its own value while the user types; only the structural
     // render writes it.
     const existing = Boolean(preview.target);
+    const locked = Boolean(preview.committing);
     if (el.previewNewFields) el.previewNewFields.hidden = existing;
     if (el.previewExistingNote) el.previewExistingNote.hidden = !existing;
-    if (el.previewModel) el.previewModel.disabled = existing;
+    if (el.previewText) el.previewText.disabled = locked;
+    if (el.previewTarget) el.previewTarget.disabled = locked;
+    if (el.previewMode) el.previewMode.disabled = locked;
+    if (el.previewCwd) el.previewCwd.disabled = locked;
+    if (el.previewTitle) el.previewTitle.disabled = locked;
+    if (el.previewModel) el.previewModel.disabled = existing || locked;
+    const currentValues = previewValues() || preview;
+    const validConfirmed = preview.confirmed && preview.confirmedPayload && sameHandoffPayload(preview.confirmedPayload, handoffInput(currentValues))
+      ? preview.confirmed
+      : null;
     if (el.previewConfirm) {
-      el.previewConfirm.disabled = Boolean(preview.busy || preview.committing);
+      el.previewConfirm.hidden = Boolean(state.committed);
+      el.previewConfirm.disabled = Boolean(preview.busy || preview.committing || state.committed);
       el.previewConfirm.textContent = preview.busy ? "预览中…" : "预览";
     }
     if (el.previewCommit) {
-      el.previewCommit.hidden = !preview.confirmed;
-      el.previewCommit.disabled = Boolean(preview.committing) || !preview.confirmed;
-      el.previewCommit.textContent = preview.committing ? "交接中…" : preview.confirmed?.newSession ? "创建会话并交接" : "交接到已有会话";
+      el.previewCommit.hidden = !validConfirmed;
+      el.previewCommit.disabled = Boolean(preview.committing) || !validConfirmed;
+      el.previewCommit.textContent = preview.committing ? "交接中…" : validConfirmed?.newSession ? "创建会话并交接" : "交接到已有会话";
     }
     if (el.previewSummary) {
-      el.previewSummary.hidden = !preview.confirmed;
-      el.previewSummary.textContent = preview.confirmed
-        ? "将写入：" + (preview.confirmed.newSession ? "新会话" : "会话 " + preview.confirmed.targetId) + " · 模式 " + preview.confirmed.mode + " · " + preview.confirmed.bytes + " 字节"
+      el.previewSummary.hidden = !validConfirmed;
+      el.previewSummary.textContent = validConfirmed
+        ? "将写入：" + (validConfirmed.newSession ? "新会话" : "会话 " + validConfirmed.targetId) + " · 模式 " + validConfirmed.mode + " · " + validConfirmed.bytes + " 字节"
         : "";
     }
     if (el.previewError) {
@@ -2200,7 +2443,19 @@ export async function activate(ctx) {
     const localTools = node("div", "ekd-tools");
     el.localTools = localTools;
     el.threadTitle = node("span", "ekd-chip", "新规划");
-    localTools.append(el.threadTitle);
+    const newThread = button("新建规划");
+    el.newThread = newThread;
+    newThread.addEventListener("click", () => {
+      if (state.local.sending || state.local.busy || state.local.thread?.status === "running") return;
+      state.local.selectionGeneration++;
+      subscribeThread(null);
+      state.local.thread = null;
+      state.local.busy = false;
+      renderThread();
+      setStatus("");
+      el.draft.focus();
+    });
+    localTools.append(el.threadTitle, newThread);
     bar.append(localTools);
 
     const more = node("div", "ekd-more");
@@ -2216,6 +2471,7 @@ export async function activate(ctx) {
       setMenuOpen(open);
       if (open) {
         renderHistory();
+        void loadThreads();
         renderSiteEditors();
         el.address.value = state.viewUrl || state.lastWebUrl || "";
         el.address.focus();
@@ -2326,10 +2582,14 @@ export async function activate(ctx) {
     el.webStatus.style.bottom = "10px";
     el.fillChoice = node("div", "ekd-menu");
     el.fillChoice.hidden = true;
+    el.fillChoice.dataset.ekdPicker = "fill-choice";
+    el.fillChoice.setAttribute("aria-label", "选择填入方式");
     el.fillChoice.style.position = "static";
     el.fillChoice.style.margin = "6px";
     el.sessionPicker = node("div", "ekd-menu");
     el.sessionPicker.hidden = true;
+    el.sessionPicker.dataset.ekdPicker = "session";
+    el.sessionPicker.setAttribute("aria-label", "选择代码会话");
     el.sessionPicker.style.position = "static";
     el.sessionPicker.style.margin = "6px";
     el.sessionPickerList = node("div", "ekd-list");
@@ -2370,6 +2630,7 @@ export async function activate(ctx) {
     el.draft.setAttribute("aria-label", "规划内容");
     el.draft.value = state.drafts.local;
     el.draft.addEventListener("input", () => {
+      state.local.draftRevision++;
       setDraft("local", el.draft.value);
       queueDrafts();
     });
@@ -2379,7 +2640,8 @@ export async function activate(ctx) {
         void sendLocal();
       }
     });
-    composer.append(el.draft);
+    el.workspace = node("div", "ekd-workspace");
+    composer.append(el.workspace, el.draft);
     const foot = node("div", "ekd-foot");
     el.runStatus = node("span", "ekd-status");
     el.runStatus.hidden = true;
@@ -2475,23 +2737,42 @@ export async function activate(ctx) {
     spacer.style.flex = "1 1 auto";
     const back = button("返回");
     back.addEventListener("click", () => {
+      state.previewSeq = (Number(state.previewSeq) || 0) + 1;
       state.preview = null;
       state.committed = null;
       applyChrome();
     });
     head.append(spacer, back);
 
+    function invalidatePreviewConfirmation() {
+      if (!state.preview) return;
+      state.committed = null;
+      state.previewSeq = (Number(state.previewSeq) || 0) + 1;
+      state.preview.seq = state.previewSeq;
+      state.preview.confirmed = null;
+      state.preview.confirmedPayload = null;
+      state.preview.busy = false;
+      state.preview.error = "";
+      syncPreviewControls(state.preview);
+    }
+
+    function bindPreviewField(control, events, apply) {
+      const handler = () => {
+        if (!state.preview) return;
+        apply();
+        invalidatePreviewConfirmation();
+      };
+      for (const name of events) control.addEventListener(name, handler);
+    }
+
     el.previewText = document.createElement("textarea");
     el.previewText.setAttribute("aria-label", "交接内容");
-    el.previewText.addEventListener("input", () => {
-      if (!state.preview) return;
+    bindPreviewField(el.previewText, ["input", "change"], () => {
       state.preview.text = el.previewText.value;
-      state.preview.confirmed = null;
       if (state.preview.from === "web") {
         setDraft("web", el.previewText.value);
         queueDrafts();
       }
-      syncPreviewControls(state.preview);
       applyChrome();
     });
 
@@ -2501,11 +2782,8 @@ export async function activate(ctx) {
     fresh.value = "";
     fresh.textContent = "新会话";
     el.previewTarget.append(fresh);
-    el.previewTarget.addEventListener("change", () => {
-      if (!state.preview) return;
+    bindPreviewField(el.previewTarget, ["change"], () => {
       state.preview.target = el.previewTarget.value;
-      state.preview.confirmed = null;
-      syncPreviewControls(state.preview);
     });
 
     el.previewMode = document.createElement("select");
@@ -2516,21 +2794,27 @@ export async function activate(ctx) {
       option.textContent = label;
       el.previewMode.append(option);
     }
-    el.previewMode.addEventListener("change", () => {
-      if (state.preview) {
-        state.preview.mode = el.previewMode.value;
-        state.preview.confirmed = null;
-      }
+    bindPreviewField(el.previewMode, ["change"], () => {
+      state.preview.mode = el.previewMode.value;
     });
 
     el.previewCwd = document.createElement("input");
     el.previewCwd.placeholder = "工作目录（留空使用核心默认）";
     el.previewCwd.setAttribute("aria-label", "新会话工作目录");
+    bindPreviewField(el.previewCwd, ["input", "change"], () => {
+      state.preview.cwd = el.previewCwd.value;
+    });
     el.previewTitle = document.createElement("input");
     el.previewTitle.placeholder = "会话标题";
     el.previewTitle.setAttribute("aria-label", "新会话标题");
+    bindPreviewField(el.previewTitle, ["input", "change"], () => {
+      state.preview.title = el.previewTitle.value;
+    });
     el.previewModel = document.createElement("select");
     el.previewModel.setAttribute("aria-label", "新会话模型");
+    bindPreviewField(el.previewModel, ["change"], () => {
+      state.preview.model = el.previewModel.value;
+    });
     el.previewNewFields = node("div", "ekd-grid");
     el.previewNewFields.append(field("工作目录", el.previewCwd), field("会话标题", el.previewTitle), field("模型", el.previewModel));
     el.previewExistingNote = node("p", "ekd-note", "已有会话保持自己的模型、目录和标题；这三项不会随交接提交。");
@@ -2587,10 +2871,12 @@ export async function activate(ctx) {
       return;
     }
     flushDrafts();
+    resetFillUi();
     state.source = source;
     setMenuOpen(false);
     void persist(STORAGE_KEYS.source, source);
     if (source === "web") {
+      viewLauncher.resetAutoFailure();
       void ensureView().then(() => renderToolbar());
     } else {
       if (el.draft) el.draft.value = state.drafts.local;
@@ -2614,10 +2900,16 @@ export async function activate(ctx) {
       sidebarRelease.dispose();
       sidebarRelease = null;
     }
-    if (!visible) flushDrafts();
+    if (!visible) {
+      flushDrafts();
+      if (state.pendingFill || state.fillInFlight || (el.sessionPicker && !el.sessionPicker.hidden)) resetFillUi();
+    }
     if (visible) {
-      if (!state.view && state.source === "web") void ensureView().then(() => renderToolbar());
-      else if (state.view && state.source === "web" && typeof state.view.onNavigate !== "function") void refreshCurrentUrl();
+      if (!state.view && !viewLauncher.pending && !viewLauncher.autoFailed && state.source === "web") {
+        void ensureView().then(() => renderToolbar());
+      } else if (state.view && state.source === "web" && typeof state.view.onNavigate !== "function") {
+        void refreshCurrentUrl();
+      }
       if (!state.local.models.length) {
         void loadModels().then(() => renderThread()).catch(error => setStatus("读取模型失败：" + errorText(error), true));
       }
@@ -2730,6 +3022,7 @@ export async function activate(ctx) {
     viewNavSubscription = null;
     if (sync) void sync.dispose().catch(() => {});
     if (state.view) void state.view.close().catch(() => {});
+    viewLauncher.clear();
     state.view = null;
     root?.remove();
     if (mountHost) mountHost.remove();

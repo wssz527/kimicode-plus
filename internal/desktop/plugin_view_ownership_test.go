@@ -111,7 +111,7 @@ func TestClosingAPluginViewUsesTheRecordedCreatorToken(t *testing.T) {
 	for _, wanted := range []string{
 		"state.pluginViewTokens.set(key, payload.token);",
 		"state.pluginViewTokens.delete(key);",
-		"const recorded = [...state.pluginViewTokens].find(([candidate, token]) => token === payload.token && candidate.endsWith('/' + payload.viewId) && state.pluginViewOwners.get(candidate) === target.id);",
+		"const recorded = [...state.pluginViewTokens].find(([candidate, token]) => token === payload.token && candidate.startsWith(payload.instanceId + '/') && candidate.endsWith('/' + payload.viewId) && state.pluginViewOwners.get(candidate) === target.id);",
 	} {
 		if !strings.Contains(bootstrapSource, wanted) {
 			t.Fatalf("a stopped plugin can no longer destroy its own views: %s", wanted)
@@ -132,5 +132,28 @@ func TestClosingAPluginViewUsesTheRecordedCreatorToken(t *testing.T) {
 	}
 	if strings.Contains(bootstrapSource, "destroyPluginViews(payload") {
 		t.Fatal("view teardown reads its scope from a caller-supplied value")
+	}
+}
+
+func TestPluginViewLifecycleIsSerializedPerView(t *testing.T) {
+	if !strings.Contains(bootstrapSource, "function withPluginViewLock(lockKey, task)") {
+		t.Fatal("bootstrap.js lost withPluginViewLock serialization helper")
+	}
+	for _, action := range []string{"case 'browser.view.open': {", "case 'browser.view.navigate': {", "case 'browser.view.close': {"} {
+		index := strings.Index(bootstrapSource, action)
+		if index < 0 {
+			t.Fatalf("bootstrap.js missing %s", action)
+		}
+		end := strings.Index(bootstrapSource[index+len(action):], "\n      case '")
+		block := bootstrapSource[index:]
+		if end >= 0 {
+			block = bootstrapSource[index : index+len(action)+end]
+		}
+		if !strings.Contains(block, "withPluginViewLock(") {
+			t.Fatalf("%s must serialize per-view lifecycle work with withPluginViewLock", action)
+		}
+	}
+	if !strings.Contains(bootstrapSource, "state.channels.get(target.id)?.instanceId !== answer.instanceId") {
+		t.Fatal("browser.view.open must verify the owner channel instance stayed alive across loadURL")
 	}
 }

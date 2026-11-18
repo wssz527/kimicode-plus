@@ -176,3 +176,31 @@ test("browser view tracks navigation events and releases listener on dispose", a
   pushNav?.("https://www.kimi.com/chat/99");
   assert.deepEqual(seen, ["https://www.kimi.com/chat/42"]);
 });
+
+test("planner send defaults sourceSessionId from host activeSession when omitted", async () => {
+  const sent: unknown[] = [];
+  const runtime = createPluginRuntime({
+    slots: {},
+    activeSession: () => "session-active",
+    request: async (_path, body) => {
+      sent.push((body as { params: unknown }).params);
+      return { value: { id: "thread-1", title: "规划", model: "synthetic", status: "running", revision: 1, messages: [] } };
+    },
+  });
+  await runtime.activate(
+    {
+      activate: async context => {
+        await context.planner!.send("thread-1", "检查当前工作区");
+        await context.planner!.send("thread-1", "显式清空", "");
+        await context.planner!.send("thread-1", "显式指定", "session-other");
+      },
+    },
+    { id: "test.plugin", version: "2.0.0", granted: ["planner:run"], token: "t" },
+  );
+  assert.deepEqual(sent, [
+    { id: "thread-1", text: "检查当前工作区", sourceSessionId: "session-active" },
+    { id: "thread-1", text: "显式清空", sourceSessionId: "" },
+    { id: "thread-1", text: "显式指定", sourceSessionId: "session-other" },
+  ]);
+  runtime.dispose();
+});

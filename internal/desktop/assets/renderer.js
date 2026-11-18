@@ -29,20 +29,12 @@ async function installNativeRenderer(options) {
     module,
     request: transport.request,
     channel,
-    features: { planner: false, multiSession: false },
+    features: { multiSession: false },
     handles: new Set(),
     entries: new Set(),
     sidebarRefs: 0,
     sidebarCollapsed: null,
     observer: null,
-    panel: null,
-    plannerHostElement: null,
-    plannerHandle: null,
-    plannerRelease: null,
-    plannerSidebarRelease: null,
-    plannerTab: null,
-    returnTabId: null,
-    wasVisible: false,
     sessionContainer: null,
     sessionHostElement: null,
     sessionHandle: null,
@@ -81,7 +73,6 @@ async function installNativeRenderer(options) {
       onActiveSession: listener => listen('ekd:active-session', listener),
       onAddSession: listener => listen('ekd:add-session', listener),
       close,
-      popout: async source => { await transport.request('window.popout', { surface: 'planner', sourceSessionId: activeSession(), initialSource: source || 'web' }); close(); },
       pickSession: exclude => options.popout ? transport.request('host.pickSession', { exclude }) : pickSession(exclude),
     }, channel);
   }
@@ -146,57 +137,6 @@ async function installNativeRenderer(options) {
       state.sidebarCollapsed = null;
       if (shouldExpand) document.querySelector('button.sidebar-toggle-btn[aria-label="展开侧边栏"]')?.click();
     };
-  }
-  function collapseSidebar() {
-    state.plannerSidebarRelease ??= acquireSidebarCollapse();
-  }
-  function restoreSidebar() {
-    state.plannerSidebarRelease?.();
-    state.plannerSidebarRelease = null;
-  }
-  function closePlanner(restore = true) {
-    unmountHandle(state.plannerHandle);
-    state.plannerHandle = null;
-    state.plannerHostElement?.remove();
-    state.plannerHostElement = null;
-    state.plannerRelease?.();
-    state.plannerRelease = null;
-    if (restore && state.returnTabId && state.panel?.panelTabs.value.some(tab => tab.id === state.returnTabId)) state.panel.activateTab(state.returnTabId);
-    state.returnTabId = null;
-    state.plannerTab?.setAttribute('aria-selected', 'false');
-    state.plannerTab?.parentElement?.classList.remove('on');
-    if (!state.wasVisible) state.panel?.hidePanel();
-    state.panel = null;
-    restoreSidebar();
-    void transport.request('host.browserBounds', { visible: false }).catch(() => {});
-  }
-  async function openPlanner(source = 'web') {
-    if (!state.features.planner) throw new Error('规划是附加功能，请先在 KimiCode+ 设置中开启');
-    if (state.plannerHandle) {
-      window.dispatchEvent(new CustomEvent('ekd:planner-source', { detail: source }));
-      state.panel?.showPanel();
-      return;
-    }
-    const currentPanel = panel();
-    const body = document.querySelector('.pt-body');
-    if (!currentPanel || !body) throw new Error('右侧规划面板契约未就绪');
-    state.panel = currentPanel;
-    state.wasVisible = currentPanel.panelVisible.value;
-    state.returnTabId = currentPanel.activeTabId.value;
-    currentPanel.activeTabId.value = null;
-    collapseSidebar();
-    currentPanel.previewWidth.value = Math.min(currentPanel.previewMax.value, Math.max(currentPanel.previewWidth.value, 605));
-    currentPanel.showPanel();
-    await new Promise(resolve => setTimeout(resolve, 0));
-    state.plannerRelease = contain(body, 'planner');
-    const element = document.createElement('div');
-    element.className = 'ekd-planner-host';
-    body.append(element);
-    state.plannerHostElement = element;
-    const host = makeHost(() => closePlanner());
-    state.plannerHandle = mount(element, 'planner', host, { initialSource: source });
-    state.plannerTab?.setAttribute('aria-selected', 'true');
-    state.plannerTab?.parentElement?.classList.add('on');
   }
   function closeSessions() {
     unmountHandle(state.sessionHandle);
@@ -384,7 +324,6 @@ async function installNativeRenderer(options) {
     });
   }
   function openOfficial(id) {
-    closePlanner();
     closeSessions();
     return activateSession(id);
   }
@@ -401,8 +340,8 @@ async function installNativeRenderer(options) {
   }
   const nativeStyle = document.createElement('style');
   nativeStyle.textContent = `
-    [data-ekd-containment=planner]>:not(.ekd-planner-host),[data-ekd-containment=sessions]>:not(.ekd-session-host),[data-ekd-containment=settings]>:not(.ekd-settings-mount){display:none!important}
-    .ekd-planner-host,.ekd-session-host{display:flex;flex:1;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden}
+    [data-ekd-containment=sessions]>:not(.ekd-session-host),[data-ekd-containment=settings]>:not(.ekd-settings-mount){display:none!important}
+    .ekd-session-host{display:flex;flex:1;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden}
     .pt-body[data-ekdp-panel]>:not(.ekdp-panel-host){display:none!important}
     .pt-body[data-ekdp-panel]>.ekdp-panel-host[hidden]{display:none!important}
     .ekdp-panel-host{display:flex;flex:1;flex-direction:column;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden}
@@ -443,15 +382,22 @@ async function installNativeRenderer(options) {
       split: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/>',
       settings: '<path d="m12 3 2.5 5 5.5 1-4 4 .8 5.5L12 16l-4.8 2.5L8 13 4 9l5.5-1L12 3Z"/>',
     };
+    const resolved = paths[kind]
+      ? kind
+      : kind.endsWith(':planner')
+        ? 'planner'
+        : (kind.endsWith(':split') || kind.endsWith(':add') || kind.includes('multi-session'))
+          ? 'split'
+          : '';
     const existing = button.querySelector('svg');
-    if (!existing || !paths[kind]) return;
+    if (!existing || !resolved) return;
     existing.setAttribute('viewBox', '0 0 24 24');
     existing.setAttribute('fill', 'none');
     existing.setAttribute('stroke', 'currentColor');
     existing.setAttribute('stroke-width', '1.6');
     existing.setAttribute('stroke-linecap', 'round');
     existing.setAttribute('stroke-linejoin', 'round');
-    existing.innerHTML = paths[kind];
+    existing.innerHTML = paths[resolved];
   }
   function setEntryLabel(button, text) {
     const label = button.querySelector('.sit-name, :scope > span:not(.ui-kbd)');
@@ -471,8 +417,7 @@ async function installNativeRenderer(options) {
     setEntryLabel(button, text);
     button.addEventListener('click', async () => {
       try {
-        if (action === 'planner') await openPlanner('web');
-        else if (action === 'split') {
+        if (action === 'split') {
           if (state.sessionHandle) window.dispatchEvent(new CustomEvent('ekd:add-session'));
           else { const id = await pickSession([activeSession()]); if (id) await mountSessions([id]); }
         }
@@ -490,7 +435,6 @@ async function installNativeRenderer(options) {
   }
   function addonEntryPlan() {
     const plan = [];
-    if (state.features.planner) plan.push({ action: 'planner', label: '规划' });
     if (state.features.multiSession) plan.push({ action: 'split', label: '添加同屏会话' });
     // Plugin entries follow the frozen built-ins. The action name carries the
     // plugin and entry id, so the per-container duplicate guard stays exact and
@@ -505,23 +449,15 @@ async function installNativeRenderer(options) {
       if (element.dataset?.ekdEntry === action) { element.remove(); state.entries.delete(element); }
     }
     for (const element of [...state.entries]) if (!element.isConnected) state.entries.delete(element);
-    if (action === 'planner') {
-      state.plannerTab?.parentElement?.remove();
-      state.plannerTab = null;
-    }
   }
   function applyFeatures(next, initial) {
     const previous = state.features;
-    state.features = { planner: next?.planner === true, multiSession: next?.multiSession === true };
-    if (!state.features.planner) {
-      if (state.plannerHandle) closePlanner();
-      removeEntry('planner');
-    }
+    state.features = { multiSession: next?.multiSession === true };
     if (!state.features.multiSession) {
       if (state.sessionContainer) closeSessions();
       removeEntry('split');
     }
-    if (!initial && (previous.planner !== state.features.planner || previous.multiSession !== state.features.multiSession)) ensure();
+    if (!initial && previous.multiSession !== state.features.multiSession) ensure();
   }
   async function refreshFeatures() {
     try {
@@ -567,35 +503,29 @@ async function installNativeRenderer(options) {
       }
     }
     // Entries whose host container went away are dropped from the registry.
-    // Only entry buttons are owned by the container loop. Other tracked nodes
-    // (the planner tab) are kept so remove() can still clean them up.
     for (const entry of [...state.entries]) {
       if (entry.classList?.contains('ekd-native-entry') && !live.has(entry)) state.entries.delete(entry);
     }
     for (const element of live) state.entries.add(element);
-    const tabs = document.querySelector('.ptb-tabs');
-    if (tabs && state.features.planner && !state.plannerTab?.isConnected) {
-      const wrapper = document.createElement('div'); wrapper.className = 'ptb-tab'; wrapper.dataset.ekdPlannerTab = '';
-      const button = document.createElement('button'); button.type = 'button'; button.className = 'ptb-tab-main'; button.textContent = 'KimiCode+ 规划'; button.setAttribute('aria-selected', 'false');
-      button.addEventListener('click', () => void openPlanner('web'));
-      const attributes = [...tabs.attributes].filter(attribute => attribute.name.startsWith('data-v-'));
-      for (const element of [wrapper, button]) for (const attribute of attributes) element.setAttribute(attribute.name, attribute.value);
-      wrapper.append(button); tabs.append(wrapper); state.plannerTab = button; state.entries.add(wrapper);
-    }
     // The sidebar cache widget used to be mounted here. It is now the preinstalled
     // Monitor plugin, which mounts through the plugin runtime's own sidebar slot,
     // so this file owns no cache surface and no private channel for one.
     syncSettingsTab();
-    if (state.sessionContainer && !state.sessionContainer.isConnected) closeSessions();
-    if (state.sessionContainer) state.sessionContainer.setAttribute('data-ekd-containment', 'sessions');
-    if (state.plannerHandle) {
-      const body = document.querySelector('.pt-body');
-      if (body && state.plannerHostElement?.parentElement !== body) {
-        state.plannerRelease?.();
-        state.plannerRelease = contain(body, 'planner');
-        body.append(state.plannerHostElement);
+    if (state.activePluginPanel && panelContract()?.activeTabId?.value) {
+      deactivatePluginPanel(state.activePluginPanel, false);
+    }
+    for (const [id, entry] of state.pluginPanels) {
+      syncPluginPanelTab(entry);
+      if (state.activePluginPanel === id) {
+        const body = panelBody();
+        if (body) {
+          body.dataset.ekdpPanel = id;
+          if (entry.host.parentElement !== body) body.append(entry.host);
+        }
       }
     }
+    if (state.sessionContainer && !state.sessionContainer.isConnected) closeSessions();
+    if (state.sessionContainer) state.sessionContainer.setAttribute('data-ekd-containment', 'sessions');
   }
   function ensure() {
     if (state.removed) return;
@@ -636,7 +566,6 @@ async function installNativeRenderer(options) {
     state.picker?.close();
     deactivateSettings();
     detachSettings();
-    closePlanner(false);
     closeSessions();
     for (const handle of [...state.handles]) unmountHandle(handle);
     for (const element of state.entries) element.remove();
@@ -645,10 +574,10 @@ async function installNativeRenderer(options) {
     delete window.__ekdNativeUI;
   };
   const nativeTabClick = event => {
-    const clickedNative = event.target.closest('.ptb-tab:not([data-ekd-planner-tab]):not([data-ekdp-plugin-panel])')
+    const clickedNative = event.target.closest('.ptb-tab:not([data-ekdp-plugin-panel])')
       || event.target.closest('.sit-link:not([data-ekd-entry]), .pt-body .pl button.ui-menu-item:not([data-ekd-entry])');
     if (!clickedNative) return;
-    if (state.plannerHandle) closePlanner(false);
+    if (clickedNative.classList?.contains('ptb-tab') && event.target.closest('.ptb-x')) return;
     if (state.activePluginPanel) deactivatePluginPanel(state.activePluginPanel, false);
   };
   const settingsTabClick = event => {
@@ -672,19 +601,18 @@ async function installNativeRenderer(options) {
     state.popoutRoot.style.cssText = 'height:100vh;min-height:0;overflow:hidden';
     document.body.replaceChildren(state.popoutRoot);
     window.__ekdNativeUI = publishNativeUI();
-  } else if (options.surface === 'settings' || options.surface === 'management' || options.popout) {
+  } else if (options.surface === 'settings' || options.surface === 'management') {
     document.documentElement.dataset.colorScheme = options.theme || 'dark';
-    const title = options.surface === 'settings' ? 'KimiCode+ 设置' : options.surface === 'management' ? 'KimiCode+ 管理' : 'KimiCode+ 规划聊天';
+    const title = options.surface === 'settings' ? 'KimiCode+ 设置' : 'KimiCode+ 管理';
     document.title = title;
     document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:var(--color-bg,#121212);color:var(--color-text,#eee)';
     const element = document.createElement('div');
     element.style.cssText = 'height:100vh;min-height:0';
     document.body.replaceChildren(element);
     const host = makeHost(() => { void transport.request('window.close'); });
-    if (options.surface === 'management') mount(element, 'management', host, { initialPath: options.initialPath });
-    else mount(element, options.surface === 'settings' ? 'settings' : 'planner', host, { initialSource: options.initialSource || 'web' });
+    mount(element, options.surface, host, { initialPath: options.initialPath });
     window.__ekdNativeUI = publishNativeUI();
-    return { status: 'installed', surface: options.surface || 'planner' };
+    return { status: 'installed', surface: options.surface };
   }
   document.addEventListener('click', nativeTabClick, true);
   publishNativeUI();
@@ -927,9 +855,34 @@ async function installNativeRenderer(options) {
   }
 
   function panelContract() {
-    if (state.panelContract) return state.panelContract;
-    state.panelContract = panel();
-    return state.panelContract;
+    const shell = document.querySelector('.pt-shell');
+    const root = document.querySelector('#app')?._vnode;
+    const cached = state.panelContract;
+    if (cached?.shell === shell && cached?.root === root && cached?.value) return cached.value;
+    const value = shell && panel();
+    state.panelContract = { shell, root, value };
+    return value;
+  }
+
+  function syncPluginPanelTab(entry) {
+    const tabs = document.querySelector(".ptb-tabs");
+    if (!tabs) return;
+    if (!entry.opened) {
+      if (entry.wrapper.isConnected) entry.wrapper.remove();
+      return;
+    }
+    const attributes = tabAttributes(tabs);
+    for (const element of [entry.wrapper, entry.tab, entry.titleSpan, entry.close]) {
+      for (const attribute of attributes) {
+        if (element.getAttribute(attribute.name) !== attribute.value) {
+          element.setAttribute(attribute.name, attribute.value);
+        }
+      }
+    }
+    const dragFill = tabs.querySelector(".ptb-drag-fill");
+    const needsMove = entry.wrapper.parentElement !== tabs
+      || (dragFill && (dragFill.compareDocumentPosition(entry.wrapper) & Node.DOCUMENT_POSITION_FOLLOWING));
+    if (needsMove) tabs.insertBefore(entry.wrapper, dragFill || null);
   }
 
   function activatePluginPanel(pluginId) {
@@ -937,18 +890,22 @@ async function installNativeRenderer(options) {
     const body = panelBody();
     const contract = panelContract();
     if (!entry || !body) return;
-    state.activePluginPanel = pluginId;
+    if (state.activePluginPanel && state.activePluginPanel !== pluginId) {
+      deactivatePluginPanel(state.activePluginPanel, false);
+    }
+    entry.opened = true;
+    if (contract?.activeTabId?.value) entry.returnTabId = contract.activeTabId.value;
     if (contract?.activeTabId) contract.activeTabId.value = null;
     contract?.showPanel?.();
-    if (contract?.previewWidth) {
-      contract.previewWidth.value = Math.min(contract.previewMax?.value ?? 900, Math.max(contract.previewWidth.value, 605));
-    }
+    syncPluginPanelTab(entry);
+    if (entry.host.parentElement !== body) body.append(entry.host);
     body.dataset.ekdpPanel = pluginId;
+    state.activePluginPanel = pluginId;
     for (const [id, other] of state.pluginPanels) {
       const active = id === pluginId;
       other.host.hidden = !active;
       other.tab.setAttribute("aria-selected", String(active));
-      other.tab.parentElement?.classList.toggle("on", active);
+      other.wrapper.classList.toggle("on", active);
     }
   }
 
@@ -956,13 +913,36 @@ async function installNativeRenderer(options) {
     const entry = state.pluginPanels.get(pluginId);
     if (!entry) return;
     entry.tab.setAttribute("aria-selected", "false");
-    entry.tab.parentElement?.classList.remove("on");
+    entry.wrapper.classList.remove("on");
     entry.host.hidden = true;
-    if (state.activePluginPanel === pluginId) {
+    if (hidePanel) {
+      entry.opened = false;
+      entry.wrapper.remove();
+    }
+    const wasActive = state.activePluginPanel === pluginId;
+    if (wasActive) {
       state.activePluginPanel = null;
       const body = panelBody();
       if (body) delete body.dataset.ekdpPanel;
-      if (hidePanel) state.panelContract?.hidePanel?.();
+    }
+    if (hidePanel && wasActive) {
+      const returnTabId = entry.returnTabId;
+      entry.returnTabId = null;
+      const nextPlugin = [...state.pluginPanels.entries()].find(([id, other]) => id !== pluginId && other.opened)?.[0];
+      if (nextPlugin) {
+        activatePluginPanel(nextPlugin);
+        return;
+      }
+      const contract = panelContract();
+      const tabs = contract?.panelTabs?.value;
+      if (Array.isArray(tabs) && tabs.length) {
+        const targetId = returnTabId && tabs.some(tab => tab.id === returnTabId) ? returnTabId : tabs[0].id;
+        contract.activateTab?.(targetId);
+        return;
+      }
+      contract?.hidePanel?.();
+    } else if (hidePanel) {
+      entry.returnTabId = null;
     }
   }
 
@@ -993,26 +973,29 @@ async function installNativeRenderer(options) {
           },
         };
       }
-      const tabs = document.querySelector(".ptb-tabs");
+      if (state.pluginPanels.has(pluginId)) state.pluginPanels.get(pluginId)?.dispose?.();
       const body = panelBody();
-      if (!tabs || !body) throw new Error("右侧面板契约未就绪");
+      if (!body || !document.querySelector(".ptb-tabs")) throw new Error("右侧面板契约未就绪");
       const wrapper = document.createElement("div");
       wrapper.className = "ptb-tab";
       wrapper.dataset.ekdpPluginPanel = pluginId;
       const tab = document.createElement("button");
       tab.type = "button";
       tab.className = "ptb-tab-main";
-      tab.textContent = definition?.title || "插件面板";
+      tab.setAttribute("role", "tab");
       tab.setAttribute("aria-selected", "false");
+      tab.tabIndex = 0;
+      const titleSpan = document.createElement("span");
+      titleSpan.className = "panel-tab-title";
+      titleSpan.textContent = definition?.title || "插件面板";
+      tab.append(titleSpan);
       const close = document.createElement("button");
       close.type = "button";
-      close.className = "ptb-tab-close";
+      close.className = "ptb-x";
       close.setAttribute("aria-label", "关闭面板");
-      close.textContent = "×";
-      const attributes = tabAttributes(tabs);
-      for (const element of [wrapper, tab, close]) for (const attribute of attributes) element.setAttribute(attribute.name, attribute.value);
+      close.tabIndex = 0;
+      close.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M17.9542 4.77253C18.3056 4.42106 18.8761 4.42106 19.2276 4.77253C19.579 5.12401 19.579 5.69452 19.2276 6.04597L13.2735 12.0001L19.2276 17.9542C19.5791 18.3056 19.5791 18.8761 19.2276 19.2276C18.8761 19.5791 18.3056 19.5791 17.9542 19.2276L12.0001 13.2735L6.04595 19.2276C5.69451 19.5791 5.12399 19.579 4.77252 19.2276C4.42104 18.8761 4.42104 18.3056 4.77252 17.9542L10.7266 12.0001L4.77252 6.04597C4.42104 5.6945 4.42104 5.124 4.77252 4.77253C5.12399 4.42107 5.69448 4.42106 6.04595 4.77253L12.0001 10.7266L17.9542 4.77253Z" fill="currentColor"></path></svg>';
       wrapper.append(tab, close);
-      tabs.append(wrapper);
       const host = document.createElement("div");
       host.className = "ekdp-panel-host";
       host.dataset.ekdpPlugin = pluginId;
@@ -1026,7 +1009,7 @@ async function installNativeRenderer(options) {
         host.remove();
         throw error;
       }
-      const entry = { tab, close, host };
+      const entry = { wrapper, tab, titleSpan, close, host, opened: false, returnTabId: null };
       state.pluginPanels.set(pluginId, entry);
       tab.addEventListener("click", () => activatePluginPanel(pluginId));
       close.addEventListener("click", event => {
@@ -1063,7 +1046,6 @@ async function installNativeRenderer(options) {
   function publishNativeUI() {
     const ui = {
       remove: () => state.remove(),
-      openPlanner: source => openPlanner(source),
       mountSessions: extraIds => mountSessions(extraIds),
       pickSession: exclude => pickSession(exclude),
       openOfficial: id => openOfficial(id),
@@ -1087,7 +1069,7 @@ async function installNativeRenderer(options) {
     return state.pluginTokens.get(id) || '';
   }
   const pluginWindowHost = {
-    popout: async pluginId => { await transport.request('plugin.window.open', { token: pluginToken(pluginId) }); },
+    popout: async pluginId => { await transport.request('plugin.window.open', { token: pluginToken(pluginId), sourceSessionId: activeSession() }); },
     close: async () => { await transport.request('window.close'); },
   };
   const pluginCommandHost = {
@@ -1287,6 +1269,7 @@ async function installNativeRenderer(options) {
         commandHost: pluginCommandHost,
         pickFiles: async () => (await transport.request('host.pickFiles', {})) || [],
         openSession: async id => { await transport.request('host.openSession', { id }); },
+        activeSession,
       });
     }
     // A plugin the runtime reports as stopped must leave the page: dropping the

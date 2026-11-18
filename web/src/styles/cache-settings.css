@@ -135,6 +135,18 @@
   min-width: 0;
 }
 
+.eks-row-label select {
+  max-width: 100%;
+  width: fit-content;
+  min-height: 28px;
+  padding: 3px 8px;
+  border: var(--eks-hairline);
+  border-radius: 6px;
+  background: var(--eks-surface);
+  color: var(--eks-text);
+  font: inherit;
+}
+
 .eks-row-label strong {
   color: var(--eks-text);
   font-size: 13px;

@@ -200,10 +200,13 @@ func TestAddonFeaturesPublishOnlyOnChange(t *testing.T) {
 }
 
 func TestRendererFreezesAddonEntries(t *testing.T) {
+	for _, removed := range []string{"state.features.planner", "openPlanner", "ekd-planner-host", "ekdPlannerTab"} {
+		if strings.Contains(rendererSource, removed) {
+			t.Fatalf("renderer.js still exposes the replaced planner: %s", removed)
+		}
+	}
 	for _, wanted := range []string{
-		"if (state.features.planner) plan.push({ action: 'planner', label: '规划' })",
 		"if (state.features.multiSession) plan.push({ action: 'split', label: '添加同屏会话' })",
-		"if (tabs && state.features.planner && !state.plannerTab?.isConnected)",
 		"if (state.sessionContainer) closeSessions();",
 		"state.unsubscribeFeatures = makeHost(() => {}).subscribe('features'",
 	} {

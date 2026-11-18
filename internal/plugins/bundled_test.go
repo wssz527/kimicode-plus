@@ -1,11 +1,16 @@
 package plugins
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"enhancedkimi/internal/storage"
 	bundle "enhancedkimi/plugins"
 )
 
@@ -19,6 +24,9 @@ func TestBundledPluginsPassManifestValidation(t *testing.T) {
 	}
 	if len(set) == 0 {
 		t.Fatal("bundled set is empty")
+	}
+	if _, ok := set["kimicode-plus.example-hello"]; ok {
+		t.Fatal("example-hello must stay a template in the repo and must not be bundled")
 	}
 	for id, files := range set {
 		raw, ok := files["plugin.json"]
@@ -99,5 +107,89 @@ func TestKCTAdapterManifest(t *testing.T) {
 		if _, ok := files[name]; !ok {
 			t.Fatalf("KCT ships without %s", name)
 		}
+	}
+}
+
+func TestExampleHelloRemovedFromBundledKeepsExistingInstallAndRefusesRestore(t *testing.T) {
+	ctx := context.Background()
+	bundled, err := bundle.BundledPlugins()
+	if err != nil {
+		t.Fatalf("bundled plugins: %v", err)
+	}
+	if _, ok := bundled["kimicode-plus.example-hello"]; ok {
+		t.Fatal("example-hello should not be bundled")
+	}
+
+	root := t.TempDir()
+	db, err := storage.Open(filepath.Join(root, "plugins.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	oldExample := map[string][]byte{
+		"plugin.json": []byte(`{
+  "id": "kimicode-plus.example-hello",
+  "name": "示例插件",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "hostVersions": ["1.*"],
+  "entry": {"renderer": "renderer.js"},
+  "capabilities": ["ui:sidebar", "storage"]
+}`),
+		"renderer.js": []byte("export function activate() {}\n"),
+		"LICENSE":     []byte("MIT\n"),
+	}
+
+	prev, err := New(db, func() bool { return false }, WithDataDir(root), WithBundled(func() (map[string]map[string][]byte, error) {
+		return map[string]map[string][]byte{"kimicode-plus.example-hello": oldExample}, nil
+	}))
+	if err != nil {
+		t.Fatalf("old manager: %v", err)
+	}
+	if err := prev.ReleaseBundled(ctx, map[string]map[string][]byte{"kimicode-plus.example-hello": oldExample}); err != nil {
+		t.Fatalf("release old example: %v", err)
+	}
+	prev.Close()
+
+	// Upgrading to the current bundled set must not uninstall the previously
+	// installed example-hello plugin, while bundled plugins start disabled.
+	cur, err := New(db, func() bool { return false }, WithDataDir(root), WithBundled(bundle.BundledPlugins), WithOfficial(bundle.OfficialDigests))
+	if err != nil {
+		t.Fatalf("upgraded manager: %v", err)
+	}
+	defer cur.Close()
+	if err := cur.ReleaseBundled(ctx, bundled); err != nil {
+		t.Fatalf("release current bundle: %v", err)
+	}
+	if _, ok := cur.Get("kimicode-plus.example-hello"); !ok {
+		t.Fatal("upgrade should preserve previously installed example-hello")
+	}
+	for _, id := range []string{"kimicode-plus.monitor", "kimicode-plus.planner", "kimicode-plus.kct"} {
+		item, ok := cur.Get(id)
+		if !ok {
+			t.Fatalf("missing bundled plugin %s", id)
+		}
+		if item.Enabled {
+			t.Fatalf("bundled plugin %s should start disabled", id)
+		}
+	}
+
+	// Once uninstalled, example-hello must not appear as restorable or be restored.
+	if err := cur.Uninstall(ctx, "kimicode-plus.example-hello"); err != nil {
+		t.Fatalf("uninstall example-hello: %v", err)
+	}
+	for _, item := range cur.List() {
+		if item.ID == "kimicode-plus.example-hello" {
+			t.Fatalf("uninstalled example-hello should not be restorable: %+v", item)
+		}
+	}
+	mux := http.NewServeMux()
+	cur.Register(mux)
+	req := httptest.NewRequest(http.MethodPost, "/enhance/v1/plugins/kimicode-plus.example-hello/restore", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "PLUGIN_NOT_BUNDLED") {
+		t.Fatalf("restore should fail with PLUGIN_NOT_BUNDLED, got %d %s", rec.Code, rec.Body.String())
 	}
 }

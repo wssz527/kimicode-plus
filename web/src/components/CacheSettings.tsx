@@ -42,7 +42,7 @@ const RECOVERY_STATUS: Record<string, string> = {
  * official client finished it". Plan M2 section 5 requires the distinction.
  */
 const RECEIPT_STATE: Record<string, { label: string; tone: "ok" | "pending" | "bad" | "muted" }> = {
-  verified: { label: "保活成功", tone: "ok" },
+  verified: { label: "后续请求命中", tone: "ok" },
   completed: { label: "官方已完成", tone: "ok" },
   acknowledged: { label: "官方已接收，等待完成", tone: "pending" },
   invalid: { label: "保活无效", tone: "bad" },
@@ -110,6 +110,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
   const [summary, setSummary] = useState<CacheSummary | null>(null);
   const [sessions, setSessions] = useState<CacheSessionRow[]>([]);
   const [retention, setRetention] = useState<CacheRetention | null>(null);
+  const [retentionModel, setRetentionModel] = useState("");
   const [receipts, setReceipts] = useState<CacheReceipt[]>([]);
   const [history, setHistory] = useState<CacheHistory | null>(null);
   const [range, setRange] = useState<"24h" | "7d" | "30d">("24h");
@@ -193,6 +194,8 @@ export function CacheSettings({ host }: { host: NativeHost }) {
   const keepAliveOff = !policy.keepAlive.enabled;
   const compactionOff = !policy.compaction.enabled;
   const recoveryOff = !policy.recovery.enabled;
+  const modelRetention = retention?.byModel?.find(item => item.model === retentionModel);
+  const retentionBuckets = modelRetention?.idleBuckets ?? retention?.idleBuckets;
 
   return <div className="eks">
     {error ? <ErrorNotice title="缓存与额度暂时不可用" message={error} recovery="可以继续使用官方客户端；修正后重新打开本页。" /> : null}
@@ -272,32 +275,37 @@ export function CacheSettings({ host }: { host: NativeHost }) {
           onChange={value => void savePolicy({ ...policy, keepAlive: { ...policy.keepAlive, enabled: value } }, value ? "后台等待保活已开启。" : "后台等待保活已关闭。")}
         />
       </div>
-      {!keepAliveOff ? <>
-        <div className="eks-row is-sub">
-          <span className="eks-row-label"><strong>主代理静默阈值</strong><small>主代理距上一次模型请求达到这个时长才保活。5–60 分钟。</small></span>
-          <NumberField label="主代理静默阈值" hideLabel value={policy.keepAlive.minutes} min={5} max={60} unit="分钟"
-            onEditingChange={value => { editing.current = value; }} onCommit={value => { if (value !== null) void savePolicy(mergePolicy(policy, { keepAlive: { ...policy.keepAlive, minutes: value } }), "保活阈值已保存。"); }} />
-        </div>
-        <div className="eks-row is-sub is-stacked">
-          <span className="eks-row-label">
-            <strong>可参考的实测保留情况</strong>
-            <small>{retention?.note ?? "正在读取观测结果。"}</small>
-          </span>
-          {retention?.idleBuckets?.length ? <div className="eks-retention">
-            {retention.idleBuckets.map(bucket => <div key={bucket.label} className="eks-retention-row">
-              <span className="eks-retention-label">{bucket.label}</span>
-              <span className="eks-retention-bar" aria-hidden="true">
-                <span className="eks-retention-fill" style={{ width: bucket.hitRate === null ? "0%" : `${Math.max(2, Math.min(100, bucket.hitRate * 100))}%` }} />
-              </span>
-              <span className="eks-retention-value">
-                {bucket.reported === NOT_REPORTED ? "未上报" : bucket.hitRate === null ? "无样本" : `${(bucket.hitRate * 100).toFixed(0)}%（${bucket.samples} 次）`}
-              </span>
-            </div>)}
-          </div> : null}
-          <p className="eks-inline-note">真实的缓存保留时长没有公开值，这里只显示观测结果，不换算成倒计时。</p>
-        </div>
-        <p className="eks-row is-sub is-note">阻塞式等待无法保活：主代理停在阻塞调用里时，消息只会排队到等待结束，此时缓存已经过期。这种情况会记录为“未发送”并说明原因。</p>
-      </> : null}
+      {!keepAliveOff ? <div className="eks-row is-sub">
+        <span className="eks-row-label"><strong>主代理静默阈值</strong><small>主代理距上一次模型请求达到这个时长才保活。5–60 分钟。</small></span>
+        <NumberField label="主代理静默阈值" hideLabel value={policy.keepAlive.minutes} min={5} max={60} unit="分钟"
+          onEditingChange={value => { editing.current = value; }} onCommit={value => { if (value !== null) void savePolicy(mergePolicy(policy, { keepAlive: { ...policy.keepAlive, minutes: value } }), "保活阈值已保存。"); }} />
+      </div> : null}
+      <div className="eks-row is-sub is-stacked">
+        <span className="eks-row-label">
+          <strong>可参考的实测保留情况</strong>
+          <small>{retention?.note ?? (error ? "暂时无法读取观测结果。" : "正在读取观测结果。")}</small>
+        </span>
+        {retention?.byModel?.length ? <label className="eks-row-label">
+          <small>统计模型</small>
+          <select value={modelRetention?.model ?? ""} onChange={event => setRetentionModel(event.target.value)}>
+            <option value="">全部模型</option>
+            {retention.byModel.map(item => <option key={item.model} value={item.model}>{item.model}</option>)}
+          </select>
+        </label> : null}
+        {retentionBuckets?.length ? <div className="eks-retention">
+          {retentionBuckets.map(bucket => <div key={bucket.label} className="eks-retention-row">
+            <span className="eks-retention-label">{bucket.label}</span>
+            <span className="eks-retention-bar" aria-hidden="true">
+              <span className="eks-retention-fill" style={{ width: bucket.hitRate === null ? "0%" : `${Math.max(2, Math.min(100, bucket.hitRate * 100))}%` }} />
+            </span>
+            <span className="eks-retention-value">
+              {bucket.reported === NOT_REPORTED ? "未上报" : bucket.hitRate === null ? "无样本" : `${(bucket.hitRate * 100).toFixed(0)}%（${bucket.samples} 次）`}
+            </span>
+          </div>)}
+        </div> : null}
+        <p className="eks-inline-note">这些历史记录反映请求命中情况。估算保活的实际收益需要对照实验。</p>
+      </div>
+      {!keepAliveOff ? <p className="eks-row is-sub is-note">主代理处于阻塞式等待时跳过保活，执行记录会说明原因。</p> : null}
 
       <div className="eks-row">
         <span className="eks-row-label">

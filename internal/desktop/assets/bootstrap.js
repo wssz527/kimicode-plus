@@ -14,7 +14,7 @@ async function installNativeBootstrap(options) {
   const pair = await pairResponse.json();
   if (!pairResponse.ok) throw new Error(pair?.error?.message || '增强核心配对失败');
   let coreToken = pair.sessionToken;
-  const state = { channels: new Map(), windows: new Map(), views: new Map(), pluginViews: new Map(), pluginViewTokens: new Map(), pluginViewOwners: new Map(), pluginCommands: new Map(), bounds: new Map(), browserWindow: null, server: null, cleanup: null };
+  const state = { channels: new Map(), windows: new Map(), views: new Map(), pluginViews: new Map(), pluginViewTokens: new Map(), pluginViewOwners: new Map(), pluginViewQueues: new Map(), pluginCommands: new Map(), bounds: new Map(), browserWindow: null, server: null, cleanup: null };
   globalThis.__ekdNative = state;
   const browserSession = session.fromPartition('persist:ekd-native-browser');
   function json(response, status, value, origin) {
@@ -100,6 +100,16 @@ async function installNativeBootstrap(options) {
     try { owner?.contentView.removeChildView(view); } catch {}
     if (!view.webContents.isDestroyed()) view.webContents.close();
     return true;
+  }
+  function withPluginViewLock(lockKey, task) {
+    const previous = state.pluginViewQueues.get(lockKey) || Promise.resolve();
+    const run = previous.catch(() => {}).then(task);
+    const settled = run.catch(() => {});
+    state.pluginViewQueues.set(lockKey, settled);
+    settled.finally(() => {
+      if (state.pluginViewQueues.get(lockKey) === settled) state.pluginViewQueues.delete(lockKey);
+    });
+    return run;
   }
   function destroyPluginViews() {
     for (const key of [...state.pluginViews.keys()]) dropPluginView(key);
@@ -192,7 +202,7 @@ async function installNativeBootstrap(options) {
     const management = kind === 'management';
     const plugin = kind.startsWith('plugin:');
     const win = new BrowserWindow({
-      title: management ? 'KimiCode+ 管理' : 'KimiCode+ 规划',
+      title: management ? 'KimiCode+ 管理' : 'KimiCode+ 插件',
       width: previous?.width || (management ? 1080 : 640),
       height: previous?.height || (management ? 760 : 840),
       x: previous?.x, y: previous?.y,
@@ -228,8 +238,7 @@ async function installNativeBootstrap(options) {
     });
     await win.loadURL('about:blank');
     if (management) await bindRenderer(win.webContents, 'management', { popout: true, theme, initialPath: managementPath(source.path) });
-    else if (plugin) await bindRenderer(win.webContents, 'plugin', { popout: true, theme, pluginId: source.pluginId });
-    else await bindRenderer(win.webContents, 'planner', { popout: true, theme, ...source });
+    else await bindRenderer(win.webContents, 'plugin', { popout: true, theme, pluginId: source.pluginId, sourceSessionId: source.sourceSessionId || '' });
     win.show(); win.focus();
     return { opened: true };
   }
@@ -267,9 +276,8 @@ async function installNativeBootstrap(options) {
       case 'plugin.window.open': {
         const answer = await corePluginAction('ui.popout', payload.token, {});
         if (typeof answer?.pluginId !== 'string' || !/^[a-z0-9][a-z0-9.-]{0,63}$/.test(answer.pluginId)) throw new Error('核心返回的插件窗口归属无效');
-        return openWindow('plugin:' + answer.pluginId, { pluginId: answer.pluginId });
+        return openWindow('plugin:' + answer.pluginId, { pluginId: answer.pluginId, sourceSessionId: typeof payload.sourceSessionId === 'string' ? payload.sourceSessionId : '' });
       }
-      case 'window.popout': return openWindow('planner', { sourceSessionId: payload.sourceSessionId || '', initialSource: payload.initialSource === 'local' ? 'local' : 'web' });
       case 'window.openManagement': return openWindow('management', { path: managementPath(payload.path) });
       case 'window.close': BrowserWindow.fromWebContents(target)?.close(); return {};
       case 'window.ensureWidth': {
@@ -320,60 +328,67 @@ async function installNativeBootstrap(options) {
       // is authorized for browser:view, the core answers with the owner and the
       // canonical URL, and only then does this process touch Electron.
       case 'browser.view.open': {
-        const answer = await coreBrowserAction('browser.open', payload.token, { viewId: payload.viewId, instanceId: payload.instanceId, url: payload.url });
-        const key = pluginViewKey(answer.pluginId, answer.viewId, answer.instanceId);
-        const url = browserURL(answer.url);
-        let view = state.pluginViews.get(key);
-        let created = false;
-        if (!view) {
-          view = new WebContentsView({ webPreferences: { session: browserSession, contextIsolation: true, nodeIntegration: false, sandbox: true } });
-          const owner = BrowserWindow.fromWebContents(target);
-          if (!owner) {
-            // The core now believes the view exists; without a window here it
-            // cannot, so the registry is put back the way it was.
-            await coreBrowserAction('browser.close', payload.token, { viewId: answer.viewId, instanceId: answer.instanceId }).catch(() => {});
-            throw new Error('插件网页视图缺少宿主窗口');
+        return withPluginViewLock(String(payload.instanceId || '') + '/' + String(payload.viewId || ''), async () => {
+          const answer = await coreBrowserAction('browser.open', payload.token, { viewId: payload.viewId, instanceId: payload.instanceId, url: payload.url });
+          const key = pluginViewKey(answer.pluginId, answer.viewId, answer.instanceId);
+          const url = browserURL(answer.url);
+          let view = state.pluginViews.get(key);
+          let created = false;
+          if (!view) {
+            const owner = target.isDestroyed() ? null : BrowserWindow.fromWebContents(target);
+            if (!owner || state.channels.get(target.id)?.instanceId !== answer.instanceId) {
+              // The core now believes the view exists; without a live owner
+              // window here it cannot, so the registry is put back the way it was.
+              await coreBrowserAction('browser.close', payload.token, { viewId: answer.viewId, instanceId: answer.instanceId }).catch(() => {});
+              throw new Error('插件网页视图缺少宿主窗口');
+            }
+            view = new WebContentsView({ webPreferences: { session: browserSession, contextIsolation: true, nodeIntegration: false, sandbox: true } });
+            owner.contentView.addChildView(view);
+            view.setVisible(false);
+            view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+            view.webContents.on('will-navigate', (event, next) => {
+              if (!isBrowserURL(next)) event.preventDefault();
+            });
+            const pushNavigate = nextUrl => {
+              if (!isBrowserURL(nextUrl)) return;
+              const ownerContents = webContents.fromId(state.pluginViewOwners.get(key));
+              if (!ownerContents || ownerContents.isDestroyed()) return;
+              const event = { pluginId: answer.pluginId, instanceId: answer.instanceId, viewId: answer.viewId, url: String(nextUrl) };
+              ownerContents.executeJavaScript('window.__ekdPluginBrowserNavigated?.(' + JSON.stringify(event) + ')').catch(() => {});
+            };
+            view.webContents.on('did-navigate', (_event, nextUrl) => pushNavigate(nextUrl));
+            view.webContents.on('did-navigate-in-page', (_event, nextUrl) => pushNavigate(nextUrl));
+            state.pluginViews.set(key, view);
+            state.pluginViewTokens.set(key, payload.token);
+            state.pluginViewOwners.set(key, target.id);
+            created = true;
           }
-          owner.contentView.addChildView(view);
-          view.setVisible(false);
-          view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-          view.webContents.on('will-navigate', (event, next) => {
-            if (!isBrowserURL(next)) event.preventDefault();
-          });
-          const pushNavigate = nextUrl => {
-            if (!isBrowserURL(nextUrl)) return;
-            const ownerContents = webContents.fromId(state.pluginViewOwners.get(key));
-            if (!ownerContents || ownerContents.isDestroyed()) return;
-            const event = { pluginId: answer.pluginId, instanceId: answer.instanceId, viewId: answer.viewId, url: String(nextUrl) };
-            ownerContents.executeJavaScript('window.__ekdPluginBrowserNavigated?.(' + JSON.stringify(event) + ')').catch(() => {});
-          };
-          view.webContents.on('did-navigate', (_event, nextUrl) => pushNavigate(nextUrl));
-          view.webContents.on('did-navigate-in-page', (_event, nextUrl) => pushNavigate(nextUrl));
-          state.pluginViews.set(key, view);
-          state.pluginViewTokens.set(key, payload.token);
-          state.pluginViewOwners.set(key, target.id);
-          created = true;
-        }
-        try {
-          if (view.webContents.getURL() !== url) await view.webContents.loadURL(url);
-        } catch (error) {
-          // A page that never loaded leaves nothing usable behind: the Electron
-          // view goes away and the core record is released, so a retry starts
-          // from a clean state instead of reusing a broken view.
-          dropPluginView(key);
-          await coreBrowserAction('browser.close', payload.token, { viewId: answer.viewId, instanceId: answer.instanceId }).catch(() => {});
-          throw error;
-        }
-        if (!created && state.pluginViewTokens.get(key) !== payload.token) state.pluginViewTokens.set(key, payload.token);
-        return { browserId: view.webContents.id, pluginId: answer.pluginId, instanceId: answer.instanceId, viewId: answer.viewId, url: answer.url };
+          try {
+            if (view.webContents.getURL() !== url) await view.webContents.loadURL(url);
+            if (target.isDestroyed() || state.channels.get(target.id)?.instanceId !== answer.instanceId) {
+              throw new Error('插件网页视图宿主窗口已关闭');
+            }
+          } catch (error) {
+            // A page that never loaded leaves nothing usable behind: the Electron
+            // view goes away and the core record is released, so a retry starts
+            // from a clean state instead of reusing a broken view.
+            dropPluginView(key);
+            await coreBrowserAction('browser.close', payload.token, { viewId: answer.viewId, instanceId: answer.instanceId }).catch(() => {});
+            throw error;
+          }
+          if (!created && state.pluginViewTokens.get(key) !== payload.token) state.pluginViewTokens.set(key, payload.token);
+          return { browserId: view.webContents.id, pluginId: answer.pluginId, instanceId: answer.instanceId, viewId: answer.viewId, url: answer.url };
+        });
       }
       case 'browser.view.navigate': {
-        const answer = await coreBrowserAction('browser.navigate', payload.token, { viewId: payload.viewId, instanceId: payload.instanceId, url: payload.url });
-        const { key, view } = livePluginView(answer, target);
-        const url = browserURL(answer.url);
-        if (view.webContents.getURL() !== url) await view.webContents.loadURL(url);
-        state.pluginViewTokens.set(key, payload.token);
-        return { pluginId: answer.pluginId, viewId: answer.viewId, url: answer.url };
+        return withPluginViewLock(String(payload.instanceId || '') + '/' + String(payload.viewId || ''), async () => {
+          const answer = await coreBrowserAction('browser.navigate', payload.token, { viewId: payload.viewId, instanceId: payload.instanceId, url: payload.url });
+          const { key, view } = livePluginView(answer, target);
+          const url = browserURL(answer.url);
+          if (view.webContents.getURL() !== url) await view.webContents.loadURL(url);
+          state.pluginViewTokens.set(key, payload.token);
+          return { pluginId: answer.pluginId, viewId: answer.viewId, url: answer.url };
+        });
       }
       case 'browser.view.history': {
         if (!['back','forward','reload'].includes(payload.operation)) throw new Error('网页导航动作无效');
@@ -427,19 +442,21 @@ async function installNativeBootstrap(options) {
       }
       case 'browser.view.close': {
         if (typeof payload.viewId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(payload.viewId)) throw new Error('网页视图 ID 无效');
-        let key;
-        try {
-          const answer = await coreBrowserAction('browser.close', payload.token, { viewId: payload.viewId, instanceId: payload.instanceId });
-          key = pluginViewKey(answer.pluginId, answer.viewId, answer.instanceId);
-        } catch (error) {
-          // Close also runs while a plugin is being stopped, when its token has
-          // already been revoked. The recorded creator token and the full key
-          // still identify the caller's own page, and teardown must not leak it.
-          const recorded = [...state.pluginViewTokens].find(([candidate, token]) => token === payload.token && candidate.endsWith('/' + payload.viewId) && state.pluginViewOwners.get(candidate) === target.id);
-          if (!recorded) throw error;
-          key = recorded[0];
-        }
-        return { closed: dropPluginView(key) };
+        const recorded = [...state.pluginViewTokens].find(([candidate, token]) => token === payload.token && candidate.startsWith(payload.instanceId + '/') && candidate.endsWith('/' + payload.viewId) && state.pluginViewOwners.get(candidate) === target.id);
+        // Interrupt an owned load before joining its queue; a stalled navigation
+        // must not prevent teardown, including after the core revokes the token.
+        const interrupted = recorded ? dropPluginView(recorded[0]) : false;
+        return withPluginViewLock(String(payload.instanceId || '') + '/' + String(payload.viewId || ''), async () => {
+          let key;
+          try {
+            const answer = await coreBrowserAction('browser.close', payload.token, { viewId: payload.viewId, instanceId: payload.instanceId });
+            key = pluginViewKey(answer.pluginId, answer.viewId, answer.instanceId);
+          } catch (error) {
+            if (!recorded) throw error;
+            key = recorded[0];
+          }
+          return { closed: dropPluginView(key) || interrupted };
+        });
       }
       case 'plugin.command.register': {
         const identity = await corePluginAction('runtime.info', payload.token, {});
@@ -541,6 +558,7 @@ async function installNativeBootstrap(options) {
     for (const view of state.views.values()) if (!view.webContents.isDestroyed()) view.webContents.close();
     state.views.clear();
     destroyPluginViews();
+    state.pluginViewQueues.clear();
     state.pluginCommands.clear();
     state.channels.clear();
     if (server.listening) {

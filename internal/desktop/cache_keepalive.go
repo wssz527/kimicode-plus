@@ -320,7 +320,7 @@ func judgeKeepAlive(step cache.Step, model string) keepAliveVerdict {
 		return keepAliveVerdict{
 			State:     keepAliveVerified,
 			CacheRead: step.InputCacheRead,
-			Note:      "主代理下一步命中缓存，input_cache_read 大于 0，保活成功",
+			Note:      "已确认保活后的主代理请求读取了缓存",
 		}
 	}
 	// read == 0 and creation == 0 means this model does not report cache fields at

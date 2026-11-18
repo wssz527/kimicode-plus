@@ -93,6 +93,7 @@ export interface PlannerThread {
   status: string;
   revision: number;
   messages: Array<{ id: string; role: string; text: string; at?: string }>;
+  workspace?: string;
   approval?: { id: string; title: string; detail?: string };
   error?: string;
 }

@@ -9,8 +9,8 @@ import (
 
 // TestBundledMonitorPluginIsComplete guards the preinstalled Monitor package the
 // binary ships. The embed directive is easy to forget when a directory is added:
-// without this the release step sees only example-hello and the sidebar widget
-// silently never installs.
+// without this the release step omits the sidebar widget and it silently never
+// installs.
 func TestBundledMonitorPluginIsComplete(t *testing.T) {
 	bundled, err := bundledpkg.BundledPlugins()
 	if err != nil {
@@ -120,7 +120,7 @@ func TestBundledPluginsHaveDistinctIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(bundled) < 2 {
-		t.Fatalf("bundled set has %d plugins, want example-hello and monitor", len(bundled))
+		t.Fatalf("bundled set has %d plugins, want official bundled plugins including monitor", len(bundled))
 	}
 	for id, files := range bundled {
 		if _, err := ParseManifest(files["plugin.json"]); err != nil {

@@ -13,7 +13,7 @@ const SECTIONS = [
   { id: "cache", label: "缓存与额度", hint: "保活、自动压缩与恢复续跑" },
   { id: "native", label: "Kimi Code 配置", hint: "子代理、步数上限与权限规则" },
   { id: "plugins", label: "插件", hint: "Monitor 与故障隔离" },
-  { id: "addons", label: "附加功能", hint: "规划与会话并排，实验性" },
+  { id: "addons", label: "附加功能", hint: "会话并排，实验性" },
   { id: "diagnostics", label: "状态与诊断", hint: "接入状态、日志与开源许可" },
 ] as const;
 type SectionId = typeof SECTIONS[number]["id"];
@@ -105,11 +105,7 @@ function PluginsSection() {
   </>;
 }
 
-const ADDON_COPY: Record<(typeof addonFeatureKeys)[number], { title: string; purpose: string }> = {
-  planner: {
-    title: "规划面板",
-    purpose: "在右侧停靠或独立窗口里做多轮规划，再把结论交给 Code。入口出现在官方“侧边聊天”下方。",
-  },
+const ADDON_COPY = {
   multiSession: {
     title: "会话并排",
     purpose: "在同一个聊天区最多并排三个已有会话，用于对照和交叉引用。",
@@ -149,10 +145,10 @@ function AddonsSection({ host }: { host: NativeHost }) {
   }
 
   return <>
-    <p className="ekds-note">这两项是实验功能，默认关闭。关闭后入口和已打开的面板都会移除，官方界面恢复原样。</p>
+    <p className="ekds-note">会话并排是实验功能，默认关闭。关闭后入口和已打开的面板都会移除，官方界面恢复原样。</p>
     {error ? <p className="ekds-note is-error">{error}</p> : null}
     <div className="ekds-group">
-      {addonFeatureKeys.map(key => {
+      {(["multiSession"] as const).map(key => {
         const copy = ADDON_COPY[key];
         const on = features?.[key] === true;
         return <div className="ekds-row" key={key}>

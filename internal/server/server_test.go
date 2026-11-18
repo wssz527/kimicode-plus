@@ -105,7 +105,7 @@ func TestRealLoopbackCoreLifecycle(t *testing.T) {
 	if code != 409 {
 		t.Fatal("settings CAS not enforced")
 	}
-	code, b = request("POST", "/plugins/kimicode-plus.example-hello/enable", nil, guard.PairingToken())
+	code, b = request("POST", "/plugins/kimicode-plus.monitor/enable", nil, guard.PairingToken())
 	if code != 409 {
 		t.Fatalf("safe mode permitted plugin activation: %d %s", code, b)
 	}
@@ -116,7 +116,7 @@ func TestRealLoopbackCoreLifecycle(t *testing.T) {
 	if code != 200 {
 		t.Fatal(string(b))
 	}
-	code, b = request("POST", "/plugins/kimicode-plus.example-hello/enable", nil, guard.PairingToken())
+	code, b = request("POST", "/plugins/kimicode-plus.monitor/enable", nil, guard.PairingToken())
 	if code != 200 {
 		t.Fatalf("leaving safe mode did not restore plugin activation: %d %s", code, b)
 	}

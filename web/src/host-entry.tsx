@@ -5,10 +5,9 @@ import { connectHostTransport, type CoreTransport } from "./api";
 import { installHost, releaseHost, type HostConnection } from "./host";
 import { useEmbeddedNavigation } from "./routes";
 import { normalizeColorScheme, rewriteAssetURLs } from "./lib/embed";
-import { Workbench } from "./components/Workbench";
 import { createCoreTransport, createEventChannel, createNativeHost, HostScopeContext, type DemoHost, type NativeHost, type HostScopeValue } from "./native";
 import { AuthProvider } from "./auth";
-import { PlannerSurface, SettingsWindow } from "./components/Surfaces";
+import { SettingsWindow } from "./components/SettingsSurface";
 import { ManagementWindow } from "./components/ManagementWindow";
 import { SessionGrid } from "./components/SessionGrid";
 import "./styles/surfaces.css";
@@ -148,29 +147,7 @@ export function mountEnhancement(element: HTMLElement, options: MountOptions): E
   return handle;
 }
 
-export function mountWorkbench(element: HTMLElement, options: { host: DemoHost; stylesheetURL: string; stylesheetText?: string; assetBaseURL?: string; colorScheme?: string }): EnhancementHandle {
-  mounts.get(element)?.unmount();
-  const shadow = element.shadowRoot ?? element.attachShadow({ mode: "open" });
-  shadow.replaceChildren();
-  const styles = createStyles(options);
-  const container = document.createElement("div");
-  container.className = "ekd-root ekd-workbench";
-  const syncTheme = () => { container.dataset.colorScheme = normalizeColorScheme(options.colorScheme ?? element.ownerDocument.documentElement.dataset.colorScheme); };
-  syncTheme();
-  const observer = new MutationObserver(syncTheme);
-  observer.observe(element.ownerDocument.documentElement, { attributes: true, attributeFilter: ["data-color-scheme"] });
-  shadow.append(styles, container);
-  const root = createRoot(container);
-  root.render(<HostScopeProvider host={options.host}><Workbench host={options.host} /></HostScopeProvider>);
-  const handle: EnhancementHandle = {
-    updateContext: () => {},
-    unmount: () => { observer.disconnect(); root.unmount(); container.remove(); styles.remove(); mounts.delete(element); },
-  };
-  mounts.set(element, handle);
-  return handle;
-}
-
-export type SurfaceName = "planner" | "sessions" | "settings" | "management";
+export type SurfaceName = "sessions" | "settings" | "management";
 export interface SurfaceMountOptions {
   host: NativeHost;
   stylesheetURL: string;
@@ -178,7 +155,6 @@ export interface SurfaceMountOptions {
   assetBaseURL?: string;
   colorScheme?: string;
   initialExtraIds?: string[];
-  initialSource?: "local" | "web";
   onNativeRestore?: () => void;
   /** Management routes start here instead of "/". Other surfaces ignore it. */
   initialPath?: string;
@@ -208,8 +184,7 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
     : null;
   const root = createRoot(container);
   const wrap = (children: React.ReactNode) => <HostScopeProvider host={options.host}>{children}</HostScopeProvider>;
-  if (surface === "planner") root.render(wrap(<PlannerSurface host={options.host} initialSource={options.initialSource} />));
-  else if (surface === "sessions") root.render(wrap(<SessionGrid host={options.host} initialExtraIds={options.initialExtraIds ?? []} onNativeRestore={options.onNativeRestore ?? (() => options.host.close())} />));
+  if (surface === "sessions") root.render(wrap(<SessionGrid host={options.host} initialExtraIds={options.initialExtraIds ?? []} onNativeRestore={options.onNativeRestore ?? (() => options.host.close())} />));
   else if (surface === "settings") root.render(wrap(<AuthProvider><SettingsWindow host={options.host} /></AuthProvider>));
   else root.render(wrap(<AuthProvider><ManagementWindow host={options.host} path={managementRoute(options.initialPath)} /></AuthProvider>));
   let mounted = true;

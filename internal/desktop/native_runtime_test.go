@@ -31,6 +31,10 @@ func TestHostContractIsExplicit(t *testing.T) {
 	if _, err := identity.Contract(); err != nil {
 		t.Fatalf("verified host rejected: %v", err)
 	}
+	identity.AppVersion = "1.3.7"
+	if _, err := identity.Contract(); err != nil {
+		t.Fatalf("verified host rejected: %v", err)
+	}
 	identity.AppVersion = "1.3.6"
 	if _, err := identity.Contract(); err == nil {
 		t.Fatal("unknown host must not be enabled")

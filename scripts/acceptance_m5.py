@@ -124,6 +124,7 @@ def run(binary, root):
         results.append("without a standalone install the migration reports nothing to do")
 
         enabled = core.request("/plugins/" + PLUGIN + "/enable", {})
+        print("本次验收启用的插件:", PLUGIN)
         assert enabled["state"] == "ENABLED" and enabled["token"], enabled
         token = enabled["token"]
         denied = core.request(

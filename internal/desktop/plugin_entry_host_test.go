@@ -56,13 +56,38 @@ func TestV2HostsRegisterInThePluginScope(t *testing.T) {
 
 func TestNativeTabClickDeactivatesPluginRightPanelWithoutHidingPanel(t *testing.T) {
 	for _, wanted := range []string{
-		".ptb-tab:not([data-ekd-planner-tab]):not([data-ekdp-plugin-panel])",
+		".ptb-tab:not([data-ekdp-plugin-panel])",
 		"if (state.activePluginPanel) deactivatePluginPanel(state.activePluginPanel, false);",
 		"if (contract?.activeTabId) contract.activeTabId.value = null;",
-		"if (hidePanel) state.panelContract?.hidePanel?.();",
+		"contract?.hidePanel?.();",
 	} {
 		if !strings.Contains(rendererSource, wanted) {
 			t.Fatalf("renderer.js lost plugin panel / native tab switch guard: %s", wanted)
 		}
+	}
+}
+
+func TestPluginRightPanelTabIsDynamicAndPreservesOfficialWidth(t *testing.T) {
+	mountStart := strings.Index(rendererSource, "const pluginRightPanelHost")
+	if mountStart < 0 {
+		t.Fatal("renderer.js lost pluginRightPanelHost")
+	}
+	mountBlock := rendererSource[mountStart : mountStart+strings.Index(rendererSource[mountStart:], "const pluginLayoutHost")]
+	if strings.Contains(mountBlock, "tabs.append(wrapper)") {
+		t.Fatal("mount() must not pin plugin tab into .ptb-tabs before open()")
+	}
+	for _, wanted := range []string{
+		`close.className = "ptb-x";`,
+		`tabs.insertBefore(entry.wrapper, dragFill || null);`,
+		"entry.opened = false;",
+		"entry.wrapper.remove();",
+		"kind.endsWith(':planner')",
+	} {
+		if !strings.Contains(rendererSource, wanted) {
+			t.Fatalf("renderer.js missing right-panel dynamic tab or icon behavior: %s", wanted)
+		}
+	}
+	if strings.Contains(rendererSource[strings.Index(rendererSource, "function activatePluginPanel"):mountStart], "previewWidth.value = Math.min") {
+		t.Fatal("activatePluginPanel must not clobber user-dragged official panel width")
 	}
 }

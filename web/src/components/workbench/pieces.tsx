@@ -1,17 +1,9 @@
 import { useId, useState, type ReactNode } from "react";
-import type { DemoMessage, NativeSession } from "../../native";
+import type { DemoMessage } from "../../native";
 import { Icon } from "../Icon";
 import { Badge, Spinner } from "../ui";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-
-export type HandoffMode = "normal" | "plan" | "tower";
-
-export const HANDOFF_MODES: { id: HandoffMode; label: string; hint: string }[] = [
-  { id: "plan", label: "Plan", hint: "先出方案，不动文件" },
-  { id: "normal", label: "普通", hint: "直接执行" },
-  { id: "tower", label: "Tower", hint: "交给多代理编排" },
-];
 
 export function errorText(error: unknown): string {
   if (error instanceof Error && error.message) return error.message;
@@ -72,32 +64,6 @@ export function RunBadge({ status }: { status: string }) {
 
 export function ClockBadge({ children }: { children: ReactNode }) {
   return <span className="wb-clock">{children}</span>;
-}
-
-export function PlanMessage({
-  message,
-  selected,
-  onSelect,
-}: {
-  message: DemoMessage;
-  selected: boolean;
-  onSelect: () => void;
-}) {
-  const mine = message.role === "user";
-  const toolCall = message.toolCalls?.[0];
-  return (
-    <li className={`wb-plan-message ${mine ? "is-mine" : ""}`}>
-      <div className={`wb-msg ${mine ? "is-mine" : ""} ${selected ? "is-selected" : ""}`}>
-        {selected || message.tool || toolCall ? <span className="wb-msg-meta">
-          {message.tool || toolCall ? <span className="wb-tool-tag">{message.tool || toolCall?.function.name}</span> : null}
-          {selected ? <><span>已选择，可交接</span><Icon name="check" size={13} /></> : null}
-        </span> : null}
-        {message.reasoning ? <span className="wb-msg-reasoning">推理：{message.reasoning}</span> : null}
-        <div className={`wb-msg-text ${message.role === "tool" ? "is-tool" : ""}`}><MessageBody text={message.text || (toolCall ? "已请求工具调用。" : "")} /></div>
-      </div>
-      <div className="wb-plan-actions"><MessageActions message={message} /><button type="button" className="wb-link" aria-label={selected ? "取消选中消息" : "选择消息交接"} aria-pressed={selected} onClick={onSelect}>{selected ? "取消选择" : "选择交接"}</button></div>
-    </li>
-  );
 }
 
 export function MessageBody({ text }: { text: string }) {
@@ -195,105 +161,6 @@ export function Composer({
           </button>
         </div>
       </div>
-    </div>
-  );
-}
-
-export function HandoffForm({
-  text,
-  onText,
-  sessions,
-  busy,
-  error,
-  result,
-  onSubmit,
-  onOpenSession,
-  submitLabel = "交接给 Code",
-}: {
-  text: string;
-  onText: (next: string) => void;
-  sessions: NativeSession[];
-  busy: boolean;
-  error: string | null;
-  result: string | null;
-  onSubmit: (target: { sessionId?: string; mode: HandoffMode }) => void;
-  onOpenSession: (id: string) => void;
-  submitLabel?: string;
-}) {
-  const [target, setTarget] = useState<string>("new");
-  const [mode, setMode] = useState<HandoffMode>("plan");
-  const selectId = useId();
-  return (
-    <div className="wb-handoff">
-      <div className="wb-handoff-head">
-        <span>交接预览</span>
-        <span className="wb-hint">可编辑，发送前只在本机</span>
-      </div>
-      <textarea
-        className="wb-textarea"
-        rows={6}
-        value={text}
-        onChange={(event) => onText(event.target.value)}
-        placeholder="这里会填入选中的规划内容；也可以直接粘贴一段讨论。"
-      />
-      <div className="wb-handoff-grid">
-        <label className="wb-field" htmlFor={selectId}>
-          <span className="wb-label">目标会话</span>
-          <select
-            id={selectId}
-            className="wb-select"
-            value={target}
-            onChange={(event) => setTarget(event.target.value)}
-          >
-            <option value="new">新建 Code 会话</option>
-            {sessions.map((session) => (
-              <option key={session.id} value={session.id}>
-                {session.title || session.id}
-              </option>
-            ))}
-          </select>
-        </label>
-        <div className="wb-field">
-          <span className="wb-label">执行方式</span>
-          <div className="wb-modes" role="group" aria-label="执行方式">
-            {HANDOFF_MODES.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                className={`wb-mode ${mode === item.id ? "is-active" : ""}`}
-                aria-pressed={mode === item.id}
-                title={item.hint}
-                onClick={() => setMode(item.id)}
-              >
-                {item.label}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-      {error ? <p className="wb-error" role="alert">{error}</p> : null}
-      <div className="wb-handoff-foot">
-        <button
-          type="button"
-          className="wb-btn is-primary"
-          disabled={busy || !text.trim()}
-          onClick={() => onSubmit({ sessionId: target === "new" ? undefined : target, mode })}
-        >
-          {busy ? <Spinner size={13} /> : <Icon name="handoff" size={14} />}
-          {submitLabel}
-        </button>
-        {result ? (
-          <button type="button" className="wb-link" onClick={() => onOpenSession(result)}>
-            打开会话
-            <Icon name="arrowRight" size={13} />
-          </button>
-        ) : null}
-      </div>
-      {result ? (
-        <p className="wb-hint" role="status">
-          已交给 Code 会话 <code>{result.slice(0, 8)}</code>，后续在本机执行。
-        </p>
-      ) : null}
     </div>
   );
 }

@@ -404,7 +404,9 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 
 ## 示例
 
-`plugins/example-hello/` 是本仓库自带的最小示例：侧栏一行文字 + 一个设置子页 + 使用私有存储记录启用次数。它也是第三方开发者的起点，可以直接复制改名。
+`plugins/example-hello/` 不再预装在发布二进制中，只作为第三方开发模板保留在仓库里。它包含最简结构：侧栏一行文字 + 一个设置子页 + 使用私有存储记录启用次数，可直接复制改名开发自己的插件。
+
+如需在 KimiCode+ 中加载它，打开设置里的「插件 → 安装本地插件」，选择 `plugins/example-hello/` 目录（或先打成 `.zip`），在权限确认弹层中核对 `ui:sidebar`、`ui:settings`、`storage` 后完成安装，再手动启用。已安装过旧版示例插件的用户在升级后不会被自动卸载；卸载后「恢复预装插件」不会再恢复它。
 
 `plugins/kct/` 是完整示例（移植自 MIT 许可的 `kimi-cot-translate`）：装饰思考块、分段与码块保护、三种翻译服务、`credentials:` 注入与私有存储缓存。它同时演示了「插件被宿主门禁拦住」的场景：独立版 KCT 的后台加载器仍在时，它的启用会被核心以 `PLUGIN_MIGRATION_REQUIRED` 拒绝。
 

@@ -50,7 +50,7 @@ func TestProviderChatVaultAndLocalFeatures(t *testing.T) {
 	}
 	actionWithToken := func(action string, params map[string]any, token string) *httptest.ResponseRecorder {
 		data, _ := json.Marshal(map[string]any{"params": params})
-		r := httptest.NewRequest("POST", "http://127.0.0.1:43125/enhance/v1/plugins/kimicode-plus.example-hello/action/"+action, bytes.NewReader(data))
+		r := httptest.NewRequest("POST", "http://127.0.0.1:43125/enhance/v1/plugins/kimicode-plus.monitor/action/"+action, bytes.NewReader(data))
 		r.Header.Set("Content-Type", "application/json")
 		r.Header.Set("Authorization", "Bearer "+guard.PairingToken())
 		if token != "" {
@@ -208,10 +208,13 @@ func TestProviderChatVaultAndLocalFeatures(t *testing.T) {
 		// through the capability gate rather than answering 404.
 		w = call("GET", "/plugins", nil, "")
 		require(w, 200)
-		if !strings.Contains(w.Body.String(), "kimicode-plus.example-hello") {
+		if strings.Contains(w.Body.String(), "kimicode-plus.example-hello") {
+			t.Fatalf("example-hello should not be preinstalled: %s", w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "kimicode-plus.monitor") {
 			t.Fatalf("bundled plugin missing from list: %s", w.Body.String())
 		}
-		enable := call("POST", "/plugins/kimicode-plus.example-hello/enable", map[string]any{}, "")
+		enable := call("POST", "/plugins/kimicode-plus.monitor/enable", map[string]any{}, "")
 		require(enable, 200)
 		var enabled struct {
 			Token string `json:"token"`
@@ -221,13 +224,13 @@ func TestProviderChatVaultAndLocalFeatures(t *testing.T) {
 		}
 		// The identity token is what makes an action attributable. Without it the
 		// call must be refused, and with it the granted capability applies.
-		w = call("POST", "/plugins/kimicode-plus.example-hello/action/runtime.info", map[string]any{}, "")
+		w = call("POST", "/plugins/kimicode-plus.monitor/action/runtime.info", map[string]any{}, "")
 		if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "PLUGIN_IDENTITY_REJECTED") {
 			t.Fatalf("action without an identity token was not refused: %d %s", w.Code, w.Body.String())
 		}
 		w = actionWithToken("runtime.info", map[string]any{}, enabled.Token)
 		require(w, 200)
-		if !strings.Contains(w.Body.String(), "kimicode-plus.example-hello") {
+		if !strings.Contains(w.Body.String(), "kimicode-plus.monitor") {
 			t.Fatal(w.Body.String())
 		}
 		// The action route exists, so an ungranted capability must be refused with
@@ -236,7 +239,7 @@ func TestProviderChatVaultAndLocalFeatures(t *testing.T) {
 		if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "PLUGIN_CAPABILITY_DENIED") {
 			t.Fatalf("capability gate did not deny config.save: %d %s", w.Code, w.Body.String())
 		}
-		require(call("POST", "/plugins/kimicode-plus.example-hello/disable", map[string]any{}, ""), 200)
+		require(call("POST", "/plugins/kimicode-plus.monitor/disable", map[string]any{}, ""), 200)
 	})
 	require(call("POST", "/credentials/lock", map[string]any{}, ""), 200)
 	app.Close()

@@ -253,6 +253,37 @@ func TestPlannerRetryPreservesFailureWithoutDuplicateUserMessage(t *testing.T) {
 	}
 }
 
+func TestPluginPlannerThreadKeepsItsFirstWorkspace(t *testing.T) {
+	generator := plannerGeneratorFunc(func(_ context.Context, _ string, _ []provider.Message, _ []map[string]any, _ string, emit func(provider.StreamEvent) error) error {
+		return emit(provider.StreamEvent{Text: "完成", Finish: "stop"})
+	})
+	planner, _, _ := newTestPlanner(t, generator)
+	first, second := t.TempDir(), t.TempDir()
+	planner.UseWorkspace(func(_ context.Context, id string) (string, error) {
+		if id == "first" {
+			return first, nil
+		}
+		return second, nil
+	})
+	const owner = "kimicode-plus.planner"
+	ctx := context.Background()
+	value, err := planner.PlannerAction(ctx, "planner.create", []byte(mustPlannerJSON(map[string]string{"model": "synthetic", "pluginOwner": owner})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := value.(PlannerThread).ID
+	for _, source := range []string{"first", "second"} {
+		payload := map[string]string{"id": id, "text": source, "sourceSessionId": source, "pluginOwner": owner}
+		if _, err := planner.PlannerAction(ctx, "planner.send", []byte(mustPlannerJSON(payload))); err != nil {
+			t.Fatal(err)
+		}
+		done := waitPlanner(t, planner, id, func(thread PlannerThread) bool { return thread.Status == "idle" })
+		if done.Workspace != first {
+			t.Fatalf("send from %s resolved to %q, want %q", source, done.Workspace, first)
+		}
+	}
+}
+
 func TestPlannerPathRejectsEscape(t *testing.T) {
 	root := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "outside.txt")

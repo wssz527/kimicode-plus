@@ -1,6 +1,6 @@
 # 原生接入门槛与当前支持边界
 
-Go Core 仍可独立运行。当前原生路径已在隔离 Kimi Code 1.3.5 / Electron 45.1.0 中完成版本化 CDP 附着、主进程代持核心凭据、正式 loopback RPC、KAP（官方本地会话 API）的会话读取/发送/事件、规划流式回复、网页内容提取、真实 Code 交接、多会话和内嵌设置。它不是官方 SDK；宿主版本或 DOM 失配时降级停用。
+Go Core 仍可独立运行。当前原生路径已在隔离 Kimi Code 1.3.5、1.3.7 / Electron 45.1.0 中完成版本化 CDP 附着、主进程代持核心凭据、正式 loopback RPC、KAP（官方本地会话 API）的会话读取/发送/事件、规划流式回复、网页内容提取、真实 Code 交接、多会话和内嵌设置。它不是官方 SDK；宿主版本或 DOM 失配时降级停用。
 
 **政策更新（2026-11-12，用户决定）**：本软件定位为本地个人开源工具。经用户显式授权，可只读复用指定官方客户端配置与凭据，导入增强程序自己的加密库，不写回官方存储。接入优先走官方公开面与本地 API；不改官方包体。界面与插件经显式授权使用版本受限的运行时接入，失配降级。
 
@@ -8,7 +8,7 @@ Go Core 仍可独立运行。当前原生路径已在隔离 Kimi Code 1.3.5 / El
 
 ## 同窗页面与宿主入口
 
-官方界面以 Vue #app 为根，使用 data-color-scheme 与字体变量。`internal/desktop/assets/renderer.js` 在官方右侧 `pt-body` 挂载规划，在主聊天 `.chat-main` 挂载多会话，在侧栏 `side-footer` 前挂载设置入口，并给插件运行时留出侧栏锚点（Monitor 插件挂在那里）。统一“规划”入口默认网页，来源与配置位于菜单；入口分别克隆已有会话侧栏行和空会话工具菜单行。容器属性与 CSS 持续隐藏 Vue 重建的官方子节点，切回原生工具或单会话时释放。内容采用 Shadow DOM 隔离 CSS，并同步宿主主题。
+官方界面以 Vue #app 为根，使用 data-color-scheme 与字体变量。`internal/desktop/assets/renderer.js` 向插件接口 v2 提供右侧 `pt-body` 面板、工具菜单入口及侧栏锚点。规划插件默认关闭，启用后注册一个“规划”入口，打开时才创建动态标签。内容使用 Shadow DOM 隔离 CSS，并跟随宿主主题。设置只嵌入官方设置对话框，不在侧栏克隆入口。旧多屏会话仍可按附加功能开关挂载到 `.chat-main`，其插件版 A2 已延期。旧内置规划挂载和演示工作台已移除。
 
 入口注入按容器判重：`syncNativeEntries` 遍历每个可见的宿主菜单容器（空面板 `.sit`、`+` 下拉 `.pl`），在该容器内查同动作入口，多于一个则删除多余项，锚点行被重建则重新插入。判断依据是容器内是否已有入口，不使用全局单引用加 `isConnected`，因此官方重渲染任一容器后入口都能恢复且不会重复。
 
@@ -37,7 +37,7 @@ Go Core 仍可独立运行。当前原生路径已在隔离 Kimi Code 1.3.5 / El
 5. 钩子借主进程 webContents 向 renderer 注入 UI，并在 `did-finish-load` 后重新挂载；卸载与核心重启时清理入口、视图和连接。
 6. 关闭时清除 deadline 并自宿主内部关闭 inspector，随后最多轮询 15 秒确认端口真的关闭；关不掉时明确报告，而不是留下调试端口。
 
-EKD 由 `internal/desktop/inject.go`、`cdp.go`、`inspector_fuse.go` 和内嵌 JS 实现该机制。仅接受明确列出的宿主版本；当前契约为 1.3.4/1.3.5 + Electron 45.1.0 + DOM revision 1。
+EKD 由 `internal/desktop/inject.go`、`cdp.go`、`inspector_fuse.go` 和内嵌 JS 实现该机制。仅接受明确列出的宿主版本；当前契约为 1.3.4/1.3.5/1.3.7 + Electron 45.1.0 + DOM revision 1。
 
 **不再要求 `--user-data-dir`**。这一条曾把接入限制成"只能接隔离副本"，而从程序坞正常启动的实例没有该参数。现在的规则：
 
@@ -77,7 +77,7 @@ enhanced-kimi attach --status --data-dir <dir>
 
 ## 网页、自动化与 Monitor
 
-网页由增强程序创建 WebContentsView 或独立窗口承载。当前支持选区/正文提取、编辑预览和向真实 Code 会话交接，不支持向第三方网站自动填写/发送消息或读取回复。来源切换保留草稿，菜单、会话选择及设置弹层出现时隐藏网页子视图。右侧滑入过渡只改变位置、不触发 ResizeObserver，因此视图坐标另在过渡运行期间同步，静止后停止。真实视图可见性和坐标已核对。
+规划插件通过 `browser:view` 创建隔离 WebContentsView，视图按插件、renderer 实例和 viewId 归属。打开、导航和核心登记清理按视图串行处理。关闭时先中断由当前令牌、实例和窗口拥有的加载视图，避免网页响应阻塞释放。加载结束后核对宿主仍存活，失败时回滚核心登记。支持五站消息适配器、选区/正文回退、编辑预览和向真实 Code 会话交接。预览绑定规范化后的内容、目标和新会话字段，字段变化或旧响应均不能沿用确认。反向支持把摘要或 Diff 填入网页输入框，不自动发送。真实站点登录后的解析和回填仍未验收。来源切换保留草稿，菜单和弹层出现时隐藏网页子视图，实际可见性和坐标分别验证。
 
 原生多会话主窗格跟随官方侧栏，同一添加入口逐次追加至三个，已显示会话通过交换避免重复。输入草稿、模型、模式、权限和附件按会话集中保存。系统文件选择返回路径，经 Go 校验最多 16 个本机常规文件后复用 KAP prompt 发送；官方消息保留时间和附件元数据。合成文件真实发送与读回已通过，系统文件对话框仅使用确定性返回值验证调用，未 GUI 点选；这不等于网站上传或旧 Outbox 上传。
 
@@ -91,9 +91,11 @@ Monitor 位于会话侧栏，默认约 233px 的紧凑布局，详情折叠。�
 
 ## 最小隔离实机验证
 
-原生验收使用与当前开发实例隔离、可丢弃的测试宿主、独立 profile、独立 KIMI_CODE_HOME 和独立 EKD 数据目录。当前可重复脚本位于 `../work/ekd-final-integration/`。
+原生验收使用与当前开发实例隔离、可丢弃的测试宿主、独立 profile、独立 KIMI_CODE_HOME 和独立 EKD 数据目录。A3 当前脚本为项目内 `work/a3-stage/verify-a3.mjs`，由 `A3_STAGE_DIR` 指定独立运行目录，逐阶段写入报告并绑定源码及二进制 SHA-256。当前候选结果见 `work/a3-stage-final/a3-acceptance-report.json`。
 
-1. `verify-review-fixes.mjs` 是当前 UI 验收入口，检查动态容器隔离、空会话入口、统一规划默认网页、两窗格追加为三窗格、官方侧栏切换/交换、草稿保留、深浅色和窄宽度；还覆盖设置的 5 项列表与独立管理窗口跳转、标签顺序/恢复、缓存撤销/默认/保存读回、紧凑 Monitor。旧 `verify-native-ui.mjs` 和 `verify-native-flow.mjs` 仅作早期记录。
+以下 `work/ekd-final-integration/` 脚本是插件化前的历史验收记录，不能作为旧规划入口仍存在或 A2 插件已完成的依据。
+
+1. `verify-review-fixes.mjs` 是当时的 UI 验收入口，检查动态容器隔离、空会话入口、统一规划默认网页、两窗格追加为三窗格、官方侧栏切换/交换、草稿保留、深浅色和窄宽度；还覆盖设置的 5 项列表与独立管理窗口跳转、标签顺序/恢复、缓存撤销/默认/保存读回、紧凑 Monitor。旧 `verify-native-ui.mjs` 和 `verify-native-flow.mjs` 仅作早期记录。
 2. `verify-settings-flow.mjs` 验证布局与浏览器权限保存/恢复、真实模型目录加载；`verify-planner-flow.mjs` 验证流式规划、停止、工具审批、多选、编辑预览与 Code 交接。
 3. `verify-multi-session.mjs` 验证三窗格并行更新、独立草稿/模型/模式、只停止目标会话及真实 Read 审批，测试后的权限规则恢复。
 4. `verify-web-flow.mjs` 验证本地合成网页的真实 WebContents 选区提取、编辑预览、视图坐标与 Code 交接，不证明网站内自动聊天。
@@ -146,7 +148,7 @@ Monitor 位于会话侧栏，默认约 233px 的紧凑布局，详情折叠。�
 | `cache.summary` | `usage:read` | 近 1 小时与今日总计、按模型分组、平均速度、`quota` 子对象（未知保持 UNKNOWN） |
 | `cache.sessions` | `usage:read` | 活跃会话：标题、模型、距上次请求、最近 5 步命中率、上下文 token 估计、后台子代理数、是否阻塞 |
 | `cache.history` | `usage:read` | `range = 24h / 7d / 30d`，按小时或按天聚合 |
-| `cache.retention` | `usage:read` | 按空闲时长分桶统计"空闲后第一次请求"的命中率，作为保活阈值的观测参考，不换算倒计时 |
+| `cache.retention` | `usage:read` | 保留综合 `idleBuckets`，新增 `byModel`。分模型仅统计同一会话连续使用同一已知模型的主代理请求，按请求间隔返回 Token 缓存读取比例和样本数 |
 | `cache.receipts` | `usage:read` | 保活/压缩/恢复的执行回执，区分"官方已接收"与"官方已完成" |
 
 `monitor.summary` 已随 Monitor 插件化删除：侧栏组件是预装插件 `plugins/monitor/`，只经 `metrics:read` 读上面的 `cache.*`，核心不再保留这条私有通道。core 不新增常驻缓存指示（D10）。
