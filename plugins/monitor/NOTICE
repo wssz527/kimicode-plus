@@ -1,0 +1,13 @@
+KimiCode+ Monitor
+=================
+
+界面结构、样式、交互与中文文案移植自 bfjnbvf/kimi-code-monitor
+(commit 1d529f0b424a708971cfac097238df444f3b5beb, MIT License)。
+上游版权声明见同目录的 LICENSE。
+
+Rive 运行时（rive.js / rive.wasm）与形象资源
+kimi_avatar_web-PnsTWI-X.riv 沿用上游的分发方式；素材为 Kimi 官方形象，
+来源与上游相同。
+
+余额数据层的读取模型移植自用户自有项目 Kimi Work+（internal/quota/），
+端点、解析规则与测试数据见 internal/quota/ 的源码。

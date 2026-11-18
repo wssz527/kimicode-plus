@@ -855,3 +855,105 @@ func TestForegroundSubagentIsNotBackgroundCounted(t *testing.T) {
 		t.Fatalf("foreground subagent counted as background: %d", signals.OpenBackground)
 	}
 }
+
+func TestHistorySplitsSubagentTotals(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Minute)
+	earlier := now.Add(-90 * time.Minute)
+	recent := now.Add(-30 * time.Minute)
+	mainUsage := sampleUsage(100, 40, 200, 0)
+	subUsage := sampleUsage(50, 25, 100, 0)
+
+	writeWire(t, home, "session_hist_sub", "main",
+		plainLine(usageRecord("synthetic/main", mainUsage, "turn", earlier)),
+		plainLine(stepEnd("uuid-m1", "0", 1, mainUsage, 400, 1000, "end_turn", earlier)),
+		plainLine(usageRecord("synthetic/main", mainUsage, "turn", recent)),
+		plainLine(stepEnd("uuid-m2", "1", 1, mainUsage, 400, 1000, "end_turn", recent)),
+	)
+	subDir := filepath.Join(home, "sessions", "wd_test", "session_hist_sub", "agents", "agent-1")
+	if err := os.MkdirAll(subDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	subContent := plainLine(usageRecord("synthetic/sub", subUsage, "turn", recent)) +
+		plainLine(stepEnd("uuid-s1", "1", 1, subUsage, 300, 800, "end_turn", recent))
+	if err := os.WriteFile(filepath.Join(subDir, "wire.jsonl"), []byte(subContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := newTestStore(t, home)
+	if _, err := store.Scan(context.Background(), now, true); err != nil {
+		t.Fatal(err)
+	}
+
+	hourly, err := store.History(context.Background(), now, "24h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	earlierBucket := earlier.In(now.Location()).Format("2006-01-02T15:00")
+	recentBucket := recent.In(now.Location()).Format("2006-01-02T15:00")
+	byBucket := map[string]HistoryPoint{}
+	for _, point := range hourly.Points {
+		byBucket[point.Bucket] = point
+	}
+	if p := byBucket[earlierBucket]; p.Totals.Output != 40 || p.Sub != nil {
+		t.Fatalf("earlier bucket = %+v, want main output=40 and Sub=nil", p)
+	}
+	if p := byBucket[recentBucket]; p.Totals.Output != 65 || p.Sub == nil || p.Sub.Output != 25 || p.Sub.InputCacheRead != 100 {
+		t.Fatalf("recent bucket = %+v, want total output=65 and Sub output=25 cacheRead=100", p)
+	}
+
+	daily, err := store.History(context.Background(), now, "7d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	todayBucket := recent.In(now.Location()).Format("2006-01-02")
+	var todayPoint *HistoryPoint
+	for i := range daily.Points {
+		if daily.Points[i].Bucket == todayBucket {
+			todayPoint = &daily.Points[i]
+			break
+		}
+	}
+	if todayPoint == nil || todayPoint.Sub == nil || todayPoint.Sub.Output != 25 {
+		t.Fatalf("daily today point = %+v, want Sub.Output=25", todayPoint)
+	}
+}
+
+func TestScanSkippedWaitsForInFlightScan(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Second)
+	usage := sampleUsage(120, 40, 300, 0)
+	writeWire(t, home, "session_inflight", "main",
+		plainLine(usageRecord("synthetic/inflight", usage, "turn", now)),
+		plainLine(stepEnd("uuid-inf-1", "0", 1, usage, 400, 1000, "end_turn", now)),
+	)
+	store := newTestStore(t, home)
+
+	// Simulate an active scan holding scanMu after claiming lastScan via beginScan.
+	if _, ok := store.beginScan(now, false); !ok {
+		t.Fatal("initial beginScan unexpectedly skipped")
+	}
+	store.scanMu.Lock()
+	entered := make(chan struct{})
+	done := make(chan ScanResult, 1)
+	go func() {
+		close(entered)
+		res, err := store.Scan(context.Background(), now.Add(100*time.Millisecond), false)
+		if err != nil {
+			t.Errorf("concurrent skipped scan failed: %v", err)
+		}
+		done <- res
+	}()
+	<-entered
+	select {
+	case res := <-done:
+		store.scanMu.Unlock()
+		t.Fatalf("skipped scan returned early while scanMu held: %+v", res)
+	case <-time.After(40 * time.Millisecond):
+	}
+	store.scanMu.Unlock()
+	res := <-done
+	if !res.Skipped {
+		t.Fatalf("second scan result = %+v, want Skipped=true", res)
+	}
+}

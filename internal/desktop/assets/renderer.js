@@ -63,6 +63,7 @@ async function installNativeRenderer(options) {
     pluginTokens: new Map(),
     pluginAssets: new Map(),
     pluginSettings: new Map(),
+    watchedSession: '',
     browserNavListeners: new Map(),
   };
   const activeSession = () => {
@@ -554,6 +555,7 @@ async function installNativeRenderer(options) {
     state.pluginSettings.clear();
     state.browserNavListeners.clear();
     delete window.__ekdPluginBrowserNavigated;
+    await unwatchActiveSession();
     state.plugins?.dispose();
     state.plugins = null;
     delete window.__ekdPlugins;
@@ -637,7 +639,36 @@ async function installNativeRenderer(options) {
   await refreshFeatures();
   if (state.removed) return { status: 'removed', surface: 'host', domRevision: 1 };
   state.unsubscribeFeatures = makeHost(() => {}).subscribe('features', value => applyFeatures(value, false));
+  let watchChain = Promise.resolve();
+  function syncActiveSessionWatch(targetId) {
+    watchChain = watchChain.then(async () => {
+      const next = state.removed ? '' : (targetId || '');
+      const prev = state.watchedSession || '';
+      if (next === prev) return;
+      if (prev) {
+        state.watchedSession = '';
+        await transport.request('session.unwatch', { id: prev }).catch(() => {});
+      }
+      if (next && !state.removed) {
+        try {
+          await transport.request('session.watch', { id: next });
+          if (state.removed) {
+            await transport.request('session.unwatch', { id: next }).catch(() => {});
+          } else {
+            state.watchedSession = next;
+          }
+        } catch {
+          // KAP may not have finished opening yet; next session change or plugin sync retries.
+        }
+      }
+    });
+    return watchChain;
+  }
+  function unwatchActiveSession() {
+    return syncActiveSessionWatch('');
+  }
   let previousSession = activeSession();
+  if (previousSession) void syncActiveSessionWatch(previousSession);
   const sessionStore = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia._s.get('kimi.sessions');
   state.unsubscribeSession = sessionStore?.$subscribe(() => {
     const id = activeSession();
@@ -647,6 +678,7 @@ async function installNativeRenderer(options) {
     for (const handle of [...state.pluginMainAreas.values()]) {
       if (handle.mode === 'page') handle.dispose();
     }
+    void syncActiveSessionWatch(id);
     window.dispatchEvent(new CustomEvent('ekd:active-session', { detail: id }));
   }, { detached: true, flush: 'sync' });
   ensure();
@@ -1208,6 +1240,8 @@ async function installNativeRenderer(options) {
   }
 
   async function reconcilePlugins() {
+    const current = activeSession();
+    if (current && state.watchedSession !== current) void syncActiveSessionWatch(current);
     let list;
     try {
       list = await coreGet('/plugins');

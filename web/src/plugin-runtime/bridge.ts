@@ -38,6 +38,8 @@ const ACTION_CAPABILITY: Record<string, string> = {
   "cache.summary": "metrics:read",
   "cache.sessions": "metrics:read",
   "cache.history": "metrics:read",
+  "cache.turns": "metrics:read",
+  "quota.balances": "metrics:read",
   "cache.retention": "metrics:read",
   "cache.receipts": "metrics:read",
   "sessions.list": "sessions:read",

@@ -1,0 +1,2387 @@
+/* ===== 宿主页面微调 ===== */
+/* 侧栏底部设置区：顶部分隔线与面板边缘重复，隐藏；
+   上间距由面板的 12px 下外边距提供，这里去掉上内边距、保留下内边距 12px，
+   使「设置」上下间距相等（12/12），面板下边缘随之下移与之对齐 */
+aside.side .side-footer {
+  border-top: none;
+  padding: 0 12px 12px;
+}
+
+/* 侧栏折叠阴影修正：面板插在会话列表与 .side-footer 之间后，滚动视口的
+   下边缘上移到面板顶，但原生的底部折叠阴影是 .side-footer::before（钉在
+   footer 上方），会错位到面板下面。面板在场时隐藏 footer 阴影，并把同款
+   渐变阴影挂到折叠处（会话列表底缘，与顶部阴影同宽、同探入方式）；显隐
+   仍由原生的 .side-footer--shadowed 类驱动（:has() 随类名切换动态生效）。
+   面板被移除时本组规则自动失效，恢复原样。
+   锚点与几何按两种挂载结构分别处理：
+   - 桌面补丁是 .col > host > widget（panel-app.js 建 host）：host 全宽且
+     紧贴列表底缘，阴影下缘即 host 顶缘；
+   - Web 扩展是 .col > widget（widget-structure.js ensureWidget 直插）：
+     widget 带 --ksb-panel-inset 外边距，阴影按同值补偿——横向贯穿整列、
+     下缘上移到列表底缘，外边距区域保持为空。 */
+aside.side > .col:has(> :is(#ksb-panel-host, #ksb-widget)) .side-footer::before,
+aside.side > .col:has(#ksb-widget) .side-footer::before {
+  opacity: 0;
+}
+
+aside.side > .col > .ekdp-sidebar-anchor:has(.ekdp-monitor-host),
+aside.side > .col > .ekdp-sidebar-anchor:has(.ekdp-monitor-host) .ekdp-slot-sidebar {
+  padding: 0;
+}
+
+aside.side > .col > :is(#ksb-panel-host, #ksb-widget),
+aside.side > .col > .ekdp-sidebar-anchor:has(#ksb-widget) {
+  position: relative;
+}
+
+aside.side > .col > :is(#ksb-panel-host, #ksb-widget)::before,
+aside.side > .col > .ekdp-sidebar-anchor:has(#ksb-widget)::before {
+  content: "";
+  position: absolute;
+  height: var(--p-sidebar-seam-h, 13px);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--duration-base, 150ms) var(--ease-out, ease-out);
+  transition-duration: var(--duration-slow, 300ms);
+  background:
+    linear-gradient(to top, color-mix(in srgb, var(--color-text, #000) 1.5%, transparent), transparent 35%),
+    linear-gradient(to top, color-mix(in srgb, var(--color-text, #000) 1%, transparent), transparent 65%),
+    linear-gradient(to top, color-mix(in srgb, var(--color-text, #000) 0.75%, transparent), transparent);
+}
+
+/* 桌面补丁：host 全宽、紧贴列表底缘，阴影下缘即折叠处 */
+aside.side > .col > #ksb-panel-host::before,
+aside.side > .col > .ekdp-sidebar-anchor:has(#ksb-widget)::before {
+  left: 0;
+  right: 0;
+  bottom: 100%;
+}
+
+/* Web 扩展：补偿面板外边距——横向贯穿整列，下缘移至列表底缘 */
+aside.side > .col > #ksb-widget::before {
+  left: calc(-1 * var(--ksb-panel-inset, 12px));
+  right: calc(-1 * var(--ksb-panel-inset, 12px));
+  bottom: calc(100% + var(--ksb-panel-inset, 12px));
+}
+
+aside.side > .col:has(> .side-footer--shadowed) > :is(#ksb-panel-host, #ksb-widget)::before,
+aside.side > .col:has(> .side-footer--shadowed) > .ekdp-sidebar-anchor:has(#ksb-widget)::before {
+  opacity: 1;
+}
+
+/* 侧栏顶部改造（宠物 ≡ 菜单「侧栏改造」开关控制，默认开启）：
+   隐藏品牌 logo，工作区上移；伸缩按钮原位绝对定位，新建对话行上移与其居中对齐。
+   注意页面规则有 min-height: calc(26px + 2*space)，必须一并清掉。
+   安全闸在 JS 侧（widget-structure.js sidebarHeaderTidySafe）：头部 .ch 内出现 logo 与
+   收起按钮之外的可见内容时不挂 ksb-sidebar-tidy，本组规则整体不生效（issue #8）。
+   RC 环境的设备选择器（.rc-dev，.ch 的兄弟行）有专属避让样式，见下方规则 */
+html.ksb-sidebar-tidy aside.side .ch {
+  position: relative;
+  height: 0;
+  min-height: 0;
+  padding: 0;
+  overflow: visible;
+}
+
+html.ksb-sidebar-tidy aside.side .ch-brand {
+  display: none;
+}
+
+html.ksb-sidebar-tidy aside.side .ch-collapse {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 2;
+}
+
+/* RC 设备选择器（.rc-dev，仅 code-rc.kimi.com 存在）：头部压平后它与右上角
+   绝对定位的收起按钮重叠（issue #8）。改为与按钮同一行：同顶缘（12px）、
+   同高（26px），右侧让出按钮位（12 页边距 + 26 按钮 + 8 间隙 = 46px），
+   设备名超宽时由原生 text-overflow: ellipsis 截断 */
+html.ksb-sidebar-tidy aside.side .rc-dev {
+  height: 26px;
+  margin: 12px 46px 0 0;
+  padding: 0 0 0 8px;
+}
+
+html.ksb-sidebar-tidy aside.side .rc-dev-trigger {
+  height: 26px;
+  padding: 4px 8px;
+}
+
+/* .btn-wrap 为旧版新建对话容器；现版本为 .sidebar-actions（新建会话 + 搜索），两者都保留兼容 */
+html.ksb-sidebar-tidy aside.side .btn-wrap,
+html.ksb-sidebar-tidy aside.side .sidebar-actions {
+  margin-top: 8px;
+}
+
+/* 侧栏改造后收起按钮悬于右上，hover 新建对话/搜索时右端的快捷键提示会与它重叠，隐藏 */
+html.ksb-sidebar-tidy aside.side .sidebar-actions .ui-kbd {
+  display: none;
+}
+
+/* ===== Kimi Web Status Widget =====
+ * 视觉值对齐 Kimi 设计 token：
+ * labels / fills / separator / status(kimiBlue, positiveGreen, orange, danger)
+ * 字阶用 webUI 的 c2(10) / c1(12) / b2(14)，数字用等宽字体 + tabular-nums。
+ */
+
+#ksb-widget {
+  --ksb-text: rgba(0, 0, 0, 0.9);
+  --ksb-text-secondary: rgba(0, 0, 0, 0.6);
+  --ksb-text-tertiary: rgba(0, 0, 0, 0.45);
+  --ksb-text-quaternary: rgba(0, 0, 0, 0.3);
+  --ksb-fill-1: rgba(0, 0, 0, 0.03);
+  --ksb-fill-2: rgba(0, 0, 0, 0.05);
+  --ksb-fill-2-hover: rgba(0, 0, 0, 0.079);
+  --ksb-surface: #ffffff;
+  --ksb-border: rgba(0, 0, 0, 0.13);
+  --ksb-accent: #1783ff;
+  --ksb-accent-hover: rgba(22, 127, 247, 1);
+  --ksb-accent-bg: rgba(23, 131, 255, 0.1);
+  --ksb-green: #16c456;
+  --ksb-orange: #ff9500;
+  --ksb-danger: #ff3849;
+  /* 数值等宽字体：优先复用宿主页面已加载的 JetBrains Mono，系统 mono 兜底 */
+  --ksb-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  /* 面板相对侧栏列的内缩距离；底部折叠阴影按同值补偿几何（见文件顶部阴影规则） */
+  --ksb-panel-inset: 12px;
+
+  position: relative;
+  margin: var(--ksb-panel-inset);
+  padding: 12px;
+  /* 规范卡片圆角：--radius-lg */
+  border-radius: 12px;
+  background: var(--ksb-fill-1);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ksb-text-secondary);
+  user-select: none;
+  -webkit-user-select: none;
+  flex-shrink: 0;
+  container-type: inline-size;
+  transition:
+    background-color 150ms ease,
+    padding 250ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+/* 使用原版暗色色板，但由 Kimi Web 自身的主题设置决定是否启用。 */
+html[data-color-scheme="dark"] #ksb-widget {
+  --ksb-text: rgba(255, 255, 255, 0.84);
+  --ksb-text-secondary: rgba(255, 255, 255, 0.56);
+  --ksb-text-tertiary: rgba(255, 255, 255, 0.42);
+  --ksb-text-quaternary: rgba(255, 255, 255, 0.26);
+  --ksb-fill-1: rgba(255, 255, 255, 0.05);
+  --ksb-fill-2: rgba(255, 255, 255, 0.1);
+  --ksb-fill-2-hover: rgba(255, 255, 255, 0.145);
+  --ksb-surface: #292929;
+  --ksb-border: rgba(255, 255, 255, 0.12);
+  --ksb-accent: #1a88ff;
+  --ksb-accent-hover: rgba(37, 142, 255, 1);
+  --ksb-accent-bg: rgba(26, 136, 255, 0.1);
+  --ksb-green: #16c456;
+  --ksb-orange: #ff9f0a;
+  --ksb-danger: #ff4756;
+}
+
+@media (prefers-color-scheme: dark) {
+  html[data-color-scheme="system"] #ksb-widget,
+  html:not([data-color-scheme]) #ksb-widget {
+    --ksb-text: rgba(255, 255, 255, 0.84);
+    --ksb-text-secondary: rgba(255, 255, 255, 0.56);
+    --ksb-text-tertiary: rgba(255, 255, 255, 0.42);
+    --ksb-text-quaternary: rgba(255, 255, 255, 0.26);
+    --ksb-fill-1: rgba(255, 255, 255, 0.05);
+    --ksb-fill-2: rgba(255, 255, 255, 0.1);
+    --ksb-fill-2-hover: rgba(255, 255, 255, 0.145);
+    --ksb-surface: #292929;
+    --ksb-border: rgba(255, 255, 255, 0.12);
+    --ksb-accent: #1a88ff;
+    --ksb-accent-hover: rgba(37, 142, 255, 1);
+    --ksb-accent-bg: rgba(26, 136, 255, 0.1);
+    --ksb-green: #16c456;
+    --ksb-orange: #ff9f0a;
+    --ksb-danger: #ff4756;
+  }
+}
+
+#ksb-widget * {
+  box-sizing: border-box;
+}
+
+/* 数值（含单位）统一等宽字体，tabular-nums 保留以对齐全角数字场景 */
+.ksb-reset,
+.ksb-quota-pct,
+.ksb-stat-value,
+.ksb-stat-sub,
+.ksb-chart-total,
+.ksb-pet-total {
+  font-family: var(--ksb-mono);
+}
+
+/* --- 待授权：整张卡片是可点按钮 --- */
+#ksb-widget.ksb-auth-required {
+  cursor: pointer;
+}
+
+#ksb-widget.ksb-auth-required:hover {
+  background: var(--ksb-fill-2);
+}
+
+/* 规范 focus ring：3px soft + 1px accent，替代 outline */
+#ksb-widget.ksb-auth-required:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 3px var(--ksb-accent-bg),
+    0 0 0 1px var(--ksb-accent);
+}
+
+/* --- 标题行（整宽模块的内容）：状态点 + 名称 + 余额 --- */
+.ksb-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 标题与状态允许先让位：药丸右边距是死的，空间不够时标题/状态先压缩，
+   再由下面的容器查询把「Kimi Code」整个缩成「Kimi」 */
+.ksb-title {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ksb-text-quaternary);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 150ms ease;
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+html[data-color-scheme="dark"] #ksb-widget .ksb-title {
+  color: var(--ksb-text-tertiary);
+}
+
+@media (prefers-color-scheme: dark) {
+  html[data-color-scheme="system"] #ksb-widget .ksb-title,
+  html:not([data-color-scheme]) #ksb-widget .ksb-title {
+    color: var(--ksb-text-tertiary);
+  }
+}
+
+.ksb-title:hover {
+  color: var(--ksb-text-secondary);
+}
+
+.ksb-title-brief {
+  display: none;
+}
+
+/* 宽度不足时标题缩为 Kimi，倒计时依次降级为单单位、隐藏 */
+@container (max-width: 170px) {
+  .ksb-title-long { display: none; }
+  .ksb-title-brief { display: inline; }
+}
+
+.ksb-reset-short {
+  display: none;
+}
+
+/* 重置时间整段降级，断点按 quota 模块自身宽度（命名容器 ksb-quota，见 .ksb-quota-group）。
+   「周四17:45」比倒计时（3d5h）宽，挂 .ksb-abs 时更早降级 */
+@container ksb-quota (max-width: 88px) {
+  .ksb-reset-full { display: none; }
+  .ksb-reset-short { display: inline; }
+}
+
+@container ksb-quota (max-width: 106px) {
+  .ksb-reset.ksb-abs .ksb-reset-full { display: none; }
+  .ksb-reset.ksb-abs .ksb-reset-short { display: inline; }
+}
+
+@container ksb-quota (max-width: 70px) {
+  .ksb-reset { display: none; }
+}
+
+/* 面板过窄时隐藏宠物右侧的标签文字，只留数据（阈值 150px，勿过早隐藏） */
+@container (max-width: 150px) {
+  #ksb-pet-label { display: none; }
+}
+
+/* 标题行右侧药丸：右边距固定（margin-left:auto 把它顶到行尾），数额越长药丸
+   越往左生长，绝不越出右边距；行内空间不够时先让字段名让位（见下方容器查询与
+   .ksb-title 的 flex-shrink），再由容器查询把「Kimi Code」缩成「Kimi」 */
+.ksb-header-stat {
+  margin-left: auto;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 100px;
+  background: var(--ksb-fill-2);
+  white-space: nowrap;
+  transition: background-color 150ms ease;
+}
+
+/* 配了「点击数据跳转」目标时整颗药丸可点（与宠物小球同一套语义） */
+.ksb-header-stat[data-link] {
+  cursor: pointer;
+}
+
+.ksb-header-stat[data-link]:hover {
+  background: var(--ksb-fill-2-hover);
+}
+
+/* 字段名：药丸里的弱化文字。宽度不够时**第一个让位**——① 面板窄到 220px 以下整体隐藏；
+   ② 极窄的行内挤压下它自己先被压没（数额 flex-shrink:0，一步不让）。
+   名称也进悬停提示，所以隐藏后信息不丢。 */
+.ksb-header-stat-label {
+  font-size: 10px;
+  color: var(--ksb-text-quaternary);
+  flex: 0 100 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+@container (max-width: 220px) {
+  .ksb-header-stat-label { display: none; }
+}
+
+.ksb-header-stat-value {
+  font-family: var(--ksb-mono);
+  font-size: 10px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--ksb-text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+/* 手动刷新小图标：无边框无底色，在数字左侧、与数字垂直居中对齐；
+   字号跟着所在容器走（标题行 10px、宠物标签 10px，用 em 缩放） */
+.ksb-stat-refresh {
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  background: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.85em;
+  line-height: 1;
+  color: var(--ksb-text-quaternary);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 150ms ease;
+}
+
+/* hidden 属性必须压过上面的 display: inline-flex——否则浏览器默认的
+   [hidden]{display:none} 被覆盖，非余额口径时图标也一直显形（真实踩过） */
+.ksb-stat-refresh[hidden] {
+  display: none;
+}
+
+/* 宠物模块：刷新图标与左上角的字段名同字号、贴在名字右边（不占大数字的视觉重心） */
+.ksb-pet-label-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+}
+
+.ksb-stat-refresh:hover {
+  color: var(--ksb-accent);
+}
+
+.ksb-stat-refresh .ksb-stat-refresh-icon {
+  width: 1em;
+  height: 1em;
+  display: block;
+}
+
+.ksb-stat-refresh.spinning {
+  animation: ksb-spin 900ms linear infinite;
+}
+
+@keyframes ksb-spin {
+  to { transform: rotate(360deg); }
+}
+
+.ksb-agent-status {
+  font-size: 10px;
+  color: var(--ksb-text-tertiary);
+  white-space: nowrap;
+}
+
+.ksb-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* 灯点外观：类名来自 metrics 的 statusAppearance（与宠物球共用同一份映射，
+   标题行是宠物模块的精简版——两边永远同色同义） */
+.ksb-status-dot.ksb-dot-idle { background: var(--ksb-text-quaternary); }
+.ksb-status-dot.ksb-dot-work {
+  background: var(--ksb-accent);
+  animation: ksb-pulse 1.2s ease-in-out infinite;
+}
+.ksb-status-dot.ksb-dot-off { background: var(--ksb-danger); }
+.ksb-status-dot.ksb-dot-warn { background: var(--ksb-orange); }
+.ksb-status-dot.ksb-dot-sub { background: var(--ksb-green); }
+
+@keyframes ksb-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
+}
+
+/* --- 模块区域：上（仅完整）下（迷你沉底）两个两列等宽网格 --- */
+.ksb-region {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 12px;
+}
+
+.ksb-region:empty {
+  display: none;
+}
+
+.ksb-region-full {
+  margin-bottom: 10px;
+}
+
+/* 底部（迷你）区域整面可点切换模式，含模块间隙 */
+.ksb-region-mini {
+  cursor: pointer;
+}
+
+.ksb-module {
+  position: relative;
+  min-width: 0;
+}
+
+.ksb-module.ksb-span-2 {
+  grid-column: 1 / -1;
+}
+
+.ksb-quota-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  /* 命名容器：重置时间的降级断点按模块自身宽度计算（widget 级断点对半宽模块过晚） */
+  container: ksb-quota / inline-size;
+}
+
+.ksb-quota-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.ksb-reset {
+  margin-left: 4px;
+  font-size: 10px;
+  color: var(--ksb-text-quaternary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  /* 不可压缩：宽度不足时由容器查询整段切换（full→short→隐藏），
+     不做右侧逐渐裁切（与「上轮」字样的隐藏逻辑一致） */
+  flex-shrink: 0;
+}
+
+.ksb-quota-pct {
+  margin-left: auto;
+}
+
+/* --- 编辑模式：长按进入，模块出描边 + 角标菜单 --- */
+#ksb-widget.ksb-editing .ksb-module {
+  outline: 1px dashed var(--ksb-text-quaternary);
+  outline-offset: 2px;
+  border-radius: 4px;
+  cursor: grab;
+}
+
+#ksb-widget.ksb-editing .ksb-region-mini {
+  cursor: default;
+}
+
+.ksb-module.ksb-dragging {
+  cursor: grabbing;
+  opacity: 0.85;
+  outline: 1px solid var(--ksb-accent);
+  z-index: 6;
+}
+
+.ksb-module-badge {
+  position: absolute;
+  top: -7px;
+  right: -5px;
+  z-index: 5;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--ksb-border);
+  background: var(--ksb-surface);
+  color: var(--ksb-text-tertiary);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+#ksb-widget.ksb-editing .ksb-module-badge {
+  display: flex;
+}
+
+.ksb-module-badge:hover {
+  color: var(--ksb-accent);
+  border-color: var(--ksb-accent);
+}
+
+.ksb-edit-menu {
+  position: absolute;
+  z-index: 30;
+  min-width: 132px;
+  /* shrink-to-fit 会随 left 左移不断变宽（正反馈），必须封顶 */
+  max-width: 190px;
+  /* 模块菜单在矮面板里整块可滚，不被顶部裁掉 */
+  max-height: min(62vh, 430px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px;
+  border-radius: 10px;
+  border: 1px solid var(--ksb-border);
+  background: var(--ksb-surface);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  font-size: 12px;
+  color: var(--ksb-text-secondary);
+}
+
+.ksb-menu-label {
+  margin: 4px 2px 2px;
+  font-size: 10px;
+  color: var(--ksb-text-quaternary);
+}
+
+.ksb-menu-label:first-child {
+  margin-top: 0;
+}
+
+.ksb-menu-opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  /* 开关项随代理/账户数量增长（同模型 200 个子代理时 ≡ 菜单就是 200 项）：
+     封顶 + 内部滚动，否则弹出层几千像素高、直接飞出面板 */
+  max-height: 180px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.ksb-menu-opt {
+  padding: 2px 8px;
+  border-radius: 100px;
+  background: var(--ksb-fill-2);
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.ksb-menu-opt:hover {
+  background: var(--ksb-fill-2-hover);
+}
+
+.ksb-menu-opt.ksb-on {
+  background: var(--ksb-accent-bg);
+  color: var(--ksb-accent);
+}
+
+/* 只读项：客户端里配了但面板查不到用量的供应商（未适配/没 key），列出名字与原因 */
+.ksb-menu-opt.ksb-off {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.ksb-menu-opt.ksb-off:hover {
+  background: var(--ksb-fill-2);
+}
+
+/* 编辑模式分区块：灰=隐藏、蓝=展开、绿=固定；浅色底 + 色点标题 + 同色模块描边，区块之间留真实间距 */
+
+#ksb-widget.ksb-editing .ksb-region {
+  border-radius: 8px;
+  padding: 6px;
+  margin-bottom: 10px;
+}
+
+#ksb-widget.ksb-editing .ksb-region-mini {
+  margin-bottom: 0;
+}
+
+#ksb-widget.ksb-editing .ksb-region-hidden {
+  background: color-mix(in srgb, var(--ksb-text) 5%, transparent);
+}
+
+#ksb-widget.ksb-editing .ksb-region-full {
+  background: color-mix(in srgb, var(--ksb-accent) 7%, transparent);
+}
+
+#ksb-widget.ksb-editing .ksb-region-mini {
+  background: color-mix(in srgb, var(--ksb-green) 8%, transparent);
+}
+
+#ksb-widget.ksb-editing .ksb-region-full .ksb-module { outline-color: var(--ksb-accent); }
+#ksb-widget.ksb-editing .ksb-region-mini .ksb-module { outline-color: var(--ksb-green); }
+#ksb-widget.ksb-editing .ksb-region-hidden .ksb-module { outline-color: var(--ksb-text-quaternary); }
+
+/* 区域标题：色点 + 说明文字，色点与模块描边一一对应 */
+.ksb-zone-label {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 2px 4px;
+  font-size: 10px;
+  color: var(--ksb-text-tertiary);
+}
+
+.ksb-zone-label::before {
+  content: '';
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 2px;
+}
+
+#ksb-widget.ksb-editing .ksb-region-hidden .ksb-zone-label::before { background: var(--ksb-text-quaternary); }
+#ksb-widget.ksb-editing .ksb-region-full .ksb-zone-label::before { background: var(--ksb-accent); }
+#ksb-widget.ksb-editing .ksb-region-mini .ksb-zone-label::before { background: var(--ksb-green); }
+
+/* 拖动中的落点预览：进入哪个区域就变哪个区域的描边色 */
+#ksb-widget.ksb-editing .ksb-module.ksb-dragging.ksb-drag-to-hidden { outline-color: var(--ksb-text-quaternary); }
+#ksb-widget.ksb-editing .ksb-module.ksb-dragging.ksb-drag-to-full { outline-color: var(--ksb-accent); }
+#ksb-widget.ksb-editing .ksb-module.ksb-dragging.ksb-drag-to-mini { outline-color: var(--ksb-green); }
+
+/* 编辑模式下强制展开全部区域（即使当前是 Mini 状态） */
+#ksb-widget.ksb-mini.ksb-editing .ksb-region-full,
+#ksb-widget.ksb-mini.ksb-editing .ksb-auth-banner {
+  max-height: 480px;
+  opacity: 1;
+  margin-bottom: 10px;
+  pointer-events: auto;
+}
+
+#ksb-widget.ksb-mini {
+  /* Mini 与完整状态内边距一致：四面 12px，切换时组件零位移 */
+  padding: 12px;
+}
+
+/* --- 待授权横幅：与 CLI 提醒框同一格式（虚线描边 + 浅底 + 左对齐），红字红框警示；
+   面板顶部显眼提示，整卡可点，Mini 模式也常驻 --- */
+.ksb-auth-banner {
+  margin: -2px 0 10px;
+  padding: 5px 8px;
+  border: 1px dashed var(--ksb-danger);
+  border-radius: 7px;
+  background: var(--ksb-fill-1);
+  color: var(--ksb-danger);
+  font-size: 12px;
+  font-weight: 500;
+  text-align: left;
+}
+
+.ksb-auth-banner small {
+  display: block;
+  margin-top: 1px;
+  font-size: 10px;
+  font-weight: 400;
+  opacity: 0.75;
+}
+
+/* --- Mini 模式：上部区域向下收起（授权横幅不收起，未授权时必须始终可见） ---
+   overflow 只在 mini 状态启用：完整态允许宠物大摆幅动画越出模块边界不被裁 */
+.ksb-region-full,
+.ksb-auth-banner {
+  overflow: hidden;
+  transition:
+    max-height 250ms cubic-bezier(0.23, 1, 0.32, 1),
+    opacity 200ms ease,
+    margin 250ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.ksb-region-full {
+  overflow: visible;
+}
+
+/* 区域内容高度可变，max-height 取大于常见内容的固定值 */
+.ksb-region-full { max-height: 480px; }
+.ksb-auth-banner { max-height: 48px; }
+
+#ksb-widget.ksb-mini .ksb-region-full {
+  overflow: hidden;
+}
+
+#ksb-widget.ksb-mini .ksb-region-full {
+  max-height: 0;
+  opacity: 0;
+  margin-bottom: 0;
+  pointer-events: none;
+}
+
+.ksb-quota-label {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--ksb-text-tertiary);
+}
+
+.ksb-progress {
+  position: relative;
+  height: 3px;
+  border-radius: 100px;
+  background: var(--ksb-fill-2);
+}
+
+.ksb-progress-fill {
+  height: 100%;
+  border-radius: 100px;
+  transition:
+    width 300ms cubic-bezier(0.23, 1, 0.32, 1),
+    background-color 200ms ease;
+}
+
+.ksb-progress-fill.ksb-low { background: var(--ksb-green); }
+.ksb-progress-fill.ksb-mid { background: var(--ksb-orange); }
+.ksb-progress-fill.ksb-high { background: var(--ksb-danger); }
+
+/* 匀速参照：按窗口已流逝比例定位的竖标，上下各凸出 1px，置顶不被用量填充盖住 */
+.ksb-pace {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--ksb-text-tertiary);
+  transition: left 300ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.ksb-quota-pct {
+  min-width: 24px;
+  text-align: right;
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--ksb-text-secondary);
+}
+
+.ksb-quota-pct.ksb-mid { color: var(--ksb-orange); }
+.ksb-quota-pct.ksb-high { color: var(--ksb-danger); }
+.ksb-quota-pct.ksb-auth-hint { color: var(--ksb-accent); }
+
+/* --- 会话折线：整宽统计模块显示，颜色随模块语义 --- */
+.ksb-spark {
+  display: none;
+  width: 100%;
+  height: 28px;
+  margin-top: 2px;
+}
+
+.ksb-module.ksb-span-2 .ksb-spark {
+  display: block;
+}
+
+.ksb-spark-input { color: var(--ksb-text-tertiary); }
+.ksb-spark-output { color: var(--ksb-green); }
+.ksb-spark-cache { color: var(--ksb-orange); }
+.ksb-spark-speed { color: var(--ksb-accent); }
+.ksb-spark-duration { color: var(--ksb-text-secondary); }
+
+.ksb-spark-line {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5px;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+/* 面积填充色由 SVG 属性里的渐变 url 提供（渐停点用 currentColor），
+   这里不能再写 fill，否则 CSS 会覆盖属性、渐隐失效 */
+.ksb-spark-area {
+  opacity: 0.08;
+}
+
+.ksb-spark-dot {
+  fill: currentColor;
+}
+
+.ksb-spark-hit {
+  pointer-events: all;
+}
+
+/* 节点悬浮提示：竖线（上下渐隐，stroke 由渐变 url 提供）+ 节点圆点，默认隐藏 */
+.ksb-spark-pt-line {
+  stroke-width: 1px;
+  vector-effect: non-scaling-stroke;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.ksb-spark-pt-dot {
+  fill: currentColor;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.ksb-spark-pt:hover .ksb-spark-pt-line {
+  opacity: 0.35;
+}
+
+.ksb-spark-pt:hover .ksb-spark-pt-dot {
+  opacity: 1;
+}
+
+/* 整宽统计模块：标签左、数字右，同一行（与消耗量整宽一致），顶部对齐 */
+.ksb-module.ksb-span-2 .ksb-stat {
+  flex-direction: row;
+  /* 基线对齐：右侧数值字号大（14px vs 10px），flex-start 顶对齐会因大行高显得下沉 */
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+/* --- 消耗量图表模块：标签行 + 柱图（本日/7 日/30 日三档） --- */
+.ksb-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ksb-chart-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  /* 命名容器：缓存命中的全称/百分比降级按图表头行实际宽度计算，
+     与 .ksb-quota-group 的 ksb-quota 同范式（实测：全称最坏需
+     标签 38 + 间距 6 + 文本 75 ≈ 119px，短版需 ≈ 77px） */
+  container: ksb-chart / inline-size;
+}
+
+/* 整宽：标签行与总量同行、总量右对齐，下方画柱图 */
+.ksb-module.ksb-span-2 .ksb-chart {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: flex-start;
+  column-gap: 6px;
+}
+
+.ksb-module.ksb-span-2 .ksb-chart-bars {
+  grid-column: 1 / -1;
+}
+
+/* 半宽：与指标模块一致（标签行在上、数字在下），不画柱图；命中率紧随标签左对齐 */
+.ksb-module:not(.ksb-span-2) .ksb-chart {
+  gap: 1px;
+}
+
+.ksb-module:not(.ksb-span-2) .ksb-chart-bars {
+  display: none;
+}
+
+/* 长期统计未连接本地 CLI：只锁定消耗量模块，其他实时指标照常工作。 */
+.ksb-cli-lock {
+  display: none;
+  width: 100%;
+  min-height: 44px;
+  padding: 5px 8px;
+  /* 虚线描边用主题蓝色，与待授权横幅的红色虚线同一格式 */
+  border: 1px dashed var(--ksb-accent);
+  border-radius: 7px;
+  background: var(--ksb-fill-1);
+  color: var(--ksb-accent);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ksb-cli-lock:hover {
+  background: var(--ksb-accent-bg);
+}
+
+.ksb-cli-lock span,
+.ksb-cli-lock small {
+  display: block;
+}
+
+.ksb-cli-lock span {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.ksb-cli-lock small {
+  margin-top: 1px;
+  color: var(--ksb-text-quaternary);
+  font-size: 9px;
+}
+
+.ksb-module.ksb-cli-required .ksb-chart {
+  display: none;
+}
+
+.ksb-module.ksb-cli-required .ksb-cli-lock {
+  display: block;
+}
+
+.ksb-module:not(.ksb-span-2) .ksb-cli-lock {
+  min-height: 0;
+  padding: 3px 6px;
+  border: none;
+  background: transparent;
+}
+
+.ksb-module:not(.ksb-span-2) .ksb-cli-lock small {
+  display: none;
+}
+
+.ksb-chart-total {
+  font-size: 14px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--ksb-text);
+  white-space: nowrap;
+}
+
+.ksb-chart-hit {
+  min-width: 0;
+  font-size: 10px;
+  color: var(--ksb-text-quaternary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 缓存命中渐进降级：头行宽→全称；放不下→只留百分比；极窄→整体隐藏。
+   断点按图表头行实际宽度（命名容器 ksb-chart），不再按模块跨度和
+   整面板宽度——实测侧栏整宽头行仅 107px，全称最坏需 124px，故默认
+   布局即落短版；ellipsis 仅作最后防线，正常不触发 */
+.ksb-chart-hit-short {
+  display: none;
+}
+
+@container ksb-chart (max-width: 124px) {
+  .ksb-chart-hit-full {
+    display: none;
+  }
+  .ksb-chart-hit-short {
+    display: inline;
+  }
+}
+
+@container ksb-chart (max-width: 78px) {
+  .ksb-chart-hit {
+    display: none;
+  }
+}
+
+/* 编辑模式下放开裁切：拖出区域边界时模块不被 region-full 的 overflow 盖住 */
+#ksb-widget.ksb-editing .ksb-region-full {
+  overflow: visible;
+}
+
+.ksb-chart-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 26px;
+}
+
+.ksb-chart-col {
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  height: 100%;
+  min-width: 0;
+}
+
+.ksb-chart-stack {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+.ksb-chart-bar {
+  width: 100%;
+  border-radius: 1px;
+  background: var(--ksb-accent);
+  opacity: 0.35;
+  transition: opacity 120ms ease;
+}
+
+/* 主/子代理堆叠：主代理淡蓝在底、子代理淡绿叠上，悬停加深 */
+.ksb-chart-bar.flat {
+  border-radius: 0;
+}
+
+.ksb-chart-bar.sub {
+  border-radius: 1px 1px 0 0;
+  background: var(--ksb-green);
+}
+
+.ksb-chart-col:hover .ksb-chart-bar {
+  opacity: 1;
+}
+
+/* --- 外部账户模块 --- */
+.ksb-external-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ksb-external-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--ksb-text-tertiary);
+  white-space: nowrap;
+}
+
+.ksb-external-row.ksb-clickable,
+.ksb-external-stat[data-url] {
+  cursor: pointer;
+}
+
+.ksb-external-row.ksb-clickable:hover .ksb-external-name {
+  color: var(--ksb-text);
+}
+
+/* 外部账户行：名称在左、数值在右。**过窄时的降级阶梯（顺序固定，用 flex 优先级实现）**——
+   ① 类型前缀（API余额 / 5小时 等）先压没：数值区整体让位优先（shrink 100），
+      区内前缀又比数字先让（同样 100）；
+   ② 还不够时账户名称尾部省略（shrink 1，优先级最低）；
+   ③ 数字与单位一步不让（.ksb-external-amount，shrink 0 + nowrap）。
+   别改成「名称数值各shrink 1」——那会按比例同时压缩，数字被挤掉（真实踩过）。 */
+.ksb-external-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ksb-text-secondary);
+}
+
+.ksb-external-value {
+  font-family: var(--ksb-mono);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  flex: 0 100 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.ksb-external-kind {
+  flex: 0 100 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ksb-text-quaternary);
+}
+
+.ksb-external-amount {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.ksb-external-sep {
+  flex: 0 0 auto;
+}
+
+.ksb-external-value.err {
+  color: var(--ksb-danger);
+}
+
+/* 面板本身就过窄时直接隐藏类型前缀（阶梯第 ① 级；行内挤压由上面的 flex 优先级兜） */
+@container (max-width: 160px) {
+  .ksb-external-kind {
+    display: none;
+  }
+}
+
+.ksb-external-empty {
+  font-size: 10px;
+  color: var(--ksb-text-quaternary);
+}
+
+/* 整宽显示账户列表，半宽显示首个账户的大数字形态 */
+.ksb-module.ksb-span-2 .ksb-external-stat {
+  display: none;
+}
+
+.ksb-module:not(.ksb-span-2) .ksb-external-full {
+  display: none;
+}
+
+/* --- 子代理总览模块：一行一个代理 --- */
+/* 标题行与数据行共用同一组列宽：名称列先收缩，再窄则由模块 overflow 整体裁切（遮罩式）。
+   font-size 必须与数据行一致（10px），否则 ch 列宽不同导致列头错位 */
+.ksb-agents {
+  width: 100%;
+  overflow: hidden;
+}
+
+.ksb-agents-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 6ch 6ch 5ch;
+  column-gap: 4px;
+  align-items: baseline;
+  margin-bottom: 3px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.ksb-agents-head .ksb-quota-label {
+  grid-column: 1 / 3;
+}
+
+.ksb-agents-head .ksb-agent-metric {
+  font-size: 9px;
+  color: var(--ksb-text-quaternary);
+}
+
+.ksb-agents-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* 子代理表格：名称列先收缩，再窄时整体被模块边界裁切（遮罩式，不逐列处理） */
+.ksb-agent-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 6ch 6ch 5ch;
+  align-items: center;
+  column-gap: 4px;
+  font-size: 10px;
+  color: var(--ksb-text-tertiary);
+  white-space: nowrap;
+}
+
+.ksb-agent-metric {
+  font-family: var(--ksb-mono);
+  text-align: right;
+  overflow: hidden;
+}
+
+/* 代理徽标：常态灰底灰字；对应代理工作时点亮（主淡蓝、子淡绿） */
+.ksb-agent-badge {
+  /* 「主」占一个字符宽，「子3」这类带序号的子代理章自动撑宽（同模型多实例时区分） */
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  box-sizing: border-box;
+  border-radius: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  color: var(--ksb-text-tertiary);
+  background: var(--ksb-fill-2);
+  transition: background-color 300ms ease;
+}
+
+.ksb-agent-badge.main.on {
+  background: rgba(23, 131, 255, 0.16);
+}
+
+.ksb-agent-badge.sub.on {
+  background: rgba(22, 196, 86, 0.18);
+}
+
+.ksb-agent-badge.sub.on {
+  background: rgba(22, 196, 86, 0.18);
+}
+
+/* 名称列：深灰以便与数字区分；紧贴徽标，窄了直接被裁切（遮罩式，无省略号） */
+.ksb-agent-model {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ksb-text-secondary);
+}
+
+.ksb-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.ksb-stat-label {
+  font-size: 10px;
+  color: var(--ksb-text-tertiary);
+  white-space: nowrap;
+}
+
+.ksb-stat-value {
+  font-size: 14px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--ksb-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* --- 速度标签旁的次级信息（上轮耗时） --- */
+.ksb-stat-sub {
+  /* 介于带圆点的宽距和缩窄后的 3px 之间的折中间距 */
+  margin-left: 5px;
+  color: var(--ksb-text-quaternary);
+  font-variant-numeric: tabular-nums;
+}
+
+.ksb-duration-word {
+  margin-right: 3px;
+}
+
+/* 宽度不足时去掉「· 上轮」字样，只留耗时数字 */
+@container (max-width: 179px) {
+  .ksb-duration-word {
+    display: none;
+  }
+}
+
+/* --- 减少动态效果偏好 --- */
+@media (prefers-reduced-motion: reduce) {
+  #ksb-widget {
+    transition: none;
+  }
+  .ksb-progress-fill,
+  .ksb-pace {
+    transition: none;
+  }
+  .ksb-region-full,
+  .ksb-auth-banner {
+    transition: none;
+  }
+  .ksb-status-dot.ksb-dot-work,
+  .ksb-stat-refresh.spinning {
+    animation: none;
+  }
+  .ksb-pet-status[data-status="thinking"],
+  .ksb-pet-status[data-status="replying"] {
+    animation: none;
+  }
+  #ksb-walk .ksb-walk-spot,
+  #ksb-walk .ksb-walk-bubble {
+    transition: none;
+    animation: none;
+  }
+}
+
+/* ===== 新手引导：分步气泡（高亮目标 + 说明气泡 + 箭头） ===== */
+#ksb-walk {
+  --ksb-text: rgba(0, 0, 0, 0.9);
+  --ksb-text-secondary: rgba(0, 0, 0, 0.6);
+  --ksb-text-tertiary: rgba(0, 0, 0, 0.45);
+  --ksb-text-quaternary: rgba(0, 0, 0, 0.3);
+  --ksb-fill-2: rgba(0, 0, 0, 0.05);
+  --ksb-surface: #ffffff;
+  --ksb-border: rgba(0, 0, 0, 0.13);
+  --ksb-accent: #1783ff;
+  --ksb-accent-hover: rgba(22, 127, 247, 1);
+  --ksb-green: #16c456;
+  --ksb-danger: #ff3849;
+  /* 规范 --shadow-md；暗色下覆盖为深色版本 */
+  --ksb-shadow: 0 4px 12px rgba(16, 24, 40, 0.07), 0 2px 4px rgba(16, 24, 40, 0.05);
+
+  position: fixed;
+  inset: 0;
+  /* 规范 --z-max；注入第三方页面需要压过宿主浮层 */
+  z-index: 9999;
+  /* 继承宿主页面字体，与 Kimi Web 保持一致 */
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ksb-text-secondary);
+}
+
+html[data-color-scheme="dark"] #ksb-walk {
+  --ksb-text: rgba(255, 255, 255, 0.84);
+  --ksb-text-secondary: rgba(255, 255, 255, 0.56);
+  --ksb-text-tertiary: rgba(255, 255, 255, 0.42);
+  --ksb-text-quaternary: rgba(255, 255, 255, 0.3);
+  --ksb-fill-2: rgba(255, 255, 255, 0.1);
+  --ksb-surface: #292929;
+  --ksb-border: rgba(255, 255, 255, 0.12);
+  --ksb-accent: #1a88ff;
+  --ksb-accent-hover: rgba(37, 142, 255, 1);
+  --ksb-green: #16c456;
+  --ksb-danger: #ff4756;
+  --ksb-shadow: 0 4px 12px rgba(0, 0, 0, 0.3), 0 2px 4px rgba(0, 0, 0, 0.24);
+}
+
+@media (prefers-color-scheme: dark) {
+  html[data-color-scheme="system"] #ksb-walk,
+  html:not([data-color-scheme]) #ksb-walk {
+    --ksb-text: rgba(255, 255, 255, 0.84);
+    --ksb-text-secondary: rgba(255, 255, 255, 0.56);
+    --ksb-text-tertiary: rgba(255, 255, 255, 0.42);
+    --ksb-text-quaternary: rgba(255, 255, 255, 0.3);
+    --ksb-fill-2: rgba(255, 255, 255, 0.1);
+    --ksb-surface: #292929;
+    --ksb-border: rgba(255, 255, 255, 0.12);
+    --ksb-accent: #1a88ff;
+    --ksb-accent-hover: rgba(37, 142, 255, 1);
+    --ksb-green: #16c456;
+    --ksb-danger: #ff4756;
+    --ksb-shadow: 0 4px 12px rgba(0, 0, 0, 0.3), 0 2px 4px rgba(0, 0, 0, 0.24);
+  }
+}
+
+#ksb-walk * {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* 目标高亮框：巨大投影把页面其余部分压暗，自身随步骤切换平滑移动 */
+#ksb-walk .ksb-walk-spot {
+  position: fixed;
+  border: 1.5px solid var(--ksb-accent);
+  border-radius: 8px;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
+  transition: left 200ms ease, top 200ms ease, width 200ms ease, height 200ms ease;
+}
+
+#ksb-walk .ksb-walk-bubble {
+  position: fixed;
+  width: 252px;
+  padding: 12px 14px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--ksb-border);
+  background: var(--ksb-surface);
+  box-shadow: var(--ksb-shadow);
+  animation: ksb-walk-in 200ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+@keyframes ksb-walk-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* 箭头：默认在气泡左缘指向目标；气泡被挤到目标左侧时（.ksb-walk-flip）翻到右缘 */
+#ksb-walk .ksb-walk-bubble::before {
+  content: '';
+  position: absolute;
+  top: var(--ksb-walk-arrow-y, 24px);
+  left: -5px;
+  width: 9px;
+  height: 9px;
+  background: var(--ksb-surface);
+  border-left: 1px solid var(--ksb-border);
+  border-bottom: 1px solid var(--ksb-border);
+  transform: translateY(-50%) rotate(45deg);
+}
+
+#ksb-walk .ksb-walk-bubble.ksb-walk-flip::before {
+  left: auto;
+  right: -5px;
+  border-left: none;
+  border-bottom: none;
+  border-right: 1px solid var(--ksb-border);
+  border-top: 1px solid var(--ksb-border);
+}
+
+#ksb-walk .ksb-walk-step {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--ksb-text-quaternary);
+  margin-bottom: 3px;
+}
+
+#ksb-walk .ksb-walk-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ksb-text);
+  margin-bottom: 4px;
+}
+
+#ksb-walk b {
+  font-weight: 600;
+  color: var(--ksb-text);
+}
+
+#ksb-walk .ksb-walk-hl {
+  color: var(--ksb-accent);
+  font-weight: 700;
+}
+
+/* 模块化三区域图例：色点与编辑模式描边颜色一一对应 */
+#ksb-walk .ksb-walk-zones {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+#ksb-walk .ksb-walk-zone {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+#ksb-walk .ksb-walk-zone i {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 3px;
+  transform: translateY(1px);
+}
+
+#ksb-walk .ksb-walk-zone.z-gray i { background: var(--ksb-text-quaternary); }
+#ksb-walk .ksb-walk-zone.z-blue i { background: var(--ksb-accent); }
+#ksb-walk .ksb-walk-zone.z-green i { background: var(--ksb-green); }
+
+#ksb-walk .ksb-walk-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 10px;
+}
+
+#ksb-walk .ksb-walk-skip {
+  padding: 4px 6px;
+  border: none;
+  background: none;
+  color: var(--ksb-text-tertiary);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+#ksb-walk .ksb-walk-skip:hover {
+  color: var(--ksb-text-secondary);
+}
+
+#ksb-walk .ksb-walk-next {
+  padding: 5px 12px;
+  border: none;
+  border-radius: 7px;
+  background: var(--ksb-accent);
+  color: #ffffff;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 150ms ease, transform 120ms ease;
+}
+
+#ksb-walk .ksb-walk-next:hover {
+  background: var(--ksb-accent-hover);
+}
+
+#ksb-walk .ksb-walk-next:active {
+  transform: scale(0.97);
+}
+/* ===== 宠物模块：吉祥物 + 状态气泡 + 24h 消耗 ===== */
+.ksb-pet {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* 画板自带留白：放大 ~1.55 倍后负边距居中，球视觉撑满 51px 框（全宽统一高度）；
+   裁切设为 visible——大摆幅动画（摇一摇等）允许越出边界，不被切 */
+.ksb-pet-clip {
+  width: 51px;
+  height: 51px;
+  flex-shrink: 0;
+  overflow: visible;
+}
+
+.ksb-pet-canvas {
+  display: block;
+  width: 79px;
+  height: 79px;
+  margin: -14px 0 0 -14px;
+  cursor: pointer;
+  opacity: 1;
+  filter: none;
+  /* 颜色瞬时切换：filter 从 none 过渡到 hue-rotate(190deg) 会经过红色，
+     缓存提醒会出现「先闪红再变黄」。只保留透明度过渡。 */
+  transition: opacity 180ms ease;
+}
+
+/* 动作由 Rive 命名动画控制；灰/红仅作为独立语义外观，移除后立即恢复默认蓝。 */
+.ksb-pet-canvas[data-appearance="gray"] {
+  filter: grayscale(1) saturate(0.2);
+  opacity: 0.72;
+}
+
+.ksb-pet-canvas[data-appearance="red"] {
+  filter: hue-rotate(140deg) saturate(1.35);
+}
+
+/* Mini 折叠时宠物快速淡出：避免球被 region-full 的 max-height 裁切露出半张脸 */
+#ksb-widget.ksb-mini .ksb-region-full .ksb-module[data-module="pet"] {
+  opacity: 0;
+  transition: opacity 60ms ease;
+}
+
+/* 状态行：平常灰、处理中蓝色呼吸、未连接/未授权红 */
+.ksb-pet-status {
+  font-size: 10px;
+  white-space: nowrap;
+  color: var(--ksb-text-quaternary);
+  transition: color 300ms ease;
+}
+
+/* 仅两行状态（如「子代理/工作中」）时切 flex 末端对齐：
+   文字块与时钟下边缘对齐、向上延伸；单行保持原有基线对齐与右对齐 */
+/* 状态时钟：与上方数值同尺寸等宽字体，颜色/呼吸随状态行继承；
+   间距与下行标签-数值间距一致（6px） */
+.ksb-pet-clock {
+  margin-left: 6px;
+  font-family: var(--ksb-mono);
+  font-size: 14px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 半宽：时钟/计时器加到状态行上方，字号与状态文字一致（10px），
+   时钟在上、状态文字在下，右对齐 */
+.ksb-module:not(.ksb-span-2) .ksb-pet-status {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.ksb-module:not(.ksb-span-2) .ksb-pet-clock {
+  order: -1;
+  margin-left: 0;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 400;
+}
+
+/* 面板过窄（<155px）：隐藏状态文字，只留时钟/计时器，与其他降级策略一致 */
+@container (max-width: 155px) {
+  #ksb-pet-status-text { display: none; }
+  /* 最窄时去掉 AM/PM，防止时钟被挤出边框 */
+  #ksb-pet-ampm { display: none; }
+}
+
+.ksb-pet-status[data-status="thinking"],
+.ksb-pet-status[data-status="executing"],
+.ksb-pet-status[data-status="replying"] {
+  color: var(--ksb-accent);
+  animation: ksb-pet-breathe 3.2s ease-in-out infinite;
+}
+
+.ksb-pet-status[data-status="offline"],
+.ksb-pet-status[data-status="unauthorized"] {
+  color: var(--ksb-danger);
+}
+
+/* 限流中：黑色；子代理工作中：绿色 */
+.ksb-pet-status[data-status="ratelimit"] {
+  color: var(--ksb-text);
+}
+
+.ksb-pet-status[data-status="subagent"] {
+  color: var(--ksb-green);
+}
+
+@keyframes ksb-pet-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.ksb-pet-stats {
+  margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  text-align: right;
+  flex-shrink: 1;
+  min-width: 0;
+}
+
+.ksb-pet-total-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.ksb-pet-total {
+  margin-top: -2px;
+  font-size: 14px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--ksb-text);
+  white-space: nowrap;
+}
+}
+
+/* 半宽：高度对齐普通半宽模块——球缩到 32px 左对齐，数据行隐藏，
+   状态文字保留并右对齐；面板极窄时状态文字也隐藏 */
+.ksb-module:not(.ksb-span-2) .ksb-pet {
+  justify-content: flex-start;
+}
+
+.ksb-module:not(.ksb-span-2) .ksb-pet-clip {
+  width: 37px;
+  height: 37px;
+}
+
+.ksb-module:not(.ksb-span-2) .ksb-pet-canvas {
+  width: 57px;
+  height: 57px;
+  margin: -10px 0 0 -10px;
+}
+
+.ksb-module:not(.ksb-span-2) .ksb-pet-total-row {
+  display: none;
+}
+
+.ksb-module:not(.ksb-span-2) .ksb-pet-stats {
+  display: block;
+  margin-left: auto;
+}
+
+@container (max-width: 150px) {
+  .ksb-module:not(.ksb-span-2) .ksb-pet-status {
+    display: none;
+  }
+}
+
+/* ===== Codex 桌面宠物（pet/pet-sprites.js 创建，position:fixed，可拖拽停放） =====
+ * 元素本身的定位/尺寸/背景图都在 JS 内联，这里只负责状态外观 */
+.codex-roam-pet-dim {
+  filter: grayscale(1);
+  opacity: 0.45;
+}
+
+.codex-roam-pet-held {
+  cursor: grabbing;
+}
+
+/* ===== AI 回复收藏（content/bookmarks.js 注入，全部 kbm- 前缀） =====
+ * 自带色板（--kbm-*），亮暗模式跟随 Kimi Web 的主题设置（data-color-scheme），
+ * 不引用页面内部 token（页面改版时收藏功能样式不随之崩坏） */
+:root {
+  --kbm-text: #14171c;
+  --kbm-muted: #6b7280;
+  --kbm-line: #e7eaee;
+  --kbm-bg: #ffffff;
+  --kbm-hover: rgba(0, 0, 0, 0.05);
+  --kbm-accent: #1783ff;
+  --kbm-accent-soft: #e8f3ff;
+  --kbm-mark: #ff9500;
+  --kbm-danger: #c0392b;
+}
+
+html[data-color-scheme="dark"] {
+  --kbm-text: #e8eaed;
+  --kbm-muted: #9aa0a8;
+  --kbm-line: #2d333b;
+  --kbm-bg: #0d1117;
+  --kbm-hover: rgba(255, 255, 255, 0.08);
+  --kbm-accent: #58a6ff;
+  --kbm-accent-soft: rgba(88, 166, 255, 0.14);
+  --kbm-mark: #ff9f0a;
+  --kbm-danger: #f85149;
+}
+
+@media (prefers-color-scheme: dark) {
+  html[data-color-scheme="system"],
+  html:not([data-color-scheme]) {
+    --kbm-text: #e8eaed;
+    --kbm-muted: #9aa0a8;
+    --kbm-line: #2d333b;
+    --kbm-bg: #0d1117;
+    --kbm-hover: rgba(255, 255, 255, 0.08);
+    --kbm-accent: #58a6ff;
+    --kbm-accent-soft: rgba(88, 166, 255, 0.14);
+    --kbm-mark: #ff9f0a;
+    --kbm-danger: #f85149;
+  }
+}
+
+/* AI 回复底部控件行里的星标按钮：与复制按钮完全同款
+   （桌面端复制按钮为 2px/5px 内距、14px 字阶、block 图标；
+   8px/10px 负边距那条只在触屏 @media(hover:none) 生效。
+   2px 负外边距收紧与复制之间的可见间距） */
+.kbm-star {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 2px 5px;
+  margin: 0 -2px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--kbm-muted);
+  opacity: 0.7;
+  cursor: pointer;
+  transition: opacity 0.12s, color 0.12s, background 0.12s;
+}
+.kbm-star svg {
+  display: block;
+  flex: none;
+}
+.kbm-star:hover { opacity: 1; color: var(--kbm-text); background: var(--kbm-hover); }
+.kbm-star.on { color: var(--kbm-mark); opacity: 1; }
+
+/* 星标的深色小 tooltip（与页面复制按钮的 tooltip 同款观感） */
+.kbm-tip {
+  position: fixed;
+  z-index: 9999;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+  background: var(--kbm-text);
+  color: var(--kbm-bg);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+}
+
+/* 右侧目录注入的收藏行：结构复用官方 .toc-row，小竖条换绿色 */
+.kbm-toc-row .toc-bar { background: var(--kbm-mark) !important; }
+
+/* 侧栏「收藏」入口：与「新建对话 / 搜索」完全同款（8px 内距、6px 圆角、
+   正文色、13px/500、tight 行高、icon 14px 下沉 0.5px 对齐） */
+.kbm-side-btn {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--kbm-text);
+  font-family: "Inter Variable", Inter, "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.25;
+  text-align: left;
+  cursor: pointer;
+}
+.kbm-side-btn svg {
+  flex: none;
+  display: block;
+  transform: translateY(-0.5px);
+}
+.kbm-side-btn:hover { background: var(--kbm-hover); }
+
+/* 收藏页面：固定覆盖主区（左缘由 JS 贴侧栏右边线） */
+#kbm-page {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 60;
+  display: none;
+  flex-direction: column;
+  background: var(--kbm-bg);
+  color: var(--kbm-text);
+  font-family: "Inter Variable", Inter, "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+#kbm-page.open { display: flex; }
+
+.kbm-page-head {
+  padding: 20px 24px 0;
+}
+/* 内容列与会话页同宽逻辑：760px 上限居中，窄窗口随宽度收缩 */
+.kbm-wrap {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  box-sizing: border-box;
+  padding: 0 24px;
+}
+.kbm-page-title {
+  font-size: 18px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.kbm-page-count {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--kbm-muted);
+}
+
+/* 工具条：左侧显示相关（视图分段控件 + 分组 + 排序），右侧操作（管理） */
+.kbm-toolbar {
+  padding: 10px 24px;
+  border-bottom: 1px solid var(--kbm-line);
+}
+.kbm-toolbar-in {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.kbm-toolbar-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.kbm-seg {
+  display: inline-flex;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--kbm-hover);
+}
+.kbm-seg-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--kbm-muted);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  padding: 4px 14px;
+  border-radius: 6px;
+}
+.kbm-seg-btn.on {
+  background: var(--kbm-bg);
+  color: var(--kbm-text);
+  font-weight: 500;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+.kbm-view-btn,
+.kbm-manage,
+.kbm-select-all,
+.kbm-delete,
+.kbm-export {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--kbm-muted);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  padding: 5px 10px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.kbm-view-btn:hover,
+.kbm-manage:hover,
+.kbm-select-all:hover,
+.kbm-export:hover { background: var(--kbm-hover); }
+.kbm-view-btn.on { color: var(--kbm-accent); font-weight: 500; }
+.kbm-delete { color: var(--kbm-danger); }
+.kbm-delete:hover { background: var(--kbm-hover); }
+.kbm-delete:disabled { opacity: 0.5; cursor: default; }
+.kbm-close {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--kbm-muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 6px;
+}
+.kbm-close:hover { background: var(--kbm-hover); }
+
+/* 批量管理模式条 */
+.kbm-manage-bar {
+  border-bottom: 1px solid var(--kbm-line);
+}
+.kbm-manage-in {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 8px 24px;
+}
+.kbm-manage-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.kbm-check,
+.kbm-check-all {
+  accent-color: var(--kbm-mark);
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.kbm-page-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0 32px;
+}
+.kbm-empty {
+  padding: 48px 0;
+  text-align: center;
+  color: var(--kbm-muted);
+  font-size: 13px;
+}
+/* 卡片视图的网格容器里，空态占满整行居中（否则只落在第一张卡片的位置） */
+.kbm-cards .kbm-empty {
+  grid-column: 1 / -1;
+}
+
+/* 列表视图：每条 = 元信息行（会话 + 日期）+ 完整内容 */
+.kbm-item {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 16px;
+  margin: 0 0 10px;
+  background: var(--kbm-bg);
+  border: 1px solid var(--kbm-line);
+  border-radius: 12px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: border-color 0.15s ease;
+}
+.kbm-item:hover { border-color: var(--kbm-muted); }
+.kbm-item .kbm-check { margin-top: 2px; flex: none; }
+.kbm-item-main { flex: 1; min-width: 0; }
+.kbm-item-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+.kbm-item-session {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--kbm-muted);
+}
+.kbm-item-date {
+  font-size: 12px;
+  color: var(--kbm-muted);
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+.kbm-item-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.55;
+}
+.kbm-item-remove {
+  position: absolute;
+  right: 12px;
+  top: 10px;
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--kbm-muted);
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 6px;
+  font-size: 11px;
+  opacity: 0;
+}
+/* 元信息行给 ✕ 留位，正文不受影响 */
+.kbm-item-meta { padding-right: 20px; }
+.kbm-item:hover .kbm-item-remove { opacity: 1; }
+.kbm-item-remove:hover { color: var(--kbm-danger); }
+
+/* 分组头（按会话分组时）：大号标题 + 计数胶囊 + 列表视图组间分隔线 */
+.kbm-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 20px 0 8px;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--kbm-text);
+}
+
+.kbm-wrap .kbm-group + .kbm-group {
+  margin-top: 28px;
+}
+
+/* 卡片视图：统一尺寸卡片网格（全宽铺开，不随列表的 760 居中列） */
+.kbm-wide {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0 24px;
+}
+.kbm-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+  padding-top: 16px;
+  padding-bottom: 32px;
+}
+/* 分组时：组块占满整行，组内卡片仍按同一网格排布 */
+.kbm-cards .kbm-group {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+}
+.kbm-cards .kbm-group-head {
+  grid-column: 1 / -1;
+}
+.kbm-card {
+  position: relative;
+  background: var(--kbm-bg);
+  border: 1px solid var(--kbm-line);
+  border-radius: 12px;
+  padding: 12px 16px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: border-color 0.15s ease;
+}
+.kbm-card:hover { border-color: var(--kbm-muted); }
+.kbm-card .kbm-check {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+}
+.kbm-card-remove {
+  top: 8px;
+  right: 8px;
+}
+.kbm-card:hover .kbm-card-remove { opacity: 1; }
+.kbm-card-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding-right: 20px;
+}
+/* 内容区固定 6 行高：所有卡片一样大；超出部分截断 */
+.kbm-card-text {
+  height: 124px;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.55;
+}
+/* 超长内容加底部渐隐（只加在超过阈值的卡片上） */
+.kbm-card-text.kbm-clamped {
+  -webkit-mask-image: linear-gradient(to bottom, #000 70%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 70%, transparent 100%);
+}
+
+/* 列表视图右侧快速目录：细条常态、hover 展开标题、当前位置高亮 */
+.kbm-page-toc {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  /* 贴 760 内容列的右缘（列半宽 380 + 间隙），与会话页目录一致 */
+  left: calc(50% + 394px);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 60%;
+  overflow-y: auto;
+  scrollbar-width: none;
+  z-index: 2;
+}
+.kbm-page-toc::-webkit-scrollbar {
+  display: none;
+}
+.kbm-toc-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--kbm-muted);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.kbm-toc-bar {
+  flex: none;
+  width: 3px;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--kbm-mark);
+  opacity: 0.3;
+  transition: opacity 0.12s, height 0.12s;
+}
+.kbm-page-toc:hover .kbm-toc-bar {
+  height: 18px;
+  opacity: 0.5;
+}
+.kbm-toc-session .kbm-toc-bar {
+  background: var(--kbm-muted);
+}
+.kbm-toc-row.on { color: var(--kbm-text); }
+.kbm-toc-row.on .kbm-toc-bar {
+  opacity: 1;
+  height: 18px;
+}
+.kbm-toc-label {
+  display: block;
+  max-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  text-overflow: ellipsis;
+  transition: max-width 0.22s ease, opacity 0.12s;
+}
+.kbm-page-toc:hover .kbm-toc-label {
+  max-width: 240px;
+  opacity: 1;
+}
+@media (max-width: 900px) {
+  .kbm-page-toc { display: none; }
+}
+
+/* 卡片详情弹层：遮罩 + 居中卡片（参考搜索弹层：淡入 + 轻微上浮缩放的过渡） */
+#kbm-detail {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 12vh 24px 24px;
+  box-sizing: border-box;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.18s cubic-bezier(0.16, 1, 0.3, 1), visibility 0s linear 0.18s;
+}
+#kbm-detail.open {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.kbm-detail-card {
+  width: 100%;
+  max-width: 640px;
+  max-height: 76vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--kbm-bg);
+  border: 1px solid var(--kbm-line);
+  border-radius: 16px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+  transform: translateY(10px) scale(0.97);
+  opacity: 0;
+  transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+#kbm-detail.open .kbm-detail-card {
+  transform: none;
+  opacity: 1;
+}
+.kbm-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px 10px;
+}
+.kbm-detail-title {
+  font-size: 15px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.kbm-detail-close {
+  flex: none;
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--kbm-muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 6px;
+}
+.kbm-detail-close:hover { background: var(--kbm-hover); }
+.kbm-detail-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 20px 8px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.kbm-detail-label {
+  margin: 10px 0 4px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--kbm-muted);
+}
+.kbm-detail-q {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--kbm-hover);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.kbm-detail-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* markdown 还原模式：交还给 app 自己的正文样式（标题/加粗/代码块等） */
+.kbm-detail-text.kbm-md,
+.kbm-item-text.kbm-md,
+.kbm-card-text.kbm-md {
+  white-space: normal;
+}
+/* 列表/卡片里的 markdown 适当收敛字号，避免标题过大撑破布局 */
+.kbm-item-text.kbm-md :is(h1, h2, h3, h4),
+.kbm-card-text.kbm-md :is(h1, h2, h3, h4) {
+  font-size: 1.1em;
+  margin: 0.5em 0 0.3em;
+}
+.kbm-item-text.kbm-md p,
+.kbm-card-text.kbm-md p {
+  margin: 0.35em 0;
+}
+.kbm-item-text.kbm-md pre,
+.kbm-card-text.kbm-md pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.kbm-detail-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--kbm-line);
+}
+.kbm-detail-jump {
+  flex: none;
+  appearance: none;
+  border: none;
+  background: var(--kbm-accent, #1783ff) !important;
+  color: #ffffff !important;
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  padding: 7px 16px;
+  border-radius: 8px;
+}
+.kbm-detail-jump:hover { opacity: 0.9; }
+
+/* 跳转命中轮的闪烁高亮 */
+@keyframes kbm-flash-bg {
+  0% { background: var(--kbm-accent-soft); }
+  100% { background: transparent; }
+}
+.kbm-flash {
+  animation: kbm-flash-bg 1.8s ease-out;
+  border-radius: 8px;
+}
+
+/* ===== 缓存提醒（content/cache-hint.js） =====
+ * 29–30 分钟进入 warn：宠物持续黄/琥珀（与警示文案同色），四槽显示缓存文案；
+ * 30 分钟恢复常规外观。文字只复用宠物模块现有四槽，不弹气泡。 */
+.ksb-pet-canvas.ksb-cache-hot {
+  /* 不能直接过渡 filter：蓝→黄会经过红色。先褪色到灰、在灰态转色相、
+     再上饱和，全程不经过红；420ms 接近一次呼吸。 */
+  animation: ksb-cache-tint 360ms ease-out both;
+}
+
+@keyframes ksb-cache-tint {
+  0% { filter: none; }
+  12% { filter: hue-rotate(0deg) saturate(0); }
+  24% { filter: hue-rotate(190deg) saturate(0); }
+  100% { filter: hue-rotate(190deg) saturate(1.45) brightness(1.05); }
+}
+
+.ksb-pet-total.ksb-cache-state {
+  font-size: 14px;
+  letter-spacing: 0;
+  font-variant-numeric: normal;
+  color: var(--ksb-text);
+}
+
+.ksb-pet-total.ksb-cache-state.ksb-cache-warn {
+  color: #b26a00;
+  animation: ksb-cache-pulse 1.8s ease-in-out infinite;
+}
+
+.ksb-pet-status.ksb-cache-warn {
+  color: #b26a00;
+}
+
+@keyframes ksb-cache-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ksb-pet-total.ksb-cache-state.ksb-cache-warn {
+    animation: none;
+  }
+  .ksb-pet-canvas.ksb-cache-hot {
+    animation: none;
+    filter: hue-rotate(190deg) saturate(1.45) brightness(1.05);
+  }
+}
+
+/* 缓存提醒接管时余额刷新图标只隐身、不消失，保持标签行宽度 */
+.ksb-stat-refresh.ksb-cache-hide-refresh {
+  visibility: hidden;
+}
+
+/* 侧栏会话列表的相对时间：25–29 分钟标黄，不用盯着面板也能看到 */
+[data-session-id] .ksb-cache-idle-warn {
+  color: #b26a00 !important;
+}
+
+html[data-color-scheme="dark"] [data-session-id] .ksb-cache-idle-warn {
+  color: #ffb020 !important;
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-color-scheme]) [data-session-id] .ksb-cache-idle-warn {
+    color: #ffb020 !important;
+  }
+}
+
+/* 深色主题下把警示橙提亮，避免 #b26a00 在深底上发闷 */
+html[data-color-scheme="dark"] .ksb-pet-total.ksb-cache-state.ksb-cache-warn,
+html[data-color-scheme="dark"] .ksb-pet-status.ksb-cache-warn {
+  color: #ffb020;
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-color-scheme]) .ksb-pet-total.ksb-cache-state.ksb-cache-warn,
+  html:not([data-color-scheme]) .ksb-pet-status.ksb-cache-warn {
+    color: #ffb020;
+  }
+}
