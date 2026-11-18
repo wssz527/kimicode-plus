@@ -660,8 +660,11 @@ export const api = {
     get: (id: string) => request<PluginRecord>(`/plugins/${encodeURIComponent(id)}`),
     enable: (id: string) => request<PluginRecord>(`/plugins/${encodeURIComponent(id)}/enable`, { method: "POST", body: {} }),
     disable: (id: string) => request<PluginRecord>(`/plugins/${encodeURIComponent(id)}/disable`, { method: "POST", body: {} }),
-    uninstall: (id: string) =>
-      request<{ id: string; uninstalled: boolean }>(`/plugins/${encodeURIComponent(id)}/uninstall`, { method: "POST", body: {} }),
+    uninstall: (id: string, options?: { deleteData?: boolean }) =>
+      request<{ id: string; uninstalled: boolean }>(`/plugins/${encodeURIComponent(id)}/uninstall`, {
+        method: "POST",
+        body: options?.deleteData ? { deleteData: true } : {},
+      }),
     preview: (root: string) => request<PluginPreview>("/plugins/preview", { method: "POST", body: { root } }),
     install: (root: string, capabilities: string[]) =>
       request<PluginRecord>("/plugins/install", { method: "POST", body: { root, capabilities } }),

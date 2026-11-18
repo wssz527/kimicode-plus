@@ -165,7 +165,7 @@ func TestExampleHelloRemovedFromBundledKeepsExistingInstallAndRefusesRestore(t *
 	if _, ok := cur.Get("kimicode-plus.example-hello"); !ok {
 		t.Fatal("upgrade should preserve previously installed example-hello")
 	}
-	for _, id := range []string{"kimicode-plus.monitor", "kimicode-plus.planner", "kimicode-plus.kct"} {
+	for _, id := range []string{"kimicode-plus.monitor", "kimicode-plus.planner", "kimicode-plus.kct", "kimicode-plus.scheduler"} {
 		item, ok := cur.Get(id)
 		if !ok {
 			t.Fatalf("missing bundled plugin %s", id)

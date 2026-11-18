@@ -126,7 +126,9 @@ function setIcon(element: Element, icon: string | undefined): void {
   svg.setAttribute("stroke-width", "1.6");
   svg.setAttribute("stroke-linecap", "round");
   svg.setAttribute("stroke-linejoin", "round");
-  svg.innerHTML = '<path d="' + icon + '"></path>';
+  const path = element.ownerDocument.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", icon);
+  svg.replaceChildren(path);
 }
 
 function removeShortcuts(element: Element): void {

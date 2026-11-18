@@ -232,6 +232,17 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 			return nil, err
 		}
 	}
+	if strings.HasPrefix(action, "schedule.") {
+		input, err := decodeObject(payload)
+		if err != nil {
+			return nil, err
+		}
+		delete(input, "pluginOwner")
+		input["pluginOwner"] = id
+		if nativePayload, err = json.Marshal(input); err != nil {
+			return nil, err
+		}
+	}
 	if action == "handoff.commit" {
 		input, err := decodeObject(payload)
 		if err != nil {

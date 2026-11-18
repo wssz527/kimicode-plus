@@ -136,6 +136,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
    */
   function eventScopeGranted(granted: string[], scope: string): boolean {
     if (scope === "cache" || scope === "automation") return granted.includes("metrics:read");
+    if (scope === "schedule") return granted.includes("schedule:manage");
     if (scope.startsWith("session:")) return granted.includes("sessions:read");
     if (scope.startsWith("planner:")) return granted.includes("planner:run");
     return false;
@@ -163,6 +164,10 @@ export function createPluginRuntime(options: RuntimeOptions) {
           const answer = await bridge.call<{ id: string }>("sessions.open", { id: sessionId });
           if (!options.openSession) throw new PluginError(409, "PLUGIN_SESSION_UNAVAILABLE", "当前宿主不能打开官方会话");
           await options.openSession(answer.id);
+        },
+        activeId(): string {
+          requireGrant(granted, "sessions:read", "sessions.activeId");
+          return options.activeSession?.() || "";
         },
         async history(input: { id: string; beforeOrdinal?: number; pageSize?: number; agentId?: string }): Promise<SessionHistoryPage> {
           requireGrant(granted, "sessions:history", "sessions.history");

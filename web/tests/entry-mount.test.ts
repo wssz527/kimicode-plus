@@ -127,7 +127,7 @@ test("one ui:entry plan reaches the session-info available group, the panel empt
   assert.ok(entry.classList.contains("sit-available"));
   // The official scoped attribute is copied, so the official CSS still applies.
   assert.equal(entry.getAttribute("data-v-test"), "");
-  assert.match(entry.querySelector("svg")?.innerHTML ?? "", /<path d="/);
+  assert.equal(entry.querySelector("svg path")?.getAttribute("d"), ICON);
   assert.equal(entry.querySelector(".sit-name")?.textContent, "规划");
   assert.equal(entry.listenerCount(), 1);
 });

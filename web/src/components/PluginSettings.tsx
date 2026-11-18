@@ -20,6 +20,12 @@ const CAPABILITY_LABELS: Record<string, { title: string; detail: string }> = {
   "ui:settings": { title: "在插件页提供设置", detail: "在插件详情里增加一个设置子页。" },
   "ui:thinking": { title: "装饰思考内容块", detail: "可以读取并改写思考块的显示。" },
   "ui:message": { title: "装饰消息块", detail: "可以读取并改写消息块的显示。" },
+  "ui:entry": { title: "在会话信息中显示入口", detail: "在会话信息的「可打开」和右侧面板列表添加快捷入口。" },
+  "ui:sidebar-nav": { title: "在左侧栏显示入口", detail: "在左侧栏「新建会话」下方添加导航入口。" },
+  "ui:main-area": { title: "在主聊天区旁打开面板", detail: "在主聊天区旁打开插件专属分栏界面。" },
+  "ui:right-panel": { title: "在右侧面板打开标签页", detail: "在右侧面板打开插件标签页。" },
+  "models:read": { title: "读取可用模型列表", detail: "读取官方已配置的模型与推理强度选项。" },
+  "schedule:manage": { title: "管理定时任务", detail: "创建、启停、立即运行和删除定时任务，查看运行记录与未读状态。" },
   storage: { title: "使用插件私有存储", detail: "只有该插件可读写的本地键值存储。" },
 };
 
@@ -299,6 +305,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
   const [granted, setGranted] = useState<string[]>([]);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [confirmForce, setConfirmForce] = useState(false);
+  const [confirmUninstall, setConfirmUninstall] = useState(false);
   const action = useAction<PluginRecord | { id: string; uninstalled: boolean }>();
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
@@ -327,13 +334,18 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
     }
   }
 
-  async function run(id: string, kind: "enable" | "disable" | "uninstall") {
+  async function run(id: string, kind: "enable" | "disable" | "uninstall", options?: { deleteData?: boolean }) {
     if (kind === "uninstall") {
-      const done = await action.run(() => api.plugins.uninstall(id));
+      const done = await action.run(() => api.plugins.uninstall(id, options));
       if (done) {
         await syncHost();
+        setConfirmUninstall(false);
         setSelected(null);
-        setFlash("插件已卸载。卸载后的预装插件不会自动恢复。");
+        setFlash(
+          options?.deleteData
+            ? "插件及其定时任务数据已卸载并删除。卸载后的预装插件不会自动恢复。"
+            : "插件已卸载，相关任务数据已保留。卸载后的预装插件不会自动恢复。",
+        );
         plugins.reload();
       }
       return;
@@ -569,10 +581,41 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
                   强制启用
                 </ActionButton>
               ) : null}
-              <ActionButton variant="danger" icon="trash" onClick={() => void run(current.id, "uninstall")} busy={action.busy || syncing}>
+              <ActionButton
+                variant="danger"
+                icon="trash"
+                onClick={() => {
+                  const hasScheduler = (current.capabilities ?? []).includes("schedule:manage")
+                    || (current.declaredCapabilities ?? []).includes("schedule:manage");
+                  if (hasScheduler) {
+                    setConfirmUninstall(true);
+                  } else {
+                    void run(current.id, "uninstall");
+                  }
+                }}
+                busy={action.busy || syncing}
+              >
                 卸载
               </ActionButton>
             </div>
+            {confirmUninstall ? (
+              <div className="plugin-confirm" role="dialog" aria-modal="true" aria-label="确认卸载插件">
+                <p>
+                  卸载「{current.name || current.id}」时，是否同时删除该插件创建的定时任务和运行记录？
+                </p>
+                <div className="inline-actions">
+                  <ActionButton variant="danger" icon="trash" onClick={() => void run(current.id, "uninstall", { deleteData: true })} busy={action.busy || syncing}>
+                    卸载并删除任务数据
+                  </ActionButton>
+                  <ActionButton onClick={() => void run(current.id, "uninstall", { deleteData: false })} busy={action.busy || syncing}>
+                    仅卸载，保留任务数据
+                  </ActionButton>
+                  <ActionButton variant="quiet" onClick={() => setConfirmUninstall(false)}>
+                    取消
+                  </ActionButton>
+                </div>
+              </div>
+            ) : null}
             {!current.enabled && !current.compatible ? (
               <InfoNote tone="warn">
                 <p>这个插件没有声明当前宿主版本，默认不会启用。强制启用后它会以未验证状态运行。</p>

@@ -1,0 +1,20 @@
+{
+  "id": "kimicode-plus.scheduler",
+  "name": "定时任务",
+  "version": "1.0.0",
+  "apiVersion": 2,
+  "description": "按时间自动在指定目录新建会话或向已有会话投递提示词，支持错过补跑、运行记录未读标记与只读分析模板。",
+  "author": "KimiCode+",
+  "license": "MIT",
+  "hostVersions": ["1.*"],
+  "entry": { "renderer": "renderer.js" },
+  "capabilities": [
+    "ui:sidebar-nav",
+    "ui:main-area",
+    "ui:entry",
+    "ui:right-panel",
+    "sessions:read",
+    "models:read",
+    "schedule:manage"
+  ]
+}

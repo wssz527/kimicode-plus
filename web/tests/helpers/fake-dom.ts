@@ -124,6 +124,11 @@ export class FakeElement {
     }
   }
 
+  replaceChildren(...nodes: FakeElement[]): void {
+    for (const child of [...this.children]) child.remove();
+    this.append(...nodes);
+  }
+
   insertAdjacentElement(position: "afterend" | "beforebegin" | "afterbegin" | "beforeend", element: FakeElement): FakeElement | null {
     const parent = this.parentElement;
     if (!parent) return null;
@@ -253,6 +258,10 @@ export class FakeDocument {
     const element = new FakeElement(tag);
     element.ownerDocument = this;
     return element;
+  }
+
+  createElementNS(_namespace: string, tag: string): FakeElement {
+    return this.createElement(tag);
   }
 
   querySelector(selector: string): FakeElement | null {
