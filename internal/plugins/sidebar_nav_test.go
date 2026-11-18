@@ -64,3 +64,29 @@ func TestSidebarNavIsNotGrantedToThePlanner(t *testing.T) {
 		t.Fatal("planner lost ui:entry")
 	}
 }
+
+func TestManagerOnChangeFiresOnEnableAndDisable(t *testing.T) {
+	manager, _ := testManager(t, func() bool { return false })
+	changes := 0
+	manager.UseOnChange(func() { changes++ })
+	source := writePluginDir(t, t.TempDir(), manifestFor("test.notify", 1, []string{"storage"}), nil)
+	declared := []string{"storage"}
+	if _, err := manager.Install(context.Background(), InstallRequest{Root: source, Capabilities: &declared}); err != nil {
+		t.Fatalf("install failed: %v", err)
+	}
+	if changes != 1 {
+		t.Fatalf("expected 1 change after install, got %d", changes)
+	}
+	if _, err := manager.Enable(context.Background(), "test.notify"); err != nil {
+		t.Fatalf("enable failed: %v", err)
+	}
+	if changes != 2 {
+		t.Fatalf("expected 2 changes after enable, got %d", changes)
+	}
+	if err := manager.Disable(context.Background(), "test.notify"); err != nil {
+		t.Fatalf("disable failed: %v", err)
+	}
+	if changes != 3 {
+		t.Fatalf("expected 3 changes after disable, got %d", changes)
+	}
+}

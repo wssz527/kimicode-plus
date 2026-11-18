@@ -438,8 +438,33 @@ async function installNativeRenderer(options) {
       open: () => entry.definition.open(),
     }));
   }
+  let lastOverlayPayload = '';
+  function allEntryPlans() {
+    return [...builtinEntryPlans(), ...pluginEntryPlans()];
+  }
+  function syncOverlayEntries(entries) {
+    if (options.popout) return;
+    const next = entries.map(entry => ({ action: entry.action, title: entry.title, icon: entry.icon || '' }));
+    const encoded = JSON.stringify(next);
+    if (encoded === lastOverlayPayload) return;
+    lastOverlayPayload = encoded;
+    void transport.request('host.syncOverlayEntries', { entries: next }).catch(() => {});
+  }
+  function invokeEntryPlan(action) {
+    const plan = allEntryPlans().find(item => item.action === action);
+    if (!plan) return false;
+    void Promise.resolve()
+      .then(() => plan.open())
+      .catch(error => {
+        if (plan.pluginId) { noteFault(plan.pluginId, error); return; }
+        if (error?.message !== '已取消选择') console.warn('native entry failed', error?.message || error);
+      });
+    return true;
+  }
   function syncEntryMount() {
-    state.entryMount?.sync([...builtinEntryPlans(), ...pluginEntryPlans()], sidebarNavPlans());
+    const entries = allEntryPlans();
+    state.entryMount?.sync(entries, sidebarNavPlans());
+    syncOverlayEntries(entries);
   }
   function removeEntry(action) {
     state.entryMount?.remove(action);
@@ -530,6 +555,8 @@ async function installNativeRenderer(options) {
     state.entryMount?.dispose();
     state.entryMount = null;
     state.pluginSidebarNav.clear();
+    lastOverlayPayload = '';
+    if (!options.popout) void transport.request('host.syncOverlayEntries', { entries: [] }).catch(() => {});
     nativeStyle.remove();
     URL.revokeObjectURL(moduleURL);
     delete window.__ekdNativeUI;
@@ -1028,6 +1055,7 @@ async function installNativeRenderer(options) {
       openOfficial: id => openOfficial(id),
       activateSession: id => activateSession(id),
       openSettings: () => openSettings(),
+      invokeEntry: action => invokeEntryPlan(action),
       get plugins() {
         const runtime = state.plugins;
         if (!runtime) return null;
@@ -1322,8 +1350,11 @@ async function installNativeRenderer(options) {
   function pluginRefresh() { void syncPlugins(); }
   document.addEventListener('visibilitychange', pluginRefresh);
   window.addEventListener('focus', pluginRefresh);
-  // Features carry the enable/disable decisions this App made; the same event
-  // also refreshes the plugin list so the page and the DOM agree.
-  state.unsubscribePlugins = makeHost(() => {}).subscribe('features', () => { void syncPlugins(); });
+  // Features and plugin lifecycle events drive syncPlugins() immediately, so
+  // enable/disable takes effect on the next frame without waiting for window focus.
+  const pluginEventHost = makeHost(() => {});
+  const unsubFeatures = pluginEventHost.subscribe('features', () => { void syncPlugins(); });
+  const unsubPlugins = pluginEventHost.subscribe('plugins', () => { void syncPlugins(); });
+  state.unsubscribePlugins = () => { unsubFeatures(); unsubPlugins(); };
   return { status: 'installed', surface: 'host', domRevision: 1 };
 }

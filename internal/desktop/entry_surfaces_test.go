@@ -37,3 +37,25 @@ func TestRendererHasNoHardcodedPlannerEntryOrPanel(t *testing.T) {
 		}
 	}
 }
+
+func TestRendererSubscribesPluginsAndSyncsOverlay(t *testing.T) {
+	for _, wanted := range []string{
+		"pluginEventHost.subscribe('plugins',",
+		"host.syncOverlayEntries",
+		"invokeEntry: action => invokeEntryPlan(action)",
+	} {
+		if !strings.Contains(rendererSource, wanted) {
+			t.Fatalf("renderer.js missing %s", wanted)
+		}
+	}
+	for _, wanted := range []string{
+		"case 'host.syncOverlayEntries':",
+		"kimi:browser-overlay-open",
+		"kimi:browser-overlay-rendered",
+		"kimi:browser-overlay-activate",
+	} {
+		if !strings.Contains(bootstrapSource, wanted) {
+			t.Fatalf("bootstrap.js missing %s", wanted)
+		}
+	}
+}

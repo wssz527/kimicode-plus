@@ -227,6 +227,7 @@ type Manager struct {
 	// outside this package (a planner thread, for instance). It is a function so
 	// the plugin host does not have to import the engine it is stopping.
 	stopPluginWork func(ctx context.Context, id string) error
+	onChange       func()
 
 	mu      sync.Mutex
 	entries map[string]*entry
@@ -311,6 +312,22 @@ func (m *Manager) UseEnableGate(gate EnableGate) {
 	m.mu.Lock()
 	m.gate = gate
 	m.mu.Unlock()
+}
+
+// UseOnChange registers a callback fired after plugin runtime states change.
+func (m *Manager) UseOnChange(fn func()) {
+	m.mu.Lock()
+	m.onChange = fn
+	m.mu.Unlock()
+}
+
+func (m *Manager) notifyChange() {
+	m.mu.Lock()
+	fn := m.onChange
+	m.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 func (m *Manager) SetHostVersion(version string) {
@@ -738,6 +755,7 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 	}
 	_ = recordActivity(ctx, m.db, id, ActivityEnable, "插件已启用", now)
 	plugin.Token = token
+	m.notifyChange()
 	return plugin, nil
 }
 
@@ -790,6 +808,7 @@ func (m *Manager) fail(ctx context.Context, id, state, message, kind string, now
 	// so a failed release must not turn into a different outcome here.
 	_ = setState(ctx, m.db, id, state, false, message, now)
 	_ = recordActivity(ctx, m.db, id, kind, message, now)
+	m.notifyChange()
 }
 
 // Disable stops a plugin and revokes its renderer token in the same step, so a
@@ -844,6 +863,7 @@ func (m *Manager) Disable(ctx context.Context, id string) error {
 		return apiError(http.StatusInternalServerError, "PLUGIN_STATE_UNAVAILABLE", "无法保存插件状态")
 	}
 	_ = recordActivity(ctx, m.db, id, ActivityDisable, "插件已停用", m.now())
+	m.notifyChange()
 	return nil
 }
 
@@ -908,6 +928,7 @@ func (m *Manager) Uninstall(ctx context.Context, id string) error {
 	m.order = removeString(m.order, id)
 	m.mu.Unlock()
 	_ = recordActivity(ctx, m.db, id, ActivityUninstall, "插件已卸载；卸载后不会自动恢复预装副本", now)
+	m.notifyChange()
 	return nil
 }
 
@@ -988,6 +1009,9 @@ func (m *Manager) EnforceSafeMode() {
 	for _, id := range changed {
 		_ = setState(ctx, m.db, id, StateBlocked, false, "安全模式已阻止插件运行。", m.now())
 		_ = recordActivity(ctx, m.db, id, ActivitySafeMode, "安全模式已阻止插件运行。", m.now())
+	}
+	if len(changed) > 0 {
+		m.notifyChange()
 	}
 }
 
