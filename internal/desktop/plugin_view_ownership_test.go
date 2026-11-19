@@ -139,16 +139,17 @@ func TestPluginViewLifecycleIsSerializedPerView(t *testing.T) {
 	if !strings.Contains(bootstrapSource, "function withPluginViewLock(lockKey, task)") {
 		t.Fatal("bootstrap.js lost withPluginViewLock serialization helper")
 	}
+	source := strings.ReplaceAll(bootstrapSource, "\r\n", "\n")
 	for _, action := range []string{"case 'browser.view.open': {", "case 'browser.view.navigate': {", "case 'browser.view.close': {"} {
-		index := strings.Index(bootstrapSource, action)
+		index := strings.Index(source, action)
 		if index < 0 {
 			t.Fatalf("bootstrap.js missing %s", action)
 		}
-		end := strings.Index(bootstrapSource[index+len(action):], "\n      case '")
-		block := bootstrapSource[index:]
-		if end >= 0 {
-			block = bootstrapSource[index : index+len(action)+end]
+		end := strings.Index(source[index+len(action):], "\n      case '")
+		if end < 0 {
+			t.Fatalf("bootstrap.js missing the action following %s", action)
 		}
+		block := source[index : index+len(action)+end]
 		if !strings.Contains(block, "withPluginViewLock(") {
 			t.Fatalf("%s must serialize per-view lifecycle work with withPluginViewLock", action)
 		}

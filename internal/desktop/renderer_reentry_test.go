@@ -44,11 +44,12 @@ func TestRendererCleanupAllowsReentrantInstall(t *testing.T) {
 			t.Fatalf("renderer cleanup can run before %s is initialized", field)
 		}
 	}
+	source := strings.ReplaceAll(rendererSource, "\r\n", "\n")
 	for _, wanted := range []string{
 		"function pluginRefresh() { void syncPlugins(); }",
 		"await refreshFeatures();\n  if (state.removed) return { status: 'removed', surface: 'host', domRevision: 1 };",
 	} {
-		if !strings.Contains(rendererSource, wanted) {
+		if !strings.Contains(source, wanted) {
 			t.Fatalf("renderer reentrant cleanup guard is missing: %s", wanted)
 		}
 	}
