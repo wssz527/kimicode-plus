@@ -4,26 +4,14 @@ package cache
 
 import (
 	"os"
-	"sync"
-	"time"
+	"syscall"
 )
 
-// Windows has no inode. File index and volume serial require opening the file
-// with backup semantics, which would mean holding official records open; instead
-// identity is derived from the creation time and size, and the reader also
-// restarts whenever the recorded size shrinks below the stored offset. The plan
-// only accepts macOS hosts this round, so this keeps Windows compiling without
-// promising the same replacement detection.
-var identityMu sync.Mutex
-
-func identityOf(info os.FileInfo) (inode, device uint64) {
-	identityMu.Lock()
-	defer identityMu.Unlock()
-	stamp := info.ModTime().UnixNano()
-	if created, ok := creationTime(info); ok {
-		stamp = created.UnixNano()
+func identityOf(file *os.File, _ os.FileInfo) (uint64, uint64, error) {
+	var info syscall.ByHandleFileInformation
+	if err := syscall.GetFileInformationByHandle(syscall.Handle(file.Fd()), &info); err != nil {
+		return 0, 0, err
 	}
-	return uint64(stamp), 0
+	index := uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)
+	return index, uint64(info.VolumeSerialNumber), nil
 }
-
-func creationTime(info os.FileInfo) (time.Time, bool) { return time.Time{}, false }

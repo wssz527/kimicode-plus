@@ -357,14 +357,22 @@ type fileState struct {
 //   - replaced file       -> inode/device changed, restart from 0
 //   - incomplete last line-> kept in carry and completed on the next scan
 func readIncremental(path string, state *fileState) ([]Step, bool, error) {
-	info, err := os.Stat(path)
+	handle, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, false, nil
 		}
 		return nil, false, err
 	}
-	inode, device := identityOf(info)
+	defer handle.Close()
+	info, err := handle.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	inode, device, err := identityOf(handle, info)
+	if err != nil {
+		return nil, false, err
+	}
 	replaced := state.ref.Inode != 0 && (state.ref.Inode != inode || state.ref.Device != device)
 	truncated := state.ref.Inode != 0 && !replaced && info.Size() < state.ref.Offset
 	if replaced || truncated {
@@ -383,14 +391,6 @@ func readIncremental(path string, state *fileState) ([]Step, bool, error) {
 		return nil, replaced || truncated, nil
 	}
 
-	handle, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, replaced || truncated, nil
-		}
-		return nil, replaced || truncated, err
-	}
-	defer handle.Close()
 	if _, err = handle.Seek(state.ref.Offset, 0); err != nil {
 		return nil, replaced || truncated, err
 	}
