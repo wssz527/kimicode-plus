@@ -3,6 +3,7 @@ package desktop
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/coder/websocket"
 )
@@ -460,5 +462,172 @@ func TestAttachWindowsCDPAndRunWindowsLauncherEndToEnd(t *testing.T) {
 	wantMethods := "Runtime.enable,Page.enable,Page.addScriptToEvaluateOnNewDocument,Runtime.evaluate"
 	if strings.Join(gotMethods, ",") != wantMethods {
 		t.Fatalf("unexpected CDP call sequence: got %v, want %s", gotMethods, wantMethods)
+	}
+}
+
+func TestEncodeWindowsPowerShellCommandRoundTrip(t *testing.T) {
+	script := "$ErrorActionPreference = 'Stop'\n" +
+		"$procs = @(Get-CimInstance Win32_Process -Filter \"Name = 'Kimi Code.exe'\")\n" +
+		"Write-Output '中文路径测试'"
+	encoded := EncodeWindowsPowerShellCommand(script)
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("base64 decode failed: %v", err)
+	}
+	if len(raw)%2 != 0 {
+		t.Fatalf("UTF-16LE payload must have even length, got %d", len(raw))
+	}
+	units := make([]uint16, len(raw)/2)
+	for i := range units {
+		units[i] = binary.LittleEndian.Uint16(raw[i*2:])
+	}
+	decoded := string(utf16.Decode(units))
+	if decoded != script {
+		t.Fatalf("decoded script mismatch:\ngot:  %q\nwant: %q", decoded, script)
+	}
+}
+
+func TestParseUserAgentVersionsAndWindowsVersionForwarding(t *testing.T) {
+	cases := []struct {
+		ua           string
+		wantApp      string
+		wantElectron string
+	}{
+		{
+			ua:           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) kimi-code-app/1.3.2 Chrome/156.0.8078.49 Electron/45.1.0 Safari/537.36",
+			wantApp:      "1.3.2",
+			wantElectron: "45.1.0",
+		},
+		{
+			ua:           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) kimi-code-app/1.3.7 Chrome/156.0.8078.49 Electron/45.1.0 Safari/537.36",
+			wantApp:      "1.3.7",
+			wantElectron: "45.1.0",
+		},
+		{
+			ua:           "Mozilla/5.0 KimiCode/1.3.7 Electron/45.1.0 Safari/537.36",
+			wantApp:      "1.3.7",
+			wantElectron: "45.1.0",
+		},
+		{
+			ua:           "Mozilla/5.0 Kimi Code/1.9.9-beta.1 Electron/45.1.0 Safari/537.36",
+			wantApp:      "1.9.9-beta.1",
+			wantElectron: "45.1.0",
+		},
+	}
+	for _, tc := range cases {
+		gotApp, gotElec := ParseUserAgentVersions(tc.ua)
+		if gotApp != tc.wantApp || gotElec != tc.wantElectron {
+			t.Fatalf("ParseUserAgentVersions(%q) = (%q, %q), want (%q, %q)", tc.ua, gotApp, gotElec, tc.wantApp, tc.wantElectron)
+		}
+	}
+
+	pairToken := strings.Repeat("p", 48)
+	coreMux := http.NewServeMux()
+	coreMux.HandleFunc("POST /enhance/v1/pair", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"sessionToken": "sess-token-123"})
+	})
+	coreMux.HandleFunc("POST /enhance/v1/desktop/bridge-session", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"bridgeKey": strings.Repeat("b", 48)})
+	})
+	coreSrv := httptest.NewServer(coreMux)
+	defer coreSrv.Close()
+
+	var cdpPort int
+	var evaluatedExpr string
+	cdpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/json/version":
+			_ = json.NewEncoder(w).Encode(WindowsCDPVersion{
+				Browser:   "Chrome/156.0.8078.49",
+				UserAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) kimi-code-app/1.3.7 Chrome/156.0.8078.49 Electron/45.1.0 Safari/537.36",
+			})
+		case "/json/list":
+			wsURL := "ws://127.0.0.1:" + strconv.Itoa(cdpPort) + "/devtools/page/main-1"
+			_ = json.NewEncoder(w).Encode([]WindowsCDPTarget{
+				{ID: "main-1", Type: "page", URL: "app://renderer/sessions/s1", WebSocketDebuggerURL: wsURL},
+			})
+		case "/devtools/page/main-1":
+			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+			if err != nil {
+				return
+			}
+			conn.SetReadLimit(32 << 20)
+			defer conn.Close(websocket.StatusNormalClosure, "")
+			for {
+				_, raw, err := conn.Read(r.Context())
+				if err != nil {
+					return
+				}
+				var msg struct {
+					ID     int             `json:"id"`
+					Method string          `json:"method"`
+					Params json.RawMessage `json:"params"`
+				}
+				if json.Unmarshal(raw, &msg) != nil {
+					return
+				}
+				var resp any
+				if msg.Method == "Runtime.evaluate" {
+					var p struct {
+						Expression string `json:"expression"`
+					}
+					_ = json.Unmarshal(msg.Params, &p)
+					evaluatedExpr = p.Expression
+					resp = map[string]any{
+						"id": msg.ID,
+						"result": map[string]any{
+							"result": map[string]any{
+								"value": map[string]any{
+									"status":    "installed",
+									"userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) kimi-code-app/1.3.7 Chrome/156.0.8078.49 Electron/45.1.0 Safari/537.36",
+								},
+							},
+						},
+					}
+				} else {
+					resp = map[string]any{"id": msg.ID, "result": map[string]any{}}
+				}
+				out, _ := json.Marshal(resp)
+				_ = conn.Write(r.Context(), websocket.MessageText, out)
+			}
+		}
+	}))
+	defer cdpSrv.Close()
+	parsedCDP, _ := url.Parse(cdpSrv.URL)
+	cdpPort, _ = strconv.Atoi(parsedCDP.Port())
+
+	res137, err := AttachWindowsCDP(context.Background(), WindowsCDPAttachOptions{
+		DebugPort:    cdpPort,
+		HostPID:      5001,
+		CoreURL:      coreSrv.URL,
+		PairingToken: pairToken,
+		Profile:      `C:\Temp\iso-profile`,
+	})
+	if err != nil {
+		t.Fatalf("AttachWindowsCDP 1.3.7 failed: %v", err)
+	}
+	if res137.AppVersion != "1.3.7" || res137.Electron != "45.1.0" || !res137.Verified || res137.VersionNote != "" {
+		t.Fatalf("unexpected 1.3.7 result: %+v", res137)
+	}
+	if !strings.Contains(evaluatedExpr, `"appVersion":"1.3.7"`) || !strings.Contains(evaluatedExpr, `"electron":"45.1.0"`) {
+		t.Fatalf("renderer config missing forwarded appVersion/electron")
+	}
+
+	res199, err := AttachWindowsCDP(context.Background(), WindowsCDPAttachOptions{
+		DebugPort:          cdpPort,
+		HostPID:            5002,
+		CoreURL:            coreSrv.URL,
+		PairingToken:       pairToken,
+		Profile:            `C:\Temp\iso-profile`,
+		AppVersionOverride: "1.9.9",
+	})
+	if err != nil {
+		t.Fatalf("AttachWindowsCDP 1.9.9 override failed: %v", err)
+	}
+	if res199.AppVersion != "1.9.9" || res199.Verified || res199.VersionNote != UnverifiedVersionNote {
+		t.Fatalf("unexpected 1.9.9 override result: %+v", res199)
+	}
+	if !strings.Contains(evaluatedExpr, `"appVersion":"1.9.9"`) {
+		t.Fatalf("renderer config missing overridden appVersion 1.9.9")
 	}
 }

@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"enhancedkimi/internal/platform"
 )
@@ -688,4 +690,15 @@ func PickFreeLoopbackPort() (int, error) {
 		return 0, errors.New("无法分配本机环回调试端口")
 	}
 	return addr.Port, nil
+}
+
+// EncodeWindowsPowerShellCommand encodes a PowerShell script as UTF-16LE base64
+// for powershell.exe -EncodedCommand, avoiding Windows command-line quote mangling.
+func EncodeWindowsPowerShellCommand(script string) string {
+	units := utf16.Encode([]rune(script))
+	raw := make([]byte, len(units)*2)
+	for i, u := range units {
+		binary.LittleEndian.PutUint16(raw[i*2:], u)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
 }

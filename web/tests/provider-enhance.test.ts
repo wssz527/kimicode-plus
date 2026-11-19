@@ -238,7 +238,7 @@ interface ProviderEnhanceHandle {
   scan(): void;
   CONTEXT_PRESETS: Array<{ label: string; value: number }>;
   THINKING_OPTIONS: Array<{ value: string; label: string; title: string }>;
-  state: { panel: MiniNode | null; panelRow: MiniNode | null; panelButton: MiniNode | null };
+  state: { panel: MiniNode | null; panelRow: MiniNode | null; panelButton: MiniNode | null; style: MiniNode | null };
 }
 
 function loadProviderEnhance(request: (action: string, payload?: Record<string, unknown>) => Promise<unknown> = async () => ({})) {
@@ -568,4 +568,87 @@ test("row enhance button toggles inline collapsible drawer inside the model row"
   await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(enhance.state.panel, null, "clicking again collapses the inline panel");
   assert.equal(btn.getAttribute("aria-expanded"), "false");
+});
+
+test("decorates provider form inside 1.3.2 ui-dialog / role=dialog without .settings-dialog", async () => {
+  const { doc, enhance } = loadProviderEnhance(async (action) => {
+    if (action === "config.get") {
+      return {
+        providers: {
+          magpie: { type: "openai_legacy", base_url: "http://127.0.0.1:3425/v1" },
+        },
+        models: {
+          "magpie/glm-5.3": { displayName: "GLM-5.3", maxContextSize: 614400, capabilities: ["tool_use"] },
+        },
+      };
+    }
+    return {};
+  });
+
+  const dialog = doc.createElement("div");
+  dialog.className = "ui-dialog ui-dialog--xl ui-dialog--flush ui-dialog--fixed-height ui-dialog--grouped";
+  dialog.setAttribute("role", "dialog");
+  const form = doc.createElement("div");
+  form.className = "pf";
+  const back = doc.createElement("button");
+  back.className = "pf-back";
+
+  const fieldName = doc.createElement("div");
+  fieldName.className = "pf-field";
+  const nameInput = doc.createElement("input");
+  nameInput.className = "ui-input";
+  nameInput.value = "magpie";
+  fieldName.append(nameInput);
+
+  const fieldType = doc.createElement("div");
+  fieldType.className = "pf-field";
+  const typeText = doc.createElement("span");
+  typeText.className = "ui-select__value-text";
+  typeText.textContent = "OpenAI";
+  fieldType.append(typeText);
+
+  const fieldKey = doc.createElement("div");
+  fieldKey.className = "pf-field";
+  const keyInput = doc.createElement("input");
+  keyInput.className = "ui-input";
+  keyInput.value = "sk-redacted";
+  fieldKey.append(keyInput);
+
+  const fieldUrl = doc.createElement("div");
+  fieldUrl.className = "pf-field";
+  const urlInput = doc.createElement("input");
+  urlInput.className = "ui-input";
+  urlInput.value = "http://127.0.0.1:3425/v1";
+  fieldUrl.append(urlInput);
+
+  const table = doc.createElement("div");
+  table.className = "pmt";
+  const head = doc.createElement("div");
+  head.className = "pmt-grid pmt-head";
+  const row = doc.createElement("div");
+  row.className = "pmt-grid";
+  const modelInput = doc.createElement("input");
+  modelInput.value = "glm-5.3";
+  const removeBtn = doc.createElement("button");
+  removeBtn.setAttribute("aria-label", "移除模型");
+  row.append(modelInput, removeBtn);
+  table.append(head, row);
+
+  form.append(back, fieldName, fieldType, fieldKey, fieldUrl, table);
+  dialog.append(form);
+  doc.body.append(dialog);
+
+  enhance.scan();
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  assert.equal(table.dataset.ekdPxTable, "1");
+  assert.ok(head.querySelector("[data-ekd-px-head-pad]"), "expected header column pad");
+  const btn = row.querySelector("[data-ekd-px-button]");
+  assert.ok(btn, "expected injected enhance button inside .ui-dialog");
+  assert.ok(enhance.state.style?.textContent.includes(".ui-dialog .pf .pmt[data-ekd-px-table=\"1\"]"));
+  assert.ok(enhance.state.style?.textContent.includes("[role=\"dialog\"] .pf .pmt[data-ekd-px-table=\"1\"]"));
+
+  btn.click();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(enhance.state.panel?.shown, "clicking enhance button inside .ui-dialog should open inline drawer");
 });

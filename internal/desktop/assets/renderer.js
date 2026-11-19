@@ -765,7 +765,7 @@ async function installNativeRenderer(options) {
     state.settingsHandle = mount(element, 'settings', host);
   }
   async function openSettings(tab) {
-    if (!document.querySelector('.settings-dialog')) {
+    if (!module.findSettingsDialogParts(document)) {
       const button = document.querySelector('button.side-footer-settings');
       if (!button) throw new Error('官方设置入口未就绪');
       button.click();
@@ -1174,7 +1174,7 @@ async function installNativeRenderer(options) {
     }
     if (state.sessionContainer && !state.sessionContainer.isConnected) closeSessions();
     if (state.sessionContainer) state.sessionContainer.setAttribute('data-ekd-containment', 'sessions');
-    scheduleContractReport(evaluation.probes, firstEvaluation || Boolean(document.querySelector('.settings-dialog')));
+    scheduleContractReport(evaluation.probes, firstEvaluation || Boolean(module.findSettingsDialogParts(document)));
   }
   function ensure() {
     if (state.removed) return;

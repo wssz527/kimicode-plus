@@ -355,7 +355,11 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
           if (currentNode.scrollTop > 0) {
             currentNode.scrollTop = 0;
           }
-          if (currentNode.classList.contains("settings-dialog")) break;
+          if (
+            currentNode.classList.contains("settings-dialog") ||
+            currentNode.classList.contains("ui-dialog") ||
+            currentNode.getAttribute("role") === "dialog"
+          ) break;
         }
         if (currentNode.parentElement) {
           currentNode = currentNode.parentElement;

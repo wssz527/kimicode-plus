@@ -217,7 +217,9 @@ function createProviderEnhance(options) {
     const models = config.models || {};
     const type = form.querySelector('.pf-field .ui-select__value-text')?.textContent.trim().toLowerCase() || '';
     const inputs = [...form.querySelectorAll('.pf-field input.ui-input')];
-    const baseUrl = inputs.length > 1 ? inputs[1].value.trim() : '';
+    const firstName = inputs.length > 0 ? inputs[0].value.trim() : '';
+    const urlInput = inputs.find(input => /^https?:\/\//i.test(input.value.trim()));
+    const baseUrl = urlInput ? urlInput.value.trim() : (inputs.length > 1 ? inputs[1].value.trim() : '');
     const ids = Object.keys(providers);
     if (baseUrl) {
       const byBase = ids.filter(id => {
@@ -226,6 +228,16 @@ function createProviderEnhance(options) {
         return storedBase === baseUrl && (!type || String(entry.type || '').toLowerCase() === type);
       });
       if (byBase.length === 1) return byBase[0];
+      const byBaseAnyType = ids.filter(id => {
+        const entry = providers[id] || {};
+        const storedBase = String(entry.base_url || entry.baseUrl || '').trim();
+        return storedBase === baseUrl;
+      });
+      if (byBaseAnyType.length === 1) return byBaseAnyType[0];
+      if (byBaseAnyType.length > 1 && firstName && byBaseAnyType.includes(firstName)) return firstName;
+    }
+    if (firstName && Object.prototype.hasOwnProperty.call(providers, firstName)) {
+      return firstName;
     }
     const rows = [...form.querySelectorAll('.pmt .pmt-grid')].filter(row => !row.classList.contains('pmt-head'));
     const owners = new Set();
@@ -243,10 +255,18 @@ function createProviderEnhance(options) {
 
   // ---------------------------------------------------------------------- DOM
 
+  function findProviderForm() {
+    return document.querySelector('.settings-dialog .pf, .ui-dialog .pf, [role="dialog"] .pf');
+  }
+
   function styleText() {
     return `
       .settings-dialog .pf .pmt[data-ekd-px-table="1"] .pmt-grid.pmt-head,
-      .settings-dialog .pf .pmt[data-ekd-px-table="1"] .pmt-grid[data-ekd-px-row="1"]{
+      .settings-dialog .pf .pmt[data-ekd-px-table="1"] .pmt-grid[data-ekd-px-row="1"],
+      .ui-dialog .pf .pmt[data-ekd-px-table="1"] .pmt-grid.pmt-head,
+      .ui-dialog .pf .pmt[data-ekd-px-table="1"] .pmt-grid[data-ekd-px-row="1"],
+      [role="dialog"] .pf .pmt[data-ekd-px-table="1"] .pmt-grid.pmt-head,
+      [role="dialog"] .pf .pmt[data-ekd-px-table="1"] .pmt-grid[data-ekd-px-row="1"]{
         grid-template-columns:minmax(0,1.35fr) minmax(0,.68fr) minmax(0,1fr) auto auto;
         row-gap:8px;
       }
@@ -434,7 +454,7 @@ function createProviderEnhance(options) {
   }
 
   function note(text, tone) {
-    const form = document.querySelector('.settings-dialog .pf');
+    const form = findProviderForm();
     if (!form) return;
     let line = form.querySelector('[data-ekd-px-note]');
     if (!line) {
@@ -450,7 +470,7 @@ function createProviderEnhance(options) {
 
   async function decorate() {
     if (state.removed) return;
-    const form = document.querySelector('.settings-dialog .pf');
+    const form = findProviderForm();
     if (!form) return;
     const table = form.querySelector('.pmt');
     if (!table) return;

@@ -52,7 +52,7 @@ type WindowsCDPAttachOptions struct {
 
 var (
 	uaElectronPattern = regexp.MustCompile(`Electron/([0-9][0-9A-Za-z._-]*)`)
-	uaKimiPattern     = regexp.MustCompile(`Kimi(?:\s*Code|Code)/([0-9][0-9A-Za-z._-]*)`)
+	uaKimiPattern     = regexp.MustCompile(`(?i)(?:kimi-code-app|kimi\s*code)/([0-9][0-9A-Za-z._-]*)`)
 )
 
 // ParseUserAgentVersions extracts Electron and app version hints from Chromium's
@@ -180,15 +180,20 @@ func fetchWindowsCDPJSON(ctx context.Context, debugPort int, path string, out an
 func buildWindowsRendererBootstrap(optionsJSON string) string {
 	return fmt.Sprintf(`(async () => {
   const cfg = %s;
+  const ua = navigator.userAgent || '';
+  if (!cfg.appVersion) {
+    const m = ua.match(/(?:kimi-code-app|kimi\s*code)\/([0-9][0-9A-Za-z._-]*)/i);
+    if (m) cfg.appVersion = m[1];
+  }
+  if (!cfg.electron) {
+    const m = ua.match(/Electron\/([0-9][0-9A-Za-z._-]*)/);
+    if (m) cfg.electron = m[1];
+  }
   const run = (%s);
   const installed = await run(cfg);
-  const pinia = document.querySelector('#app')?.__vue_app__?.config?.globalProperties?.$pinia?._s;
-  const cfgStore = pinia?.get('kimi.config');
-  const serverVer = typeof cfgStore?.serverVersion === 'string' ? cfgStore.serverVersion : '';
   return {
     status: installed?.status || (window.__ekdNativeUI ? 'installed' : 'failed'),
-    userAgent: navigator.userAgent || '',
-    serverVersion: serverVer,
+    userAgent: ua,
   };
 })()`, optionsJSON, rendererBundle)
 }
@@ -261,11 +266,23 @@ func AttachWindowsCDP(ctx context.Context, opts WindowsCDPAttachOptions) (*Attac
 		return nil, err
 	}
 
+	appVersion, electronVersion := ParseUserAgentVersions(version.UserAgent)
+	overrideApp := ""
+	if opts.Profile != "" && strings.TrimSpace(opts.AppVersionOverride) != "" {
+		overrideApp = strings.TrimSpace(opts.AppVersionOverride)
+	}
+	configAppVersion := appVersion
+	if overrideApp != "" {
+		configAppVersion = overrideApp
+	}
+
 	rendererConfig, err := json.Marshal(map[string]any{
 		"endpoint":     strings.TrimRight(opts.CoreURL, "/"),
 		"bridgeKey":    bridgeKey,
 		"surface":      "host",
 		"transport":    "windows-cdp-loopback",
+		"appVersion":   configAppVersion,
+		"electron":     electronVersion,
 		"moduleSource": string(moduleSource),
 		"cssSource":    string(cssSource),
 	})
@@ -274,7 +291,7 @@ func AttachWindowsCDP(ctx context.Context, opts WindowsCDPAttachOptions) (*Attac
 	}
 	script := buildWindowsRendererBootstrap(string(rendererConfig))
 
-	var detectedUA, detectedServerVer string
+	var detectedUA string
 	injectedCount := 0
 	for _, target := range targets {
 		pageRes, evalErr := injectWindowsPageTarget(ctx, target.WebSocketDebuggerURL, opts.DebugPort, script)
@@ -288,15 +305,11 @@ func AttachWindowsCDP(ctx context.Context, opts WindowsCDPAttachOptions) (*Attac
 		if pageRes.UserAgent != "" {
 			detectedUA = pageRes.UserAgent
 		}
-		if pageRes.ServerVersion != "" {
-			detectedServerVer = pageRes.ServerVersion
-		}
 	}
 	if injectedCount == 0 {
 		return nil, errors.New("没有成功注入任何 Kimi Code 渲染页面")
 	}
 
-	appVersion, electronVersion := ParseUserAgentVersions(version.UserAgent)
 	if uaApp, uaElec := ParseUserAgentVersions(detectedUA); uaApp != "" || uaElec != "" {
 		if appVersion == "" {
 			appVersion = uaApp
@@ -305,17 +318,14 @@ func AttachWindowsCDP(ctx context.Context, opts WindowsCDPAttachOptions) (*Attac
 			electronVersion = uaElec
 		}
 	}
-	if appVersion == "" && detectedServerVer != "" {
-		appVersion = detectedServerVer
+	if overrideApp != "" {
+		appVersion = overrideApp
 	}
 	if appVersion == "" {
 		appVersion = "unknown"
 	}
 	if electronVersion == "" {
 		electronVersion = "unknown"
-	}
-	if opts.Profile != "" && strings.TrimSpace(opts.AppVersionOverride) != "" {
-		appVersion = strings.TrimSpace(opts.AppVersionOverride)
 	}
 
 	alerts := append([]WindowsDebugClientAlert(nil), preAttachAlerts...)
@@ -344,9 +354,8 @@ func AttachWindowsCDP(ctx context.Context, opts WindowsCDPAttachOptions) (*Attac
 }
 
 type windowsPageInjectResult struct {
-	Status        string `json:"status"`
-	UserAgent     string `json:"userAgent"`
-	ServerVersion string `json:"serverVersion"`
+	Status    string `json:"status"`
+	UserAgent string `json:"userAgent"`
 }
 
 func injectWindowsPageTarget(ctx context.Context, wsURL string, debugPort int, script string) (windowsPageInjectResult, error) {

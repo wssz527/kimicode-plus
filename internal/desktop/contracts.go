@@ -8,8 +8,11 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
+
+var apiProbeTimeout = 4 * time.Second
 
 const (
 	ContractAvailable = "available"
@@ -117,13 +120,16 @@ func (s *NativeService) reportContracts(raw json.RawMessage) (ContractReport, er
 	}
 
 	s.mu.Lock()
-	if strings.TrimSpace(input.AppVersion) != "" {
-		s.contractAppVersion = strings.TrimSpace(input.AppVersion)
+	nextVersion := strings.TrimSpace(input.AppVersion)
+	nextElectron := strings.TrimSpace(input.Electron)
+	versionChanged := nextVersion != "" && s.contractAppVersion != "" && nextVersion != s.contractAppVersion
+	if nextVersion != "" {
+		s.contractAppVersion = nextVersion
 	}
-	if strings.TrimSpace(input.Electron) != "" {
-		s.contractElectron = strings.TrimSpace(input.Electron)
+	if nextElectron != "" {
+		s.contractElectron = nextElectron
 	}
-	if s.domProbes == nil {
+	if s.domProbes == nil || versionChanged {
 		s.domProbes = map[string]ContractProbe{}
 	}
 	for id, probe := range byID {
@@ -207,15 +213,30 @@ func (s *NativeService) probeOfficialAPI(ctx context.Context) []ContractProbe {
 			{ID: "api.sessions", Group: "api", Label: "官方接口 /sessions", Status: ContractUntested, Reason: "尚未连接官方本地服务", CheckedAt: now},
 		}
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	defer cancel()
-	return []ContractProbe{
-		probeAPIConfig(probeCtx, s.kap, now),
-		probeAPIProviders(probeCtx, s.kap, now),
-		probeAPIModels(probeCtx, s.kap, now),
-		probeAPIOAuthUsage(probeCtx, s.kap, now),
-		probeAPISessions(probeCtx, s.kap, now),
+	tasks := []func(context.Context, *KAPClient, string) ContractProbe{
+		probeAPIConfig,
+		probeAPIProviders,
+		probeAPIModels,
+		probeAPIOAuthUsage,
+		probeAPISessions,
 	}
+	timeout := apiProbeTimeout
+	if timeout <= 0 {
+		timeout = 4 * time.Second
+	}
+	results := make([]ContractProbe, len(tasks))
+	var wg sync.WaitGroup
+	for i, fn := range tasks {
+		wg.Add(1)
+		go func(idx int, run func(context.Context, *KAPClient, string) ContractProbe) {
+			defer wg.Done()
+			probeCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			results[idx] = run(probeCtx, s.kap, now)
+		}(i, fn)
+	}
+	wg.Wait()
+	return results
 }
 
 func probeAPIConfig(ctx context.Context, kap *KAPClient, now string) ContractProbe {

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func contractProbeByID(t *testing.T, report ContractReport, id string) ContractProbe {
@@ -188,5 +189,80 @@ func TestContractSingleFailureIsolatesOnlyAffectedProbe(t *testing.T) {
 	}
 	if p := contractProbeByID(t, report, "api.config"); p.Status != ContractAvailable {
 		t.Fatalf("healthy config probe affected: %+v", p)
+	}
+}
+
+func TestContractReportResetsStaleProbesOnVersionTransition(t *testing.T) {
+	service := &NativeService{}
+	raw132, _ := json.Marshal(map[string]any{
+		"appVersion": "1.3.2",
+		"electron":   SupportedElectron,
+		"probes": []ContractProbe{
+			{ID: "dom.settings_account", Group: "dom", Status: ContractAvailable},
+			{ID: "dom.sidebar_nav", Group: "dom", Status: ContractAvailable},
+		},
+	})
+	if _, err := service.Action(context.Background(), "contracts.report", raw132); err != nil {
+		t.Fatal(err)
+	}
+	r132 := service.ContractStatus(context.Background())
+	if r132.AppVersion != "1.3.2" || r132.Verified {
+		t.Fatalf("1.3.2 status = %+v, want unverified 1.3.2", r132)
+	}
+	if p := contractProbeByID(t, r132, "dom.settings_account"); p.Status != ContractAvailable {
+		t.Fatalf("1.3.2 settings_account = %+v", p)
+	}
+
+	raw137, _ := json.Marshal(map[string]any{
+		"appVersion": "1.3.7",
+		"electron":   SupportedElectron,
+		"probes": []ContractProbe{
+			{ID: "dom.sidebar_nav", Group: "dom", Status: ContractAvailable},
+		},
+	})
+	if _, err := service.Action(context.Background(), "contracts.report", raw137); err != nil {
+		t.Fatal(err)
+	}
+	r137 := service.ContractStatus(context.Background())
+	if r137.AppVersion != "1.3.7" || !r137.Verified || r137.VersionNote != "" {
+		t.Fatalf("1.3.7 transition status = %+v, want verified 1.3.7", r137)
+	}
+	if p := contractProbeByID(t, r137, "dom.settings_account"); p.Status != ContractUntested {
+		t.Fatalf("stale 1.3.2 probe leaked across version upgrade: %+v", p)
+	}
+}
+
+func TestSlowAPIProbeDoesNotStarveOtherProbes(t *testing.T) {
+	prev := apiProbeTimeout
+	apiProbeTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { apiProbeTimeout = prev })
+
+	kap := newContractTestServer(t, map[string]http.HandlerFunc{
+		"/config": func(w http.ResponseWriter, r *http.Request) {
+			writeNativeTestEnvelope(w, map[string]any{"providers": map[string]any{}, "models": map[string]any{}})
+		},
+		"/providers": func(w http.ResponseWriter, r *http.Request) {
+			writeNativeTestEnvelope(w, map[string]any{"items": []any{map[string]any{"id": "kimi"}}})
+		},
+		"/models": func(w http.ResponseWriter, r *http.Request) {
+			writeNativeTestEnvelope(w, map[string]any{"items": []any{map[string]any{"id": "kimi/k2.8"}}})
+		},
+		"/oauth/usage": func(w http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+		},
+		"/sessions": func(w http.ResponseWriter, r *http.Request) {
+			writeNativeTestEnvelope(w, map[string]any{"items": []any{map[string]any{"id": "s1"}}})
+		},
+	})
+	service := &NativeService{kap: kap}
+	report := service.ContractStatus(context.Background())
+
+	if p := contractProbeByID(t, report, "api.oauth_usage"); p.Status != ContractDisabled {
+		t.Fatalf("hanging oauth_usage probe = %+v, want disabled", p)
+	}
+	for _, id := range []string{"api.config", "api.providers", "api.models", "api.sessions"} {
+		if p := contractProbeByID(t, report, id); p.Status != ContractAvailable {
+			t.Fatalf("healthy probe %s starved by slow oauth_usage: %+v", id, p)
+		}
 	}
 }

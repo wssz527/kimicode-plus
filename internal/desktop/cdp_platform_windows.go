@@ -3,6 +3,7 @@
 package desktop
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -43,18 +44,25 @@ func windowsPowerShellPath() string {
 }
 
 func runWindowsPowerShell(ctx context.Context, script string, extraEnv ...string) ([]byte, error) {
+	encoded := EncodeWindowsPowerShellCommand(script)
 	cmd := exec.CommandContext(ctx, windowsPowerShellPath(),
-		"-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script)
+		"-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	env := os.Environ()
 	env = append(env, extraEnv...)
 	cmd.Env = env
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("PowerShell 执行失败：%w (%s)", err, strings.TrimSpace(string(out)))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = strings.TrimSpace(stdout.String())
+		}
+		return nil, fmt.Errorf("PowerShell 执行失败：%w (%s)", err, detail)
 	}
 	// Strip UTF-8 BOM if emitted by PowerShell.
-	return []byte(strings.TrimPrefix(strings.TrimSpace(string(out)), "\ufeff")), nil
+	return []byte(strings.TrimPrefix(strings.TrimSpace(stdout.String()), "\ufeff")), nil
 }
 
 type windowsDiscoverPayload struct {
