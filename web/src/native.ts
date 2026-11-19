@@ -786,6 +786,7 @@ export interface AccountSwitchResult {
   sessionsCount?: number;
   hostPid?: number;
   warnings?: string[];
+  backupCleanupWarning?: string;
   refreshAuth: boolean;
 }
 

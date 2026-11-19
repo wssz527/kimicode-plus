@@ -2,16 +2,22 @@ package desktop
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
+	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"enhancedkimi/internal/cache"
@@ -903,7 +909,7 @@ func (s *NativeService) runIdleKeepAliveOnce(ctx context.Context, settings Autom
 	}
 
 	preLastTurnID := loaded.turns[len(loaded.turns)-1].TurnID
-	preGit, hasGit := gitStatusFingerprint(ctx, loaded.session.CWD)
+	preGit, preGitErr := gitStatusFingerprint(ctx, loaded.session.CWD)
 	sentAt := time.Now().UTC()
 	if !now.IsZero() && now.Before(sentAt.Add(-time.Minute)) {
 		// Preserve synthetic test clock when caller injects a simulated timestamp.
@@ -974,8 +980,8 @@ func (s *NativeService) runIdleKeepAliveOnce(ctx context.Context, settings Autom
 			userMessageID:  promptResp.UserMessageID,
 			promptID:       promptResp.PromptID,
 			cwd:            loaded.session.CWD,
-			preGitStatus:   preGit,
-			hasGit:         hasGit,
+			preGit:         preGit,
+			preGitErr:      preGitErr,
 			anchorStepUUID: anchorStepUUID,
 			model:          policy.Model,
 			sentAt:         sentAt,
@@ -990,8 +996,8 @@ type idleKeepAliveJob struct {
 	userMessageID  string
 	promptID       string
 	cwd            string
-	preGitStatus   string
-	hasGit         bool
+	preGit         string
+	preGitErr      error
 	anchorStepUUID string
 	model          string
 	sentAt         time.Time
@@ -1042,27 +1048,228 @@ func turnHasSettledOutput(turn NativeTurn) bool {
 	return false
 }
 
-func gitStatusFingerprint(ctx context.Context, cwd string) (string, bool) {
-	cwd = strings.TrimSpace(cwd)
-	if cwd == "" {
-		return "", false
+const (
+	gitFingerprintMaxFileBytes  = 8 << 20
+	gitFingerprintMaxTotalBytes = 64 << 20
+	gitFingerprintMaxStatus     = 4 << 20
+	gitFingerprintMaxEntries    = 16_384
+)
+
+// An empty fingerprint with no error means Git confirmed there is no repository.
+func gitStatusFingerprint(ctx context.Context, cwd string) (string, error) {
+	if strings.TrimSpace(cwd) == "" {
+		return "", errors.New("会话未记录工作目录")
 	}
-	if _, err := os.Stat(filepath.Join(cwd, ".git")); err != nil {
-		// Also support worktrees or subdirectories inside a git repo.
-		checkCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
-		defer cancel()
-		out, err := exec.CommandContext(checkCtx, "git", "-C", cwd, "rev-parse", "--is-inside-work-tree").Output()
-		if err != nil || strings.TrimSpace(string(out)) != "true" {
-			return "", false
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	stderr := &limitedBuffer{limit: 4096}
+	top := &limitedBuffer{limit: 64 << 10}
+	cmd := exec.CommandContext(ctx, "git", "-C", cwd, "rev-parse", "--show-toplevel")
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	cmd.Stderr = stderr
+	cmd.Stdout = top
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.ExitCode() == 128 &&
+			strings.HasPrefix(stderr.buf.String(), "fatal: not a git repository (or any of the parent directories") {
+			return "", confirmNonGitDirectory(cwd)
+		}
+		return "", fmt.Errorf("无法定位 Git 工作区：%w", err)
+	}
+	rootPath, ok := strings.CutSuffix(top.buf.String(), "\n")
+	if top.truncated || !ok || !filepath.IsAbs(rootPath) {
+		return "", errors.New("Git 工作区路径无效")
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+
+	status, truncated, err := runGitCapped(ctx, rootPath, gitFingerprintMaxStatus, "--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=normal")
+	if err != nil {
+		return "", fmt.Errorf("无法读取 Git 状态：%w", err)
+	}
+	if truncated {
+		return "", errors.New("Git 状态超过大小上限")
+	}
+	digest := sha256.New()
+	_, _ = io.WriteString(digest, rootPath+"\x00"+status+"\x00")
+	scan := gitFingerprintScan{ctx: ctx, root: root, entries: gitFingerprintMaxEntries, bytes: gitFingerprintMaxTotalBytes}
+	for status != "" {
+		var entry string
+		entry, status, ok = strings.Cut(status, "\x00")
+		if !ok || len(entry) < 4 || entry[2] != ' ' {
+			return "", errors.New("Git 状态条目无效")
+		}
+		xy := entry[:2]
+		if err := scan.addPath(digest, entry[3:], strings.Contains(xy, "D")); err != nil {
+			return "", err
+		}
+		if strings.ContainsAny(xy, "RC") {
+			var source string
+			source, status, ok = strings.Cut(status, "\x00")
+			if !ok {
+				return "", errors.New("Git 状态缺少重命名或复制的源路径")
+			}
+			if err := scan.addPath(digest, source, strings.Contains(xy, "R")); err != nil {
+				return "", err
+			}
 		}
 	}
-	cmdCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(cmdCtx, "git", "-C", cwd, "status", "--porcelain=v1", "--untracked-files=normal").Output()
-	if err != nil {
-		return "", false
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
-	return string(out), true
+	return fmt.Sprintf("%x", digest.Sum(nil)), nil
+}
+
+func confirmNonGitDirectory(cwd string) error {
+	path, err := filepath.Abs(cwd)
+	if err != nil {
+		return err
+	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		return err
+	}
+	for {
+		if _, err := os.Lstat(filepath.Join(path, ".git")); err == nil {
+			return errors.New("发现 .git，但 Git 无法读取工作区")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return nil
+		}
+		path = parent
+	}
+}
+
+type gitFingerprintScan struct {
+	ctx     context.Context
+	root    *os.Root
+	entries int
+	bytes   int64
+}
+
+func (s *gitFingerprintScan) addPath(digest hash.Hash, path string, allowMissing bool) error {
+	path = filepath.FromSlash(strings.TrimSuffix(path, "/"))
+	if path == "." || !filepath.IsLocal(path) {
+		return fmt.Errorf("Git 状态路径无效：%q", path)
+	}
+	if err := s.addEntry(digest, path, allowMissing); err != nil {
+		return fmt.Errorf("无法读取工作区条目 %q：%w", path, err)
+	}
+	return nil
+}
+
+func (s *gitFingerprintScan) addEntry(dst hash.Hash, path string, allowMissing bool) error {
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	if s.entries == 0 {
+		return errors.New("工作区条目超过数量上限")
+	}
+	s.entries--
+	info, err := s.root.Lstat(path)
+	if err != nil {
+		if allowMissing && (errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)) {
+			_, _ = io.WriteString(dst, "-")
+			return nil
+		}
+		return err
+	}
+
+	digest := sha256.New()
+	var kind string
+	switch mode := info.Mode(); {
+	case mode.IsRegular():
+		kind = "F"
+		if err := s.hashFile(digest, path, info); err != nil {
+			return err
+		}
+	case mode.IsDir():
+		kind = "D"
+		entries, err := s.readDir(path)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			_, _ = io.WriteString(digest, entry.Name()+"\x00")
+			if err := s.addEntry(digest, filepath.Join(path, entry.Name()), false); err != nil {
+				return fmt.Errorf("%q：%w", entry.Name(), err)
+			}
+		}
+	case mode&os.ModeSymlink != 0:
+		kind = "L"
+		target, err := s.root.Readlink(path)
+		if err != nil {
+			return err
+		}
+		if int64(len(target)) > s.bytes {
+			return errors.New("工作区文件超过大小上限")
+		}
+		s.bytes -= int64(len(target))
+		_, _ = io.WriteString(digest, target)
+	default:
+		return errors.New("工作区条目类型不支持")
+	}
+	_, _ = io.WriteString(dst, kind)
+	_, _ = dst.Write(digest.Sum(nil))
+	return nil
+}
+
+func (s *gitFingerprintScan) readDir(path string) ([]fs.DirEntry, error) {
+	dir, err := s.root.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	entries, err := dir.ReadDir(s.entries + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if len(entries) > s.entries {
+		return nil, errors.New("工作区条目超过数量上限")
+	}
+	slices.SortFunc(entries, func(a, b fs.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	return entries, nil
+}
+
+func (s *gitFingerprintScan) hashFile(digest hash.Hash, path string, info os.FileInfo) error {
+	limit := min(gitFingerprintMaxFileBytes, s.bytes)
+	if info.Size() > limit {
+		return errors.New("工作区文件超过大小上限")
+	}
+	file, err := s.root.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	current, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(info, current) || !current.Mode().IsRegular() {
+		return errors.New("工作区文件在读取前发生变化")
+	}
+	read, err := io.Copy(digest, io.LimitReader(file, limit+1))
+	if err != nil {
+		return err
+	}
+	if read > limit {
+		return errors.New("工作区文件超过大小上限")
+	}
+	current, err = s.root.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(info, current) || info.Size() != read || current.Size() != read || !info.ModTime().Equal(current.ModTime()) {
+		return errors.New("工作区文件在读取期间发生变化")
+	}
+	s.bytes -= read
+	return nil
 }
 
 func (s *NativeService) completeIdleKeepAlive(job idleKeepAliveJob) {
@@ -1160,8 +1367,20 @@ func (s *NativeService) completeIdleKeepAlive(job idleKeepAliveJob) {
 		s.finishIdleKeepAliveWithoutUndo(job, "failed", "保活回合意外触发工具调用，未自动撤回", true, "undo_skipped")
 		return
 	}
-	if job.hasGit {
-		if postGit, ok := gitStatusFingerprint(checkCtx, job.cwd); ok && postGit != job.preGitStatus {
+	if job.preGitErr != nil {
+		s.finishIdleKeepAliveWithoutUndo(job, "failed", "无法确认保活前的工作区状态，未自动撤回："+job.preGitErr.Error(), true, "undo_skipped")
+		return
+	}
+	if job.preGit != "" {
+		postGit, err := gitStatusFingerprint(checkCtx, job.cwd)
+		if err == nil && postGit == "" {
+			err = errors.New("工作目录已不是 Git 仓库")
+		}
+		if err != nil {
+			s.finishIdleKeepAliveWithoutUndo(job, "failed", "无法确认撤回前的工作区状态，未自动撤回："+err.Error(), true, "undo_skipped")
+			return
+		}
+		if postGit != job.preGit {
 			s.finishIdleKeepAliveWithoutUndo(job, "failed", "保活期间工作区文件发生变化，未自动撤回", true, "undo_skipped")
 			return
 		}

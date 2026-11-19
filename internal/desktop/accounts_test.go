@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,17 +20,20 @@ import (
 )
 
 type fakeAccountKAP struct {
-	home       string
-	mu         sync.Mutex
-	tokens     map[string]AccountProfile // access_token -> profile
-	sessions   []map[string]any
-	models     map[string]any
-	hasManaged bool
-	failModels bool
-	failUser   int
-	wrongUID   string
-	rotateNext map[string]string // old access_token -> rotated access_token
-	server     *httptest.Server
+	home              string
+	mu                sync.Mutex
+	tokens            map[string]AccountProfile // access_token -> profile
+	sessions          []map[string]any
+	models            map[string]any
+	hasManaged        bool
+	failModels        bool
+	failUser          int
+	wrongUID          string
+	failConfigRestore bool
+	failAfterPatch    bool
+	configRestores    int
+	rotateNext        map[string]string // access_token -> rotated access_token
+	server            *httptest.Server
 }
 
 func newFakeAccountKAP(t *testing.T) *fakeAccountKAP {
@@ -147,7 +151,20 @@ func (f *fakeAccountKAP) handle(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&patch)
 		if providers, ok := patch["providers"].(map[string]any); ok {
 			if val, present := providers["managed:kimi-code"]; present {
+				if val == nil {
+					f.configRestores++
+					if f.failConfigRestore {
+						w.WriteHeader(http.StatusInternalServerError)
+						_ = json.NewEncoder(w).Encode(map[string]any{"code": 500, "msg": "config restore rejected"})
+						return
+					}
+				}
 				f.hasManaged = val != nil
+				if val != nil && f.failAfterPatch {
+					w.WriteHeader(http.StatusInternalServerError)
+					_ = json.NewEncoder(w).Encode(map[string]any{"code": 500, "msg": "config patch applied before error"})
+					return
+				}
 			}
 		}
 		writeNativeTestEnvelope(w, map[string]any{"ok": true})
@@ -460,6 +477,140 @@ func TestAccountSwitchRollsBackOnWriteAndVerificationFailures(t *testing.T) {
 	})
 }
 
+func TestAccountSwitchRollbackBackup(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		failCredential    bool
+		failConfig        bool
+		failAfterPatch    bool
+		missingCredential bool
+	}{
+		{name: "credential restore fails", failCredential: true},
+		{name: "config restore fails", failConfig: true},
+		{name: "both restores fail", failCredential: true, failConfig: true},
+		{name: "credential was absent", failCredential: true, missingCredential: true},
+		{name: "both restores succeed"},
+		{name: "patch applied before error", failAfterPatch: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, fake, _ := newAccountTestService(t)
+			_, target := saveTwoTestAccounts(t, service, fake)
+			credPath := fake.credPath()
+			backupPath := credPath + ".ekd-bak"
+			original, err := os.ReadFile(credPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.missingCredential {
+				if err := os.Remove(credPath); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fake.mu.Lock()
+			fake.hasManaged = false
+			fake.failConfigRestore = tc.failConfig
+			fake.failAfterPatch = tc.failAfterPatch
+			fake.mu.Unlock()
+
+			service.hostPIDProvider = func() int {
+				if tc.failCredential {
+					if err := os.Remove(credPath); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Mkdir(credPath, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(credPath, "block-restore"), nil, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return 9999
+			}
+			payload, _ := json.Marshal(map[string]any{"id": target.ID, "expectedPid": 4242})
+			_, err = service.Action(context.Background(), "accounts.switch", payload)
+			if err == nil {
+				t.Fatal("expected switch to fail")
+			}
+			trigger := "客户端进程号发生变化"
+			if tc.failAfterPatch {
+				trigger = "config patch applied before error"
+			}
+			message := err.Error()
+			if !strings.Contains(message, trigger) ||
+				strings.Contains(message, "恢复凭据文件失败") != tc.failCredential ||
+				strings.Contains(message, "恢复官方供应商配置失败") != tc.failConfig {
+				t.Fatalf("switch error = %q", message)
+			}
+			fake.mu.Lock()
+			managed, restores := fake.hasManaged, fake.configRestores
+			fake.mu.Unlock()
+			if managed != tc.failConfig || restores != 1 {
+				t.Fatalf("provider present = %t, restore attempts = %d", managed, restores)
+			}
+			if !tc.failCredential {
+				restored, err := os.ReadFile(credPath)
+				if err != nil || !bytes.Equal(restored, original) {
+					t.Fatalf("original credential was not restored: %v", err)
+				}
+			}
+			backup, backupErr := os.ReadFile(backupPath)
+			if !tc.failCredential && !tc.failConfig {
+				if !errors.Is(backupErr, os.ErrNotExist) || !strings.Contains(message, "已自动恢复原账号") {
+					t.Fatalf("successful rollback error = %q, backup read error = %v", message, backupErr)
+				}
+				return
+			}
+			if backupErr != nil || !strings.Contains(message, backupPath) || strings.Contains(message, "已自动恢复原账号") {
+				t.Fatalf("incomplete rollback error = %q, backup read error = %v", message, backupErr)
+			}
+			if tc.missingCredential {
+				if !bytes.Contains(backup, []byte("no credential file existed")) {
+					t.Fatal("backup does not record the absence of an original credential")
+				}
+			} else if !bytes.Equal(backup, original) {
+				t.Fatal("backup does not contain the original credential")
+			}
+			if _, err := service.Action(context.Background(), "accounts.switch", payload); err == nil || !strings.Contains(err.Error(), backupPath) {
+				t.Fatalf("retry should stop with backup path, got %v", err)
+			}
+			if afterRetry, err := os.ReadFile(backupPath); err != nil || !bytes.Equal(afterRetry, backup) {
+				t.Fatalf("retry altered the retained backup: %v", err)
+			}
+		})
+	}
+}
+
+func TestAccountSwitchReportsBackupCleanupFailure(t *testing.T) {
+	service, fake, _ := newAccountTestService(t)
+	_, target := saveTwoTestAccounts(t, service, fake)
+	backupPath := fake.credPath() + ".ekd-bak"
+	service.hostPIDProvider = func() int {
+		backup, err := os.ReadFile(backupPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(backupPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(backupPath, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(backupPath, "backup"), backup, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return 4242
+	}
+	payload, _ := json.Marshal(map[string]any{"id": target.ID, "expectedPid": 4242})
+	value, err := service.Action(context.Background(), "accounts.switch", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := value.(AccountSwitchResult)
+	if !result.Switched || !strings.Contains(result.BackupCleanupWarning, backupPath) {
+		t.Fatalf("switch must succeed with the backup cleanup warning: %+v", result)
+	}
+}
+
 func TestAccountSwitchResnapshotsRotatedTokenBeforeLeaving(t *testing.T) {
 	service, fake, _ := newAccountTestService(t)
 	accA, accB := saveTwoTestAccounts(t, service, fake)
@@ -484,6 +635,9 @@ func TestAccountSwitchResnapshotsRotatedTokenBeforeLeaving(t *testing.T) {
 	}
 	if got := fake.readDiskToken(t).AccessToken; got != "tok-acc-b-secret-1" {
 		t.Fatalf("expected B token on disk, got %s", got)
+	}
+	if _, err := os.Lstat(fake.credPath() + ".ekd-bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovery backup still present after successful switch: %v", err)
 	}
 
 	// Switch B -> A: disk must receive A's rotated v2 token (not stale v1!).

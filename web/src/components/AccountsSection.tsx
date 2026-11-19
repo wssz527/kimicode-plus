@@ -186,6 +186,7 @@ export function AccountSwitchModal({
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [backupWarning, setBackupWarning] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -222,6 +223,10 @@ export function AccountSwitchModal({
       const result = await switchAccount(host, targetId, waitUntilIdle);
       if (result.switched) {
         dispatchAccountSwitched();
+        if (result.backupCleanupWarning) {
+          setBackupWarning(result.backupCleanupWarning);
+          return;
+        }
       }
       onClose();
     } catch (cause) {
@@ -253,7 +258,15 @@ export function AccountSwitchModal({
       }}
     >
       <div className="ekds-acc-modal-card">
-        {loading ? (
+        {backupWarning ? (
+          <div className="ekds-acc-confirm">
+            <strong>账号已切换</strong>
+            <p className="ekds-note is-warn" role="status">{backupWarning}</p>
+            <div className="ekds-acc-confirm-actions">
+              <button type="button" className="ekds-btn" onClick={onClose}>关闭</button>
+            </div>
+          </div>
+        ) : loading ? (
           <p className="ekds-note">正在检查会话状态与账号信息…</p>
         ) : preflight ? (
           <AccountSwitchConfirmPanel
@@ -296,6 +309,7 @@ export function AccountsManagerSection({
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [backupWarning, setBackupWarning] = useState<string | null>(null);
 
   const [vaultPassword, setVaultPassword] = useState("");
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -322,10 +336,11 @@ export function AccountsManagerSection({
 
   useEffect(() => {
     void load(false);
-    const unsub = host.subscribe<{ type?: string; refreshAuth?: boolean; error?: string }>("accounts", (event) => {
+    const unsub = host.subscribe<{ type?: string; refreshAuth?: boolean; error?: string; backupCleanupWarning?: string }>("accounts", (event) => {
       if (event?.type === "account.switched" && event.refreshAuth) {
         dispatchAccountSwitched();
-        setNotice("已自动完成账号切换。");
+        setNotice("已完成账号切换。");
+        setBackupWarning(event.backupCleanupWarning || null);
       } else if (event?.type === "account.switch_failed" && event.error) {
         setError(event.error);
       }
@@ -483,6 +498,7 @@ export function AccountsManagerSection({
       } else if (res.switched && res.account) {
         dispatchAccountSwitched();
         setNotice(`已切换到账号「${res.account.label}」，现有 ${res.sessionsCount ?? 0} 个会话均保持完整。`);
+        setBackupWarning(res.backupCleanupWarning || null);
       }
       await load(false);
     } catch (cause) {
@@ -564,6 +580,7 @@ export function AccountsManagerSection({
       {fallbackReason ? <FallbackNotice label="账户" reason={fallbackReason} /> : null}
       {error ? <p className="ekds-note is-error" role="alert">{error}</p> : null}
       {notice ? <p className="ekds-note is-ok" role="status">{notice}</p> : null}
+      {backupWarning ? <p className="ekds-note is-warn" role="status">{backupWarning}</p> : null}
 
       {state?.pendingSwitch ? (
         <div className="ekds-acc-banner" role="status" data-ekd-account-pending="true">

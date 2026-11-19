@@ -115,14 +115,15 @@ type AccountSwitchPreflight struct {
 }
 
 type AccountSwitchResult struct {
-	Switched      bool                  `json:"switched"`
-	Queued        bool                  `json:"queued,omitempty"`
-	Account       *AccountSummary       `json:"account,omitempty"`
-	PendingSwitch *AccountPendingSwitch `json:"pendingSwitch,omitempty"`
-	SessionsCount int                   `json:"sessionsCount,omitempty"`
-	HostPID       int                   `json:"hostPid,omitempty"`
-	Warnings      []string              `json:"warnings,omitempty"`
-	RefreshAuth   bool                  `json:"refreshAuth"`
+	Switched             bool                  `json:"switched"`
+	Queued               bool                  `json:"queued,omitempty"`
+	Account              *AccountSummary       `json:"account,omitempty"`
+	PendingSwitch        *AccountPendingSwitch `json:"pendingSwitch,omitempty"`
+	SessionsCount        int                   `json:"sessionsCount,omitempty"`
+	HostPID              int                   `json:"hostPid,omitempty"`
+	Warnings             []string              `json:"warnings,omitempty"`
+	BackupCleanupWarning string                `json:"backupCleanupWarning,omitempty"`
+	RefreshAuth          bool                  `json:"refreshAuth"`
 }
 
 type storedKimiAccountSecret struct {
@@ -305,6 +306,21 @@ func writeFileAtomic0600(target string, data []byte) error {
 	return nil
 }
 
+func writeAccountSwitchBackup(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.Write(data)
+	if err := errors.Join(writeErr, file.Sync(), file.Close()); err != nil {
+		return errors.Join(err, os.Remove(path))
+	}
+	return nil
+}
+
 func (s *NativeService) writeCredentialFile(target string, data []byte) error {
 	if s.writeAccountFileHook != nil {
 		return s.writeAccountFileHook(target, data)
@@ -312,27 +328,32 @@ func (s *NativeService) writeCredentialFile(target string, data []byte) error {
 	return writeFileAtomic0600(target, data)
 }
 
-func (s *NativeService) readManagedProviderConfig(ctx context.Context) (oauthKey, oauthHost, baseURL string, exists bool, rawProvider any) {
+func (s *NativeService) readManagedProviderConfig(ctx context.Context) (oauthKey, oauthHost, baseURL string, exists bool, err error) {
 	oauthKey = defaultManagedOAuthKey
 	baseURL = defaultManagedBaseURL
 	raw, err := s.kap.Request(ctx, http.MethodGet, "/config", nil)
 	if err != nil {
-		return oauthKey, oauthHost, baseURL, false, nil
+		return oauthKey, oauthHost, baseURL, false, err
 	}
 	var cfg map[string]any
-	if json.Unmarshal(raw, &cfg) != nil {
-		return oauthKey, oauthHost, baseURL, false, nil
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return oauthKey, oauthHost, baseURL, false, err
 	}
-	providers, _ := cfg["providers"].(map[string]any)
-	if providers == nil {
-		return oauthKey, oauthHost, baseURL, false, nil
+	if cfg == nil {
+		return oauthKey, oauthHost, baseURL, false, errors.New("官方供应商配置为空")
+	}
+	providers, ok := cfg["providers"].(map[string]any)
+	if !ok && cfg["providers"] != nil {
+		return oauthKey, oauthHost, baseURL, false, errors.New("官方供应商配置格式无效")
 	}
 	managed, ok := providers[defaultManagedProviderID].(map[string]any)
-	if !ok || managed == nil {
+	if !ok && providers[defaultManagedProviderID] != nil {
+		return oauthKey, oauthHost, baseURL, false, errors.New("官方账号供应商配置格式无效")
+	}
+	if managed == nil {
 		return oauthKey, oauthHost, baseURL, false, nil
 	}
 	exists = true
-	rawProvider = managed
 	if u, _ := managed["baseUrl"].(string); strings.TrimSpace(u) != "" {
 		baseURL = strings.TrimRight(strings.TrimSpace(u), "/")
 	} else if u, _ := managed["base_url"].(string); strings.TrimSpace(u) != "" {
@@ -348,7 +369,7 @@ func (s *NativeService) readManagedProviderConfig(ctx context.Context) (oauthKey
 			oauthHost = strings.TrimRight(strings.TrimSpace(h), "/")
 		}
 	}
-	return oauthKey, oauthHost, baseURL, exists, rawProvider
+	return oauthKey, oauthHost, baseURL, exists, nil
 }
 
 func (s *NativeService) readOfficialUserInfo(ctx context.Context) (*AccountProfile, int, string) {
@@ -1262,65 +1283,85 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 	defer resumeAutomation()
 
 	// Step 3: Re-snapshot outgoing current account's latest kimi-code.json (tokens may have rotated).
-	currentOAuthKey, currentOAuthHost, currentBaseURL, providerExists, prevProviderRaw := s.readManagedProviderConfig(ctx)
-	currentProfile, _, _ := s.readOfficialUserInfo(ctx)
+	currentOAuthKey, currentOAuthHost, currentBaseURL, providerExists, configErr := s.readManagedProviderConfig(ctx)
 	targetOAuthKey := firstNonEmpty(targetSecret.OAuthKey, targetRow.OAuthKey, currentOAuthKey, defaultManagedOAuthKey)
 	credPath, err := s.kimiCredentialPath(targetOAuthKey)
 	if err != nil {
 		return AccountSwitchResult{}, err
 	}
+	backupPath := credPath + ".ekd-bak"
+	backupExistsErr := fmt.Errorf("切换已停止，请先处理留存的恢复备份：%s", backupPath)
+	if _, err := os.Lstat(backupPath); err == nil {
+		return AccountSwitchResult{}, backupExistsErr
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return AccountSwitchResult{}, fmt.Errorf("无法检查恢复备份 %s：%w", backupPath, err)
+	}
+	if configErr != nil {
+		return AccountSwitchResult{}, fmt.Errorf("切换前无法读取官方供应商配置：%w", configErr)
+	}
+	currentProfile, _, _ := s.readOfficialUserInfo(ctx)
 	s.waitForOAuthRefreshLock(ctx, targetOAuthKey)
 
-	var backupBytes []byte
-	hadBackupFile := false
-	if existingBytes, readErr := os.ReadFile(credPath); readErr == nil {
-		backupBytes = existingBytes
-		hadBackupFile = true
-		if currentProfile != nil {
-			if fields, parseErr := parseRawTokenFields(existingBytes); parseErr == nil && !tokenIsRevokedOrEmpty(fields) {
-				if existingRow, findErr := s.loadAccountRowByUserID(ctx, currentProfile.UserID); findErr == nil {
-					_, _ = s.upsertAccountWithSecret(ctx, currentProfile, existingBytes, currentOAuthKey, currentOAuthHost, currentBaseURL, existingRow.Label)
-				}
-			}
-		}
-	} else if !errors.Is(readErr, os.ErrNotExist) {
+	backupBytes, readErr := os.ReadFile(credPath)
+	hadCredential := readErr == nil
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 		return AccountSwitchResult{}, fmt.Errorf("无法读取当前凭据文件：%w", readErr)
 	}
 
-	// Step 4: Write backup file on disk + atomically write target credentials.
-	backupPath := credPath + ".ekd-bak"
-	if hadBackupFile {
-		if err := writeFileAtomic0600(backupPath, backupBytes); err != nil {
-			return AccountSwitchResult{}, fmt.Errorf("备份当前凭据失败：%w", err)
-		}
-		defer func() { _ = os.Remove(backupPath) }()
+	// Step 4: Reserve the recovery backup before changing credentials or configuration.
+	backupData := backupBytes
+	if !hadCredential {
+		backupData = []byte("EKD: no credential file existed before the switch\n")
 	}
-
-	configModified := false
-	rollback := func() {
-		if hadBackupFile {
-			_ = writeFileAtomic0600(credPath, backupBytes)
-		} else {
-			_ = os.Remove(credPath)
+	if err := writeAccountSwitchBackup(backupPath, backupData); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return AccountSwitchResult{}, backupExistsErr
 		}
-		if configModified {
-			rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer rbCancel()
-			if providerExists && prevProviderRaw != nil {
-				_, _ = s.kap.Request(rbCtx, http.MethodPost, "/config", map[string]any{
-					"providers": map[string]any{defaultManagedProviderID: prevProviderRaw},
-				})
-			} else {
-				_, _ = s.kap.Request(rbCtx, http.MethodPost, "/config", map[string]any{
-					"providers": map[string]any{defaultManagedProviderID: nil},
-				})
+		return AccountSwitchResult{}, fmt.Errorf("写入恢复备份 %s 失败：%w", backupPath, err)
+	}
+	if hadCredential && currentProfile != nil {
+		if fields, parseErr := parseRawTokenFields(backupBytes); parseErr == nil && !tokenIsRevokedOrEmpty(fields) {
+			if existingRow, findErr := s.loadAccountRowByUserID(ctx, currentProfile.UserID); findErr == nil {
+				_, _ = s.upsertAccountWithSecret(ctx, currentProfile, backupBytes, currentOAuthKey, currentOAuthHost, currentBaseURL, existingRow.Label)
 			}
 		}
 	}
 
+	removeBackup := func() error {
+		if err := os.Remove(backupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("无法删除恢复备份 %s：%w", backupPath, err)
+		}
+		return nil
+	}
+	configPatchAttempted := false
+	rollback := func(cause error) (AccountSwitchResult, error) {
+		var credentialErr, configErr error
+		if hadCredential {
+			credentialErr = writeFileAtomic0600(credPath, backupBytes)
+		} else if err := os.Remove(credPath); !errors.Is(err, os.ErrNotExist) {
+			credentialErr = err
+		}
+		if credentialErr != nil {
+			credentialErr = fmt.Errorf("恢复凭据文件失败：%w", credentialErr)
+		}
+		if configPatchAttempted {
+			rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer rbCancel()
+			_, configErr = s.kap.Request(rbCtx, http.MethodPost, "/config", map[string]any{
+				"providers": map[string]any{defaultManagedProviderID: nil},
+			})
+			if configErr != nil {
+				configErr = fmt.Errorf("恢复官方供应商配置失败：%w", configErr)
+			}
+		}
+		if err := errors.Join(credentialErr, configErr); err != nil {
+			return AccountSwitchResult{}, fmt.Errorf("切换失败，且未能完全恢复原账号，备份保留在 %s：%w", backupPath, errors.Join(cause, err))
+		}
+		return AccountSwitchResult{}, errors.Join(fmt.Errorf("%w，已自动恢复原账号", cause), removeBackup())
+	}
+
 	if err := s.writeCredentialFile(credPath, targetSecret.RawCredential); err != nil {
-		rollback()
-		return AccountSwitchResult{}, fmt.Errorf("写入目标账号凭据失败，已恢复原账号：%w", err)
+		return rollback(fmt.Errorf("写入目标账号凭据失败：%w", err))
 	}
 
 	// If managed:kimi-code provider was absent (signed-out state), provision it so /auth and /oauth/userinfo recognize the credential.
@@ -1342,47 +1383,42 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 				},
 			},
 		}
-		if _, patchErr := s.kap.Request(ctx, http.MethodPost, "/config", patch); patchErr != nil {
-			rollback()
-			return AccountSwitchResult{}, fmt.Errorf("补回官方账号供应商配置失败，已恢复原状态：%w", patchErr)
+		// An error response can arrive after the configuration change was applied.
+		configPatchAttempted = true
+		if _, err := s.kap.Request(ctx, http.MethodPost, "/config", patch); err != nil {
+			return rollback(fmt.Errorf("补回官方账号供应商配置失败：%w", err))
 		}
-		configModified = true
 	}
 
 	// Step 5: Verify /oauth/userinfo matches target, models readable, host PID unchanged, sessions intact.
 	verifiedProfile, verifyStatus, verifyMsg := s.readOfficialUserInfo(ctx)
 	if verifiedProfile == nil {
-		rollback()
 		if verifyStatus == http.StatusUnauthorized || verifyStatus == http.StatusForbidden {
+			result, err := rollback(&NativeError{Code: "ACCOUNT_RELOGIN_REQUIRED", Message: "目标账号令牌已失效，请重新登录目标账号"})
 			s.markAccountStatus(ctx, targetRow.ID, accountStatusReloginRequired, "目标账号令牌已被官方拒绝，需要重新登录")
-			return AccountSwitchResult{}, &NativeError{Code: "ACCOUNT_RELOGIN_REQUIRED", Message: "目标账号令牌已失效，已自动恢复原账号，请重新登录目标账号"}
+			return result, err
 		}
-		return AccountSwitchResult{}, fmt.Errorf("切换后身份校验失败（%s），已自动恢复原账号", firstNonEmpty(verifyMsg, "无法读取用户信息"))
+		return rollback(fmt.Errorf("切换后身份校验失败（%s）", firstNonEmpty(verifyMsg, "无法读取用户信息")))
 	}
 	if verifiedProfile.UserID != targetRow.UserID {
-		rollback()
-		return AccountSwitchResult{}, fmt.Errorf("切换后身份不匹配（返回 %s，期望 %s），已自动恢复原账号", verifiedProfile.UserID, targetRow.UserID)
+		return rollback(fmt.Errorf("切换后身份不匹配（返回 %s，期望 %s）", verifiedProfile.UserID, targetRow.UserID))
 	}
 	if _, err := s.kap.Models(ctx); err != nil {
-		rollback()
-		return AccountSwitchResult{}, fmt.Errorf("切换后读取模型列表失败，已自动恢复原账号：%w", err)
+		return rollback(fmt.Errorf("切换后读取模型列表失败：%w", err))
 	}
 	sessionsAfter, err := s.kap.Sessions(ctx)
 	if err != nil {
-		rollback()
-		return AccountSwitchResult{}, fmt.Errorf("切换后读取会话列表失败，已自动恢复原账号：%w", err)
+		return rollback(fmt.Errorf("切换后读取会话列表失败：%w", err))
 	}
 	if !sessionsPreserved(sessionsBefore, sessionsAfter) {
-		rollback()
-		return AccountSwitchResult{}, errors.New("切换后会话列表数量或条目发生异常变化，已自动恢复原账号")
+		return rollback(errors.New("切换后会话列表数量或条目发生异常变化"))
 	}
 	afterPID := expectedPID
 	if expectedPID > 0 {
 		if measured := s.currentHostPID(); measured > 0 {
 			afterPID = measured
 			if measured != expectedPID {
-				rollback()
-				return AccountSwitchResult{}, fmt.Errorf("客户端进程号发生变化（%d -> %d），已自动恢复原账号", expectedPID, measured)
+				return rollback(fmt.Errorf("客户端进程号发生变化（%d -> %d）", expectedPID, measured))
 			}
 		}
 	}
@@ -1400,22 +1436,29 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 	}
 	summary := s.accountRowToSummary(ctx, updatedRow, verifiedProfile.UserID)
 	warnings := []string{"切换后各会话的第一次请求不会命中提示词缓存（缓存按账号计算）。"}
+	var backupCleanupWarning string
+	if err := removeBackup(); err != nil {
+		backupCleanupWarning = err.Error()
+		warnings = append(warnings, backupCleanupWarning)
+	}
 	if s.detectRunningKimiCLI(ctx) {
 		warnings = append(warnings, "检测到本机有正在运行的 kimi 命令行进程，已同步切到新账号。")
 	}
 	s.bus.Publish("accounts", map[string]any{
-		"type":        "account.switched",
-		"accountId":   summary.ID,
-		"userId":      summary.UserID,
-		"refreshAuth": true,
+		"type":                 "account.switched",
+		"accountId":            summary.ID,
+		"userId":               summary.UserID,
+		"refreshAuth":          true,
+		"backupCleanupWarning": backupCleanupWarning,
 	})
 	return AccountSwitchResult{
-		Switched:      true,
-		Account:       &summary,
-		SessionsCount: len(sessionsAfter),
-		HostPID:       afterPID,
-		Warnings:      warnings,
-		RefreshAuth:   true,
+		Switched:             true,
+		Account:              &summary,
+		SessionsCount:        len(sessionsAfter),
+		HostPID:              afterPID,
+		Warnings:             warnings,
+		BackupCleanupWarning: backupCleanupWarning,
+		RefreshAuth:          true,
 	}, nil
 }
 

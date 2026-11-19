@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -94,7 +95,7 @@ type idleTestHarness struct {
 	undoFail        bool
 	appendExtraTurn bool
 	emitToolCall    bool
-	mutateFile      string
+	mutateWorkspace func() error
 	nextTurnNum     int
 }
 
@@ -102,6 +103,7 @@ func newIdleTestHarness(model string) *idleTestHarness {
 	limit := int64(200000)
 	sess := nativeTestSession("s1", 150000, &limit)
 	sess["agent_config"] = map[string]any{"model": model}
+	delete(sess, "metadata")
 	return &idleTestHarness{
 		session: sess,
 		turns: []NativeTurn{
@@ -174,8 +176,10 @@ func (h *idleTestHarness) handler(t *testing.T) http.Handler {
 			}
 			items = append(items, NativeItem{ItemID: "msg-ka-a", Type: "assistant_message", Text: "1"})
 			h.turns = append(h.turns, NativeTurn{TurnID: turnID, Items: items})
-			if h.mutateFile != "" {
-				_ = os.WriteFile(h.mutateFile, []byte("changed\n"), 0o600)
+			if h.mutateWorkspace != nil {
+				if err := h.mutateWorkspace(); err != nil {
+					t.Error(err)
+				}
 			}
 			if h.appendExtraTurn {
 				h.turns = append(h.turns, NativeTurn{
@@ -223,6 +227,9 @@ func (h *idleTestHarness) handler(t *testing.T) http.Handler {
 
 func startIdleKeepAliveService(t *testing.T, h *idleTestHarness, home string, lastActivity time.Time) *NativeService {
 	t.Helper()
+	if h.session["metadata"] == nil {
+		h.session["metadata"] = map[string]any{"cwd": home}
+	}
 	service, _ := newAutomationTestServiceWithHome(t, h.handler(t), home)
 	service.verifyPoll = 15 * time.Millisecond
 	service.idleVerifyPoll = 15 * time.Millisecond
@@ -550,6 +557,127 @@ func TestIdleKeepAliveGuardrails(t *testing.T) {
 	})
 }
 
+func newIdleTestGitRepository(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	repo := t.TempDir()
+	runIdleTestGit(t, repo, "init")
+	return repo
+}
+
+func runIdleTestGit(t *testing.T, cwd string, args ...string) []byte {
+	t.Helper()
+	out, err := exec.Command("git", append([]string{"-C", cwd}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+	return out
+}
+
+func writeIdleTestFile(t *testing.T, path, text string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGitStatusFingerprint(t *testing.T) {
+	ctx := context.Background()
+	repo := newIdleTestGitRepository(t)
+	nested := filepath.Join(repo, "untracked directory")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldPath, newPath := "old name", "new name"
+	if os.PathSeparator == '/' {
+		oldPath += "\nold"
+		newPath += " -> name\tnew"
+	}
+	writeIdleTestFile(t, filepath.Join(repo, oldPath), "renamed\n")
+	writeIdleTestFile(t, filepath.Join(repo, "deleted"), "deleted\n")
+	runIdleTestGit(t, repo, "add", oldPath, "deleted")
+	runIdleTestGit(t, repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init")
+	runIdleTestGit(t, repo, "mv", oldPath, newPath)
+	if err := os.Remove(filepath.Join(repo, "deleted")); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(nested, "child")
+	writeIdleTestFile(t, child, "first\n")
+	status := runIdleTestGit(t, repo, "-c", "status.renames=true", "status", "--porcelain=v1", "-z", "--untracked-files=normal")
+	for _, entry := range [][]byte{[]byte("R  " + newPath + "\x00" + oldPath + "\x00"), []byte(" D deleted\x00"), []byte("?? untracked directory/\x00")} {
+		if !bytes.Contains(status, entry) {
+			t.Fatalf("expected %q in status %q", entry, status)
+		}
+	}
+	runIdleTestGit(t, repo, "config", "status.renames", "true")
+	before, err := gitStatusFingerprint(ctx, nested)
+	if err != nil || before == "" {
+		t.Fatalf("fingerprint for rename, deletion, and directory = %q, %v", before, err)
+	}
+	if repeated, err := gitStatusFingerprint(ctx, repo); err != nil || repeated != before {
+		t.Fatalf("repository root and nested working directory fingerprints differ: %q, %q, %v", before, repeated, err)
+	}
+	writeIdleTestFile(t, child, "other\n")
+	if after := runIdleTestGit(t, repo, "status", "--porcelain=v1", "-z", "--untracked-files=normal"); !bytes.Equal(after, status) {
+		t.Fatalf("porcelain changed after rewriting an untracked child: %q", after)
+	}
+	if after, err := gitStatusFingerprint(ctx, repo); err != nil || after == "" || after == before {
+		t.Fatalf("directory child rewrite must change the fingerprint: %q, %q, %v", before, after, err)
+	}
+
+	t.Run("bounded total content", func(t *testing.T) {
+		for i := range gitFingerprintMaxTotalBytes/gitFingerprintMaxFileBytes + 1 {
+			path := filepath.Join(nested, "large-"+string(rune('a'+i)))
+			writeIdleTestFile(t, path, "")
+			if err := os.Truncate(path, gitFingerprintMaxFileBytes); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if fingerprint, err := gitStatusFingerprint(ctx, repo); err == nil || fingerprint != "" || !strings.Contains(err.Error(), "超过大小上限") {
+			t.Fatalf("fingerprint over cumulative cap = %q, %v", fingerprint, err)
+		}
+	})
+
+	t.Run("non Git differs from missing working directory", func(t *testing.T) {
+		plain := t.TempDir()
+		if fingerprint, err := gitStatusFingerprint(ctx, plain); err != nil || fingerprint != "" {
+			t.Fatalf("non-Git directory fingerprint = %q, %v", fingerprint, err)
+		}
+		if fingerprint, err := gitStatusFingerprint(ctx, filepath.Join(plain, "missing")); err == nil || fingerprint != "" {
+			t.Fatalf("missing directory fingerprint = %q, %v", fingerprint, err)
+		}
+		if err := os.Mkdir(filepath.Join(plain, ".git"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if fingerprint, err := gitStatusFingerprint(ctx, plain); err == nil || fingerprint != "" {
+			t.Fatalf("invalid repository fingerprint = %q, %v", fingerprint, err)
+		}
+	})
+
+	t.Run("unreadable file", func(t *testing.T) {
+		repo := newIdleTestGitRepository(t)
+		path := filepath.Join(repo, "unreadable")
+		writeIdleTestFile(t, path, "unreadable\n")
+		if err := os.Chmod(path, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := os.Chmod(path, 0o600); err != nil {
+				t.Error(err)
+			}
+		})
+		if file, err := os.Open(path); err == nil {
+			_ = file.Close()
+			t.Skip("filesystem or current user can still read the file")
+		}
+		if fingerprint, err := gitStatusFingerprint(ctx, repo); err == nil || fingerprint != "" || !strings.Contains(err.Error(), "unreadable") {
+			t.Fatalf("fingerprint with unreadable path = %q, %v", fingerprint, err)
+		}
+	})
+}
+
 func TestIdleKeepAliveUndoSafetyChecks(t *testing.T) {
 	t.Run("skips undo when newer turn arrived", func(t *testing.T) {
 		home := t.TempDir()
@@ -597,36 +725,72 @@ func TestIdleKeepAliveUndoSafetyChecks(t *testing.T) {
 		}
 	})
 
-	t.Run("skips undo when git workspace files changed", func(t *testing.T) {
-		repo := t.TempDir()
-		if err := exec.Command("git", "-C", repo, "init").Run(); err != nil {
-			t.Skip("git unavailable")
-		}
-		file := filepath.Join(repo, "a.txt")
-		_ = os.WriteFile(file, []byte("initial\n"), 0o600)
-		_ = exec.Command("git", "-C", repo, "add", "a.txt").Run()
-		_ = exec.Command("git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init").Run()
+	for _, tc := range []struct {
+		name       string
+		largeFirst bool
+		largeAfter bool
+		wantUndo   bool
+		wantNote   string
+	}{
+		{name: "git status and file content unchanged", wantUndo: true, wantNote: "已自动撤回保活回合"},
+		{name: "git status unchanged but file changed", wantNote: "工作区文件发生变化"},
+		{name: "git fingerprint unknown before prompt", largeFirst: true, wantNote: "无法确认保活前的工作区状态"},
+		{name: "git fingerprint unknown before undo", largeAfter: true, wantNote: "无法确认撤回前的工作区状态"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newIdleTestGitRepository(t)
+			file := filepath.Join(repo, "a.txt")
+			writeIdleTestFile(t, file, "initial\n")
+			runIdleTestGit(t, repo, "add", "a.txt")
+			runIdleTestGit(t, repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init")
+			writeIdleTestFile(t, file, "modified\n")
+			if tc.largeFirst {
+				if err := os.Truncate(file, gitFingerprintMaxFileBytes+1); err != nil {
+					t.Fatal(err)
+				}
+			}
+			porcelainBefore := runIdleTestGit(t, repo, "status", "--porcelain=v1", "-z")
 
-		home := t.TempDir()
-		now := time.Now().UTC().Truncate(time.Millisecond)
-		keepAliveFixture{home: home, mainAge: 26 * time.Minute}.write(t, "kimi-code/kimi-for-coding")
-		h := newIdleTestHarness("kimi-code/kimi-for-coding")
-		h.session["metadata"] = map[string]any{"cwd": repo}
-		h.mutateFile = file
-		service := startIdleKeepAliveService(t, h, home, now.Add(-26*time.Minute))
-		settings := defaultAutomationSettings()
-		settings.IdleKeepAlive.Enabled = true
-		_ = service.storeAutomationSettings(context.Background(), settings)
+			home := t.TempDir()
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			keepAliveFixture{home: home, mainAge: 26 * time.Minute}.write(t, "kimi-code/kimi-for-coding")
+			h := newIdleTestHarness("kimi-code/kimi-for-coding")
+			h.session["metadata"] = map[string]any{"cwd": repo}
+			switch {
+			case tc.largeAfter:
+				h.mutateWorkspace = func() error { return os.Truncate(file, gitFingerprintMaxFileBytes+1) }
+			case !tc.largeFirst && !tc.wantUndo:
+				h.mutateWorkspace = func() error { return os.WriteFile(file, []byte("changed!\n"), 0o600) }
+			}
+			service := startIdleKeepAliveService(t, h, home, now.Add(-26*time.Minute))
+			settings := defaultAutomationSettings()
+			settings.IdleKeepAlive.Enabled = true
+			if err := service.storeAutomationSettings(context.Background(), settings); err != nil {
+				t.Fatal(err)
+			}
 
-		service.runIdleKeepAliveOnce(context.Background(), settings, "s1", now)
-		waitUntilIdleDone(t, service, "s1")
+			service.runIdleKeepAliveOnce(context.Background(), settings, "s1", now)
+			waitUntilIdleDone(t, service, "s1")
 
-		h.mu.Lock()
-		if len(h.undos) != 0 {
-			t.Fatalf("undos = %d, want 0 when workspace files changed", len(h.undos))
-		}
-		h.mu.Unlock()
-	})
+			if after := runIdleTestGit(t, repo, "status", "--porcelain=v1", "-z"); len(after) == 0 || !bytes.Equal(after, porcelainBefore) {
+				t.Fatalf("expected identical dirty porcelain before and after, got %q and %q", porcelainBefore, after)
+			}
+			h.mu.Lock()
+			prompts, undos := len(h.prompts), len(h.undos)
+			h.mu.Unlock()
+			wantUndos, wantStop := 0, "undo_skipped"
+			if tc.wantUndo {
+				wantUndos, wantStop = 1, ""
+			}
+			if prompts != 1 || undos != wantUndos {
+				t.Fatalf("prompts = %d, undos = %d, want 1 and %d", prompts, undos, wantUndos)
+			}
+			view, err := service.sessionKeepAliveView(context.Background(), "s1", now)
+			if err != nil || view.StoppedReason != wantStop || !strings.Contains(view.LastNote, tc.wantNote) {
+				t.Fatalf("keepalive view = %+v, err = %v", view, err)
+			}
+		})
+	}
 
 	t.Run("stops and alerts without retry when undo fails", func(t *testing.T) {
 		home := t.TempDir()
