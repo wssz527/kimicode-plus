@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -239,6 +240,12 @@ func TestDiscoverHostReportsWithoutAttaching(t *testing.T) {
 	// No Kimi Code instance is running in the test environment, so discovery must
 	// report that plainly instead of failing the call.
 	value, err := DiscoverHost(context.Background(), "/tmp/definitely-absent-profile")
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		if value != nil || !errors.Is(err, ErrUnsupportedPlatform) {
+			t.Fatalf("discovery on %s returned %+v, %v", runtime.GOOS, value, err)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatalf("discovery refused to report: %v", err)
 	}
