@@ -1,0 +1,398 @@
+package updater
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	defaultRepo = "wssz527/kimicode-plus"
+	defaultAPI  = "https://api.github.com"
+
+	Idle        = "idle"
+	Checking    = "checking"
+	UpToDate    = "up_to_date"
+	Available   = "available"
+	Downloading = "downloading"
+	Verifying   = "verifying"
+	Restarting  = "restarting"
+	Updated     = "updated"
+	RolledBack  = "rolled_back"
+	Failed      = "error"
+)
+
+var (
+	ErrSafeMode = errors.New("安全模式下无法更新核心，请退出安全模式后重试")
+	ErrBusy     = errors.New("核心更新操作正在进行，请稍候")
+	repoPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]*/[a-zA-Z0-9_.-]+$`)
+)
+
+type Options struct {
+	CurrentVersion    string
+	Executable        string
+	DataDir           string
+	Safe              func() bool
+	Dispatch          func(func() error) error
+	RestartState      func() RestartState
+	RequestRestart    func()
+	launchSupervisor  func(string, string) error
+	APIBaseURL        string
+	AllowInsecureHTTP bool
+	AllowTemporaryExe bool
+	GOOS              string
+	GOARCH            string
+	HTTPClient        *http.Client
+	Now               func() time.Time
+}
+
+type Status struct {
+	State             string        `json:"state"`
+	CurrentVersion    string        `json:"currentVersion"`
+	LatestVersion     string        `json:"latestVersion,omitempty"`
+	CheckedAt         string        `json:"checkedAt,omitempty"`
+	PublishedAt       string        `json:"publishedAt,omitempty"`
+	ReleaseURL        string        `json:"releaseUrl,omitempty"`
+	ReleaseNotes      string        `json:"releaseNotes,omitempty"`
+	UpdateAvailable   bool          `json:"updateAvailable"`
+	CanApply          bool          `json:"canApply"`
+	CannotApplyReason string        `json:"cannotApplyReason,omitempty"`
+	Note              string        `json:"note,omitempty"`
+	Error             string        `json:"error,omitempty"`
+	DownloadedBytes   int64         `json:"downloadedBytes"`
+	TotalBytes        int64         `json:"totalBytes"`
+	LastAttempt       *UpdateResult `json:"lastAttempt,omitempty"`
+}
+
+type asset struct {
+	Name string `json:"name"`
+	URL  string `json:"browser_download_url"`
+	Size int64  `json:"size"`
+}
+
+type release struct {
+	Tag         string  `json:"tag_name"`
+	PublishedAt string  `json:"published_at"`
+	URL         string  `json:"html_url"`
+	Notes       string  `json:"body"`
+	Assets      []asset `json:"assets"`
+}
+
+type Manager struct {
+	options   Options
+	current   version
+	repo      string
+	api       string
+	client    http.Client
+	configErr error
+	ctx       context.Context
+	cancel    context.CancelFunc
+	operation sync.Mutex
+	mu        sync.RWMutex
+	status    Status
+	archive   asset
+	checksums asset
+}
+
+func New(options Options) *Manager {
+	if options.GOOS == "" {
+		options.GOOS = runtime.GOOS
+	}
+	if options.GOARCH == "" {
+		options.GOARCH = runtime.GOARCH
+	}
+	if options.Now == nil {
+		options.Now = time.Now
+	}
+	if options.Safe == nil {
+		options.Safe = func() bool { return false }
+	}
+	if options.launchSupervisor == nil {
+		options.launchSupervisor = startSupervisor
+	}
+	if executable, err := filepath.EvalSymlinks(options.Executable); err == nil && options.Executable != "" {
+		options.Executable = executable
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &Manager{options: options, ctx: ctx, cancel: cancel, status: Status{State: Idle, CurrentVersion: strings.TrimPrefix(options.CurrentVersion, "v")}}
+	if options.HTTPClient != nil {
+		m.client = *options.HTTPClient
+	}
+	checkRedirect := m.client.CheckRedirect
+	m.client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 || !m.validURL(req.URL) {
+			return errors.New("更新服务重定向地址无效")
+		}
+		if checkRedirect != nil {
+			return checkRedirect(req, via)
+		}
+		return nil
+	}
+	m.repo = os.Getenv("EKD_UPDATE_REPO")
+	if m.repo == "" {
+		m.repo = defaultRepo
+	}
+	m.api = options.APIBaseURL
+	if m.api == "" {
+		m.api = os.Getenv("EKD_UPDATE_API_BASE")
+	}
+	if m.api == "" {
+		m.api = defaultAPI
+	}
+	m.api = strings.TrimRight(m.api, "/")
+	apiURL, urlErr := url.Parse(m.api)
+	current, validVersion := parseVersion(options.CurrentVersion)
+	m.current = current
+	switch {
+	case !repoPattern.MatchString(m.repo) || strings.HasSuffix(m.repo, "/.") || strings.HasSuffix(m.repo, "/.."):
+		m.configErr = errors.New("EKD_UPDATE_REPO 必须使用有效的 owner/repo 格式")
+	case urlErr != nil || !m.validURL(apiURL) || apiURL.RawQuery != "" || apiURL.ForceQuery:
+		m.configErr = errors.New("更新 API 地址必须是有效的 HTTPS 地址")
+	case !validVersion:
+		m.configErr = errors.New("当前核心版本号无效，无法比较发布版本")
+	}
+	if m.configErr == nil {
+		m.status.ReleaseURL = "https://github.com/" + m.repo + "/releases"
+	} else {
+		m.status.State, m.status.Error = Failed, m.configErr.Error()
+	}
+	return m
+}
+
+func (m *Manager) validURL(u *url.URL) bool {
+	if u == nil || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.Opaque != "" {
+		return false
+	}
+	return u.Scheme == "https" || (m.options.AllowInsecureHTTP && u.Scheme == "http" &&
+		(u.Hostname() == "localhost" || net.ParseIP(u.Hostname()).IsLoopback()))
+}
+
+func (m *Manager) Status() Status {
+	m.mu.RLock()
+	status := m.status
+	m.mu.RUnlock()
+	if result := readResult(m.options.DataDir); result.State != "" {
+		status.LastAttempt = &result.UpdateResult
+		if status.State == Idle || status.State == Restarting || result.State == Restarting {
+			status.State, status.LatestVersion, status.Error = result.State, result.TargetVersion, result.Error
+			status.UpdateAvailable, status.CanApply, status.CannotApplyReason = false, false, ""
+		}
+	}
+	if status.UpdateAvailable && m.options.Safe() {
+		status.CanApply = false
+		status.CannotApplyReason = ErrSafeMode.Error()
+	}
+	return status
+}
+
+func (m *Manager) change(update func(*Status)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	update(&m.status)
+}
+
+func (m *Manager) Close() {
+	m.cancel()
+	m.operation.Lock()
+	m.operation.Unlock()
+}
+
+func (m *Manager) begin() error {
+	if !m.operation.TryLock() {
+		return ErrBusy
+	}
+	if err := m.ctx.Err(); err != nil {
+		m.operation.Unlock()
+		return err
+	}
+	if m.Status().State == Restarting {
+		m.operation.Unlock()
+		return ErrBusy
+	}
+	return nil
+}
+
+func (m *Manager) Check(ctx context.Context) (Status, error) {
+	if err := m.begin(); err != nil {
+		return m.Status(), err
+	}
+	defer m.operation.Unlock()
+	return m.check(ctx)
+}
+
+func (m *Manager) check(ctx context.Context) (response Status, err error) {
+	if m.configErr != nil {
+		return m.Status(), m.configErr
+	}
+	status := Status{State: Checking, CurrentVersion: strings.TrimPrefix(m.options.CurrentVersion, "v"), ReleaseURL: "https://github.com/" + m.repo + "/releases"}
+	m.archive, m.checksums = asset{}, asset{}
+	m.change(func(s *Status) { *s = status })
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	stop := context.AfterFunc(m.ctx, cancel)
+	defer stop()
+	published, err := m.latest(ctx)
+	status.CheckedAt = m.options.Now().UTC().Format(time.RFC3339)
+	defer func() {
+		m.change(func(s *Status) { *s = status })
+		response = m.Status()
+	}()
+	if err != nil {
+		status.State, status.Error = Failed, err.Error()
+		return status, err
+	}
+	status.State = UpToDate
+	if published == nil {
+		status.Note = "仓库尚未发布正式 Release 版本"
+		return status, nil
+	}
+	latest, valid := parseVersion(published.Tag)
+	if !valid {
+		err = errors.New("发布版本号无效，无法检查更新")
+		status.State, status.Error = Failed, err.Error()
+		return status, err
+	}
+	status.LatestVersion = strings.TrimPrefix(published.Tag, "v")
+	if link, parseErr := url.Parse(published.URL); parseErr == nil && m.validURL(link) && link.Scheme == "https" {
+		status.ReleaseURL = link.String()
+	}
+	status.PublishedAt = published.PublishedAt
+	status.ReleaseNotes = strings.ToValidUTF8(published.Notes[:min(len(published.Notes), 64<<10)], "")
+	if latest.compare(m.current) <= 0 {
+		return status, nil
+	}
+	status.State, status.UpdateAvailable = Available, true
+	m.archive, m.checksums = m.selectAssets(published.Assets, status.LatestVersion)
+	switch {
+	case m.archive.Name == "":
+		status.CannotApplyReason = "该版本缺少本平台安装包，请前往 GitHub Releases 查看"
+	case m.checksums.Name == "":
+		status.CannotApplyReason = "该发布版本缺少 SHA256SUMS 校验文件，无法自动更新"
+	default:
+		status.CannotApplyReason = m.executableBlocker()
+	}
+	status.CanApply = status.CannotApplyReason == ""
+	return status, nil
+}
+
+func (m *Manager) latest(ctx context.Context) (*release, error) {
+	res, err := m.get(ctx, m.api+"/repos/"+m.repo+"/releases/latest", "application/vnd.github+json")
+	if err != nil {
+		return nil, fmt.Errorf("无法连接更新服务：%w", err)
+	}
+	defer res.Body.Close()
+	switch res.StatusCode {
+	case http.StatusNotFound:
+		return nil, nil
+	case http.StatusOK:
+	case http.StatusForbidden:
+		if res.Header.Get("X-RateLimit-Remaining") == "0" {
+			return nil, errors.New("GitHub API 匿名请求已达每小时上限（HTTP 403），请稍后重试或前往 GitHub 发布页查看")
+		}
+		return nil, fmt.Errorf("更新服务返回 HTTP %d，请稍后重试", res.StatusCode)
+	default:
+		return nil, fmt.Errorf("更新服务返回 HTTP %d，请稍后重试", res.StatusCode)
+	}
+	body, err := readBounded(res.Body, 2<<20)
+	if err != nil {
+		return nil, errors.New("无法读取发布信息或发布信息超过大小限制")
+	}
+	var latest release
+	if err = json.Unmarshal(body, &latest); err != nil {
+		return nil, errors.New("更新服务返回了无效的发布信息")
+	}
+	return &latest, nil
+}
+
+func (m *Manager) get(ctx context.Context, address, accept string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
+	if err != nil || !m.validURL(req.URL) {
+		return nil, errors.New("更新下载地址无效")
+	}
+	req.Header.Set("Accept", accept)
+	req.Header.Set("User-Agent", "KimiCodePlus/"+m.options.CurrentVersion)
+	return m.client.Do(req)
+}
+
+func (m *Manager) selectAssets(assets []asset, latest string) (archive, checksums asset) {
+	ext := ".tar.gz"
+	if m.options.GOOS == "windows" {
+		ext = ".zip"
+	}
+	suffix := "-" + m.options.GOOS + "-" + m.options.GOARCH + ext
+	latest = strings.TrimPrefix(latest, "v")
+	plainName, prefixedName := "enhanced-kimi-"+latest+suffix, "enhanced-kimi-v"+latest+suffix
+	for _, item := range assets {
+		link, err := url.Parse(item.URL)
+		if err != nil || !m.validURL(link) {
+			continue
+		}
+		switch item.Name {
+		case "SHA256SUMS":
+			if checksums.Name == "" {
+				checksums = item
+			}
+		case plainName:
+			archive = item
+		case prefixedName:
+			if archive.Name == "" {
+				archive = item
+			}
+		}
+	}
+	return archive, checksums
+}
+
+func (m *Manager) executableBlocker() string {
+	const manual = "，请前往 GitHub Releases 手动下载"
+	if m.options.GOOS != "darwin" && m.options.GOOS != "linux" && m.options.GOOS != "windows" {
+		return "当前系统不支持自动替换核心" + manual
+	}
+	file := m.options.Executable
+	if !filepath.IsAbs(file) || !filepath.IsAbs(m.options.DataDir) || m.options.RestartState == nil || m.options.RequestRestart == nil {
+		return "当前运行方式不支持自动替换核心" + manual
+	}
+	for _, part := range strings.Split(filepath.ToSlash(file), "/") {
+		if !m.options.AllowTemporaryExe && strings.HasPrefix(part, "go-build") {
+			return "当前核心由 go run 临时构建，无法自动替换" + manual
+		}
+	}
+	info, err := os.Lstat(file)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o222 == 0 {
+		return "核心文件不可写" + manual
+	}
+	dir := filepath.Dir(file)
+	if info, err = os.Stat(dir); err != nil || info.Mode().Perm()&0o222 == 0 {
+		return "核心所在目录不可写" + manual
+	}
+	probe, err := os.CreateTemp(dir, ".enhanced-kimi.update-check.*")
+	if err != nil {
+		return "核心所在目录不可写" + manual
+	}
+	closeErr := probe.Close()
+	removeErr := os.Remove(probe.Name())
+	if closeErr != nil || removeErr != nil {
+		return "无法在核心所在目录创建更新文件" + manual
+	}
+	return ""
+}
+
+func readBounded(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err == nil && int64(len(data)) > limit {
+		err = errors.New("文件超过大小限制")
+	}
+	return data, err
+}

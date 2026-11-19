@@ -22,6 +22,7 @@ import (
 	"enhancedkimi/internal/httpx"
 	"enhancedkimi/internal/redact"
 	"enhancedkimi/internal/storage"
+	"enhancedkimi/internal/updater"
 )
 
 type PlannerActions interface {
@@ -92,6 +93,7 @@ type NativeService struct {
 	verifyPoll   time.Duration
 	planner      PlannerActions
 	scheduler    SchedulerActions
+	updater      *updater.Manager
 	attach       AttachConfig
 	// quota is the balance layer. It owns no timer: a plugin asks for a refresh and
 	// that is the only thing that makes a request.
@@ -226,6 +228,12 @@ func (s *NativeService) UsePlanner(planner PlannerActions) {
 func (s *NativeService) UseScheduler(scheduler SchedulerActions) {
 	s.mu.Lock()
 	s.scheduler = scheduler
+	s.mu.Unlock()
+}
+
+func (s *NativeService) UseUpdater(manager *updater.Manager) {
+	s.mu.Lock()
+	s.updater = manager
 	s.mu.Unlock()
 }
 
@@ -464,6 +472,21 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.attachStatus(ctx), nil
 	case "diagnostics.get":
 		return s.diagnosticsStatus(), nil
+	case "update.status", "update.check", "update.apply":
+		s.mu.Lock()
+		manager := s.updater
+		s.mu.Unlock()
+		if manager == nil {
+			return nil, errors.New("核心更新服务尚未启用")
+		}
+		switch action {
+		case "update.check":
+			return manager.Check(ctx)
+		case "update.apply":
+			return manager.StartApply(ctx)
+		default:
+			return manager.Status(), nil
+		}
 	case "contracts.status":
 		return s.ContractStatus(ctx), nil
 	case "contracts.report":

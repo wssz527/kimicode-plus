@@ -1,6 +1,12 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -103,5 +109,52 @@ func TestAttachInstallValidatesBeforeWriting(t *testing.T) {
 	}
 	if err = validateAgentArguments(desktop.AttachArguments(received)); err != nil {
 		t.Fatalf("the installed definition does not parse: %v", err)
+	}
+}
+
+func TestResolveAttachCredentialsPrefersLiveRuntime(t *testing.T) {
+	ctx := context.Background()
+	staleToken := strings.Repeat("a", 48)
+	liveToken := strings.Repeat("b", 48)
+	staleURL := "http://127.0.0.1:1"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/enhance/v1/health" && r.Header.Get("Authorization") == "Bearer "+liveToken {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	if gotURL, gotToken := resolveAttachCredentials(ctx, dir, staleURL, staleToken); gotURL != staleURL || gotToken != staleToken {
+		t.Fatalf("missing runtime.json did not fall back: %s %s", gotURL, gotToken)
+	}
+
+	writeRuntime := func(rawURL, token string) {
+		t.Helper()
+		payload, err := json.Marshal(map[string]any{"url": rawURL, "pairingToken": token})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "runtime.json"), payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeRuntime(server.URL, liveToken)
+	if gotURL, gotToken := resolveAttachCredentials(ctx, dir, staleURL, staleToken); gotURL != server.URL || gotToken != liveToken {
+		t.Fatalf("live runtime.json was not preferred: got (%s, %s), want (%s, %s)", gotURL, gotToken, server.URL, liveToken)
+	}
+
+	writeRuntime("https://remote.example", liveToken)
+	if gotURL, gotToken := resolveAttachCredentials(ctx, dir, staleURL, staleToken); gotURL != staleURL || gotToken != staleToken {
+		t.Fatalf("non-loopback runtime.json was accepted: %s", gotURL)
+	}
+
+	writeRuntime(server.URL, strings.Repeat("x", 48))
+	if gotURL, gotToken := resolveAttachCredentials(ctx, dir, staleURL, staleToken); gotURL != staleURL || gotToken != staleToken {
+		t.Fatalf("unauthorized runtime.json did not fall back: %s", gotURL)
 	}
 }

@@ -444,6 +444,47 @@
   font-family: var(--font-mono, monospace);
 }
 
+.ekds-update-status,
+.ekds-update-note,
+.ekds-update-notes {
+  padding: 0 16px 12px;
+}
+
+.ekds-update-status .ekds-state {
+  font: inherit;
+  font-size: 12px;
+}
+
+.ekds-update-status progress {
+  display: block;
+  width: 100%;
+  height: 6px;
+  margin-top: 8px;
+  accent-color: var(--ekds-accent);
+}
+
+.ekds-update-link {
+  color: var(--ekds-accent);
+  font-size: 12px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.ekds-update-notes summary {
+  width: fit-content;
+  margin-bottom: 6px;
+  color: var(--ekds-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ekds-update-link:focus-visible,
+.ekds-update-notes summary:focus-visible {
+  outline: none;
+  border-radius: 3px;
+  box-shadow: var(--ekds-ring);
+}
+
 /* A log is read, not decoded: fixed monospace, its own scroll, and a height
    that leaves the surrounding rows visible. */
 .ekds-log {
@@ -537,6 +578,12 @@
 
   .ekds-facts.is-inset {
     padding: 0 13px;
+  }
+
+  .ekds-update-status,
+  .ekds-update-note,
+  .ekds-update-notes {
+    padding-inline: 13px;
   }
 }
 

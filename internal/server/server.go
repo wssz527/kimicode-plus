@@ -26,12 +26,13 @@ import (
 	"enhancedkimi/internal/registry"
 	"enhancedkimi/internal/scheduler"
 	"enhancedkimi/internal/security"
+	"enhancedkimi/internal/updater"
 	"enhancedkimi/internal/usage"
 	"enhancedkimi/internal/webassets"
 	bundledPlugins "enhancedkimi/plugins"
 )
 
-const Version = "0.2.0"
+var Version = "0.2.0"
 
 type Module struct {
 	ID      string `json:"id"`
@@ -39,13 +40,17 @@ type Module struct {
 	Message string `json:"message,omitempty"`
 }
 type NativeOptions struct {
-	Home         string
-	CWD          string
-	DataDir      string
-	Executable   string
-	Profile      string
-	CoreURL      string
-	PairingToken string
+	Home             string
+	CWD              string
+	DataDir          string
+	Executable       string
+	Profile          string
+	CoreURL          string
+	PairingToken     string
+	RestartState     func() updater.RestartState
+	RequestRestart   func()
+	UpdateAPIBaseURL string
+	UpdateHTTPClient *http.Client
 }
 
 type App struct {
@@ -57,6 +62,7 @@ type App struct {
 	pluginManager *plugins.Manager
 	adapter       *desktop.Mock
 	native        *desktop.NativeService
+	updater       *updater.Manager
 	started       time.Time
 	gateway       *gateway.Gateway
 	planner       *chat.PlannerService
@@ -104,6 +110,8 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /enhance/v1/pair", guard.Pair)
 	app.adapter.Register(mux)
+	app.updater = newUpdater(native, cfg)
+	registerUpdateRoutes(mux, app.updater)
 	add := func(id string, init func() error) {
 		if !settings.Modules[id] {
 			app.modules = append(app.modules, Module{id, "DISABLED", "重启后应用模块设置"})
@@ -250,6 +258,7 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 			if vault != nil {
 				nativeService.UseVault(vault)
 			}
+			nativeService.UseUpdater(app.updater)
 			nativeService.Register(mux)
 			app.native = nativeService
 			if app.pluginManager != nil {
@@ -413,6 +422,9 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 	return app, nil
 }
 func (a *App) Close() error {
+	if a.updater != nil {
+		a.updater.Close()
+	}
 	if a.scheduler != nil {
 		a.scheduler.Close()
 	}
@@ -427,6 +439,46 @@ func (a *App) Close() error {
 	}
 	return nil
 }
+func newUpdater(native NativeOptions, cfg *config.Store) *updater.Manager {
+	options := updater.Options{
+		CurrentVersion: Version, DataDir: native.DataDir, Safe: cfg.Safe,
+		Executable: native.Executable, RestartState: native.RestartState, RequestRestart: native.RequestRestart,
+		APIBaseURL: native.UpdateAPIBaseURL, HTTPClient: native.UpdateHTTPClient,
+	}
+	options.Dispatch = func(fn func() error) error {
+		err := cfg.Dispatch(fn)
+		if errors.Is(err, config.ErrSafeMode) {
+			return updater.ErrSafeMode
+		}
+		return err
+	}
+	return updater.New(options)
+}
+
+func registerUpdateRoutes(mux *http.ServeMux, manager *updater.Manager) {
+	mux.HandleFunc("GET /enhance/v1/update/status", func(w http.ResponseWriter, r *http.Request) {
+		httpx.JSON(w, http.StatusOK, manager.Status())
+	})
+	mux.HandleFunc("POST /enhance/v1/update/check", func(w http.ResponseWriter, r *http.Request) {
+		status, err := manager.Check(r.Context())
+		if err == nil {
+			httpx.JSON(w, http.StatusOK, status)
+		} else if errors.Is(err, updater.ErrBusy) {
+			httpx.Fail(w, http.StatusConflict, "UPDATE_BUSY", err.Error())
+		} else {
+			httpx.Fail(w, http.StatusBadGateway, "UPDATE_CHECK_FAILED", err.Error())
+		}
+	})
+	mux.HandleFunc("POST /enhance/v1/update/apply", func(w http.ResponseWriter, r *http.Request) {
+		status, err := manager.StartApply(r.Context())
+		if err != nil {
+			httpx.Fail(w, http.StatusConflict, "UPDATE_REJECTED", err.Error())
+			return
+		}
+		httpx.JSON(w, http.StatusAccepted, status)
+	})
+}
+
 func recoverer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {

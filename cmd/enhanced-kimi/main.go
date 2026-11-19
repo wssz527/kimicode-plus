@@ -22,6 +22,7 @@ import (
 	"enhancedkimi/internal/security"
 	"enhancedkimi/internal/server"
 	"enhancedkimi/internal/storage"
+	"enhancedkimi/internal/updater"
 )
 
 type redactedWriter struct{ out io.Writer }
@@ -47,6 +48,13 @@ func newHTTPServer(handler http.Handler) *http.Server {
 }
 
 func run() error {
+	return runCore("", nil)
+}
+
+func runCore(updateAPIBaseURL string, updateHTTPClient *http.Client) error {
+	if len(os.Args) == 3 && os.Args[1] == updater.SupervisorCommand {
+		return updater.RunSupervisor(os.Args[2])
+	}
 	if len(os.Args) > 1 && os.Args[1] == "attach" {
 		return runAttach(os.Args[2:])
 	}
@@ -87,17 +95,32 @@ func run() error {
 		}
 		*dir = defaultDir
 	}
-	instance, err := platform.Acquire(*dir)
+	instance, supervised, err := updater.AcquireCore(*dir)
 	if err != nil {
 		return err
 	}
 	defer instance.Close()
+	runtimePath := filepath.Join(instance.Dir, "runtime.json")
+	resume := updater.ReadRestartState(instance.Dir)
+	listenPort := *port
+	if listenPort == 0 {
+		listenPort = resume.Port
+	}
+	runtimeWritten := false
+	defer func() {
+		if runtimeWritten {
+			_ = os.Remove(runtimePath)
+		}
+	}()
 	db, err := storage.Open(filepath.Join(instance.Dir, "enhancement.db"))
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	listener, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", *port))
+	listener, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", listenPort))
+	if err != nil && !supervised && *port == 0 && resume.Port != 0 {
+		listener, err = net.Listen("tcp4", "127.0.0.1:0")
+	}
 	if err != nil {
 		return err
 	}
@@ -125,25 +148,48 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	attachParent, stopAttach := context.WithCancel(ctx)
+	defer stopAttach()
+	restartRequested := make(chan struct{}, 1)
 	app, err := server.NewWithNative(db, guard, *safe, gatewayToken, server.NativeOptions{
 		Home: effectiveKimiHome, CWD: cwd, DataDir: instance.Dir, Executable: executable,
 		Profile: *hostProfile, CoreURL: "http://" + listener.Addr().String(), PairingToken: guard.PairingToken(),
+		UpdateAPIBaseURL: updateAPIBaseURL, UpdateHTTPClient: updateHTTPClient,
+		RestartState: func() updater.RestartState {
+			state := updater.RestartState{Port: listener.Addr().(*net.TCPAddr).Port}
+			last := desktop.ReadAttachState(instance.Dir)
+			state.Reattach = last["status"] == "installed"
+			state.ReattachDaily = state.Reattach && last["daily"] == true
+			if desktop.HostPlatformName() == "windows" && desktop.ReadWindowsLauncherState(instance.Dir) != nil {
+				state.Reattach, state.ReattachDaily = true, *hostProfile == ""
+			}
+			return state
+		},
+		RequestRestart: func() {
+			select {
+			case restartRequested <- struct{}{}:
+			default:
+			}
+			stopAttach()
+		},
 	})
 	if err != nil {
 		return err
 	}
 	defer app.Close()
 	base := "http://" + listener.Addr().String()
-	runtimePath := filepath.Join(instance.Dir, "runtime.json")
 	runtimeData := map[string]any{"url": base, "pairingToken": guard.PairingToken(), "pairingUrl": base + "/#pair=" + guard.PairingToken(), "gatewayUrl": base + "/v1", "pid": os.Getpid(), "version": server.Version}
 	b, _ := json.MarshalIndent(runtimeData, "", "  ")
 	if err = platform.AtomicPrivateFile(runtimePath, b); err != nil {
 		return err
 	}
-	defer os.Remove(runtimePath)
+	runtimeWritten = true
+	if resume.Port != 0 {
+		updater.ClearRestartState(instance.Dir)
+	}
 	httpServer := newHTTPServer(server.Deadlines{}.Handler(app.Handler))
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	done := make(chan error, 1)
 	go func() {
 		e := httpServer.Serve(listener)
@@ -154,13 +200,20 @@ func run() error {
 	}()
 	var hostResult *desktop.AttachResult
 	hostError := ""
-	if *hostProfile != "" || *allowDaily {
-		attachCtx, attachCancel := context.WithTimeout(ctx, 90*time.Second)
-		hostResult, err = desktop.AttachNative(attachCtx, desktop.AttachOptions{DataDir: instance.Dir, Profile: *hostProfile, CoreURL: base, PairingToken: guard.PairingToken(), AllowDailyInstance: *allowDaily})
+	if *hostProfile != "" || *allowDaily || resume.Reattach {
+		attachCtx, attachCancel := context.WithTimeout(attachParent, 90*time.Second)
+		options := desktop.AttachOptions{DataDir: instance.Dir, Profile: *hostProfile, CoreURL: base, PairingToken: guard.PairingToken(), AllowDailyInstance: *allowDaily || resume.ReattachDaily}
+		if resume.Reattach {
+			hostResult, err = desktop.AttachOnce(attachCtx, options)
+		} else {
+			hostResult, err = desktop.AttachNative(attachCtx, options)
+		}
 		attachCancel()
 		if err != nil {
 			hostError = err.Error()
 			log.Printf("native enhancement not attached: %s", hostError)
+		} else if hostResult != nil {
+			_ = desktop.RecordAttach(instance.Dir, hostResult)
 		}
 	}
 	startup := map[string]any{"status": "READY", "url": base, "runtimeFile": runtimePath, "pairingToken": guard.PairingToken(), "gatewayUrl": base + "/v1", "version": server.Version}
@@ -171,16 +224,22 @@ func run() error {
 		startup["hostError"] = hostError
 	}
 	json.NewEncoder(os.Stdout).Encode(startup)
+	restarting := false
 	select {
 	case err = <-done:
 		return err
+	case <-restartRequested:
+		restarting = true
 	case <-ctx.Done():
 	}
 	shutdown, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	if err = httpServer.Shutdown(shutdown); err != nil {
-		httpServer.Close()
-		return err
+		_ = httpServer.Close()
+		if !restarting {
+			return err
+		}
+		log.Printf("forced HTTP shutdown before core restart: %v", err)
 	}
 	return <-done
 }

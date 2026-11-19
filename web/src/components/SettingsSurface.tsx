@@ -191,6 +191,30 @@ type DiagnosticsFile = {
 
 type Diagnostics = { attachLog: DiagnosticsFile; notices: DiagnosticsFile };
 
+export interface CoreUpdateStatus {
+  state: "idle" | "checking" | "up_to_date" | "available" | "downloading" | "verifying" | "restarting" | "updated" | "rolled_back" | "error";
+  currentVersion: string;
+  latestVersion?: string;
+  checkedAt?: string;
+  publishedAt?: string;
+  releaseUrl?: string;
+  releaseNotes?: string;
+  updateAvailable: boolean;
+  canApply: boolean;
+  cannotApplyReason?: string;
+  note?: string;
+  error?: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  lastAttempt?: {
+    state: "restarting" | "updated" | "rolled_back" | "error";
+    targetVersion: string;
+    previousVersion: string;
+    completedAt?: string;
+    error?: string;
+  };
+}
+
 const FUSE_TEXT: Record<string, string> = {
   ready: "允许临时调试端点",
   "signal-disabled": "已禁用调试信号，无法接入",
@@ -202,6 +226,202 @@ function byteText(bytes: number | undefined): string {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${bytes} B`;
+}
+
+export function coreUpdateBusy(state?: CoreUpdateStatus["state"]): boolean {
+  return state === "checking" || state === "downloading" || state === "verifying" || state === "restarting";
+}
+
+export function coreUpdateText(status: CoreUpdateStatus | null, reconnecting = false): string {
+  if (reconnecting || status?.state === "restarting") return "正在重启并检查核心状态，请稍候…";
+  switch (status?.state) {
+    case "checking": return "正在检查更新…";
+    case "downloading": {
+      if (status.totalBytes > 0) {
+        const percent = Math.min(100, Math.floor(100 * status.downloadedBytes / status.totalBytes));
+        return `正在下载安装包 · ${percent}%`;
+      }
+      return status.downloadedBytes > 0 ? `正在下载安装包 · ${byteText(status.downloadedBytes)}` : "正在下载安装包…";
+    }
+    case "verifying": return "正在校验并准备安装…";
+    case "available": return status.canApply ? "有新版本可更新" : "有新版本可手动下载";
+    case "up_to_date": return status.note || "当前已是最新版本";
+    case "updated": return `核心已更新至 ${status.currentVersion}`;
+    case "rolled_back": return status.error || "更新失败，已回滚";
+    case "error": return status.error || "更新操作失败，请重试";
+    case "idle": return "尚未检查更新";
+    default: return "正在读取版本状态…";
+  }
+}
+
+export function checkCoreUpdate(host: Pick<NativeHost, "request">): Promise<CoreUpdateStatus> {
+  return host.request<CoreUpdateStatus>("update.check");
+}
+
+export async function watchCoreUpdate(
+  host: Pick<NativeHost, "request">,
+  observe: (status: CoreUpdateStatus | null, reconnecting: boolean) => void,
+  signal: AbortSignal,
+  pause: () => Promise<void> = () => new Promise(resolve => setTimeout(resolve, 750)),
+  now: () => number = Date.now,
+): Promise<CoreUpdateStatus | null> {
+  let restartDeadline: number | undefined;
+  while (!signal.aborted) {
+    const status = await host.request<CoreUpdateStatus>("update.status").catch(() => null);
+    if (signal.aborted) break;
+    const reconnecting = !status || status.state === "restarting";
+    observe(status, reconnecting);
+    if (status && !coreUpdateBusy(status.state)) return status;
+    if (reconnecting) {
+      restartDeadline ??= now() + 2 * 60_000;
+      if (now() >= restartDeadline) break;
+    } else {
+      restartDeadline = undefined;
+    }
+    await pause();
+  }
+  return null;
+}
+
+function dateText(value: string | undefined, dateOnly = false): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return dateOnly ? date.toLocaleDateString("zh-CN") : date.toLocaleString("zh-CN");
+}
+
+function CoreUpdateSection({ host, fallbackVersion, onVersion, onRecovered }: {
+  host: NativeHost;
+  fallbackVersion?: string;
+  onVersion: (version: string) => void;
+  onRecovered: () => void;
+}) {
+  const [status, setStatus] = useState<CoreUpdateStatus | null>(null);
+  const [pending, setPending] = useState<"check" | "apply" | null>(null);
+  const [tracking, setTracking] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [error, setError] = useState("");
+
+  const receive = useCallback((next: CoreUpdateStatus) => {
+    setStatus(next);
+    onVersion(next.currentVersion);
+  }, [onVersion]);
+
+  useEffect(() => {
+    let active = true;
+    void host.request<CoreUpdateStatus>("update.status").then(next => {
+      if (!active) return;
+      receive(next);
+      if (coreUpdateBusy(next.state)) setTracking(true);
+    }).catch(cause => {
+      if (active) setError(errorText(cause));
+    });
+    return () => { active = false; };
+  }, [host, receive]);
+
+  useEffect(() => {
+    if (!tracking) return;
+    const monitor = new AbortController();
+    let restartObserved = false;
+    void watchCoreUpdate(host, (next, disconnected) => {
+      restartObserved ||= disconnected;
+      setReconnecting(disconnected);
+      if (next) receive(next);
+    }, monitor.signal).then(next => {
+      if (monitor.signal.aborted) return;
+      setReconnecting(false);
+      setTracking(false);
+      if (!next || (restartObserved && next.state === "idle")) {
+        setError("暂时无法确认更新结果，请确认核心是否运行后再检查更新。");
+      }
+      if (next && (restartObserved || next.state === "updated" || next.state === "rolled_back")) onRecovered();
+    });
+    return () => monitor.abort();
+  }, [host, onRecovered, receive, tracking]);
+
+  async function check() {
+    setPending("check");
+    setError("");
+    try {
+      receive(await checkCoreUpdate(host));
+    } catch (cause) {
+      setError(errorText(cause));
+      const next = await host.request<CoreUpdateStatus>("update.status").catch(() => null);
+      if (next) receive(next);
+    } finally {
+      setPending(null);
+    }
+  }
+
+  async function apply() {
+    if (!status?.canApply) return;
+    setPending("apply");
+    setError("");
+    try {
+      const next = await host.request<CoreUpdateStatus>("update.apply");
+      receive(next);
+      setTracking(true);
+    } catch (cause) {
+      const next = await host.request<CoreUpdateStatus>("update.status").catch(() => null);
+      if (next) {
+        receive(next);
+        if (coreUpdateBusy(next.state) || next.state === "updated" || next.state === "rolled_back") {
+          setTracking(true);
+        } else if (next.state !== "error") {
+          setError(errorText(cause));
+        }
+      } else {
+        setReconnecting(true);
+        setTracking(true);
+      }
+    } finally {
+      setPending(null);
+    }
+  }
+
+  const busy = pending !== null || tracking;
+  const checked = dateText(status?.checkedAt);
+  const published = dateText(status?.publishedAt, true);
+  const message = pending === "check" ? "正在检查更新…" : pending === "apply" ? "正在准备下载…" : coreUpdateText(status, reconnecting);
+  const stateClass = error || status?.state === "error" || status?.state === "rolled_back" ? "faulted" : status?.state === "up_to_date" || status?.state === "updated" ? "ready" : "unknown";
+  const previousError = status?.lastAttempt?.error;
+  return <div className="ekds-group ekds-update" aria-label="版本更新">
+    <div className="ekds-row">
+      <span className="ekds-row-label">
+        <strong>版本更新</strong>
+        <small>当前版本 {status?.currentVersion || fallbackVersion || "未知"}{checked ? ` · 检查于 ${checked}` : ""}</small>
+      </span>
+      <button type="button" className="ekds-btn" onClick={() => void check()} disabled={busy}>检查更新</button>
+    </div>
+    <div className="ekds-update-status" role="status" aria-live="polite">
+      <p className={`ekds-note ekds-state is-${stateClass}`}>{error || message}</p>
+      {previousError && previousError !== message ? <p className="ekds-note">{previousError}</p> : null}
+      {status?.state === "downloading" && status.totalBytes > 0 && !reconnecting ? (
+        <progress value={Math.min(status.downloadedBytes, status.totalBytes)} max={status.totalBytes} aria-label="更新下载进度" />
+      ) : null}
+    </div>
+    {status?.updateAvailable ? <>
+      <div className="ekds-row">
+        <span className="ekds-row-label">
+          <strong>新版本 {status.latestVersion}</strong>
+          {published ? <small>发布于 {published}</small> : null}
+          {status.releaseUrl ? <a className="ekds-update-link" href={status.releaseUrl} target="_blank" rel="noreferrer">GitHub 发布页</a> : null}
+        </span>
+        {status.canApply ? (
+          <button type="button" className="ekds-btn is-primary" onClick={() => void apply()} disabled={busy}>下载并更新</button>
+        ) : null}
+      </div>
+      <p className="ekds-note ekds-update-note">
+        {status.canApply ? "更新并重启核心后，预装增强插件会自动平滑升级，原有授权和数据不变。" : status.cannotApplyReason}
+      </p>
+      {status.releaseNotes ? <details className="ekds-update-notes">
+        <summary>更新说明</summary>
+        <pre className="ekds-log" tabIndex={0} aria-label="更新说明">{status.releaseNotes}</pre>
+      </details> : null}
+    </> : status?.releaseUrl && (error || status.state === "error" || status.state === "rolled_back" || (status.state === "up_to_date" && status.latestVersion)) ? (
+      <p className="ekds-note ekds-update-note"><a className="ekds-update-link" href={status.releaseUrl} target="_blank" rel="noreferrer">GitHub 发布页</a></p>
+    ) : null}
+  </div>;
 }
 
 /**
@@ -219,6 +439,7 @@ function DiagnosticsSection({
   onContractsChange: (next: ContractReport | null) => void;
 }) {
   const { health } = useAuth();
+  const [coreVersion, setCoreVersion] = useState("");
   const [status, setStatus] = useState<AttachStatus | null>(null);
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
   const [error, setError] = useState("");
@@ -271,8 +492,24 @@ function DiagnosticsSection({
     }
   }
 
+  const coreRunning = Boolean(coreVersion) || health?.status === "OK";
+  const coreDiagnostics = <>
+    <div className="ekds-group">
+      <div className="ekds-row">
+        <span className="ekds-row-label">
+          <strong>增强核心</strong>
+          <small>{coreRunning ? `运行中 · 版本 ${coreVersion || health?.version || "未知"}` : "未连接，下面的状态可能不是最新的"}</small>
+        </span>
+        <span className={`ekds-state is-${coreRunning ? "ready" : "unknown"}`}>{coreRunning ? "运行中" : "未连接"}</span>
+      </div>
+    </div>
+    <CoreUpdateSection host={host} fallbackVersion={health?.version} onVersion={setCoreVersion} onRecovered={reload} />
+  </>;
   if (!status) {
-    return <p className="ekds-note">{error || "正在读取宿主接入状态…"}</p>;
+    return <div className="ekds-body">
+      {coreDiagnostics}
+      <p className="ekds-note">{error || "正在读取宿主接入状态…"}</p>
+    </div>;
   }
   const running = status.host.running === true;
   const daily = status.host.dailyInstance === true;
@@ -286,14 +523,8 @@ function DiagnosticsSection({
   const domProbes = (contracts?.probes ?? []).filter(probe => probe.group === "dom");
   const apiProbes = (contracts?.probes ?? []).filter(probe => probe.group === "api");
   return <div className="ekds-body">
+    {coreDiagnostics}
     <div className="ekds-group">
-      <div className="ekds-row">
-        <span className="ekds-row-label">
-          <strong>增强核心</strong>
-          <small>{health?.status === "OK" ? `运行中 · 版本 ${health.version ?? "未知"}` : "未连接，下面的状态可能不是最新的"}</small>
-        </span>
-        <span className={`ekds-state is-${health?.status === "OK" ? "ready" : "unknown"}`}>{health?.status === "OK" ? "运行中" : "未连接"}</span>
-      </div>
       <div className="ekds-row">
         <span className="ekds-row-label">
           <strong>Kimi Code</strong>

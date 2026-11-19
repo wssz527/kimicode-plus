@@ -7,7 +7,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"enhancedkimi/internal/desktop"
@@ -95,9 +99,10 @@ func runAttach(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	coreURL, pairingToken := resolveAttachCredentials(ctx, options.dataDir, options.coreURL, options.pairingToken)
 	result, attachErr := desktop.AttachOnce(ctx, desktop.AttachOptions{
 		DataDir: options.dataDir, KimiExecutable: options.kimiExe, DebugPort: options.debugPort,
-		Profile: options.profile, CoreURL: options.coreURL, PairingToken: options.pairingToken,
+		Profile: options.profile, CoreURL: coreURL, PairingToken: pairingToken,
 		AllowDailyInstance: options.allowDailyInstance,
 		AppVersionOverride: options.appVersionOverride,
 	})
@@ -109,6 +114,57 @@ func runAttach(args []string) error {
 		fmt.Fprintln(os.Stderr, "接入结果未能写入状态文件：", recordErr)
 	}
 	return json.NewEncoder(os.Stdout).Encode(result)
+}
+
+func resolveAttachCredentials(ctx context.Context, dataDir, fallbackURL, fallbackToken string) (string, string) {
+	if dataDir == "" {
+		return fallbackURL, fallbackToken
+	}
+	data, err := os.ReadFile(filepath.Join(dataDir, "runtime.json"))
+	if err != nil {
+		return fallbackURL, fallbackToken
+	}
+	var runtimeInfo struct {
+		URL          string `json:"url"`
+		PairingToken string `json:"pairingToken"`
+	}
+	if json.Unmarshal(data, &runtimeInfo) != nil {
+		return fallbackURL, fallbackToken
+	}
+	liveURL := strings.TrimRight(strings.TrimSpace(runtimeInfo.URL), "/")
+	liveToken := strings.TrimSpace(runtimeInfo.PairingToken)
+	if !isLoopbackHTTPURL(liveURL) || len(liveToken) < desktop.AttachTokenMinLength {
+		return fallbackURL, fallbackToken
+	}
+	if liveURL == strings.TrimRight(strings.TrimSpace(fallbackURL), "/") && liveToken == strings.TrimSpace(fallbackToken) {
+		return fallbackURL, fallbackToken
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, liveURL+"/enhance/v1/health", nil)
+	if err != nil {
+		return fallbackURL, fallbackToken
+	}
+	req.Header.Set("Authorization", "Bearer "+liveToken)
+	client := &http.Client{Transport: &http.Transport{Proxy: nil}}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fallbackURL, fallbackToken
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fallbackURL, fallbackToken
+	}
+	return liveURL, liveToken
+}
+
+func isLoopbackHTTPURL(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "http" || parsed.User != nil {
+		return false
+	}
+	host := parsed.Hostname()
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
 // installLaunchAgent is the install step, indirected so a test can prove
