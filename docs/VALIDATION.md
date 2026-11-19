@@ -32,6 +32,10 @@ F3 自更新由独立进程监督。`runtime.json` 须指向新启动的核心�
 | 构建及发行二进制 | `make build` 通过，`scripts/acceptance.py` 27/27 通过 |
 | 五平台归档 | macOS ARM64 / Intel、Windows x64 / ARM64、Linux x64 全部构建并打包，逐包校验了二进制、`LICENSE`、`THIRD_PARTY_NOTICES.txt` 和 SHA-256 |
 
+### Windows 补验与 CI 修正
+
+Windows 缓存扫描使用文件句柄的卷序列号和文件索引区分追加、截断及替换。`wssz-win` 已通过对应回归，最终归档再次通过第三方 ZIP 安装、命令路由、正常更新及故障回滚。Windows 测试使用真实路径的 JSON 编码，按平台验证启动器和文件权限，并等待 Node 探针关闭后自然退出。回归报告见 `work/release-fix-20261119/windows-followup/`。Windows 官方宿主的交互验收仍需已登录的桌面会话。
+
 ## 下一轮 N0–N6 合并与隔离宿主验收（2026-11-19）
 
 最终候选在 macOS ARM64 的隔离 Kimi Code 1.3.7 / Electron 45.1.0 上完成 N0–N6 全链路回归与深/浅色截图读回核验。预装增强插件版本为 `kimicode-plus.monitor@1.1.0`、`kimicode-plus.planner@1.0.3`、`kimicode-plus.kct@1.0.2`、`kimicode-plus.scheduler@1.1.0`（均默认关闭）。最终 `dist/enhanced-kimi`（`darwin/arm64`）SHA-256 为 `67a9b20580f685c316b1622b58f3c2880d718424014a30f1d72c00f634f36ab9`，`dist/THIRD_PARTY_NOTICES.txt` SHA-256 为 `324013f931785e5f6731318db5a6db106b6742f7e5e12ed5bd48da702ac77e84`。

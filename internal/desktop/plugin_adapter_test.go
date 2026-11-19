@@ -16,7 +16,7 @@ func TestSiteAdapterRunsAsOneBoundedExpression(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bootstrapSource := string(source)
+	bootstrapSource := strings.ReplaceAll(string(source), "\r\n", "\n")
 	start := strings.Index(bootstrapSource, "async function runSiteAdapter(contents, adapter) {")
 	if start < 0 {
 		t.Fatal("bootstrap.js has no runSiteAdapter")
@@ -49,7 +49,7 @@ func TestSiteAdapterIsAuthorizedBeforeItRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bootstrapSource := string(source)
+	bootstrapSource := strings.ReplaceAll(string(source), "\r\n", "\n")
 	start := strings.Index(bootstrapSource, "case 'browser.view.adapter': {")
 	if start < 0 {
 		t.Fatal("bootstrap.js has no browser.view.adapter")
@@ -100,6 +100,9 @@ func TestSiteAdapterIsAuthorizedBeforeItRuns(t *testing.T) {
 		t.Fatal("bootstrap.js has no currentPluginPage")
 	}
 	guardEnd := strings.Index(bootstrapSource[guard:], "\n  }\n")
+	if guardEnd < 0 {
+		t.Fatal("currentPluginPage is not terminated")
+	}
 	guardBlock := bootstrapSource[guard : guard+guardEnd]
 	for _, wanted := range []string{"view.webContents.getURL()", "isBrowserURL(current)"} {
 		if !strings.Contains(guardBlock, wanted) {

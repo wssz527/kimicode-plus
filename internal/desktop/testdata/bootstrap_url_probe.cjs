@@ -112,13 +112,14 @@ Module._load = function (request) {
 };
 globalThis.require = require;
 
+const fixture = http.createServer((request, response) => {
+  response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  response.end('<!doctype html><html><body><main>Alpha</main></body></html>');
+});
+
 async function main() {
   await new Promise(resolve => core.listen(0, '127.0.0.1', resolve));
   const coreURL = `http://127.0.0.1:${core.address().port}`;
-  const fixture = http.createServer((request, response) => {
-    response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    response.end('<!doctype html><html><body><main>Alpha</main></body></html>');
-  });
   await new Promise(resolve => fixture.listen(0, '127.0.0.1', resolve));
   recorded.url = `http://127.0.0.1:${fixture.address().port}/list`;
 
@@ -187,18 +188,24 @@ async function main() {
   await read('fileScheme', 'file:///etc/passwd');
   await read('dataScheme', 'data:text/html,<h1>hi</h1>');
 
-  await state.cleanup();
-  fixture.close();
   return findings;
 }
 
-main()
-  .then(findings => {
-    core.close();
+async function run() {
+  try {
+    const findings = await main();
     process.stdout.write(JSON.stringify(findings, null, 2) + '\n');
-    process.exit(findings.fatal ? 1 : 0);
-  })
-  .catch(error => {
-    process.stderr.write(String(error && error.stack || error) + '\n');
-    process.exit(1);
-  });
+    if (findings.fatal) process.exitCode = 1;
+  } finally {
+    try {
+      await globalThis.__ekdNative?.cleanup();
+    } finally {
+      await Promise.all([core, fixture].map(server => new Promise(resolve => server.close(resolve))));
+    }
+  }
+}
+
+run().catch(error => {
+  process.stderr.write(String(error?.stack || error) + '\n');
+  process.exitCode = 1;
+});

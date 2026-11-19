@@ -196,7 +196,7 @@ func TestInstallLaunchAgentWritesThePlistOwnedByTheUser(t *testing.T) {
 	}
 	// The plist carries the pairing token, so it must stay readable by the user
 	// only.
-	if mode := info.Mode().Perm(); mode != 0o600 {
+	if mode := info.Mode().Perm(); runtime.GOOS != "windows" && mode != 0o600 {
 		t.Fatalf("plist permissions are %o, want 600", mode)
 	}
 	data, err := os.ReadFile(path)

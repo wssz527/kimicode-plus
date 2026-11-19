@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -16,12 +17,16 @@ func TestCatalogOversizeTimeoutRetainSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mode := "ok"
+	const (
+		oversizeResponse = iota + 1
+		noResponse
+	)
+	var mode atomic.Int32
 	host := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch mode {
-		case "large":
+		switch mode.Load() {
+		case oversizeResponse:
 			io.Copy(w, io.LimitReader(strings.NewReader(strings.Repeat(" ", catalogLimit+1)), catalogLimit+1))
-		case "timeout":
+		case noResponse:
 			<-r.Context().Done()
 		default:
 			w.Write(raw)
@@ -33,13 +38,13 @@ func TestCatalogOversizeTimeoutRetainSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, m := range []string{"large", "timeout"} {
-		mode = m
+	for _, m := range []int32{oversizeResponse, noResponse} {
+		mode.Store(m)
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		_, err = s.refreshCatalog(ctx, host.Client(), host.URL)
 		cancel()
 		if err == nil {
-			t.Fatalf("accepted %s", m)
+			t.Fatalf("accepted invalid response mode %d", m)
 		}
 		cached, err := s.cachedCatalog(context.Background())
 		if err != nil || cached.status.SHA256 != first.SHA256 || cached.status.LastError == "" {

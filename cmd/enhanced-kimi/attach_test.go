@@ -84,6 +84,12 @@ func TestAttachInstallValidatesBeforeWriting(t *testing.T) {
 	}
 	t.Cleanup(func() { installLaunchAgent = previous })
 	err := runAttach([]string{"--install", "--data-dir", t.TempDir()})
+	if desktop.HostPlatformName() == "windows" {
+		if err != nil || installs != 1 {
+			t.Fatalf("Windows launcher install needs only its data directory: installs=%d, error=%v", installs, err)
+		}
+		return
+	}
 	if err == nil {
 		t.Fatal("install ran without a core URL")
 	}

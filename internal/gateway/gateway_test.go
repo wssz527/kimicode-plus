@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -447,8 +448,8 @@ func TestTokenFileIsStablePrivateAndShortLivedOnlyOnDemand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("token file permissions %o", info.Mode().Perm())
+	if !info.Mode().IsRegular() || runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("token file mode %v", info.Mode())
 	}
 	second, err := LoadOrCreateToken(dir)
 	if err != nil || second != first {

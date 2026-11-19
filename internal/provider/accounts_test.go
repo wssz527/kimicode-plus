@@ -342,11 +342,24 @@ func writeImportFile(t *testing.T, document string) string {
 	return path
 }
 
+func importRequest(t *testing.T, path string, fields map[string]string) string {
+	t.Helper()
+	if fields == nil {
+		fields = make(map[string]string)
+	}
+	fields["path"] = path
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(payload)
+}
+
 func TestImportPreviewIsReadOnlyAndNeverReturnsValues(t *testing.T) {
 	f := newAccountFixture(t)
 	f.createProvider(t, "kimi", "")
 	path := writeImportFile(t, `{"apiKey":"sk-synthetic-import-value","refreshToken":"synthetic-refresh","expiresAt":"2026-12-01T00:00:00Z","email":"synthetic@example.invalid"}`)
-	w := f.call(t, "POST", "/accounts/import/preview", `{"path":"`+path+`"}`)
+	w := f.call(t, "POST", "/accounts/import/preview", importRequest(t, path, nil))
 	if w.Code != 200 {
 		t.Fatalf("preview %d: %s", w.Code, w.Body.String())
 	}
@@ -383,7 +396,7 @@ func TestImportPreviewIsReadOnlyAndNeverReturnsValues(t *testing.T) {
 		t.Fatalf("preview wrote accounts: %d %v", accounts, err)
 	}
 	// Applying with a stale fingerprint must not store anything.
-	if got := f.call(t, "POST", "/providers/kimi/accounts/import", `{"path":"`+path+`","fingerprint":"sha256:stale"}`); got.Code != 400 {
+	if got := f.call(t, "POST", "/providers/kimi/accounts/import", importRequest(t, path, map[string]string{"fingerprint": "sha256:stale"})); got.Code != 400 {
 		t.Fatalf("stale fingerprint %d: %s", got.Code, got.Body.String())
 	}
 	var refs []string
@@ -397,14 +410,14 @@ func TestImportApplyCreatesDisabledAccount(t *testing.T) {
 	f := newAccountFixture(t)
 	f.createProvider(t, "kimi", "")
 	path := writeImportFile(t, `{"apiKey":"sk-synthetic-import-value"}`)
-	w := f.call(t, "POST", "/accounts/import/preview", `{"path":"`+path+`"}`)
+	w := f.call(t, "POST", "/accounts/import/preview", importRequest(t, path, nil))
 	var payload struct {
 		Preview struct {
 			Fingerprint string `json:"fingerprint"`
 		} `json:"preview"`
 	}
 	json.Unmarshal(w.Body.Bytes(), &payload)
-	w = f.call(t, "POST", "/providers/kimi/accounts/import", `{"path":"`+path+`","label":"Imported","fingerprint":"`+payload.Preview.Fingerprint+`"}`)
+	w = f.call(t, "POST", "/providers/kimi/accounts/import", importRequest(t, path, map[string]string{"label": "Imported", "fingerprint": payload.Preview.Fingerprint}))
 	if w.Code != 201 {
 		t.Fatalf("apply %d: %s", w.Code, w.Body.String())
 	}
@@ -431,7 +444,7 @@ func TestImportApplyCreatesDisabledAccount(t *testing.T) {
 		t.Fatalf("source file modified: %v", err)
 	}
 	// A second apply with the same id is a conflict, not a silent overwrite.
-	if again := f.call(t, "POST", "/providers/kimi/accounts/import", `{"path":"`+path+`","label":"Imported","accountId":"`+account.Account.ID+`","fingerprint":"`+payload.Preview.Fingerprint+`"}`); again.Code != 409 {
+	if again := f.call(t, "POST", "/providers/kimi/accounts/import", importRequest(t, path, map[string]string{"label": "Imported", "accountId": account.Account.ID, "fingerprint": payload.Preview.Fingerprint})); again.Code != 409 {
 		t.Fatalf("duplicate apply %d: %s", again.Code, again.Body.String())
 	}
 	value, err = f.vault.Get(context.Background(), account.Account.RedactedRef)
@@ -447,27 +460,27 @@ func TestImportRejectsAmbientAndUnsafePaths(t *testing.T) {
 	if got := f.call(t, "POST", "/accounts/import/preview", `{"path":"relative.json"}`); got.Code != 400 {
 		t.Fatalf("relative path %d", got.Code)
 	}
-	if got := f.call(t, "POST", "/accounts/import/preview", `{"path":"`+filepath.Join(dir, "missing.json")+`"}`); got.Code != 400 {
+	if got := f.call(t, "POST", "/accounts/import/preview", importRequest(t, filepath.Join(dir, "missing.json"), nil)); got.Code != 400 {
 		t.Fatalf("missing file %d: %s", got.Code, got.Body.String())
 	}
 	link := filepath.Join(dir, "link.json")
 	if err := os.Symlink(writeImportFile(t, `{"apiKey":"sk-x"}`), link); err != nil {
 		t.Fatal(err)
 	}
-	if got := f.call(t, "POST", "/accounts/import/preview", `{"path":"`+link+`"}`); got.Code != 400 || !strings.Contains(got.Body.String(), "SYMLINK_DENIED") {
+	if got := f.call(t, "POST", "/accounts/import/preview", importRequest(t, link, nil)); got.Code != 400 || !strings.Contains(got.Body.String(), "SYMLINK_DENIED") {
 		t.Fatalf("symlink %d: %s", got.Code, got.Body.String())
 	}
 	if got := f.call(t, "POST", "/accounts/import/preview", `{"path":"/etc/hosts"}`); got.Code != 400 {
 		t.Fatalf("non-JSON file %d: %s", got.Code, got.Body.String())
 	}
-	if got := f.call(t, "POST", "/accounts/import/preview", `{"path":"`+dir+`"}`); got.Code != 400 {
+	if got := f.call(t, "POST", "/accounts/import/preview", importRequest(t, dir, nil)); got.Code != 400 {
 		t.Fatalf("directory %d: %s", got.Code, got.Body.String())
 	}
 	big := writeImportFile(t, `{"apiKey":"`+strings.Repeat("a", importMaxBytes)+`"}`)
-	if got := f.call(t, "POST", "/accounts/import/preview", `{"path":"`+big+`"}`); got.Code != 400 {
+	if got := f.call(t, "POST", "/accounts/import/preview", importRequest(t, big, nil)); got.Code != 400 {
 		t.Fatalf("oversized file %d: %s", got.Code, got.Body.String())
 	}
-	if got := f.call(t, "POST", "/accounts/import/preview", `{"path":"`+writeImportFile(t, `{"account":"nothing"}`)+`"}`); got.Code != 400 {
+	if got := f.call(t, "POST", "/accounts/import/preview", importRequest(t, writeImportFile(t, `{"account":"nothing"}`), nil)); got.Code != 400 {
 		t.Fatalf("file without a credential %d: %s", got.Code, got.Body.String())
 	}
 }
@@ -486,7 +499,7 @@ func TestExplicitOfficialPathIsReadableWithoutAmbientScan(t *testing.T) {
 	if err := os.WriteFile(official, []byte(`{"apiKey":"sk-synthetic-official","expires_at":1767225600}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	w := f.call(t, "POST", "/accounts/import/preview", `{"path":"`+official+`"}`)
+	w := f.call(t, "POST", "/accounts/import/preview", importRequest(t, official, nil))
 	if w.Code != 200 {
 		t.Fatalf("explicit official path denied: %d %s", w.Code, w.Body.String())
 	}
@@ -514,7 +527,7 @@ func TestExplicitOfficialPathIsReadableWithoutAmbientScan(t *testing.T) {
 	if err := os.WriteFile(sibling, []byte(`{"apiKey":"sk-sibling-not-requested"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	w = f.call(t, "POST", "/accounts/import/preview", `{"path":"`+official+`"}`)
+	w = f.call(t, "POST", "/accounts/import/preview", importRequest(t, official, nil))
 	if strings.Contains(w.Body.String(), "sibling") || strings.Contains(w.Body.String(), "other.json") {
 		t.Fatalf("importer scanned beyond the named path: %s", w.Body.String())
 	}
@@ -560,7 +573,7 @@ func TestImportApplyRequiresUnlockedVault(t *testing.T) {
 	f := newAccountFixture(t)
 	f.createProvider(t, "kimi", "")
 	path := writeImportFile(t, `{"apiKey":"sk-synthetic-import-value"}`)
-	w := f.call(t, "POST", "/accounts/import/preview", `{"path":"`+path+`"}`)
+	w := f.call(t, "POST", "/accounts/import/preview", importRequest(t, path, nil))
 	var payload struct {
 		Preview struct {
 			Fingerprint string `json:"fingerprint"`
@@ -568,7 +581,7 @@ func TestImportApplyRequiresUnlockedVault(t *testing.T) {
 	}
 	json.Unmarshal(w.Body.Bytes(), &payload)
 	f.vault.Lock()
-	got := f.call(t, "POST", "/providers/kimi/accounts/import", `{"path":"`+path+`","fingerprint":"`+payload.Preview.Fingerprint+`"}`)
+	got := f.call(t, "POST", "/providers/kimi/accounts/import", importRequest(t, path, map[string]string{"fingerprint": payload.Preview.Fingerprint}))
 	if got.Code != 423 || !strings.Contains(got.Body.String(), "VAULT_LOCKED") {
 		t.Fatalf("locked apply %d: %s", got.Code, got.Body.String())
 	}

@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,6 +53,9 @@ func TestGatewayThroughRealProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	bin := filepath.Join(t.TempDir(), "ekd")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
 	build := exec.Command("go", "build", "-o", bin, "./cmd/enhanced-kimi")
 	build.Dir = repo
 	if out, err := build.CombinedOutput(); err != nil {
@@ -65,9 +70,9 @@ func TestGatewayThroughRealProcess(t *testing.T) {
 	}
 
 	// Synthetic upstream: emits reasoning then content, then usage.
-	var upstreamCalls int
+	var upstreamCalls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalls++
+		upstreamCalls.Add(1)
 		switch {
 		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/models"):
 			w.Header().Set("Content-Type", "application/json")
@@ -245,7 +250,13 @@ func TestGatewayThroughRealProcess(t *testing.T) {
 	}
 
 	// The gateway token is stable across a restart.
-	cmd.Process.Signal(os.Interrupt)
+	if runtime.GOOS == "windows" {
+		if err := cmd.Process.Kill(); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
 	cmd.Wait()
 	stopped = true
 	again, err := LoadOrCreateToken(dataDir)
@@ -268,12 +279,11 @@ func TestGatewayThroughRealProcess(t *testing.T) {
 	if strings.Contains(string(stored), "synthetic-upstream-key") {
 		t.Fatal("credential stored in plaintext")
 	}
-	if upstreamCalls == 0 {
+	if upstreamCalls.Load() == 0 {
 		t.Fatal("synthetic upstream was never called")
 	}
-	// The gateway token file must not be world readable.
 	info, err := os.Stat(filepath.Join(dataDir, tokenFile))
-	if err != nil || info.Mode().Perm() != 0o600 {
+	if err != nil || !info.Mode().IsRegular() || runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("token file mode: %v %v", info, err)
 	}
 }

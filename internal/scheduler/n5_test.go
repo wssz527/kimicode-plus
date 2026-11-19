@@ -417,7 +417,7 @@ func TestN5PreflightValidationFailures(t *testing.T) {
 			}
 			waitUntil(t, func() bool {
 				runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
-				return len(runs) == 1 && runs[0].Status == RunFailed
+				return len(runs) == 1 && runs[0].Status == RunFailed && len(collectNotifications(exec)) > 0
 			})
 			runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
 			if runs[0].FailureKind != FailurePreflight || !strings.Contains(runs[0].Message, tc.wantText) || !strings.Contains(runs[0].Message, "下一步") {

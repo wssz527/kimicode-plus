@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -71,7 +72,11 @@ func handoffService(t *testing.T) (*NativeService, *handoffCalls) {
 func TestHandoffCreatesASessionWithTheChosenDirectoryAndModel(t *testing.T) {
 	service, calls := handoffService(t)
 	dir := t.TempDir()
-	value, err := service.Action(context.Background(), "handoff", json.RawMessage(`{"text":"carry on","mode":"plan","cwd":"`+dir+`","model":"kimi-k2","title":"继续实现"}`))
+	payload, err := json.Marshal(map[string]string{"text": "carry on", "mode": "plan", "cwd": dir, "model": "kimi-k2", "title": "继续实现"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := service.Action(context.Background(), "handoff", payload)
 	if err != nil {
 		t.Fatalf("handoff: %v", err)
 	}
@@ -164,10 +169,23 @@ func TestHandoffDefaultsToTheCoreDirectory(t *testing.T) {
 func TestHandoffCleansTheDirectory(t *testing.T) {
 	service, calls := handoffService(t)
 	dir := t.TempDir()
-	if _, err := service.Action(context.Background(), "handoff", json.RawMessage(`{"text":"x","cwd":"`+dir+`/a/.."}`)); err == nil {
-		t.Fatal("a directory that only resolves by removing a missing segment was accepted")
+	handoffFrom := func(suffix string) error {
+		payload, err := json.Marshal(map[string]string{"text": "x", "cwd": dir + suffix})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = service.Action(t.Context(), "handoff", payload)
+		return err
 	}
-	if _, err := service.Action(context.Background(), "handoff", json.RawMessage(`{"text":"x","cwd":"`+dir+`/."}`)); err != nil {
+	if err := handoffFrom("/a"); err == nil {
+		t.Fatal("a missing directory was accepted")
+	}
+	if runtime.GOOS != "windows" {
+		if err := handoffFrom("/a/.."); err == nil {
+			t.Fatal("a directory that only resolves by removing a missing segment was accepted")
+		}
+	}
+	if err := handoffFrom("/."); err != nil {
 		t.Fatalf("a cleaned directory was rejected: %v", err)
 	}
 	metadata, _ := calls.created[0]["metadata"].(map[string]any)
