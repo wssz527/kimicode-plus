@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"strings"
@@ -167,17 +168,18 @@ func (e *SchedulerExecutor) AbortSession(ctx context.Context, sessionID string) 
 }
 
 func (e *SchedulerExecutor) CheckAccount(ctx context.Context) (bool, string) {
-	profile, status, reason := e.service.readOfficialUserInfo(ctx)
+	profile, _, reason := e.service.readOfficialUserInfo(ctx)
 	if profile != nil && strings.TrimSpace(profile.UserID) != "" {
 		return true, ""
 	}
-	// If the client has no managed Kimi Code provider configured (for example
-	// pure custom API providers or a minimal synthetic fixture), do not falsely
-	// block on /oauth/userinfo 404.
-	if status == http.StatusNotFound {
-		_, _, _, managedExists, _ := e.service.readManagedProviderConfig(ctx)
-		if !managedExists {
-			return true, ""
+	if raw, err := e.service.kap.Request(ctx, http.MethodGet, "/config", nil); err == nil {
+		var cfg map[string]any
+		if json.Unmarshal(raw, &cfg) == nil {
+			if providers, ok := cfg["providers"].(map[string]any); ok && len(providers) > 0 {
+				if _, hasManaged := providers[defaultManagedProviderID]; !hasManaged {
+					return true, ""
+				}
+			}
 		}
 	}
 	if strings.TrimSpace(reason) == "" {

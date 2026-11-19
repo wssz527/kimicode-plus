@@ -107,3 +107,56 @@ func TestCodeUsageRemainingPercentSelectsLowestActiveWindow(t *testing.T) {
 		t.Fatal("unavailable code usage must report known=false")
 	}
 }
+
+func TestSchedulerCheckAccountCustomVsManagedProvider(t *testing.T) {
+	var mu sync.Mutex
+	configBody := `{"providers":{"custom_openai":{"type":"openai","api_key":"sk-test"}}}`
+	userInfoStatus := http.StatusOK
+	userInfoBody := `{"kind":"error","status":401,"message":"No token for \"kimi-code\"."}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		cfg := configBody
+		st := userInfoStatus
+		ui := userInfoBody
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/oauth/userinfo":
+			w.WriteHeader(st)
+			_, _ = w.Write([]byte(ui))
+		case "/api/v1/config":
+			_, _ = w.Write([]byte(cfg))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	kap := NewKAPClient(t.TempDir())
+	kap.base = server.URL
+	kap.token = "test-token"
+	exec := &SchedulerExecutor{service: &NativeService{kap: kap}}
+
+	// Custom provider without managed:kimi-code must not fail preflight on /oauth/userinfo 401.
+	if ok, reason := exec.CheckAccount(context.Background()); !ok {
+		t.Fatalf("expected custom provider setup to pass CheckAccount, got ok=%v reason=%q", ok, reason)
+	}
+
+	// Managed provider configured with 401 token must fail preflight.
+	mu.Lock()
+	configBody = `{"providers":{"managed:kimi-code":{"type":"kimi"}}}`
+	mu.Unlock()
+	if ok, reason := exec.CheckAccount(context.Background()); ok || !strings.Contains(reason, "kimi-code") {
+		t.Fatalf("expected managed provider with 401 to fail CheckAccount, got ok=%v reason=%q", ok, reason)
+	}
+
+	// Logged-in managed account passes.
+	mu.Lock()
+	userInfoStatus = http.StatusOK
+	userInfoBody = `{"userInfo":{"userId":"u_123","nickname":"Demo"}}`
+	mu.Unlock()
+	if ok, reason := exec.CheckAccount(context.Background()); !ok {
+		t.Fatalf("expected logged-in managed account to pass CheckAccount, got ok=%v reason=%q", ok, reason)
+	}
+}
