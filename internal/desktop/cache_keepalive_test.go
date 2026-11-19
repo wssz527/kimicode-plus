@@ -360,10 +360,13 @@ func TestKeepAlivePromptIsFixedAndAsksForNothing(t *testing.T) {
 	if strings.Contains(keepAlivePrompt, "继续") && !strings.Contains(keepAlivePrompt, "继续等待") {
 		t.Fatal("keepalive prompt must not be a bare instruction to continue")
 	}
-	for _, required := range []string{"缓存保活", "不需要任何操作"} {
+	for _, required := range []string{"保活", "无需操作", "继续等待"} {
 		if !strings.Contains(keepAlivePrompt, required) {
 			t.Fatalf("keepalive prompt is missing %q", required)
 		}
+	}
+	if len([]rune(keepAlivePrompt)) > 20 {
+		t.Fatalf("keepalive steer prompt should stay short, got %q", keepAlivePrompt)
 	}
 }
 

@@ -135,7 +135,7 @@ function isOfficialEntryButton(button: Element): boolean {
   return button.classList.contains("sit-link") || button.classList.contains("ui-menu-item");
 }
 
-function findSessionInfoAside(document: Document): Element | null {
+export function findSessionInfoAside(document: Document): Element | null {
   const direct = document.querySelector("aside.session-info");
   if (direct) return direct;
   const labels = resolveOfficialTexts(document, "header.sessionInfo");
@@ -145,6 +145,14 @@ function findSessionInfoAside(document: Document): Element | null {
     }
   }
   return null;
+}
+
+export function findSessionInfoKeepAliveAnchor(document: Document): { aside: Element; folders: Element | null; before: Element | null } | null {
+  const aside = findSessionInfoAside(document);
+  if (!aside) return null;
+  const folders = aside.querySelector(".si-folders");
+  const sit = aside.querySelector(".sit");
+  return { aside, folders, before: sit };
 }
 
 export function findSessionInfoAvailableContainers(document: Document): Element[] {

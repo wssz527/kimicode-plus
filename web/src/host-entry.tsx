@@ -10,6 +10,7 @@ import { AuthProvider } from "./auth";
 import { SettingsWindow } from "./components/SettingsSurface";
 import { AccountSettingsSection, LabSettingsSection } from "./components/OfficialSettingsSections";
 import { AccountSwitchModal } from "./components/AccountsSection";
+import { SessionKeepAliveMenu } from "./components/SessionKeepAliveMenu";
 import { NativeSettings } from "./components/NativeSettings";
 import { SessionGrid } from "./components/SessionGrid";
 import "./styles/surfaces.css";
@@ -29,6 +30,8 @@ export {
   findOfficialSettingsPanel,
   findOfficialSettingsSection,
   findOfficialSettingsTab,
+  findSessionInfoAside,
+  findSessionInfoKeepAliveAnchor,
   findSettingsDialogParts,
   findSidebarFooter,
   findSidebarNewChatButtons,
@@ -179,7 +182,8 @@ export type SurfaceName =
   | "settings-agent-permissions"
   | "settings-agent-subagent"
   | "settings-lab"
-  | "account-switch-modal";
+  | "account-switch-modal"
+  | "session-keepalive-menu";
 export interface SurfaceMountOptions {
   host: NativeHost;
   stylesheetURL: string;
@@ -189,6 +193,8 @@ export interface SurfaceMountOptions {
   initialExtraIds?: string[];
   onNativeRestore?: () => void;
   accountTargetId?: string;
+  sessionId?: string;
+  onKeepAliveUpdated?: (view: unknown) => void;
   onCloseModal?: () => void;
 }
 
@@ -224,6 +230,8 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
     root.render(wrap(<LabSettingsSection host={options.host} />));
   } else if (surface === "account-switch-modal") {
     root.render(wrap(<AccountSwitchModal host={options.host} targetId={options.accountTargetId ?? ""} onClose={options.onCloseModal ?? (() => options.host.close())} />));
+  } else if (surface === "session-keepalive-menu") {
+    root.render(wrap(<SessionKeepAliveMenu host={options.host} sessionId={options.sessionId ?? ""} onClose={options.onCloseModal ?? (() => options.host.close())} onUpdated={options.onKeepAliveUpdated} />));
   } else {
     root.render(wrap(<AuthProvider><SettingsWindow host={options.host} /></AuthProvider>));
   }

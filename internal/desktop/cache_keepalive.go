@@ -7,12 +7,10 @@ import (
 	"enhancedkimi/internal/cache"
 )
 
-// keepAlivePrompt is the fixed minimal message a keepalive sends.
-//
-// The previous text was "继续", which invites the main agent to take another step
-// and can change what it does. This one states why it exists and explicitly asks
-// for no action, so the only effect is the model request itself.
-const keepAlivePrompt = "[缓存保活] 这是自动发送的缓存保活消息，不需要任何操作或回复，请继续等待后台任务完成。"
+// keepAlivePrompt is the short steer message sent while the main agent waits for
+// a background subagent. Steered messages cannot be individually undone, so it is
+// kept as brief as possible while explicitly asking for no action.
+const keepAlivePrompt = "[保活]无需操作，继续等待"
 
 // keepAliveVerdict describes what the closed loop observed after a keepalive.
 type keepAliveVerdict struct {
@@ -48,9 +46,8 @@ func (s *NativeService) keepAliveGate(ctx context.Context, id string, settings A
 		Pending:     pendingNativeInteraction(snapshot),
 		GoalBlocked: goalBlocksIdle(snapshot),
 	}
-	// An approval or question waiting for the user means the session is not
-	// "waiting for a background task"; sending anything would race the user.
-	if candidate.Pending || candidate.GoalBlocked {
+	// An approval, question, or archived/completed session is never kept alive.
+	if candidate.Pending || candidate.GoalBlocked || sessionIsArchivedOrDone(snapshot.session) {
 		return candidate, false
 	}
 	store, err := s.cacheStore()

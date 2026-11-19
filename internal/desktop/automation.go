@@ -8,17 +8,35 @@ import (
 	"time"
 )
 
+// ProviderTTLSettings lets advanced users override the assumed cache TTL (in minutes)
+// per provider class. Interval is derived by subtracting the safety margin.
+type ProviderTTLSettings struct {
+	SubscriptionMinutes int `json:"subscriptionMinutes"`
+	OpenPlatformMinutes int `json:"openPlatformMinutes"`
+	OtherMinutes        int `json:"otherMinutes"`
+}
+
+// IdleKeepAliveSettings configures optional idle-session cache keepalive (N4).
+// Individual sessions can override the global switch and count.
+type IdleKeepAliveSettings struct {
+	Enabled         bool                `json:"enabled"`
+	DefaultCount    int                 `json:"defaultCount"`
+	MinQuotaPercent int                 `json:"minQuotaPercent"`
+	ProviderTTL     ProviderTTLSettings `json:"providerTTL"`
+}
+
 // KeepAliveSettings configures the background-wait keepalive only.
 //
-// D8: this never applies to an idle session. Minutes counts from the main agent's
-// own last model request, not from session or subagent activity.
+// Waiting for a background subagent has no repeat limit and steers a minimal
+// message into the running turn. Minutes counts from the main agent's own last
+// model request, not from session or subagent activity.
 type KeepAliveSettings struct {
 	Enabled bool `json:"enabled"`
 	Minutes int  `json:"minutes"`
 }
 
-// CompactionSettings configures idle auto-compaction, which replaces keepalive for
-// idle sessions. It only ever runs when the session is neither busy nor active.
+// CompactionSettings configures idle auto-compaction. When idle keepalive is active
+// for a session, compaction waits until keepalive finishes before taking over.
 type CompactionSettings struct {
 	Enabled          bool `json:"enabled"`
 	IdleMinutes      int  `json:"idleMinutes"`
@@ -41,16 +59,35 @@ type RecoverySettings struct {
 }
 
 type AutomationSettings struct {
-	KeepAlive  KeepAliveSettings  `json:"keepAlive"`
-	Compaction CompactionSettings `json:"compaction"`
-	Recovery   RecoverySettings   `json:"recovery"`
+	KeepAlive     KeepAliveSettings     `json:"keepAlive"`
+	IdleKeepAlive IdleKeepAliveSettings `json:"idleKeepAlive"`
+	Compaction    CompactionSettings    `json:"compaction"`
+	Recovery      RecoverySettings      `json:"recovery"`
+}
+
+func defaultProviderTTLSettings() ProviderTTLSettings {
+	return ProviderTTLSettings{
+		SubscriptionMinutes: 30,
+		OpenPlatformMinutes: 5,
+		OtherMinutes:        0,
+	}
+}
+
+func defaultIdleKeepAliveSettings() IdleKeepAliveSettings {
+	return IdleKeepAliveSettings{
+		Enabled:         false,
+		DefaultCount:    2,
+		MinQuotaPercent: 10,
+		ProviderTTL:     defaultProviderTTLSettings(),
+	}
 }
 
 func defaultAutomationSettings() AutomationSettings {
 	return AutomationSettings{
-		KeepAlive:  KeepAliveSettings{Enabled: false, Minutes: 25},
-		Compaction: CompactionSettings{Enabled: false, IdleMinutes: 25, ContextThreshold: 60},
-		Recovery:   RecoverySettings{Enabled: false, IntervalSeconds: 60, Entries: []RecoveryEntry{}},
+		KeepAlive:     KeepAliveSettings{Enabled: false, Minutes: 25},
+		IdleKeepAlive: defaultIdleKeepAliveSettings(),
+		Compaction:    CompactionSettings{Enabled: false, IdleMinutes: 25, ContextThreshold: 60},
+		Recovery:      RecoverySettings{Enabled: false, IntervalSeconds: 60, Entries: []RecoveryEntry{}},
 	}
 }
 
@@ -73,17 +110,35 @@ func (s *NativeService) automationSettings(ctx context.Context) (AutomationSetti
 	return settings, validateAutomationSettings(settings)
 }
 
-// keepAliveMinMinutes / keepAliveMaxMinutes bound the main-agent inactivity
-// threshold. The plan fixes the range at 5 to 60 minutes; the user's measured
-// cache loss is around 30.
 const (
 	keepAliveMinMinutes = 5
 	keepAliveMaxMinutes = 60
+
+	idleKeepAliveMinCount = 1
+	idleKeepAliveMaxCount = 20
+	providerTTLMinMinutes = 2
+	providerTTLMaxMinutes = 240
 )
 
 func validateAutomationSettings(settings AutomationSettings) error {
 	if settings.KeepAlive.Minutes < keepAliveMinMinutes || settings.KeepAlive.Minutes > keepAliveMaxMinutes {
 		return errors.New("保活阈值须为 5–60 分钟")
+	}
+	if settings.IdleKeepAlive.DefaultCount < idleKeepAliveMinCount || settings.IdleKeepAlive.DefaultCount > idleKeepAliveMaxCount {
+		return errors.New("默认保活次数须为 1–20 次")
+	}
+	if settings.IdleKeepAlive.MinQuotaPercent < 0 || settings.IdleKeepAlive.MinQuotaPercent > 100 {
+		return errors.New("额度停止阈值须为 0–100%")
+	}
+	ttl := settings.IdleKeepAlive.ProviderTTL
+	if ttl.SubscriptionMinutes < providerTTLMinMinutes || ttl.SubscriptionMinutes > providerTTLMaxMinutes {
+		return errors.New("订阅缓存时长须为 2–240 分钟")
+	}
+	if ttl.OpenPlatformMinutes < providerTTLMinMinutes || ttl.OpenPlatformMinutes > providerTTLMaxMinutes {
+		return errors.New("开放平台缓存时长须为 2–240 分钟")
+	}
+	if ttl.OtherMinutes != 0 && (ttl.OtherMinutes < providerTTLMinMinutes || ttl.OtherMinutes > providerTTLMaxMinutes) {
+		return errors.New("其他供应商缓存时长须为 0（不自动保活）或 2–240 分钟")
 	}
 	if settings.Compaction.IdleMinutes < 5 || settings.Compaction.IdleMinutes > 1440 {
 		return errors.New("空闲阈值须为 5–1440 分钟")
@@ -120,7 +175,14 @@ func (s *NativeService) publishAutomationSettings(settings AutomationSettings) {
 func (s *NativeService) saveAutomationSettings(ctx context.Context, payload json.RawMessage) (AutomationSettings, error) {
 	s.automationMu.Lock()
 	defer s.automationMu.Unlock()
-	settings := defaultAutomationSettings()
+	settings, err := s.automationSettings(ctx)
+	if err != nil {
+		settings = defaultAutomationSettings()
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &rawMap); err != nil {
+		return settings, errors.New("自动化设置格式无效")
+	}
 	if err := json.Unmarshal(payload, &settings); err != nil {
 		return settings, errors.New("自动化设置格式无效")
 	}

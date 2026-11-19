@@ -1,0 +1,283 @@
+.ekd-surface.ekd-surface-session-keepalive-menu {
+  container-type: normal;
+  width: auto;
+  height: auto;
+  overflow: visible;
+  background: transparent;
+}
+
+.ekka-menu {
+  --ekka-text: var(--color-text, var(--ink));
+  --ekka-muted: var(--color-text-secondary, var(--ink-muted));
+  --ekka-faint: var(--color-text-faint, var(--ink-faint));
+  --ekka-line: var(--color-line, var(--line));
+  --ekka-bg: var(--color-menu-bg, var(--color-surface-raised, var(--surface-raised)));
+  --ekka-hover: var(--color-hover, var(--surface-sunken));
+  --ekka-accent: var(--color-accent, var(--accent));
+  --ekka-ok: var(--color-success, var(--success, #27865a));
+  --ekka-warn: var(--color-warning, var(--warning, #b4761f));
+  --ekka-danger: var(--color-danger, var(--danger, #c64b52));
+
+  width: 288px;
+  max-width: calc(100vw - 24px);
+  padding: 6px;
+  background: var(--ekka-bg);
+  -webkit-backdrop-filter: var(--p-menu-backdrop, blur(14px));
+  backdrop-filter: var(--p-menu-backdrop, blur(14px));
+  border: 1px solid var(--ekka-line);
+  border-radius: var(--radius-lg, 12px);
+  box-shadow: var(--shadow-menu, 0 10px 30px rgba(0, 0, 0, 0.22));
+  color: var(--ekka-text);
+  font-family: var(--font-ui, var(--font-sans));
+  font-size: 12.5px;
+  line-height: 1.45;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  box-sizing: border-box;
+}
+
+.ekka-menu *,
+.ekka-menu *::before,
+.ekka-menu *::after {
+  box-sizing: border-box;
+}
+
+.ekka-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.ekka-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px 6px;
+  border-bottom: 1px solid var(--ekka-line);
+}
+
+.ekka-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ekka-text);
+}
+
+.ekka-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: var(--ekka-muted);
+  background: color-mix(in srgb, var(--ekka-muted) 12%, transparent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 185px;
+}
+
+.ekka-badge.is-ok,
+.ekka-badge.is-active {
+  color: var(--ekka-ok);
+  background: color-mix(in srgb, var(--ekka-ok) 14%, transparent);
+}
+
+.ekka-badge.is-warn {
+  color: var(--ekka-warn);
+  background: color-mix(in srgb, var(--ekka-warn) 16%, transparent);
+}
+
+.ekka-badge.is-error {
+  color: var(--ekka-danger);
+  background: color-mix(in srgb, var(--ekka-danger) 16%, transparent);
+}
+
+.ekka-loading {
+  padding: 12px 8px;
+  color: var(--ekka-muted);
+  font-size: 12px;
+}
+
+.ekka-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ekka-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: var(--radius-menu-item, 7px);
+  background: transparent;
+  color: var(--ekka-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.ekka-item:hover:not(:disabled),
+.ekka-item:focus-visible {
+  background: var(--ekka-hover);
+  outline: none;
+}
+
+.ekka-item.is-active {
+  background: color-mix(in srgb, var(--ekka-hover) 85%, transparent);
+}
+
+.ekka-item:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.ekka-item-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.ekka-item-main small {
+  color: var(--ekka-muted);
+  font-size: 11px;
+}
+
+.ekka-check {
+  flex: none;
+  color: var(--ekka-ok);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ekka-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 8px 8px;
+  margin: 0 2px 2px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--ekka-hover) 65%, transparent);
+}
+
+.ekka-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.ekka-preset {
+  flex: 1 0 auto;
+  padding: 3px 8px;
+  border: 1px solid var(--ekka-line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ekka-text);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.ekka-preset:hover,
+.ekka-preset.is-selected {
+  background: color-mix(in srgb, var(--ekka-accent) 16%, transparent);
+  border-color: color-mix(in srgb, var(--ekka-accent) 45%, var(--ekka-line));
+}
+
+.ekka-inline-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ekka-inline-form input {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--ekka-line);
+  border-radius: 6px;
+  background: var(--color-surface, transparent);
+  color: var(--ekka-text);
+  font: inherit;
+}
+
+.ekka-unit {
+  color: var(--ekka-muted);
+  font-size: 11.5px;
+}
+
+.ekka-apply {
+  flex: none;
+  height: 28px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--ekka-accent);
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.ekka-apply:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.ekka-error {
+  margin: 2px 6px;
+  color: var(--ekka-danger);
+  font-size: 11.5px;
+}
+
+.ekka-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 2px;
+  padding: 8px 8px 4px;
+  border-top: 1px solid var(--ekka-line);
+  font-size: 11.5px;
+  color: var(--ekka-muted);
+}
+
+.ekka-meta-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ekka-meta-row strong {
+  color: var(--ekka-text);
+  font-weight: 500;
+  text-align: right;
+}
+
+.ekka-note {
+  margin: 2px 0 0;
+  font-size: 11px;
+  color: var(--ekka-muted);
+}
+
+.ekka-note.is-warn {
+  color: var(--ekka-warn);
+}
+
+.ekka-cost {
+  margin: 2px 0 0;
+  font-size: 11px;
+  color: var(--ekka-faint);
+}

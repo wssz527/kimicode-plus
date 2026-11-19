@@ -324,8 +324,8 @@ func (s *Store) Live(ctx context.Context, sessionID string) (LiveSignals, error)
 func (s *Store) LastMainStep(ctx context.Context, sessionID string) (Step, bool, error) {
 	step := Step{}
 	var at string
-	err := s.db.QueryRowContext(ctx, `SELECT session_id,agent,step_uuid,model,time,input_other,input_cache_read,input_cache_creation,output,first_token_ms,decode_ms FROM cache_steps WHERE session_id=? AND agent='main' ORDER BY time DESC,rowid DESC LIMIT 1`, sessionID).
-		Scan(&step.SessionID, &step.Agent, &step.StepUUID, &step.Model, &at, &step.InputOther, &step.InputCacheRead, &step.InputCacheCreation, &step.Output, &step.FirstTokenMS, &step.DecodeMS)
+	err := s.db.QueryRowContext(ctx, `SELECT session_id,agent,step_uuid,model,time,turn_id,input_other,input_cache_read,input_cache_creation,output,first_token_ms,decode_ms FROM cache_steps WHERE session_id=? AND agent='main' ORDER BY time DESC,rowid DESC LIMIT 1`, sessionID).
+		Scan(&step.SessionID, &step.Agent, &step.StepUUID, &step.Model, &at, &step.TurnID, &step.InputOther, &step.InputCacheRead, &step.InputCacheCreation, &step.Output, &step.FirstTokenMS, &step.DecodeMS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return step, false, nil
 	}
@@ -341,8 +341,8 @@ func (s *Store) LastMainStep(ctx context.Context, sessionID string) (Step, bool,
 func (s *Store) StepAfter(ctx context.Context, sessionID string, after time.Time) (Step, bool, error) {
 	step := Step{}
 	var at string
-	err := s.db.QueryRowContext(ctx, `SELECT session_id,agent,step_uuid,model,time,input_other,input_cache_read,input_cache_creation,output,first_token_ms,decode_ms FROM cache_steps WHERE session_id=? AND agent='main' AND time>? ORDER BY time ASC,rowid ASC LIMIT 1`, sessionID, storage.SortableTime(after)).
-		Scan(&step.SessionID, &step.Agent, &step.StepUUID, &step.Model, &at, &step.InputOther, &step.InputCacheRead, &step.InputCacheCreation, &step.Output, &step.FirstTokenMS, &step.DecodeMS)
+	err := s.db.QueryRowContext(ctx, `SELECT session_id,agent,step_uuid,model,time,turn_id,input_other,input_cache_read,input_cache_creation,output,first_token_ms,decode_ms FROM cache_steps WHERE session_id=? AND agent='main' AND time>? ORDER BY time ASC,rowid ASC LIMIT 1`, sessionID, storage.SortableTime(after)).
+		Scan(&step.SessionID, &step.Agent, &step.StepUUID, &step.Model, &at, &step.TurnID, &step.InputOther, &step.InputCacheRead, &step.InputCacheCreation, &step.Output, &step.FirstTokenMS, &step.DecodeMS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return step, false, nil
 	}

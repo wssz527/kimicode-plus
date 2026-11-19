@@ -57,8 +57,18 @@ async function installNativeRenderer(options) {
     accountsFetchPromise: null,
     accountSwitchModalEl: null,
     accountSwitchModalHandle: null,
+    keepAliveCache: new Map(),
+    keepAliveFetchPromises: new Map(),
+    keepAliveMenuEl: null,
+    keepAliveMenuHandle: null,
+    keepAliveMenuSessionId: '',
+    keepAliveMenuOutside: null,
+    keepAliveSuppress: new Map(),
+    restoreNotifyCompletion: null,
     unsubscribeConfig: null,
     unsubscribeAccounts: null,
+    unsubscribeKeepAlive: null,
+    unsubscribeAutomation: null,
     removed: false,
     pluginEntries: new Map(),
     pluginSidebarNav: new Map(),
@@ -444,6 +454,222 @@ async function installNativeRenderer(options) {
       menu.append(group);
     }
   }
+  function closeKeepAliveMenu() {
+    if (state.keepAliveMenuOutside) {
+      document.removeEventListener('pointerdown', state.keepAliveMenuOutside, true);
+      window.removeEventListener('resize', closeKeepAliveMenu);
+      state.keepAliveMenuOutside = null;
+    }
+    unmountHandle(state.keepAliveMenuHandle);
+    state.keepAliveMenuHandle = null;
+    state.keepAliveMenuEl?.remove();
+    state.keepAliveMenuEl = null;
+    state.keepAliveMenuSessionId = '';
+  }
+  function positionKeepAliveMenu(menuEl, anchorEl) {
+    const rect = anchorEl.getBoundingClientRect();
+    const menuWidth = 296;
+    const estHeight = 320;
+    let left = rect.right - menuWidth;
+    if (left < 12) left = Math.min(rect.left, Math.max(12, window.innerWidth - menuWidth - 12));
+    if (left + menuWidth > window.innerWidth - 12) left = Math.max(12, window.innerWidth - menuWidth - 12);
+    let top = rect.bottom + 6;
+    if (top + estHeight > window.innerHeight - 12 && rect.top - estHeight - 6 > 12) {
+      top = rect.top - estHeight - 6;
+    }
+    menuEl.style.left = `${Math.round(left)}px`;
+    menuEl.style.top = `${Math.round(Math.max(12, top))}px`;
+  }
+  function openKeepAliveMenu(anchorEl, sessionId) {
+    if (!sessionId || state.removed) return;
+    if (state.keepAliveMenuEl && state.keepAliveMenuSessionId === sessionId) {
+      closeKeepAliveMenu();
+      return;
+    }
+    closeKeepAliveMenu();
+    const hostEl = document.createElement('div');
+    hostEl.className = 'ekd-keepalive-popover';
+    hostEl.dataset.ekdKeepalivePopover = 'true';
+    positionKeepAliveMenu(hostEl, anchorEl);
+    document.body.append(hostEl);
+    state.keepAliveMenuEl = hostEl;
+    state.keepAliveMenuSessionId = sessionId;
+    state.keepAliveMenuHandle = mount(hostEl, 'session-keepalive-menu', makeHost(closeKeepAliveMenu), {
+      sessionId,
+      onCloseModal: closeKeepAliveMenu,
+      onKeepAliveUpdated: view => {
+        if (view && typeof view === 'object' && view.sessionId) {
+          state.keepAliveCache.set(view.sessionId, { view, fetchedAt: Date.now() });
+          syncSessionInfoKeepAlive();
+        }
+      },
+    });
+    state.keepAliveMenuOutside = event => {
+      const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+      if (path.includes(hostEl) || path.includes(anchorEl)) return;
+      closeKeepAliveMenu();
+    };
+    document.addEventListener('pointerdown', state.keepAliveMenuOutside, true);
+    window.addEventListener('resize', closeKeepAliveMenu);
+  }
+  async function fetchSessionKeepAlive(sessionId, force = false) {
+    if (!sessionId || state.removed) return null;
+    const cached = state.keepAliveCache.get(sessionId);
+    if (!force && cached && Date.now() - cached.fetchedAt < 10000) return cached.view;
+    if (state.keepAliveFetchPromises.has(sessionId)) return state.keepAliveFetchPromises.get(sessionId);
+    const promise = transport.request('keepalive.session.get', { id: sessionId })
+      .then(view => {
+        if (!state.removed && view && typeof view === 'object') {
+          state.keepAliveCache.set(sessionId, { view, fetchedAt: Date.now() });
+          syncSessionInfoKeepAlive();
+        }
+        return view;
+      })
+      .catch(() => cached?.view ?? null)
+      .finally(() => {
+        state.keepAliveFetchPromises.delete(sessionId);
+      });
+    state.keepAliveFetchPromises.set(sessionId, promise);
+    return promise;
+  }
+  function pushKeepAliveToast(event) {
+    if (!event || state.removed) return;
+    const severity = event.severity === 'error' ? 'error' : event.severity === 'info' ? 'info' : 'warning';
+    const title = String(event.title || '空闲缓存保活已停止');
+    const message = String(event.message || '');
+    try {
+      const warningsStore = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia?._s?.get('kimi.warnings');
+      if (typeof warningsStore?.pushWarning === 'function') {
+        warningsStore.pushWarning({ severity, title, message });
+        return;
+      }
+    } catch {
+      // fall through to lightweight native-styled toast fallback
+    }
+    let stack = document.querySelector('[data-ekd-toast-stack]');
+    if (!stack) {
+      stack = document.createElement('div');
+      stack.className = 'ekd-toast-stack';
+      stack.dataset.ekdToastStack = 'true';
+      document.body.append(stack);
+    }
+    const toast = document.createElement('div');
+    toast.className = `ekd-toast is-${severity}`;
+    toast.setAttribute('role', 'status');
+    const body = document.createElement('div');
+    body.className = 'ekd-toast-body';
+    const heading = document.createElement('strong');
+    heading.textContent = title;
+    body.append(heading);
+    if (message) {
+      const text = document.createElement('p');
+      text.textContent = message;
+      body.append(text);
+    }
+    const dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.className = 'ekd-toast-close';
+    dismiss.setAttribute('aria-label', '关闭提示');
+    dismiss.textContent = '×';
+    dismiss.onclick = () => toast.remove();
+    toast.append(body, dismiss);
+    stack.append(toast);
+    setTimeout(() => toast.remove(), 9000);
+  }
+  function installKeepAliveNotifySuppress() {
+    if (state.restoreNotifyCompletion) return;
+    try {
+      const store = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia?._s?.get('kimi.notifications');
+      if (!store || typeof store.maybeNotifyCompletion !== 'function') return;
+      const original = store.maybeNotifyCompletion;
+      store.maybeNotifyCompletion = function patchedNotifyCompletion(sessionId, payload) {
+        const entry = state.keepAliveSuppress.get(sessionId);
+        if (entry) {
+          const now = Date.now();
+          if (now <= entry.expiresAt) {
+            if (!entry.promptId || !payload?.promptId || entry.promptId === payload.promptId) {
+              return;
+            }
+          } else {
+            state.keepAliveSuppress.delete(sessionId);
+          }
+        }
+        return original.apply(this, arguments);
+      };
+      state.restoreNotifyCompletion = () => {
+        if (store.maybeNotifyCompletion !== original) {
+          store.maybeNotifyCompletion = original;
+        }
+      };
+    } catch {
+      // ignore if notifications store is unavailable
+    }
+  }
+  function syncSessionInfoKeepAlive() {
+    if (options.surface !== 'host' || options.popout || state.removed) return;
+    const anchor = module.findSessionInfoKeepAliveAnchor(document);
+    if (!anchor) return;
+    const sessionId = activeSession();
+    if (!sessionId) {
+      anchor.aside.querySelector('[data-ekd-keepalive-row]')?.remove();
+      return;
+    }
+    const cached = state.keepAliveCache.get(sessionId);
+    if (!cached || Date.now() - cached.fetchedAt > 15000) {
+      void fetchSessionKeepAlive(sessionId, false);
+    }
+    const view = cached?.view;
+    const statusText = view?.statusLabel || '跟随默认';
+    const tone = view?.statusTone || 'muted';
+    const digest = `${sessionId}|${statusText}|${tone}`;
+
+    let container = anchor.folders;
+    let wrapper = null;
+    if (!container) {
+      wrapper = anchor.aside.querySelector('[data-ekd-keepalive-wrap]');
+      if (!wrapper) {
+        wrapper = document.createElement('div');
+        wrapper.className = 'ekd-si-keepalive-wrap';
+        wrapper.dataset.ekdKeepaliveWrap = 'true';
+        if (anchor.before && anchor.before.parentElement === anchor.aside) {
+          anchor.aside.insertBefore(wrapper, anchor.before);
+        } else {
+          anchor.aside.prepend(wrapper);
+        }
+      }
+      container = wrapper;
+    } else {
+      anchor.aside.querySelector('[data-ekd-keepalive-wrap]')?.remove();
+    }
+
+    let button = container.querySelector('[data-ekd-keepalive-row]');
+    if (button && button.dataset.ekdKeepaliveDigest === digest) return;
+    if (!button) {
+      button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'sif-line sif-action ekd-keepalive-line';
+      button.dataset.ekdKeepaliveRow = 'true';
+      button.setAttribute('aria-haspopup', 'menu');
+      button.innerHTML =
+        '<svg class="kw-icon ekd-keepalive-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg>' +
+        '<span class="ekd-keepalive-label">缓存保活</span>' +
+        '<span class="ekd-keepalive-status"></span>';
+      button.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        const currentId = activeSession();
+        if (currentId) openKeepAliveMenu(button, currentId);
+      });
+      container.append(button);
+    }
+    button.dataset.ekdKeepaliveDigest = digest;
+    button.title = view?.stoppedDetail || view?.lastNote || `缓存保活：${statusText}`;
+    const statusEl = button.querySelector('.ekd-keepalive-status');
+    if (statusEl) {
+      statusEl.textContent = statusText;
+      statusEl.className = `ekd-keepalive-status is-${tone}`;
+    }
+  }
   function attachSettingsObserver(dialog) {
     state.settingsObserver?.disconnect();
     state.settingsObserver = null;
@@ -708,6 +934,24 @@ async function installNativeRenderer(options) {
     .ekd-account-menu-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}
     .ekd-account-menu-meta{flex:none;font-size:11px;color:var(--color-text-secondary,#8e8e93)}
     .ekd-account-menu-check{flex:none;color:var(--success,#27865a);font-size:12px;font-weight:600}
+    .ekd-si-keepalive-wrap{position:relative;padding:8px 0 10px;border-bottom:1px solid var(--color-line,rgba(128,128,128,.22))}
+    .ekd-keepalive-line{display:flex;align-items:center;gap:8px;width:100%;min-height:32px;margin:0;padding:4px 16px;border:0;border-radius:6px;background:transparent;color:var(--color-text-muted,var(--color-text-secondary,#8e8e93));font:12px/1.4 var(--font-ui,system-ui);text-align:left;cursor:pointer;appearance:none;-webkit-appearance:none;box-sizing:border-box;transition:background 120ms ease,color 120ms ease}
+    .ekd-keepalive-line:hover,.ekd-keepalive-line:focus-visible{background:var(--color-hover,rgba(128,128,128,.14));color:var(--color-text,inherit);outline:none}
+    .ekd-keepalive-icon{flex:none;color:var(--color-text-faint,currentColor)}
+    .ekd-keepalive-label{flex:none;white-space:nowrap}
+    .ekd-keepalive-status{flex:1;min-width:0;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px;color:var(--color-text-faint,#8e8e93)}
+    .ekd-keepalive-status.is-ok,.ekd-keepalive-status.is-active{color:var(--color-success,var(--success,#27865a))}
+    .ekd-keepalive-status.is-warn{color:var(--color-warning,var(--warning,#b4761f))}
+    .ekd-keepalive-status.is-error{color:var(--color-danger,var(--danger,#c64b52))}
+    .ekd-keepalive-popover{position:fixed;z-index:2147483000}
+    .ekd-toast-stack{position:fixed;right:18px;bottom:18px;z-index:2147483001;display:flex;flex-direction:column;gap:8px;max-width:360px}
+    .ekd-toast{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border-radius:12px;border:1px solid var(--color-line,rgba(128,128,128,.28));background:var(--color-surface-raised,#222);color:var(--color-text,#eee);box-shadow:0 8px 24px rgba(0,0,0,.22);font:12.5px/1.45 var(--font-ui,system-ui)}
+    .ekd-toast.is-warning{border-color:color-mix(in srgb,var(--color-warning,#b4761f) 45%,var(--color-line,#8884))}
+    .ekd-toast.is-error{border-color:color-mix(in srgb,var(--color-danger,#c64b52) 45%,var(--color-line,#8884))}
+    .ekd-toast-body{flex:1;min-width:0}
+    .ekd-toast-body strong{display:block;font-weight:600;margin-bottom:2px}
+    .ekd-toast-body p{margin:0;color:var(--color-text-secondary,#aaa)}
+    .ekd-toast-close{flex:none;border:0;background:transparent;color:var(--color-text-secondary,#aaa);font-size:16px;line-height:1;cursor:pointer;padding:0 2px}
     @media(prefers-reduced-motion:reduce){.ekd-session-picker{scroll-behavior:auto}}
   `;
   document.head.append(nativeStyle);
@@ -873,6 +1117,7 @@ async function installNativeRenderer(options) {
       state.providerEnhance?.clearDecorations?.();
     }
     syncAccountMenu(evaluation);
+    syncSessionInfoKeepAlive();
     if (!gates.rightPanel) {
       if (state.activePluginPanel) deactivatePluginPanel(state.activePluginPanel, false);
       for (const entry of state.pluginPanels.values()) {
@@ -926,12 +1171,17 @@ async function installNativeRenderer(options) {
     state.unsubscribeSession?.();
     state.unsubscribeConfig?.();
     state.unsubscribeAccounts?.();
+    state.unsubscribeKeepAlive?.();
+    state.unsubscribeAutomation?.();
     state.unsubscribeFeatures?.();
     state.unsubscribePlugins?.();
+    state.restoreNotifyCompletion?.();
+    state.restoreNotifyCompletion = null;
     window.removeEventListener('ekd:config-saved', onConfigSaved);
     window.removeEventListener('ekd:account-switched', onAccountSwitched);
     closeAccountSwitchModal();
-    for (const node of document.querySelectorAll('[data-ekd-account-menu]')) node.remove();
+    closeKeepAliveMenu();
+    for (const node of document.querySelectorAll('[data-ekd-account-menu],[data-ekd-keepalive-row],[data-ekd-keepalive-wrap],[data-ekd-toast-stack]')) node.remove();
     document.removeEventListener('visibilitychange', pluginRefresh);
     window.removeEventListener('focus', pluginRefresh);
     for (const release of [...state.pluginReleases.values()]) release();
@@ -1074,6 +1324,9 @@ async function installNativeRenderer(options) {
       if (handle.mode === 'page') handle.dispose();
     }
     void syncActiveSessionWatch(id);
+    closeKeepAliveMenu();
+    if (id) void fetchSessionKeepAlive(id, true);
+    else syncSessionInfoKeepAlive();
     window.dispatchEvent(new CustomEvent('ekd:active-session', { detail: id }));
   }, { detached: true, flush: 'sync' });
   const configStore = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia?._s?.get('kimi.config');
@@ -1104,6 +1357,29 @@ async function installNativeRenderer(options) {
     } else {
       void refreshAccountsCache(true);
     }
+  });
+  installKeepAliveNotifySuppress();
+  state.unsubscribeKeepAlive = accountEventHost.subscribe('keepalive', event => {
+    if (!event || typeof event !== 'object') return;
+    if (event.type === 'keepalive.suppress' && event.sessionId) {
+      const expiresAt = Date.parse(event.expiresAt || '') || (Date.now() + 5 * 60 * 1000);
+      state.keepAliveSuppress.set(event.sessionId, { promptId: event.promptId || '', expiresAt });
+      installKeepAliveNotifySuppress();
+      return;
+    }
+    if (event.type === 'keepalive.alert') {
+      pushKeepAliveToast(event);
+      if (event.sessionId) void fetchSessionKeepAlive(event.sessionId, true);
+      return;
+    }
+    if (event.type === 'keepalive.session' && event.sessionId && event.view) {
+      state.keepAliveCache.set(event.sessionId, { view: event.view, fetchedAt: Date.now() });
+      syncSessionInfoKeepAlive();
+    }
+  });
+  state.unsubscribeAutomation = accountEventHost.subscribe('automation', () => {
+    const currentId = activeSession();
+    if (currentId) void fetchSessionKeepAlive(currentId, true);
   });
   void refreshAccountsCache(true);
   ensure();

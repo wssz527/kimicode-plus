@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   CACHE_NOT_REPORTED,
+  cacheIntervalForTTL,
   commitNumberField,
   hitRateLabel,
+  idleKeepAliveCoverageMinutes,
   idleLabel,
   mergePolicy,
   shouldApplyPolicyEvent,
@@ -13,6 +15,16 @@ import {
 
 const policy = {
   keepAlive: { enabled: false, minutes: 25 },
+  idleKeepAlive: {
+    enabled: false,
+    defaultCount: 2,
+    minQuotaPercent: 10,
+    providerTTL: {
+      subscriptionMinutes: 30,
+      openPlatformMinutes: 5,
+      otherMinutes: 0,
+    },
+  },
   compaction: { enabled: false, idleMinutes: 25, contextThreshold: 60 },
   recovery: { enabled: false, intervalSeconds: 60, entries: [] },
 };
@@ -87,8 +99,35 @@ test("merging ignores a malformed payload instead of throwing", () => {
 });
 
 test("keepalive policy defaults stay off", () => {
-  // Plan D8 / M2: all three policies are opt-in.
+  // Plan D8 / M2 / N4: all policies are opt-in.
   assert.equal(policy.keepAlive.enabled, false);
+  assert.equal(policy.idleKeepAlive.enabled, false);
+  assert.equal(policy.idleKeepAlive.defaultCount, 2);
   assert.equal(policy.compaction.enabled, false);
   assert.equal(policy.recovery.enabled, false);
+});
+
+test("idle keepalive TTL interval and coverage derivation matches N4", () => {
+  assert.deepEqual(cacheIntervalForTTL(30), { interval: 25, margin: 5 });
+  assert.deepEqual(cacheIntervalForTTL(5), { interval: 4, margin: 1 });
+  assert.deepEqual(cacheIntervalForTTL(2), { interval: 1, margin: 1 });
+  assert.deepEqual(cacheIntervalForTTL(0), { interval: 0, margin: 0 });
+  assert.equal(idleKeepAliveCoverageMinutes(30, 2), 80);
+  assert.equal(idleKeepAliveCoverageMinutes(5, 2), 13);
+  assert.equal(idleKeepAliveCoverageMinutes(0, 2), 0);
+});
+
+test("merging idleKeepAlive preserves nested providerTTL fields", () => {
+  const merged = mergePolicy(policy, {
+    idleKeepAlive: {
+      enabled: true,
+      defaultCount: 3,
+      minQuotaPercent: 10,
+      providerTTL: { subscriptionMinutes: 40, openPlatformMinutes: 5, otherMinutes: 12 },
+    },
+  });
+  assert.equal(merged.idleKeepAlive.enabled, true);
+  assert.equal(merged.idleKeepAlive.defaultCount, 3);
+  assert.equal(merged.idleKeepAlive.providerTTL.subscriptionMinutes, 40);
+  assert.equal(merged.idleKeepAlive.providerTTL.otherMinutes, 12);
 });

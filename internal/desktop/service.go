@@ -112,6 +112,13 @@ type NativeService struct {
 	cliDetector               func(ctx context.Context) bool
 	hostPIDProvider           func() int
 	codeUsageEndpointOverride string
+
+	idleMu          sync.Mutex
+	idleInFlight    map[string]idleInFlightState
+	idleAlerted     map[string]string
+	idleConfigCache map[string]any
+	idleConfigAt    time.Time
+	idleVerifyPoll  time.Duration
 }
 
 const addonFeaturesKey = "features"
@@ -166,6 +173,7 @@ func NewNativeService(db *sql.DB, kap *KAPClient, cwd string, safe func() bool) 
 		`CREATE TABLE native_state(key TEXT PRIMARY KEY,data TEXT NOT NULL)`,
 		`CREATE TABLE automation_intents(id TEXT PRIMARY KEY,kind TEXT NOT NULL,host_id TEXT NOT NULL,session_id TEXT NOT NULL,model_id TEXT NOT NULL,context_revision TEXT NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,result TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE kimi_accounts(id TEXT PRIMARY KEY,user_id TEXT NOT NULL UNIQUE,label TEXT NOT NULL DEFAULT '',nickname TEXT NOT NULL DEFAULT '',avatar TEXT NOT NULL DEFAULT '',plan TEXT NOT NULL DEFAULT '',region TEXT NOT NULL DEFAULT '',oauth_key TEXT NOT NULL DEFAULT 'kimi-code',oauth_host TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'ready',status_reason TEXT NOT NULL DEFAULT '',quota_json TEXT NOT NULL DEFAULT '',models_json TEXT NOT NULL DEFAULT '',last_seen_at TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL)`,
+		`CREATE TABLE session_keepalive_state(session_id TEXT PRIMARY KEY,mode TEXT NOT NULL DEFAULT 'default',target_count INTEGER NOT NULL DEFAULT 2,until_at TEXT NOT NULL DEFAULT '',used_count INTEGER NOT NULL DEFAULT 0,anchor_at TEXT NOT NULL DEFAULT '',last_keepalive_at TEXT NOT NULL DEFAULT '',last_keepalive_turn_id TEXT NOT NULL DEFAULT '',last_result TEXT NOT NULL DEFAULT '',last_note TEXT NOT NULL DEFAULT '',stopped_reason TEXT NOT NULL DEFAULT '',stopped_detail TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL DEFAULT '')`,
 	}); err != nil {
 		return nil, err
 	}
@@ -443,6 +451,9 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 			return nil, errors.New("需要非空配置补丁")
 		}
 		raw, err := s.kap.Request(ctx, http.MethodPost, "/config", wrapper.Patch)
+		if err == nil {
+			s.invalidateOfficialConfigCache()
+		}
 		return rawJSON(raw), err
 	case "providers.updateModel":
 		return s.updateProviderModel(ctx, input)
@@ -486,6 +497,10 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.automationSettings(ctx)
 	case "automation.set":
 		return s.saveAutomationSettings(ctx, payload)
+	case "keepalive.session.get":
+		return s.sessionKeepAliveView(ctx, stringInput(input, "id"), time.Now().UTC())
+	case "keepalive.session.set":
+		return s.setSessionKeepAlive(ctx, input)
 	case "recovery.get":
 		settings, err := s.automationSettings(ctx)
 		return settings.Recovery, err
@@ -1070,6 +1085,7 @@ func (s *NativeService) applyFrame(frame NativeFrame) {
 	if frame.Type == "compaction.completed" || frame.Type == "compaction.cancelled" || frame.Type == "compaction.blocked" {
 		s.finishCompaction(frame)
 	}
+	s.noteUserMessageFromFrame(frame)
 	if ok {
 		s.bus.Publish("session:"+frame.SessionID, sessionViewFromCache(cache))
 	}
@@ -1158,6 +1174,9 @@ func (s *NativeService) sendPrompt(ctx context.Context, input map[string]any) (a
 	}
 	s.touchSession(id)
 	raw, err := s.kap.Request(ctx, http.MethodPost, "/sessions/"+id+"/prompts", body)
+	if err == nil && text != keepAlivePrompt && text != idleKeepAlivePrompt {
+		s.noteUserMessage(ctx, id, time.Now().UTC())
+	}
 	return rawAsAny(raw), err
 }
 

@@ -243,11 +243,11 @@ func (s *NativeService) refreshAutomationSnapshot(ctx context.Context, id string
 
 func (s *NativeService) runCompaction(ctx context.Context, settings AutomationSettings, id string, now time.Time) {
 	snapshot, ok := s.automationSnapshot(id)
-	if !ok || compactionBlocked(snapshot, s.openBackground(ctx, id)) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
+	if !ok || sessionIsArchivedOrDone(snapshot.session) || compactionBlocked(snapshot, s.openBackground(ctx, id)) || s.isIdleKeepAliveProtecting(ctx, settings, id, now) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
 		return
 	}
 	snapshot, ok, err := s.refreshAutomationSnapshot(ctx, id, now)
-	if err != nil || !ok || compactionBlocked(snapshot, s.openBackground(ctx, id)) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
+	if err != nil || !ok || sessionIsArchivedOrDone(snapshot.session) || compactionBlocked(snapshot, s.openBackground(ctx, id)) || s.isIdleKeepAliveProtecting(ctx, settings, id, now) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
 		return
 	}
 	usage := snapshot.session.Usage
@@ -363,7 +363,8 @@ func (s *NativeService) automationTick(ctx context.Context, now time.Time) error
 		return nil
 	}
 	var syncErr error
-	if settings.KeepAlive.Enabled || settings.Compaction.Enabled || settings.Recovery.Enabled {
+	hasIdleOverrides := s.hasAnySessionKeepAliveOverride(ctx)
+	if settings.KeepAlive.Enabled || settings.IdleKeepAlive.Enabled || hasIdleOverrides || settings.Compaction.Enabled || settings.Recovery.Enabled {
 		// Refresh the session-record metrics first: keepalive's clock and its
 		// background-subagent condition both come from cache_steps/cache_live, so they
 		// must be current before any policy decision this tick. Creating the store here
@@ -382,6 +383,9 @@ func (s *NativeService) automationTick(ctx context.Context, now time.Time) error
 	for _, id := range s.automationSessionIDs() {
 		if settings.KeepAlive.Enabled {
 			s.runKeepAliveOnce(ctx, settings, id, now)
+		}
+		if settings.IdleKeepAlive.Enabled || hasIdleOverrides {
+			s.runIdleKeepAliveOnce(ctx, settings, id, now)
 		}
 		if settings.Compaction.Enabled {
 			s.runCompaction(ctx, settings, id, now)

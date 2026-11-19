@@ -32,6 +32,10 @@ type NativeSession struct {
 	ID                 string       `json:"id"`
 	Title              string       `json:"title"`
 	CWD                string       `json:"cwd,omitempty"`
+	Model              string       `json:"model,omitempty"`
+	Status             string       `json:"status,omitempty"`
+	Archived           bool         `json:"archived,omitempty"`
+	ArchivedAt         string       `json:"archived_at,omitempty"`
 	UpdatedAt          string       `json:"updated_at,omitempty"`
 	LastTurnReason     string       `json:"last_turn_reason,omitempty"`
 	Busy               bool         `json:"busy"`
@@ -329,13 +333,27 @@ func mapNativeSession(raw json.RawMessage) (NativeSession, error) {
 	var value struct {
 		ID                 string       `json:"id"`
 		Title              string       `json:"title"`
+		Model              string       `json:"model"`
+		Status             string       `json:"status"`
+		Archived           bool         `json:"archived"`
+		ArchivedAt         string       `json:"archived_at"`
 		UpdatedAt          string       `json:"updated_at"`
 		LastTurnReason     string       `json:"last_turn_reason"`
 		Busy               bool         `json:"busy"`
 		MainTurnActive     bool         `json:"main_turn_active"`
 		PendingInteraction string       `json:"pending_interaction"`
 		Usage              *NativeUsage `json:"usage"`
-		Metadata           struct {
+		AgentConfig        struct {
+			Model string `json:"model"`
+		} `json:"agent_config"`
+		Activity struct {
+			Status string `json:"status"`
+		} `json:"activity"`
+		Meta struct {
+			Archived   bool   `json:"archived"`
+			ArchivedAt string `json:"archived_at"`
+		} `json:"meta"`
+		Metadata struct {
 			CWD string `json:"cwd"`
 		} `json:"metadata"`
 	}
@@ -346,7 +364,55 @@ func mapNativeSession(raw json.RawMessage) (NativeSession, error) {
 	if pending == "" {
 		pending = "none"
 	}
-	return NativeSession{ID: value.ID, Title: value.Title, CWD: value.Metadata.CWD, UpdatedAt: value.UpdatedAt, LastTurnReason: value.LastTurnReason, Busy: value.Busy, MainTurnActive: value.MainTurnActive, PendingInteraction: pending, Usage: value.Usage}, nil
+	model := strings.TrimSpace(value.AgentConfig.Model)
+	if model == "" {
+		model = strings.TrimSpace(value.Model)
+	}
+	status := strings.TrimSpace(value.Status)
+	if status == "" {
+		status = strings.TrimSpace(value.Activity.Status)
+	}
+	archived := value.Archived || value.Meta.Archived
+	archivedAt := strings.TrimSpace(value.ArchivedAt)
+	if archivedAt == "" {
+		archivedAt = strings.TrimSpace(value.Meta.ArchivedAt)
+	}
+	return NativeSession{
+		ID:                 value.ID,
+		Title:              value.Title,
+		CWD:                value.Metadata.CWD,
+		Model:              model,
+		Status:             status,
+		Archived:           archived,
+		ArchivedAt:         archivedAt,
+		UpdatedAt:          value.UpdatedAt,
+		LastTurnReason:     value.LastTurnReason,
+		Busy:               value.Busy,
+		MainTurnActive:     value.MainTurnActive,
+		PendingInteraction: pending,
+		Usage:              value.Usage,
+	}, nil
+}
+
+func (k *KAPClient) UndoSession(ctx context.Context, sessionID, turnID, agentID string) ([]string, error) {
+	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(turnID) == "" {
+		return nil, errors.New("撤回回合缺少会话 ID 或回合 ID")
+	}
+	body := map[string]any{"turn_id": turnID}
+	if strings.TrimSpace(agentID) != "" {
+		body["agent_id"] = strings.TrimSpace(agentID)
+	}
+	raw, err := k.Request(ctx, http.MethodPost, "/sessions/"+url.PathEscape(sessionID)+":undo", body)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		RemovedTurnIDs []string `json:"removed_turn_ids"`
+	}
+	if len(raw) > 0 && string(raw) != "null" {
+		_ = json.Unmarshal(raw, &out)
+	}
+	return out.RemovedTurnIDs, nil
 }
 
 func (k *KAPClient) Sessions(ctx context.Context) ([]NativeSession, error) {
