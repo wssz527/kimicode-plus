@@ -67,6 +67,51 @@ func TestNativeDOMAllowsEmptyOfficialChat(t *testing.T) {
 	}
 }
 
+func TestDarwinDOMWaitStaysWithinInspectorFuse(t *testing.T) {
+	if darwinDOMWaitBudget >= darwinInspectorFuse {
+		t.Fatalf("DOM wait budget %v must stay below inspector fuse %v", darwinDOMWaitBudget, darwinInspectorFuse)
+	}
+	if darwinMountedGrace >= darwinDOMWaitBudget {
+		t.Fatalf("mounted grace %v must stay below DOM wait budget %v", darwinMountedGrace, darwinDOMWaitBudget)
+	}
+	partial := map[string]bool{"appMounted": true, "ptShell": true, "ptBody": true, "sideColumn": false, "sideFooter": false}
+	if domReadyForNativeAttach(partial, 100*time.Millisecond) {
+		t.Fatal("partial mounted DOM should wait brief hydration grace")
+	}
+	if !domReadyForNativeAttach(partial, darwinMountedGrace) {
+		t.Fatal("mounted DOM with alternate sidebar layout must proceed before inspector fuse expires")
+	}
+	if domReadyForNativeAttach(map[string]bool{"appMounted": false}, darwinMountedGrace) {
+		t.Fatal("unmounted app must not proceed")
+	}
+}
+
+func TestIsMainRendererURLFiltersAuxiliaryPages(t *testing.T) {
+	accepted := []string{
+		"app://renderer/",
+		"app://renderer/index.html",
+		"app://renderer/index.html#/sessions/s1",
+		"app://renderer/sessions/s1",
+	}
+	for _, u := range accepted {
+		if !isMainRendererURL(u) {
+			t.Fatalf("expected main renderer URL %q to be accepted", u)
+		}
+	}
+	rejected := []string{
+		"app://renderer/browser-control.html",
+		"app://renderer/browser-overlay.html",
+		"app://renderer/screenshot.html",
+		"app://renderer/aux-popup.html?id=1",
+		"https://example.com/index.html",
+	}
+	for _, u := range rejected {
+		if isMainRendererURL(u) {
+			t.Fatalf("expected auxiliary URL %q to be rejected", u)
+		}
+	}
+}
+
 func TestEventBusScopesAndUnknownCursor(t *testing.T) {
 	bus := NewEventBus()
 	initial := bus.Poll(context.Background(), -1, []string{"session:a"}, 0)

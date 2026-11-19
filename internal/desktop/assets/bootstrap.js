@@ -5,7 +5,13 @@ async function installNativeBootstrap(options) {
   const crypto = req('node:crypto');
   if (app.getVersion() !== options.expectedApp || process.versions.electron !== options.expectedElectron) throw new Error('宿主版本在接入时发生变化');
   if (globalThis.__ekdNative) await globalThis.__ekdNative.cleanup();
-  const wc = webContents.getAllWebContents().find(item => item.getURL().startsWith('app://renderer/') && !/screenshot|browser-overlay/.test(item.getURL()));
+  const isMainRendererURL = url => {
+    if (typeof url !== 'string' || !url.startsWith('app://renderer/')) return false;
+    if (/screenshot|browser-overlay|browser-control/.test(url)) return false;
+    const path = url.slice('app://renderer/'.length).split(/[?#]/)[0];
+    return path === '' || path === 'index.html' || !path.endsWith('.html');
+  };
+  const wc = webContents.getAllWebContents().find(item => !item.isDestroyed() && isMainRendererURL(item.getURL()));
   if (!wc) throw new Error('隔离主窗口未找到');
   const pairResponse = await fetch(new URL('/enhance/v1/pair', options.coreURL), {
     method: 'POST', headers: { 'Content-Type': 'application/json' },

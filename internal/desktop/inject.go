@@ -77,6 +77,12 @@ type AttachResult struct {
 // instance and no explicit consent was given.
 var ErrConsentRequired = errors.New("检测到日常客户端正在运行；接入会改变它的界面，需要你显式授权后才会继续")
 
+const (
+	darwinInspectorFuse = 12 * time.Second
+	darwinDOMWaitBudget = 6 * time.Second
+	darwinMountedGrace  = 1200 * time.Millisecond
+)
+
 func missingNativeCapability(capabilities map[string]bool) string {
 	for _, capability := range []string{"ptShell", "ptBody", "sideColumn", "sideFooter"} {
 		if !capabilities[capability] {
@@ -84,6 +90,13 @@ func missingNativeCapability(capabilities map[string]bool) string {
 		}
 	}
 	return ""
+}
+
+func domReadyForNativeAttach(capabilities map[string]bool, mountedElapsed time.Duration) bool {
+	if missingNativeCapability(capabilities) == "" {
+		return true
+	}
+	return capabilities["appMounted"] && mountedElapsed >= darwinMountedGrace
 }
 
 // resolveHost finds the instance to attach to and completes every identity check
@@ -171,14 +184,22 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (*AttachResu
 		return nil, err
 	}
 	var capabilities map[string]bool
-	domDeadline := time.Now().Add(15 * time.Second)
+	domDeadline := time.Now().Add(darwinDOMWaitBudget)
+	var mountedAt time.Time
 	for {
-		domRaw, domErr := cdp.Evaluate(attachCtx, `(async()=>{const req=typeof require==='function'?require:process.mainModule.require.bind(process.mainModule);const{webContents}=req('electron');const wc=webContents.getAllWebContents().find(item=>item.getURL().startsWith('app://renderer/')&&!/screenshot|browser-overlay/.test(item.getURL()));if(!wc)throw new Error('隔离主窗口未找到');return wc.executeJavaScript("(()=>({appMounted:!!(document.querySelector('#app')&&document.querySelector('#app').childElementCount>0),ptShell:!!document.querySelector('.pt-shell'),ptBody:!!document.querySelector('.pt-body'),sideColumn:!!document.querySelector('.side .col'),sideFooter:!!document.querySelector('.side-footer'),chat:!!document.querySelector('.chat'),composer:!!document.querySelector('.composer'),sideChat:[...document.querySelectorAll('button.sit-link')].some(button=>button.textContent.trim()==='侧边聊天')}))()")})()`)
+		domRaw, domErr := cdp.Evaluate(attachCtx, `(async()=>{const req=typeof require==='function'?require:process.mainModule.require.bind(process.mainModule);const{webContents}=req('electron');const isMain=u=>{if(typeof u!=='string'||!u.startsWith('app://renderer/'))return false;if(/screenshot|browser-overlay|browser-control/.test(u))return false;const p=u.slice('app://renderer/'.length).split(/[?#]/)[0];return p===''||p==='index.html'||!p.endsWith('.html');};const wc=webContents.getAllWebContents().find(item=>!item.isDestroyed()&&isMain(item.getURL()));if(!wc)throw new Error('隔离主窗口未找到');return wc.executeJavaScript("(()=>({appMounted:!!(document.querySelector('#app')&&document.querySelector('#app').childElementCount>0),ptShell:!!document.querySelector('.pt-shell'),ptBody:!!document.querySelector('.pt-body'),sideColumn:!!document.querySelector('.side .col'),sideFooter:!!document.querySelector('.side-footer'),chat:!!document.querySelector('.chat'),composer:!!document.querySelector('.composer'),sideChat:[...document.querySelectorAll('button.sit-link')].some(button=>button.textContent.trim()==='侧边聊天')}))()")})()`)
 		missing := ""
 		if domErr == nil {
 			if json.Unmarshal(domRaw, &capabilities) == nil {
 				missing = missingNativeCapability(capabilities)
-				if missing == "" {
+				if capabilities["appMounted"] && mountedAt.IsZero() {
+					mountedAt = time.Now()
+				}
+				mountedElapsed := time.Duration(0)
+				if !mountedAt.IsZero() {
+					mountedElapsed = time.Since(mountedAt)
+				}
+				if domReadyForNativeAttach(capabilities, mountedElapsed) {
 					break
 				}
 			}

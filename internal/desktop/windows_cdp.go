@@ -67,6 +67,20 @@ func ParseUserAgentVersions(userAgent string) (appVersion, electron string) {
 	return appVersion, electron
 }
 
+func isMainRendererURL(raw string) bool {
+	if !strings.HasPrefix(raw, "app://renderer/") {
+		return false
+	}
+	if strings.Contains(raw, "screenshot") || strings.Contains(raw, "browser-overlay") || strings.Contains(raw, "browser-control") {
+		return false
+	}
+	rest := strings.TrimPrefix(raw, "app://renderer/")
+	if idx := strings.IndexAny(rest, "?#"); idx >= 0 {
+		rest = rest[:idx]
+	}
+	return rest == "" || rest == "index.html" || !strings.HasSuffix(rest, ".html")
+}
+
 // FilterWindowsRendererTargets selects only main Kimi Code renderer pages served
 // over app://renderer/ whose WebSocket URL stays strictly on 127.0.0.1:<port>.
 func FilterWindowsRendererTargets(targets []WindowsCDPTarget, debugPort int) []WindowsCDPTarget {
@@ -76,10 +90,7 @@ func FilterWindowsRendererTargets(targets []WindowsCDPTarget, debugPort int) []W
 		if target.Type != "page" {
 			continue
 		}
-		if !strings.HasPrefix(target.URL, "app://renderer/") {
-			continue
-		}
-		if strings.Contains(target.URL, "screenshot") || strings.Contains(target.URL, "browser-overlay") {
+		if !isMainRendererURL(target.URL) {
 			continue
 		}
 		if target.WebSocketDebuggerURL == "" {
