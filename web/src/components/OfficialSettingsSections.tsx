@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { readAddonFeatures, writeAddonFeatures, type AddonFeatures, type NativeHost } from "../native";
+import { AccountsManagerSection } from "./AccountsSection";
 import { Toggle } from "./ui";
 import { errorText } from "./workbench/pieces";
 import "../styles/native-settings-surface.css";
@@ -18,31 +19,13 @@ export function FallbackNotice({ label, reason }: { label: string; reason?: stri
  * inside KimiCode+ when the official account panel probe is disabled).
  */
 export function AccountSettingsSection({
-  host: _host,
+  host,
   fallbackReason,
 }: {
   host: NativeHost;
   fallbackReason?: string;
 }) {
-  return (
-    <div className="ekds ekds-official-sec" data-ekd-official-content="account">
-      <div className="ekds-sec-head">
-        <h3 className="ekds-sec-title">账号</h3>
-      </div>
-      {fallbackReason ? <FallbackNotice label="账户" reason={fallbackReason} /> : null}
-      <div className="ekds-group" role="group" aria-label="Kimi Code 订阅账号">
-        <div className="ekds-row">
-          <span className="ekds-row-label">
-            <strong>Kimi Code 订阅账号</strong>
-            <small>
-              这里用于管理多个 Kimi Code 订阅账号并一键切换，不退出客户端且不影响现有会话。下方官方账户与套餐用量保持原样显示当前账号。
-            </small>
-          </span>
-          <span className="ekds-state">暂未保存其他账号</span>
-        </div>
-      </div>
-    </div>
-  );
+  return <AccountsManagerSection host={host} fallbackReason={fallbackReason} />;
 }
 
 /**

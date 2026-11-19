@@ -246,6 +246,9 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 		if nativeErr != nil {
 			app.modules = append(app.modules, Module{"native-host", "FAULTED", "原生服务初始化失败，其余模块仍可使用"})
 		} else {
+			if vault != nil {
+				nativeService.UseVault(vault)
+			}
 			nativeService.Register(mux)
 			app.native = nativeService
 			if app.pluginManager != nil {

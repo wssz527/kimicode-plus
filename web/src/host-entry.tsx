@@ -9,6 +9,7 @@ import { createCoreTransport, createEventChannel, createNativeHost, HostScopeCon
 import { AuthProvider } from "./auth";
 import { SettingsWindow } from "./components/SettingsSurface";
 import { AccountSettingsSection, LabSettingsSection } from "./components/OfficialSettingsSections";
+import { AccountSwitchModal } from "./components/AccountsSection";
 import { NativeSettings } from "./components/NativeSettings";
 import { SessionGrid } from "./components/SessionGrid";
 import "./styles/surfaces.css";
@@ -177,7 +178,8 @@ export type SurfaceName =
   | "settings-account"
   | "settings-agent-permissions"
   | "settings-agent-subagent"
-  | "settings-lab";
+  | "settings-lab"
+  | "account-switch-modal";
 export interface SurfaceMountOptions {
   host: NativeHost;
   stylesheetURL: string;
@@ -186,6 +188,8 @@ export interface SurfaceMountOptions {
   colorScheme?: string;
   initialExtraIds?: string[];
   onNativeRestore?: () => void;
+  accountTargetId?: string;
+  onCloseModal?: () => void;
 }
 
 const SETTINGS_PERMISSIONS = ["core:read", "settings:write", "models:read", "usage:read", "usage:write", "plugins:read", "plugins:write", "credentials:read", "credentials:write"];
@@ -202,7 +206,7 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
   const observer = new MutationObserver(syncTheme);
   observer.observe(element.ownerDocument.documentElement, { attributes: true, attributeFilter: ["data-color-scheme"] });
   shadow.append(styles, container);
-  const needsSettingsTransport = surface === "settings" || surface.startsWith("settings-");
+  const needsSettingsTransport = surface === "settings" || surface.startsWith("settings-") || surface === "account-switch-modal";
   const releaseTransport = needsSettingsTransport
     ? acquireTransport(createCoreTransport(options.host), SETTINGS_PERMISSIONS)
     : null;
@@ -218,6 +222,8 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
     root.render(wrap(<div className="ekds ekds-official-sec"><NativeSettings embedded mode="subagent" /></div>));
   } else if (surface === "settings-lab") {
     root.render(wrap(<LabSettingsSection host={options.host} />));
+  } else if (surface === "account-switch-modal") {
+    root.render(wrap(<AccountSwitchModal host={options.host} targetId={options.accountTargetId ?? ""} onClose={options.onCloseModal ?? (() => options.host.close())} />));
   } else {
     root.render(wrap(<AuthProvider><SettingsWindow host={options.host} /></AuthProvider>));
   }

@@ -52,7 +52,13 @@ async function installNativeRenderer(options) {
     settingsRelease: null,
     settingsObserver: null,
     officialSections: new Map(),
+    accountsCache: null,
+    accountsFetchedAt: 0,
+    accountsFetchPromise: null,
+    accountSwitchModalEl: null,
+    accountSwitchModalHandle: null,
     unsubscribeConfig: null,
+    unsubscribeAccounts: null,
     removed: false,
     pluginEntries: new Map(),
     pluginSidebarNav: new Map(),
@@ -270,6 +276,172 @@ async function installNativeRenderer(options) {
       const key = stale.dataset.ekdOfficialSection;
       const active = key ? state.officialSections.get(key) : null;
       if (!active || active.hostEl !== stale) stale.remove();
+    }
+  }
+  function closeAccountSwitchModal() {
+    unmountHandle(state.accountSwitchModalHandle);
+    state.accountSwitchModalHandle = null;
+    state.accountSwitchModalEl?.remove();
+    state.accountSwitchModalEl = null;
+  }
+  function openAccountSwitchModal(targetId) {
+    if (!targetId || state.removed) return;
+    closeAccountSwitchModal();
+    const el = document.createElement('div');
+    el.dataset.ekdAccountModal = 'true';
+    document.body.append(el);
+    state.accountSwitchModalEl = el;
+    state.accountSwitchModalHandle = mount(el, 'account-switch-modal', makeHost(closeAccountSwitchModal), {
+      accountTargetId: targetId,
+      onCloseModal: closeAccountSwitchModal,
+    });
+  }
+  async function refreshAccountsCache(force = false) {
+    if (state.removed) return state.accountsCache;
+    if (!force && state.accountsCache && Date.now() - state.accountsFetchedAt < 15000) {
+      return state.accountsCache;
+    }
+    if (state.accountsFetchPromise) return state.accountsFetchPromise;
+    state.accountsFetchPromise = transport.request('accounts.list', {})
+      .then(result => {
+        if (!state.removed && result && Array.isArray(result.accounts)) {
+          state.accountsCache = result;
+          state.accountsFetchedAt = Date.now();
+          if (state.contracts) syncAccountMenu(state.contracts);
+        }
+        return state.accountsCache;
+      })
+      .catch(() => state.accountsCache)
+      .finally(() => {
+        state.accountsFetchPromise = null;
+      });
+    return state.accountsFetchPromise;
+  }
+  async function refreshOfficialAuth() {
+    try {
+      const pinia = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia?._s;
+      const authStore = pinia?.get('kimi.auth');
+      if (authStore) {
+        if (typeof authStore.resetAuth === 'function') {
+          authStore.resetAuth();
+          await new Promise(resolve => setTimeout(resolve, 45));
+        }
+        if (typeof authStore.checkAuth === 'function') {
+          await authStore.checkAuth();
+        }
+        if (typeof authStore.probeMembership === 'function') {
+          await authStore.probeMembership();
+        }
+      }
+      const configStore = pinia?.get('kimi.config');
+      if (typeof configStore?.loadConfig === 'function') {
+        await configStore.loadConfig();
+      }
+    } catch {
+      // ignore official store refresh errors if host structure changes
+    }
+    void refreshAccountsCache(true);
+  }
+  function syncAccountMenu(evaluation) {
+    if (evaluation.byId['dom.account_menu']?.status === 'disabled') {
+      for (const node of document.querySelectorAll('[data-ekd-account-menu]')) node.remove();
+      return;
+    }
+    const menu = document.querySelector('.user-menu');
+    if (!menu) return;
+    if (!state.accountsCache || Date.now() - state.accountsFetchedAt > 15000) {
+      void refreshAccountsCache(false);
+    }
+    const accounts = Array.isArray(state.accountsCache?.accounts) ? state.accountsCache.accounts : [];
+    const digest = JSON.stringify(accounts.map(a => [a.id, a.label, a.current, a.status, a.avatar || '', a.plan || '']));
+    const existing = menu.querySelector('[data-ekd-account-menu]');
+    if (accounts.length === 0) {
+      existing?.remove();
+      delete menu.dataset.ekdAccountDigest;
+      return;
+    }
+    if (existing && menu.dataset.ekdAccountDigest === digest) return;
+    existing?.remove();
+    menu.dataset.ekdAccountDigest = digest;
+
+    const group = document.createElement('div');
+    group.dataset.ekdAccountMenu = 'true';
+
+    const sep = document.createElement('div');
+    sep.className = 'ui-menu-sep ekd-account-menu-sep';
+    sep.setAttribute('role', 'separator');
+    group.append(sep);
+
+    const title = document.createElement('div');
+    title.className = 'ekd-account-menu-title';
+    title.textContent = '切换账号';
+    group.append(title);
+
+    for (const acc of accounts) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ui-menu-item ekd-account-menu-item';
+      btn.dataset.ekdAccountQuickId = acc.id;
+
+      if (acc.avatar) {
+        const img = document.createElement('img');
+        img.className = 'ekd-account-menu-avatar';
+        img.src = acc.avatar;
+        img.alt = '';
+        img.referrerPolicy = 'no-referrer';
+        img.onerror = () => {
+          const fallback = document.createElement('span');
+          fallback.className = 'ekd-account-menu-avatar is-fallback';
+          fallback.textContent = ((acc.label || 'K').trim()[0] || 'K').toUpperCase();
+          img.replaceWith(fallback);
+        };
+        btn.append(img);
+      } else {
+        const fallback = document.createElement('span');
+        fallback.className = 'ekd-account-menu-avatar is-fallback';
+        fallback.textContent = ((acc.label || 'K').trim()[0] || 'K').toUpperCase();
+        btn.append(fallback);
+      }
+
+      const name = document.createElement('span');
+      name.className = 'ekd-account-menu-name';
+      name.textContent = acc.label || acc.nickname || acc.userId;
+      btn.append(name);
+
+      if (acc.current) {
+        const check = document.createElement('span');
+        check.className = 'ekd-account-menu-check';
+        check.textContent = '✓';
+        btn.append(check);
+      } else if (acc.status === 'relogin_required') {
+        const meta = document.createElement('span');
+        meta.className = 'ekd-account-menu-meta';
+        meta.textContent = '需重登';
+        btn.append(meta);
+      } else if (acc.plan) {
+        const meta = document.createElement('span');
+        meta.className = 'ekd-account-menu-meta';
+        meta.textContent = acc.plan;
+        btn.append(meta);
+      }
+
+      btn.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        if (!acc.current) {
+          openAccountSwitchModal(acc.id);
+        }
+      });
+      group.append(btn);
+    }
+
+    const separators = Array.from(menu.querySelectorAll(':scope > .ui-menu-sep'));
+    const lastSep = separators.length > 0 ? separators[separators.length - 1] : null;
+    if (lastSep && lastSep.parentElement === menu) {
+      menu.insertBefore(group, lastSep);
+    } else {
+      menu.append(group);
     }
   }
   function attachSettingsObserver(dialog) {
@@ -527,6 +699,15 @@ async function installNativeRenderer(options) {
     .ekd-picker-list strong,.ekd-picker-list small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .ekd-picker-list small{margin-top:2px;color:var(--color-text-secondary,#aaa);font-size:11px}
     .ekd-picker-foot,.ekd-picker-empty{margin:10px 18px 16px;color:var(--color-text-secondary,#aaa);font-size:11px}
+    .ekd-account-menu-sep{height:1px;margin:4px 6px;background:var(--color-line,rgba(128,128,128,.22))}
+    .ekd-account-menu-title{padding:4px 10px 3px;color:var(--color-text-secondary,#8e8e93);font-size:11px;font-weight:500;letter-spacing:.02em;user-select:none}
+    .ekd-account-menu-item{display:flex;align-items:center;gap:8px;width:100%;height:30px;margin:0;padding:0 10px;border:0;border-radius:6px;background:transparent;color:var(--color-text,inherit);font:13px/1.4 var(--font-ui,system-ui);text-align:left;cursor:pointer;appearance:none;-webkit-appearance:none;box-sizing:border-box}
+    .ekd-account-menu-item:hover,.ekd-account-menu-item:focus-visible{background:var(--color-hover,rgba(128,128,128,.16));outline:none}
+    .ekd-account-menu-avatar{flex:none;width:18px;height:18px;border-radius:50%;object-fit:cover;border:1px solid var(--color-line,#8883)}
+    .ekd-account-menu-avatar.is-fallback{display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;background:color-mix(in srgb,var(--color-accent,#5b8def) 18%,transparent);color:var(--color-text,inherit)}
+    .ekd-account-menu-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}
+    .ekd-account-menu-meta{flex:none;font-size:11px;color:var(--color-text-secondary,#8e8e93)}
+    .ekd-account-menu-check{flex:none;color:var(--success,#27865a);font-size:12px;font-weight:600}
     @media(prefers-reduced-motion:reduce){.ekd-session-picker{scroll-behavior:auto}}
   `;
   document.head.append(nativeStyle);
@@ -691,6 +872,7 @@ async function installNativeRenderer(options) {
     if (evaluation.byId['dom.settings_providers']?.status === 'disabled') {
       state.providerEnhance?.clearDecorations?.();
     }
+    syncAccountMenu(evaluation);
     if (!gates.rightPanel) {
       if (state.activePluginPanel) deactivatePluginPanel(state.activePluginPanel, false);
       for (const entry of state.pluginPanels.values()) {
@@ -743,9 +925,13 @@ async function installNativeRenderer(options) {
     state.settingsObserver = null;
     state.unsubscribeSession?.();
     state.unsubscribeConfig?.();
+    state.unsubscribeAccounts?.();
     state.unsubscribeFeatures?.();
     state.unsubscribePlugins?.();
     window.removeEventListener('ekd:config-saved', onConfigSaved);
+    window.removeEventListener('ekd:account-switched', onAccountSwitched);
+    closeAccountSwitchModal();
+    for (const node of document.querySelectorAll('[data-ekd-account-menu]')) node.remove();
     document.removeEventListener('visibilitychange', pluginRefresh);
     window.removeEventListener('focus', pluginRefresh);
     for (const release of [...state.pluginReleases.values()]) release();
@@ -907,6 +1093,19 @@ async function installNativeRenderer(options) {
     }
   };
   window.addEventListener('ekd:config-saved', onConfigSaved);
+  const onAccountSwitched = () => {
+    void refreshOfficialAuth();
+  };
+  window.addEventListener('ekd:account-switched', onAccountSwitched);
+  const accountEventHost = makeHost(() => {});
+  state.unsubscribeAccounts = accountEventHost.subscribe('accounts', event => {
+    if (event?.type === 'account.switched' && event?.refreshAuth) {
+      void refreshOfficialAuth();
+    } else {
+      void refreshAccountsCache(true);
+    }
+  });
+  void refreshAccountsCache(true);
   ensure();
   state.observer = new MutationObserver(ensure);
   state.observer.observe(document.body, { childList: true, subtree: true });

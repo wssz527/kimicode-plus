@@ -110,6 +110,7 @@ type Engine struct {
 	mu          sync.Mutex
 	activeTasks map[string]activeRun
 	closed      bool
+	pauseCount  int
 }
 
 type activeRun struct {
@@ -245,11 +246,36 @@ func (e *Engine) DeletePluginData(ctx context.Context, pluginID string) error {
 	return nil
 }
 
+// Pause temporarily suspends scheduled ticks (for example while switching
+// accounts) and returns an idempotent resume callback.
+func (e *Engine) Pause() func() {
+	e.mu.Lock()
+	e.pauseCount++
+	e.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			e.mu.Lock()
+			if e.pauseCount > 0 {
+				e.pauseCount--
+			}
+			e.mu.Unlock()
+		})
+	}
+}
+
+func (e *Engine) Paused() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.pauseCount > 0
+}
+
 func (e *Engine) Tick(ctx context.Context) error {
 	e.mu.Lock()
 	closed := e.closed
+	paused := e.pauseCount > 0
 	e.mu.Unlock()
-	if closed || e.ctx.Err() != nil {
+	if closed || paused || e.ctx.Err() != nil {
 		return nil
 	}
 	connected, _ := e.exec.KAPConnected(ctx)

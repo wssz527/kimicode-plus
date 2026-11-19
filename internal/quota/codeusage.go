@@ -419,22 +419,51 @@ func parseCodeMoney(value any) *codeMoney {
 }
 
 func (c *CodeUsage) request(ctx context.Context, key string) (any, string, *int) {
-	if c.client == nil {
+	return requestCodeUsage(ctx, c.client, c.timeoutMS, CodeUsageEndpoint, key)
+}
+
+// FetchCodeUsageWithToken fetches and parses Kimi Code subscription usage for
+// one explicit access token without caching or logging the token.
+func FetchCodeUsageWithToken(ctx context.Context, client *http.Client, endpoint string, token string) (CodeUsagePayload, string, *int) {
+	secret, ok := readSecret(token)
+	if !ok {
+		return CodeUsagePayload{}, "credential_missing", nil
+	}
+	target := strings.TrimSpace(endpoint)
+	if target == "" {
+		target = CodeUsageEndpoint
+	}
+	document, code, status := requestCodeUsage(ctx, client, defaultTimeoutMS, target, secret)
+	if code != "" {
+		return CodeUsagePayload{}, code, status
+	}
+	parsed, parseCode := ParseCodeUsageReply(document)
+	if parseCode != "" {
+		return CodeUsagePayload{}, parseCode, status
+	}
+	return parsed, "", status
+}
+
+func requestCodeUsage(ctx context.Context, client *http.Client, timeoutMS int64, endpoint string, key string) (any, string, *int) {
+	if client == nil {
 		return nil, "network_error", nil
 	}
-	client := c.client
-	if client.Timeout == 0 {
-		copied := *client
-		copied.Timeout = time.Duration(c.timeoutMS) * time.Millisecond
-		client = &copied
+	activeClient := client
+	if activeClient.Timeout == 0 {
+		copied := *activeClient
+		if timeoutMS <= 0 {
+			timeoutMS = defaultTimeoutMS
+		}
+		copied.Timeout = time.Duration(timeoutMS) * time.Millisecond
+		activeClient = &copied
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, CodeUsageEndpoint, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, "network_error", nil
 	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Authorization", "Bearer "+key)
-	reply, err := client.Do(request)
+	reply, err := activeClient.Do(request)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, "timeout", nil

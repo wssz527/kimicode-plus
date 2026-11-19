@@ -107,6 +107,10 @@ func nativeActionPermission(action string) string {
 	switch action {
 	case "bootstrap", "events.poll", "config.get", "automation.get", "recovery.get", "diagnostics.get", "contracts.status":
 		return "core:read"
+	case "accounts.list", "accounts.switchPreflight":
+		return "credentials:read"
+	case "accounts.saveCurrent", "accounts.beginAdd", "accounts.completeAdd", "accounts.rename", "accounts.delete", "accounts.refreshQuotas", "accounts.switch", "accounts.cancelPending":
+		return "credentials:write"
 	case "contracts.report":
 		return "adapter:write"
 	case "session.view", "session.watch", "session.unwatch":

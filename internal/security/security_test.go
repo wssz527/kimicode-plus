@@ -81,6 +81,11 @@ func TestNativeActionPermissionsFollowIntent(t *testing.T) {
 		"automation.get": "core:read", "automation.set": "settings:write",
 		"recovery.get": "core:read", "recovery.set": "settings:write", "recovery.watch": "tasks:write",
 		"recovery.check": "tasks:write", "planner.get": "chat:read", "planner.send": "chat:write",
+		"accounts.list": "credentials:read", "accounts.switchPreflight": "credentials:read",
+		"accounts.saveCurrent": "credentials:write", "accounts.beginAdd": "credentials:write",
+		"accounts.completeAdd": "credentials:write", "accounts.rename": "credentials:write",
+		"accounts.delete": "credentials:write", "accounts.refreshQuotas": "credentials:write",
+		"accounts.switch": "credentials:write", "accounts.cancelPending": "credentials:write",
 		"session.send": "tasks:write", "session.create": "tasks:write", "session.abort": "tasks:write",
 		"session.reply": "tasks:write", "handoff": "tasks:write",
 	} {

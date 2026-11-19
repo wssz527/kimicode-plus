@@ -624,6 +624,157 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+export interface AccountQuotaSummary {
+  status: "ok" | "unknown" | "auth_rejected";
+  limit5hUsed?: number;
+  limit7dUsed?: number;
+  limit5hReset?: string;
+  limit7dReset?: string;
+  checkedAt?: string;
+  error?: string;
+}
+
+export interface AccountProfile {
+  userId: string;
+  nickname: string;
+  avatar?: string;
+  plan?: string;
+  region?: string;
+  email?: string;
+}
+
+export interface AccountSummary {
+  id: string;
+  userId: string;
+  label: string;
+  nickname: string;
+  avatar?: string;
+  plan?: string;
+  region?: string;
+  current: boolean;
+  status: "ready" | "relogin_required" | string;
+  statusReason?: string;
+  quota?: AccountQuotaSummary | null;
+  credentialSaved: boolean;
+  updatedAt: string;
+}
+
+export interface AccountBusySession {
+  id: string;
+  title: string;
+  reason: string;
+}
+
+export interface AccountPendingSwitch {
+  targetId: string;
+  targetLabel: string;
+  busySessionIds: string[];
+  queuedAt: string;
+}
+
+export interface AccountAddFlow {
+  active: boolean;
+  mode: "add" | "relogin";
+  previousUserId?: string;
+  reloginAccountId?: string;
+  startedAt?: string;
+}
+
+export interface AccountsState {
+  vaultUnlocked: boolean;
+  signedIn: boolean;
+  currentAccountId?: string;
+  currentProfile?: AccountProfile | null;
+  accounts: AccountSummary[];
+  pendingSwitch?: AccountPendingSwitch | null;
+  addFlow?: AccountAddFlow | null;
+  cliRunning: boolean;
+}
+
+export interface AccountSwitchPreflight {
+  target: AccountSummary;
+  vaultUnlocked: boolean;
+  canSwitch: boolean;
+  requiresLogin: boolean;
+  busySessions: AccountBusySession[];
+  warnings: string[];
+  cliRunning: boolean;
+  activeModel?: string;
+  modelMayDiffer: boolean;
+}
+
+export interface AccountSwitchResult {
+  switched: boolean;
+  queued?: boolean;
+  account?: AccountSummary | null;
+  pendingSwitch?: AccountPendingSwitch | null;
+  sessionsCount?: number;
+  hostPid?: number;
+  warnings?: string[];
+  refreshAuth: boolean;
+}
+
+export function formatAccountQuotaLine(quota?: AccountQuotaSummary | null): string {
+  if (!quota || quota.status === "unknown") {
+    return "5小时：未知 · 每周：未知";
+  }
+  if (quota.status === "auth_rejected") {
+    return "令牌已失效，需要重新登录";
+  }
+  const parts: string[] = [];
+  if (typeof quota.limit5hUsed === "number" && Number.isFinite(quota.limit5hUsed)) {
+    parts.push(`5小时 ${Math.round(quota.limit5hUsed)}%`);
+  } else {
+    parts.push("5小时：未知");
+  }
+  if (typeof quota.limit7dUsed === "number" && Number.isFinite(quota.limit7dUsed)) {
+    parts.push(`每周 ${Math.round(quota.limit7dUsed)}%`);
+  } else {
+    parts.push("每周：未知");
+  }
+  return parts.join(" · ");
+}
+
+export function listAccounts(host: NativeHost, refreshQuota = false): Promise<AccountsState> {
+  return host.request<AccountsState>("accounts.list", refreshQuota ? { refreshQuota: true } : {});
+}
+
+export function saveCurrentAccount(host: NativeHost, label?: string): Promise<AccountSummary> {
+  return host.request<AccountSummary>("accounts.saveCurrent", label ? { label } : {});
+}
+
+export function beginAddAccount(host: NativeHost, reloginAccountId?: string): Promise<{ addFlow: AccountAddFlow; savedCurrent?: AccountSummary | null }> {
+  return host.request("accounts.beginAdd", reloginAccountId ? { reloginAccountId } : {});
+}
+
+export function completeAddAccount(host: NativeHost, options?: { cancel?: boolean; label?: string }): Promise<{ completed: boolean; cancelled?: boolean; reason?: string; account?: AccountSummary }> {
+  return host.request("accounts.completeAdd", options ?? {});
+}
+
+export function renameAccount(host: NativeHost, id: string, label: string): Promise<AccountSummary> {
+  return host.request<AccountSummary>("accounts.rename", { id, label });
+}
+
+export function deleteAccount(host: NativeHost, id: string): Promise<{ deleted: boolean; id: string }> {
+  return host.request("accounts.delete", { id });
+}
+
+export function refreshAccountQuotas(host: NativeHost): Promise<Record<string, AccountQuotaSummary>> {
+  return host.request("accounts.refreshQuotas", {});
+}
+
+export function preflightAccountSwitch(host: NativeHost, id: string, activeModel?: string): Promise<AccountSwitchPreflight> {
+  return host.request<AccountSwitchPreflight>("accounts.switchPreflight", activeModel ? { id, activeModel } : { id });
+}
+
+export function switchAccount(host: NativeHost, id: string, waitUntilIdle = false): Promise<AccountSwitchResult> {
+  return host.request<AccountSwitchResult>("accounts.switch", waitUntilIdle ? { id, waitUntilIdle: true } : { id });
+}
+
+export function cancelPendingAccountSwitch(host: NativeHost): Promise<{ cancelled: boolean }> {
+  return host.request("accounts.cancelPending", {});
+}
+
 export function createCoreTransport(host: NativeHost) {
   return async (path: string, init: RequestInit): Promise<Response> => {
     let body = "";

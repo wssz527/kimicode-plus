@@ -359,6 +359,9 @@ func (s *NativeService) automationTick(ctx context.Context, now time.Time) error
 	if s.safe != nil && s.safe() {
 		return nil
 	}
+	if s.isAutomationPausedForSwitch() {
+		return nil
+	}
 	var syncErr error
 	if settings.KeepAlive.Enabled || settings.Compaction.Enabled || settings.Recovery.Enabled {
 		// Refresh the session-record metrics first: keepalive's clock and its

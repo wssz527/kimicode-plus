@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"enhancedkimi/internal/cache"
+	"enhancedkimi/internal/credentials"
 	"enhancedkimi/internal/httpx"
 	"enhancedkimi/internal/redact"
 	"enhancedkimi/internal/storage"
@@ -100,6 +101,17 @@ type NativeService struct {
 	contractElectron   string
 	contractUpdatedAt  string
 	domProbes          map[string]ContractProbe
+
+	accountVault              *credentials.KimiAccountVault
+	accountMu                 sync.Mutex
+	switchMu                  sync.Mutex
+	switchPauseCount          int
+	pendingSwitch             *pendingSwitchState
+	addFlow                   *AccountAddFlow
+	writeAccountFileHook      func(target string, data []byte) error
+	cliDetector               func(ctx context.Context) bool
+	hostPIDProvider           func() int
+	codeUsageEndpointOverride string
 }
 
 const addonFeaturesKey = "features"
@@ -153,6 +165,7 @@ func NewNativeService(db *sql.DB, kap *KAPClient, cwd string, safe func() bool) 
 	if err := storage.Migrate(db, "native_service", []string{
 		`CREATE TABLE native_state(key TEXT PRIMARY KEY,data TEXT NOT NULL)`,
 		`CREATE TABLE automation_intents(id TEXT PRIMARY KEY,kind TEXT NOT NULL,host_id TEXT NOT NULL,session_id TEXT NOT NULL,model_id TEXT NOT NULL,context_revision TEXT NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,result TEXT NOT NULL DEFAULT '')`,
+		`CREATE TABLE kimi_accounts(id TEXT PRIMARY KEY,user_id TEXT NOT NULL UNIQUE,label TEXT NOT NULL DEFAULT '',nickname TEXT NOT NULL DEFAULT '',avatar TEXT NOT NULL DEFAULT '',plan TEXT NOT NULL DEFAULT '',region TEXT NOT NULL DEFAULT '',oauth_key TEXT NOT NULL DEFAULT 'kimi-code',oauth_host TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'ready',status_reason TEXT NOT NULL DEFAULT '',quota_json TEXT NOT NULL DEFAULT '',models_json TEXT NOT NULL DEFAULT '',last_seen_at TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL)`,
 	}); err != nil {
 		return nil, err
 	}
@@ -484,6 +497,26 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.unwatchRecovery(ctx, input)
 	case "recovery.check":
 		return s.recoveryCheck(ctx)
+	case "accounts.list":
+		return s.accountsList(ctx, input)
+	case "accounts.saveCurrent":
+		return s.accountsSaveCurrent(ctx, input)
+	case "accounts.beginAdd":
+		return s.accountsBeginAdd(ctx, input)
+	case "accounts.completeAdd":
+		return s.accountsCompleteAdd(ctx, input)
+	case "accounts.rename":
+		return s.accountsRename(ctx, input)
+	case "accounts.delete":
+		return s.accountsDelete(ctx, input)
+	case "accounts.refreshQuotas":
+		return s.accountsRefreshQuotas(ctx, "")
+	case "accounts.switchPreflight":
+		return s.accountsSwitchPreflight(ctx, input)
+	case "accounts.switch":
+		return s.accountsSwitch(ctx, input)
+	case "accounts.cancelPending":
+		return s.accountsCancelPending(), nil
 	default:
 		return nil, fmt.Errorf("未知或未经允许的宿主动作：%s", action)
 	}

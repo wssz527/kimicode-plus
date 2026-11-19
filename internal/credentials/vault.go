@@ -31,6 +31,7 @@ func NewVault(db *sql.DB) (*Vault, error) {
 	if err := storage.Migrate(db, "vault", []string{
 		`CREATE TABLE vault_meta(id INTEGER PRIMARY KEY CHECK(id=1),salt BLOB NOT NULL,check_value BLOB NOT NULL); CREATE TABLE vault_entries(ref TEXT PRIMARY KEY,value BLOB NOT NULL);`,
 		`CREATE TABLE vault_browser_entries(ref TEXT PRIMARY KEY,value BLOB NOT NULL,expires_at INTEGER NOT NULL DEFAULT 0); CREATE INDEX vault_browser_expiry ON vault_browser_entries(expires_at) WHERE expires_at > 0;`,
+		`CREATE TABLE vault_kimi_accounts(ref TEXT PRIMARY KEY,value BLOB NOT NULL);`,
 	}); err != nil {
 		return nil, err
 	}
