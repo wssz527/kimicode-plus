@@ -47,6 +47,14 @@ export type {
   SettingsDialogParts,
 } from "./plugin-runtime/contracts";
 export { loadModule as loadPluginModule, entryPath as pluginEntryPath } from "./plugin-runtime/loader";
+export {
+  ALLOWED_SCHEDULER_NOTIFY_EVENTS,
+  dispatchSchedulerNotification,
+  isOfficialNotificationEnabled,
+  isOfficialNotificationSoundEnabled,
+  shouldDispatchSchedulerNotification,
+} from "./plugin-runtime/scheduler-notify";
+export type { SchedulerNotificationPayload, SchedulerNotifyEnv } from "./plugin-runtime/scheduler-notify";
 export type { ActivePlugin, PluginRuntime } from "./plugin-runtime/runtime";
 import "./styles/workbench.css";
 

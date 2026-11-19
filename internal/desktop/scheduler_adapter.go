@@ -4,8 +4,10 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
+	"enhancedkimi/internal/quota"
 	"enhancedkimi/internal/scheduler"
 )
 
@@ -150,6 +152,121 @@ func (e *SchedulerExecutor) SendPrompt(ctx context.Context, sessionID, text, mod
 	}
 	_, err := e.service.sendPrompt(ctx, input)
 	return err
+}
+
+func (e *SchedulerExecutor) ArchiveSession(ctx context.Context, sessionID string) error {
+	return e.service.kap.ArchiveSession(ctx, sessionID)
+}
+
+func (e *SchedulerExecutor) ArchiveSessions(ctx context.Context, sessionIDs []string) error {
+	return e.service.kap.ArchiveSessions(ctx, sessionIDs)
+}
+
+func (e *SchedulerExecutor) AbortSession(ctx context.Context, sessionID string) error {
+	return e.service.kap.AbortSession(ctx, sessionID)
+}
+
+func (e *SchedulerExecutor) CheckAccount(ctx context.Context) (bool, string) {
+	profile, status, reason := e.service.readOfficialUserInfo(ctx)
+	if profile != nil && strings.TrimSpace(profile.UserID) != "" {
+		return true, ""
+	}
+	// If the client has no managed Kimi Code provider configured (for example
+	// pure custom API providers or a minimal synthetic fixture), do not falsely
+	// block on /oauth/userinfo 404.
+	if status == http.StatusNotFound {
+		_, _, _, managedExists, _ := e.service.readManagedProviderConfig(ctx)
+		if !managedExists {
+			return true, ""
+		}
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "当前未登录 Kimi Code 账号或登录已失效"
+	}
+	return false, reason
+}
+
+func codeUsageRemainingPercent(state quota.CodeUsageState, now time.Time) (float64, bool, string) {
+	if state.Status != quota.CodeAvailable || len(state.Windows) == 0 {
+		return 0, false, ""
+	}
+	known := false
+	minRemaining := 100.0
+	worstLabel := ""
+	for _, w := range state.Windows {
+		if w.ResetAt != nil && strings.TrimSpace(*w.ResetAt) != "" {
+			if reset, err := time.Parse(time.RFC3339, strings.TrimSpace(*w.ResetAt)); err == nil && !now.Before(reset) {
+				continue
+			}
+		}
+		known = true
+		rem := w.RemainingPercent
+		if rem < 0 {
+			rem = 0
+		}
+		if rem > 100 {
+			rem = 100
+		}
+		if rem < minRemaining || worstLabel == "" {
+			minRemaining = rem
+			worstLabel = w.Label
+		}
+	}
+	return minRemaining, known, worstLabel
+}
+
+func (e *SchedulerExecutor) QuotaRemainingPercent(ctx context.Context) (float64, bool, string, string) {
+	now := time.Now().UTC()
+	// First check R3's cached Kimi Code usage state if already warm and fresh.
+	if e.service.quota != nil {
+		if state, err := e.service.quota.balances(ctx, false); err == nil {
+			if code, ok := state.KimiCode.(quota.CodeUsageState); ok && !code.Stale {
+				if rem, known, label := codeUsageRemainingPercent(code, now); known {
+					return rem, true, "R3 codeusage", label
+				}
+			}
+		}
+	}
+	// Official local /oauth/usage (fast, loopback-only, respects isolated KIMI_CODE_HOME).
+	if raw, err := e.service.kap.Request(ctx, http.MethodGet, "/oauth/usage", nil); err == nil {
+		if usage, parseErr := parseManagedUsage(raw); parseErr == nil {
+			if rem, known := managedQuotaRemainingPercent(usage, now); known {
+				return rem, true, "官方 /oauth/usage", ""
+			}
+		}
+	}
+	// Fallback: trigger R3 Kimi Code usage refresh if local /oauth/usage was unavailable.
+	if e.service.quota != nil {
+		if state, err := e.service.quota.balances(ctx, true); err == nil {
+			if code, ok := state.KimiCode.(quota.CodeUsageState); ok {
+				if rem, known, label := codeUsageRemainingPercent(code, now); known {
+					return rem, true, "R3 codeusage", label
+				}
+			}
+		}
+	}
+	return 0, false, "", ""
+}
+
+func (e *SchedulerExecutor) AutoAttachStatus(ctx context.Context) scheduler.AutoAttachInfo {
+	raw := e.service.attachStatus(ctx)
+	info := scheduler.AutoAttachInfo{}
+	if agent, ok := raw["agent"].(LaunchAgentState); ok {
+		info.Enabled = agent.Enabled
+	}
+	if kind, ok := raw["autoAttachKind"].(string); ok {
+		info.Kind = kind
+	}
+	if platform, ok := raw["platform"].(string); ok {
+		info.Platform = platform
+	}
+	if available, ok := raw["available"].(bool); ok {
+		info.Available = available
+	}
+	if reason, ok := raw["unavailableReason"].(string); ok {
+		info.UnavailableReason = reason
+	}
+	return info
 }
 
 func (e *SchedulerExecutor) SessionCacheStats(ctx context.Context, sessionIDs []string) (map[string]scheduler.SessionCacheStat, bool, int) {

@@ -330,6 +330,8 @@ var actionCapability = map[string]string{
 	"schedule.markRead":    CapScheduleManage,
 	"schedule.markAllRead": CapScheduleManage,
 	"schedule.prefs":       CapScheduleManage,
+	"schedule.checkGit":    CapScheduleManage,
+	"schedule.archiveRun":  CapScheduleManage,
 }
 
 // eventScopeCapability maps an event scope to the capability that reveals it.

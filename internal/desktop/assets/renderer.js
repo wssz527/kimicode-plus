@@ -92,6 +92,8 @@ async function installNativeRenderer(options) {
     keepAliveCache: new Map(),
     keepAliveFetchPromises: new Map(),
     keepAliveMenuEl: null,
+    seenSchedulerNotifyTags: new Set(),
+    unsubscribeSchedule: null,
     keepAliveMenuHandle: null,
     keepAliveMenuSessionId: '',
     keepAliveMenuOutside: null,
@@ -768,7 +770,7 @@ async function installNativeRenderer(options) {
       if (!button) throw new Error('官方设置入口未就绪');
       button.click();
     }
-    const officialTabs = new Set(['account', 'agent', 'providers', 'lab', 'archived']);
+    const officialTabs = new Set(['general', 'account', 'agent', 'providers', 'lab', 'archived']);
     const wantOfficial = typeof tab === 'string' && officialTabs.has(tab);
     const findOfficialTab = key => module.findOfficialSettingsTab(document, key);
     const deadline = Date.now() + 10000;
@@ -1205,6 +1207,7 @@ async function installNativeRenderer(options) {
     state.unsubscribeAccounts?.();
     state.unsubscribeKeepAlive?.();
     state.unsubscribeAutomation?.();
+    state.unsubscribeSchedule?.();
     state.unsubscribeFeatures?.();
     state.unsubscribePlugins?.();
     state.restoreNotifyCompletion?.();
@@ -1412,6 +1415,21 @@ async function installNativeRenderer(options) {
   state.unsubscribeAutomation = accountEventHost.subscribe('automation', () => {
     const currentId = activeSession();
     if (currentId) void fetchSessionKeepAlive(currentId, true);
+  });
+  state.unsubscribeSchedule = accountEventHost.subscribe('schedule', event => {
+    if (!event || typeof event !== 'object' || event.kind !== 'run.notify' || !event.notification) return;
+    if (typeof module.dispatchSchedulerNotification !== 'function') return;
+    module.dispatchSchedulerNotification(event.notification, {
+      document,
+      storage: window.localStorage,
+      seenTags: state.seenSchedulerNotifyTags,
+      showWindow: () => { window.kimiDesktop?.showWindow?.(); },
+      focusWindow: () => { window.focus(); },
+      openSession: id => openOfficial(id),
+      openRuns: detail => {
+        window.dispatchEvent(new CustomEvent('ekd:scheduler-open-runs', { detail }));
+      },
+    });
   });
   void refreshAccountsCache(true);
   ensure();
@@ -2004,6 +2022,7 @@ async function installNativeRenderer(options) {
         commandHost: pluginCommandHost,
         pickFiles: async () => (await transport.request('host.pickFiles', {})) || [],
         pickDirectory: async opts => ((await transport.request('host.pickDirectory', opts || {}))?.path) || null,
+        openSettings: async tab => { await openSettings(tab || ''); },
         openSession: async id => { await transport.request('host.openSession', { id }); },
         activeSession,
       });

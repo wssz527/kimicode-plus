@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type KctMigrationResult, type PluginActivity, type PluginPreview, type PluginRecord } from "../api";
 import { pluginHostBridge, syncPluginHost } from "../plugin-runtime/host";
+import type { NativeHost } from "../native";
 import { Icon } from "./Icon";
 import { ActionButton, Badge, EmptyState, ErrorNotice, Field, InfoNote, Panel, SkeletonRows, StateBadge } from "./ui";
 import { PluginCredentials } from "./PluginCredentials";
@@ -289,14 +290,27 @@ function KctMigrationPanel({ show }: { show: boolean }) {
   );
 }
 
+const SCHEDULER_PLUGIN_ID = "kimicode-plus.scheduler";
+
+interface SchedulerAttachPromptState {
+  pluginName: string;
+  platform: string;
+  autoAttachKind: string;
+  available: boolean;
+  unavailableReason: string;
+  dailyInstance: boolean;
+}
+
 export interface PluginSettingsProps {
   /** Rendered inside the settings dialog, where the page header is the dialog's. */
   embedded?: boolean;
+  /** Native host bridge, used to inspect and enable auto-attach when scheduler is enabled. */
+  host?: NativeHost | null;
   /** Notifies the host settings surface when entering or leaving a single-plugin detail subpage. */
   onDetailChange?: (active: boolean) => void;
 }
 
-export function PluginSettings({ embedded = false, onDetailChange }: PluginSettingsProps) {
+export function PluginSettings({ embedded = false, host = null, onDetailChange }: PluginSettingsProps) {
   const plugins = useResource("plugins/list", () => api.plugins.list());
   const [selected, setSelected] = useState<string | null>(null);
   const returnToRef = useRef<string | null>(null);
@@ -311,6 +325,10 @@ export function PluginSettings({ embedded = false, onDetailChange }: PluginSetti
   const [previewBusy, setPreviewBusy] = useState(false);
   const [confirmForce, setConfirmForce] = useState(false);
   const [confirmUninstall, setConfirmUninstall] = useState(false);
+  const [autoAttachPrompt, setAutoAttachPrompt] = useState<SchedulerAttachPromptState | null>(null);
+  const [autoAttachBusy, setAutoAttachBusy] = useState(false);
+  const [autoAttachConsent, setAutoAttachConsent] = useState(false);
+  const [autoAttachError, setAutoAttachError] = useState<string | null>(null);
   const action = useAction<PluginRecord | { id: string; uninstalled: boolean }>();
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
@@ -384,6 +402,56 @@ export function PluginSettings({ embedded = false, onDetailChange }: PluginSetti
     }
   }
 
+  async function maybePromptSchedulerAutoAttach(record: PluginRecord) {
+    const isScheduler = record.id === SCHEDULER_PLUGIN_ID
+      || (record.capabilities ?? []).includes("schedule:manage");
+    if (!isScheduler || !host) return;
+    try {
+      const status = await host.request<{
+        host?: { dailyInstance?: boolean };
+        agent?: { enabled?: boolean };
+        platform?: string;
+        autoAttachKind?: string;
+        available?: boolean;
+        unavailableReason?: string;
+      }>("attach.status");
+      if (status?.agent?.enabled) {
+        setAutoAttachPrompt(null);
+        return;
+      }
+      setAutoAttachConsent(false);
+      setAutoAttachError(null);
+      setAutoAttachPrompt({
+        pluginName: record.name || record.id,
+        platform: status?.platform ?? "",
+        autoAttachKind: status?.autoAttachKind ?? "",
+        available: status?.available !== false,
+        unavailableReason: status?.unavailableReason ?? "",
+        dailyInstance: status?.host?.dailyInstance === true,
+      });
+    } catch {
+      // Do not block plugin activation if attach.status is temporarily unavailable.
+    }
+  }
+
+  async function enableAutoAttachFromPrompt() {
+    if (!host || !autoAttachPrompt) return;
+    setAutoAttachBusy(true);
+    setAutoAttachError(null);
+    try {
+      await host.request("attach.enable", { allowDailyInstance: autoAttachConsent });
+      setAutoAttachPrompt(null);
+      setFlash("已开启「随 Kimi Code 自动接入」。Kimi Code 重启后定时任务将自动恢复接入并按时运行。");
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("ekd:attach-changed"));
+      }
+    } catch (error) {
+      setAutoAttachError(errorMessage(error) || "开启自动接入失败，请稍后在「状态与诊断」中重试。");
+    } finally {
+      setAutoAttachBusy(false);
+    }
+  }
+
   async function run(id: string, kind: "enable" | "disable" | "uninstall", options?: { deleteData?: boolean }) {
     if (kind === "uninstall") {
       const done = await action.run(() => api.plugins.uninstall(id, options));
@@ -406,6 +474,11 @@ export function PluginSettings({ embedded = false, onDetailChange }: PluginSetti
       setFlash(`「${result.name || result.id}」现在${PLAIN_STATE[result.state] ?? stateLabel(result.state)}。`);
       plugins.reload();
       activity.reload();
+      if (kind === "enable") {
+        await maybePromptSchedulerAutoAttach(result);
+      } else if (id === SCHEDULER_PLUGIN_ID) {
+        setAutoAttachPrompt(null);
+      }
     }
   }
 
@@ -461,6 +534,7 @@ export function PluginSettings({ embedded = false, onDetailChange }: PluginSetti
       setFlash(`「${result.name || result.id}」已强制启用。它未在当前宿主版本验证。`);
       plugins.reload();
       activity.reload();
+      await maybePromptSchedulerAutoAttach(result);
     }
   }
 
@@ -485,6 +559,59 @@ export function PluginSettings({ embedded = false, onDetailChange }: PluginSetti
       <ActionButton icon="refresh" onClick={() => void syncHost()} busy={syncing}>
         重新同步侧栏
       </ActionButton>
+    </div>
+  ) : null;
+
+  const autoAttachDialog = autoAttachPrompt ? (
+    <div
+      className="plugin-confirm"
+      role="dialog"
+      aria-modal="true"
+      aria-label="建议开启随 Kimi Code 自动接入"
+      data-ekd-autoattach-prompt="true"
+    >
+      <p>
+        <strong>建议开启「随 Kimi Code 自动接入」</strong>
+      </p>
+      <p>
+        已启用「{autoAttachPrompt.pluginName}」，但当前未开启
+        {autoAttachPrompt.autoAttachKind === "windows_launcher" || autoAttachPrompt.platform === "windows"
+          ? " Windows 固定路径启动器自动接入"
+          : " LaunchAgent 后台自动接入"}
+        。如果不开启，Kimi Code 重启后，定时任务要等您手动重新接入才会运行。
+      </p>
+      {autoAttachPrompt.dailyInstance ? (
+        <label className="capability-choice">
+          <input
+            type="checkbox"
+            checked={autoAttachConsent}
+            onChange={event => setAutoAttachConsent(event.target.checked)}
+          />
+          <span>我知道开启后会接入当前日常 Kimi Code 客户端界面</span>
+        </label>
+      ) : null}
+      {!autoAttachPrompt.available && autoAttachPrompt.unavailableReason ? (
+        <p className="panel-note">{autoAttachPrompt.unavailableReason}</p>
+      ) : null}
+      {autoAttachError ? (
+        <ErrorNotice message={autoAttachError} onDismiss={() => setAutoAttachError(null)} />
+      ) : null}
+      <div className="inline-actions">
+        {autoAttachPrompt.available ? (
+          <ActionButton
+            variant="primary"
+            icon="check"
+            onClick={() => void enableAutoAttachFromPrompt()}
+            busy={autoAttachBusy}
+            disabled={autoAttachPrompt.dailyInstance && !autoAttachConsent}
+          >
+            立即开启自动接入
+          </ActionButton>
+        ) : null}
+        <ActionButton variant="quiet" onClick={() => setAutoAttachPrompt(null)} disabled={autoAttachBusy}>
+          暂不开启
+        </ActionButton>
+      </div>
     </div>
   ) : null;
 
@@ -545,6 +672,7 @@ export function PluginSettings({ embedded = false, onDetailChange }: PluginSetti
             {flash}
           </div>
         ) : null}
+        {autoAttachDialog}
         {syncNotice}
         {action.error ? (
           <ErrorNotice message={errorMessage(action.error)} recovery={errorRecovery(action.error)} onDismiss={action.clearError} />
@@ -748,6 +876,7 @@ export function PluginSettings({ embedded = false, onDetailChange }: PluginSetti
         </div>
       ) : null}
 
+      {autoAttachDialog}
       {syncNotice}
       {safeMode ? (
         <InfoNote tone="warn">

@@ -36,7 +36,8 @@ func WithLocation(loc *time.Location) Option {
 func WithMaxConcurrent(n int) Option {
 	return func(e *Engine) {
 		if n > 0 {
-			e.maxConcurrent = n
+			e.maxConcurrent = clampInt(n, 1, MaxAllowedConcurrent)
+			e.maxConcurrentOverride = true
 		}
 	}
 }
@@ -87,25 +88,46 @@ func WithDefaultCWD(cwd string) Option {
 	}
 }
 
+func WithTimeoutScale(d time.Duration) Option {
+	return func(e *Engine) {
+		if d > 0 {
+			e.timeoutScale = d
+		}
+	}
+}
+
+func WithGitChecker(fn func(ctx context.Context, cwd string) GitWorktreeStatus) Option {
+	return func(e *Engine) {
+		if fn != nil {
+			e.gitChecker = fn
+		}
+	}
+}
+
 type Engine struct {
 	store *Store
 	exec  Executor
 
-	now             func() time.Time
-	loc             *time.Location
-	maxConcurrent   int
-	tickInterval    time.Duration
-	busyWaitTimeout time.Duration
-	pollInterval    time.Duration
-	catchupGrace    time.Duration
-	pluginEnabled   func(string) bool
-	defaultCWD      string
+	now                   func() time.Time
+	loc                   *time.Location
+	maxConcurrent         int
+	maxConcurrentOverride bool
+	tickInterval          time.Duration
+	busyWaitTimeout       time.Duration
+	pollInterval          time.Duration
+	catchupGrace          time.Duration
+	timeoutScale          time.Duration
+	pluginEnabled         func(string) bool
+	gitChecker            func(ctx context.Context, cwd string) GitWorktreeStatus
+	defaultCWD            string
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	sem chan struct{}
+	slotMu       sync.Mutex
+	runningSlots int
+	slotWaiters  []chan struct{}
 
 	mu          sync.Mutex
 	activeTasks map[string]activeRun
@@ -120,18 +142,22 @@ type activeRun struct {
 }
 
 type SaveTaskInput struct {
-	ID             string       `json:"id,omitempty"`
-	Name           string       `json:"name"`
-	Prompt         string       `json:"prompt"`
-	CWD            string       `json:"cwd"`
-	Mode           string       `json:"mode"`
-	SessionID      string       `json:"sessionId,omitempty"`
-	Model          string       `json:"model,omitempty"`
-	Effort         string       `json:"effort,omitempty"`
-	PermissionMode string       `json:"permissionMode"`
-	Schedule       ScheduleRule `json:"schedule"`
-	MissedPolicy   string       `json:"missedPolicy"`
-	Enabled        *bool        `json:"enabled,omitempty"`
+	ID               string       `json:"id,omitempty"`
+	Name             string       `json:"name"`
+	Prompt           string       `json:"prompt"`
+	CWD              string       `json:"cwd"`
+	Mode             string       `json:"mode"`
+	SessionID        string       `json:"sessionId,omitempty"`
+	Model            string       `json:"model,omitempty"`
+	Effort           string       `json:"effort,omitempty"`
+	PermissionMode   string       `json:"permissionMode"`
+	Schedule         ScheduleRule `json:"schedule"`
+	MissedPolicy     string       `json:"missedPolicy"`
+	ArchiveOnRead    *bool        `json:"archiveOnRead,omitempty"`
+	TimeoutMinutes   *int         `json:"timeoutMinutes,omitempty"`
+	MaxTurns         *int         `json:"maxTurns,omitempty"`
+	ConfirmDirtyYolo bool         `json:"confirmDirtyYolo,omitempty"`
+	Enabled          *bool        `json:"enabled,omitempty"`
 }
 
 func NewEngine(store *Store, exec Executor, opts ...Option) (*Engine, error) {
@@ -147,12 +173,14 @@ func NewEngine(store *Store, exec Executor, opts ...Option) (*Engine, error) {
 		exec:            exec,
 		now:             time.Now,
 		loc:             time.Local,
-		maxConcurrent:   2,
+		maxConcurrent:   DefaultMaxConcurrent,
 		tickInterval:    5 * time.Second,
 		busyWaitTimeout: 10 * time.Minute,
 		pollInterval:    1 * time.Second,
 		catchupGrace:    90 * time.Second,
+		timeoutScale:    time.Minute,
 		pluginEnabled:   func(string) bool { return true },
+		gitChecker:      CheckGitWorktree,
 		ctx:             ctx,
 		cancel:          cancel,
 		activeTasks:     map[string]activeRun{},
@@ -162,7 +190,6 @@ func NewEngine(store *Store, exec Executor, opts ...Option) (*Engine, error) {
 			opt(e)
 		}
 	}
-	e.sem = make(chan struct{}, e.maxConcurrent)
 	if _, err := store.RecoverInFlight(context.Background(), e.now().UTC()); err != nil {
 		cancel()
 		return nil, err
@@ -186,6 +213,66 @@ func (e *Engine) isPluginEnabled(pluginID string) bool {
 		return true
 	}
 	return fn(pluginID)
+}
+
+func (e *Engine) effectiveMaxConcurrent(ctx context.Context, pluginID string) int {
+	prefs := e.store.GetPrefs(ctx, pluginID)
+	if prefs.MaxConcurrent >= 1 && prefs.MaxConcurrent <= MaxAllowedConcurrent {
+		if e.maxConcurrentOverride && prefs.MaxConcurrent == DefaultMaxConcurrent && e.maxConcurrent != DefaultMaxConcurrent {
+			return e.maxConcurrent
+		}
+		return prefs.MaxConcurrent
+	}
+	if e.maxConcurrent > 0 {
+		return e.maxConcurrent
+	}
+	return DefaultMaxConcurrent
+}
+
+func (e *Engine) acquireSlot(ctx context.Context, limit int) bool {
+	if limit < 1 {
+		limit = 1
+	}
+	for {
+		e.slotMu.Lock()
+		if e.runningSlots < limit {
+			e.runningSlots++
+			e.slotMu.Unlock()
+			return true
+		}
+		ch := make(chan struct{})
+		e.slotWaiters = append(e.slotWaiters, ch)
+		e.slotMu.Unlock()
+
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+func (e *Engine) releaseSlot() {
+	e.slotMu.Lock()
+	if e.runningSlots > 0 {
+		e.runningSlots--
+	}
+	waiters := e.slotWaiters
+	e.slotWaiters = nil
+	e.slotMu.Unlock()
+	for _, ch := range waiters {
+		close(ch)
+	}
+}
+
+func (e *Engine) wakeSlotWaiters() {
+	e.slotMu.Lock()
+	waiters := e.slotWaiters
+	e.slotWaiters = nil
+	e.slotMu.Unlock()
+	for _, ch := range waiters {
+		close(ch)
+	}
 }
 
 func (e *Engine) Start() {
@@ -219,6 +306,7 @@ func (e *Engine) Close() {
 		cancel()
 	}
 	e.cancel()
+	e.wakeSlotWaiters()
 	e.wg.Wait()
 }
 
@@ -278,14 +366,13 @@ func (e *Engine) Tick(ctx context.Context) error {
 	if closed || paused || e.ctx.Err() != nil {
 		return nil
 	}
-	connected, _ := e.exec.KAPConnected(ctx)
-	if !connected {
-		return nil
-	}
 	now := e.now().UTC()
 	due, err := e.store.DueTasks(ctx, now)
 	if err != nil {
 		return err
+	}
+	if len(due) == 0 {
+		return nil
 	}
 	for _, task := range due {
 		if !e.isPluginEnabled(task.PluginID) {
@@ -301,7 +388,7 @@ func (e *Engine) Tick(ctx context.Context) error {
 
 		if e.isTaskActive(task.ID) {
 			if err := e.store.UpdateTaskSchedule(ctx, task.ID, nextEnabled, nextStr, now); err == nil {
-				e.recordSkipped(ctx, task, TriggerScheduled, task.NextRunAt, "上一次运行尚未结束，已跳过本次重叠调度", now)
+				e.recordSkipped(ctx, task, TriggerScheduled, task.NextRunAt, FailureOverlap, "上一次运行尚未结束，已跳过本次重叠调度", now)
 			}
 			continue
 		}
@@ -310,7 +397,16 @@ func (e *Engine) Tick(ctx context.Context) error {
 		if missed && task.MissedPolicy == MissedSkip {
 			if err := e.store.UpdateTaskSchedule(ctx, task.ID, nextEnabled, nextStr, now); err == nil {
 				label := scheduledAt.In(e.loc).Format("2006-01-02 15:04")
-				e.recordSkipped(ctx, task, TriggerScheduled, task.NextRunAt, fmt.Sprintf("错过预定时间（%s），按任务设置已跳过", label), now)
+				e.recordSkipped(ctx, task, TriggerScheduled, task.NextRunAt, FailureMissed, fmt.Sprintf("错过预定时间（%s），按任务设置已跳过", label), now)
+			}
+			continue
+		}
+
+		limit := e.effectiveMaxConcurrent(ctx, task.PluginID)
+		if e.activeTaskCount() >= limit {
+			if err := e.store.UpdateTaskSchedule(ctx, task.ID, nextEnabled, nextStr, now); err == nil {
+				e.recordSkipped(ctx, task, TriggerScheduled, task.NextRunAt, FailureConcurrencyLimit,
+					fmt.Sprintf("当前并发运行任务已达全局上限（%d），已跳过本次调度", limit), now)
 			}
 			continue
 		}
@@ -327,7 +423,7 @@ func (e *Engine) Tick(ctx context.Context) error {
 	return nil
 }
 
-func (e *Engine) recordSkipped(ctx context.Context, task Task, triggerKind, scheduledFor, message string, now time.Time) {
+func (e *Engine) recordSkipped(ctx context.Context, task Task, triggerKind, scheduledFor, failureKind, message string, now time.Time) {
 	stamp := storage.SortableTime(now)
 	run := RunRecord{
 		ID:             newID("run"),
@@ -341,6 +437,7 @@ func (e *Engine) recordSkipped(ctx context.Context, task Task, triggerKind, sche
 		Effort:         task.Effort,
 		PermissionMode: task.PermissionMode,
 		Status:         RunSkipped,
+		FailureKind:    failureKind,
 		Message:        message,
 		Unread:         true,
 		ScheduledFor:   scheduledFor,
@@ -350,6 +447,7 @@ func (e *Engine) recordSkipped(ctx context.Context, task Task, triggerKind, sche
 	_ = e.store.InsertRun(ctx, run)
 	_ = e.store.UpdateTaskLastResult(ctx, task.ID, stamp, RunSkipped, message, "", now)
 	e.publishScheduleUpdate(task.PluginID, "run.finished", run.ID)
+	e.maybePublishNotification(run)
 }
 
 func (e *Engine) isTaskActive(taskID string) bool {
@@ -357,6 +455,12 @@ func (e *Engine) isTaskActive(taskID string) bool {
 	defer e.mu.Unlock()
 	_, ok := e.activeTasks[taskID]
 	return ok
+}
+
+func (e *Engine) activeTaskCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.activeTasks)
 }
 
 func (e *Engine) runningTaskIDs(pluginID string) []string {
@@ -430,6 +534,19 @@ func (e *Engine) SaveTask(ctx context.Context, pluginID string, input SaveTaskIn
 		return TaskView{}, errors.New("权限模式只支持 manual、yolo 或 auto")
 	}
 
+	allowDirtyYolo := false
+	if permissionMode == "yolo" && cwd != "" {
+		gitStatus := e.gitChecker(ctx, cwd)
+		if gitStatus.IsGitRepo && !gitStatus.Clean {
+			if !input.ConfirmDirtyYolo {
+				return TaskView{}, fmt.Errorf("项目目录是 Git 仓库且工作区存在 %d 处未提交改动。使用「始终允许（免审批）」可能修改或覆盖未提交文件，请先清理工作区，或在勾选风险确认后再保存", max(1, gitStatus.DirtyCount))
+			}
+			allowDirtyYolo = true
+		} else if input.ConfirmDirtyYolo {
+			allowDirtyYolo = true
+		}
+	}
+
 	missedPolicy := strings.TrimSpace(input.MissedPolicy)
 	if missedPolicy == "" {
 		missedPolicy = MissedCatchup
@@ -486,6 +603,35 @@ func (e *Engine) SaveTask(ctx context.Context, pluginID string, input SaveTaskIn
 		id = newID("task")
 	}
 
+	archiveOnRead := mode == ModeNewSession
+	if input.ArchiveOnRead != nil {
+		archiveOnRead = *input.ArchiveOnRead && mode == ModeNewSession
+	} else if existing != nil {
+		archiveOnRead = existing.ArchiveOnRead && mode == ModeNewSession
+	}
+
+	timeoutMinutes := DefaultTimeoutMinutes
+	if existing != nil && existing.TimeoutMinutes > 0 {
+		timeoutMinutes = existing.TimeoutMinutes
+	}
+	if input.TimeoutMinutes != nil {
+		if *input.TimeoutMinutes < 1 || *input.TimeoutMinutes > MaxTimeoutMinutes {
+			return TaskView{}, fmt.Errorf("单次超时必须在 1–%d 分钟之间", MaxTimeoutMinutes)
+		}
+		timeoutMinutes = *input.TimeoutMinutes
+	}
+
+	maxTurns := 0
+	if existing != nil {
+		maxTurns = existing.MaxTurns
+	}
+	if input.MaxTurns != nil {
+		if *input.MaxTurns < 0 || *input.MaxTurns > 500 {
+			return TaskView{}, errors.New("最大回合数必须在 0–500 之间（0 表示不限）")
+		}
+		maxTurns = *input.MaxTurns
+	}
+
 	enabled := true
 	if input.Enabled != nil {
 		enabled = *input.Enabled
@@ -519,6 +665,10 @@ func (e *Engine) SaveTask(ctx context.Context, pluginID string, input SaveTaskIn
 		PermissionMode: permissionMode,
 		Schedule:       rule,
 		MissedPolicy:   missedPolicy,
+		ArchiveOnRead:  archiveOnRead,
+		TimeoutMinutes: timeoutMinutes,
+		MaxTurns:       maxTurns,
+		AllowDirtyYolo: allowDirtyYolo,
 		Enabled:        enabled,
 		NextRunAt:      nextRunAt,
 		CreatedAt:      stamp,
@@ -586,13 +736,6 @@ func (e *Engine) RunNow(ctx context.Context, pluginID, id string) (RunRecord, er
 	}
 	if !e.isPluginEnabled(pluginID) {
 		return RunRecord{}, errors.New("插件未启用，无法运行任务")
-	}
-	connected, reason := e.exec.KAPConnected(ctx)
-	if !connected {
-		if reason == "" {
-			reason = "官方客户端未连接（KAP 不可用）"
-		}
-		return RunRecord{}, errors.New(reason)
 	}
 	if e.isTaskActive(task.ID) {
 		return RunRecord{}, errors.New("该任务正在运行中，请等待当前运行结束")
@@ -731,32 +874,128 @@ func (e *Engine) clearActive(taskID, runID string) {
 	e.mu.Unlock()
 }
 
-func (e *Engine) executeRun(ctx context.Context, task Task, run RunRecord) {
-	select {
-	case e.sem <- struct{}{}:
-		defer func() { <-e.sem }()
-	case <-ctx.Done():
-		e.finishRun(task, run, RunSkipped, "任务已取消或插件已停用", "")
-		return
+func (e *Engine) preflightCheck(ctx context.Context, task Task) (bool, string) {
+	connected, connReason := e.exec.KAPConnected(ctx)
+	if !connected {
+		detail := strings.TrimSpace(connReason)
+		if detail == "" {
+			detail = "本地服务未连接"
+		}
+		return false, fmt.Sprintf("运行前校验失败：官方客户端尚未接入（%s）。下一步：请启动 Kimi Code 并在「设置 → KimiCode+ → 状态与诊断」中重新接入或开启自动接入。", detail)
 	}
 
+	validAccount, accReason := e.exec.CheckAccount(ctx)
+	if !validAccount {
+		detail := strings.TrimSpace(accReason)
+		if detail == "" {
+			detail = "账号未登录或凭据已失效"
+		}
+		return false, fmt.Sprintf("运行前校验失败：当前账号不可用（%s）。下一步：请打开「设置 → 账户」重新登录或切换至有效账号。", detail)
+	}
+
+	dirToCheck := strings.TrimSpace(task.CWD)
+	if task.Mode == ModeBoundSession {
+		sess, err := e.exec.GetSession(ctx, task.SessionID)
+		if err != nil {
+			return false, fmt.Sprintf("运行前校验失败：绑定的会话（%s）不存在或无法读取（%s）。下一步：请编辑任务重新绑定会话，或改为「新开会话」模式。", task.SessionID, err.Error())
+		}
+		if dirToCheck == "" {
+			dirToCheck = strings.TrimSpace(sess.CWD)
+		}
+	}
+	if task.Mode == ModeNewSession || dirToCheck != "" {
+		if dirToCheck == "" || !filepath.IsAbs(dirToCheck) {
+			return false, "运行前校验失败：项目目录无效。下一步：请编辑该任务并选择有效的本机绝对目录。"
+		}
+		info, err := os.Stat(dirToCheck)
+		if err != nil || !info.IsDir() {
+			return false, fmt.Sprintf("运行前校验失败：项目目录「%s」不存在或不是文件夹。下一步：请恢复该目录，或编辑任务重新选择工作目录。", dirToCheck)
+		}
+	}
+
+	if model := strings.TrimSpace(task.Model); model != "" {
+		models, err := e.exec.Models(ctx)
+		if err != nil {
+			return false, fmt.Sprintf("运行前校验失败：无法读取官方模型列表（%s）。下一步：请确认官方客户端服务正常后重试。", err.Error())
+		}
+		found := false
+		for _, item := range models {
+			if item.ID == model {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false, fmt.Sprintf("运行前校验失败：任务指定的模型「%s」已不在官方可用模型列表中。下一步：请编辑任务重新选择可用模型，或在「设置 → 模型供应商」中恢复该模型。", model)
+		}
+	}
+
+	if task.PermissionMode == "yolo" && !task.AllowDirtyYolo && dirToCheck != "" {
+		gitStatus := e.gitChecker(ctx, dirToCheck)
+		if gitStatus.IsGitRepo && !gitStatus.Clean {
+			return false, fmt.Sprintf("运行前校验失败：任务使用「始终允许（免审批）」，但 Git 工作区存在 %d 处未提交改动。下一步：请先提交或暂存工作区改动，或在编辑任务中勾选风险确认后保存。", max(1, gitStatus.DirtyCount))
+		}
+	}
+
+	return true, ""
+}
+
+func (e *Engine) executeRun(ctx context.Context, task Task, run RunRecord) {
+	limit := e.effectiveMaxConcurrent(context.Background(), task.PluginID)
+	if !e.acquireSlot(ctx, limit) {
+		e.finishRun(task, run, RunSkipped, FailureCancelled, "任务已取消或插件已停用", "")
+		return
+	}
+	defer e.releaseSlot()
+
 	if !e.isPluginEnabled(task.PluginID) {
-		e.finishRun(task, run, RunSkipped, "插件已停用，已取消本次运行", "")
+		e.finishRun(task, run, RunSkipped, FailureCancelled, "插件已停用，已取消本次运行", "")
 		return
 	}
 
 	run.Status = RunRunning
-	run.Message = "正在执行…"
+	run.Message = "正在执行运行前校验…"
 	_ = e.store.UpdateRun(context.Background(), run)
 	_ = e.store.UpdateTaskLastResult(context.Background(), task.ID, run.StartedAt, RunRunning, run.Message, "", e.now().UTC())
 	e.publishScheduleUpdate(task.PluginID, "run.started", run.ID)
 
+	if ok, preflightMsg := e.preflightCheck(ctx, task); !ok {
+		e.finishRun(task, run, RunFailed, FailurePreflight, preflightMsg, "")
+		return
+	}
+
+	prefs := e.store.GetPrefs(context.Background(), task.PluginID)
+	if prefs.MinQuotaPercent > 0 {
+		if rem, known, _, detail := e.exec.QuotaRemainingPercent(ctx); known && rem < float64(prefs.MinQuotaPercent) {
+			msg := fmt.Sprintf("跳过（额度不足）：当前剩余额度约 %.0f%%，低于阈值 %d%%", rem, prefs.MinQuotaPercent)
+			if strings.TrimSpace(detail) != "" {
+				msg += "（" + strings.TrimSpace(detail) + "）"
+			}
+			e.finishRun(task, run, RunSkipped, FailureQuotaInsufficient, msg, "")
+			return
+		}
+	}
+
+	timeoutMin := task.TimeoutMinutes
+	if timeoutMin <= 0 {
+		timeoutMin = DefaultTimeoutMinutes
+	}
+	execCtx, execCancel := context.WithTimeout(ctx, time.Duration(timeoutMin)*e.timeoutScale)
+	defer execCancel()
+
+	run.Message = "正在执行…"
+	_ = e.store.UpdateRun(context.Background(), run)
+
 	targetSessionID := task.SessionID
 	if task.Mode == ModeNewSession {
-		title := fmt.Sprintf("[定时] %s", task.Name)
-		sess, err := e.exec.CreateSession(ctx, task.CWD, title, task.Model, task.Effort, task.PermissionMode)
+		title := FormatScheduledSessionTitle(task.Name)
+		sess, err := e.exec.CreateSession(execCtx, task.CWD, title, task.Model, task.Effort, task.PermissionMode)
 		if err != nil {
-			e.finishRun(task, run, RunFailed, "创建会话失败："+err.Error(), "")
+			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+				e.finishRun(task, run, RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟）", timeoutMin), "")
+				return
+			}
+			e.finishRun(task, run, RunFailed, FailureExecution, "创建会话失败："+err.Error(), "")
 			return
 		}
 		targetSessionID = sess.ID
@@ -765,36 +1004,46 @@ func (e *Engine) executeRun(ctx context.Context, task Task, run RunRecord) {
 		e.exec.RecordPluginActivity(context.Background(), task.PluginID, fmt.Sprintf("定时任务「%s」新建会话 %s", task.Name, sess.ID))
 		_ = e.store.UpdateRun(context.Background(), run)
 	} else {
-		ok, waitErr := e.waitForSessionIdle(ctx, task, &run)
+		ok, waitErr := e.waitForSessionIdle(execCtx, task, &run)
 		if !ok {
+			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+				e.finishRun(task, run, RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟）", timeoutMin), targetSessionID)
+				return
+			}
 			if ctx.Err() != nil {
-				e.finishRun(task, run, RunSkipped, "任务已取消或插件已停用", "")
+				e.finishRun(task, run, RunSkipped, FailureCancelled, "任务已取消或插件已停用", "")
 				return
 			}
 			if waitErr != nil {
-				e.finishRun(task, run, RunFailed, waitErr.Error(), "")
+				e.finishRun(task, run, RunFailed, FailureExecution, waitErr.Error(), "")
 				return
 			}
-			e.finishRun(task, run, RunSkipped, fmt.Sprintf("绑定会话持续忙碌超过 %s，已跳过本次运行", formatDuration(e.busyWaitTimeout)), "")
+			e.finishRun(task, run, RunSkipped, FailureBusyTimeout, fmt.Sprintf("绑定会话持续忙碌超过 %s，已跳过本次运行", formatDuration(e.busyWaitTimeout)), "")
 			return
 		}
 	}
 
-	beforeTurns, _ := e.exec.GetSessionTurns(ctx, targetSessionID, 20)
+	beforeTurns, _ := e.exec.GetSessionTurns(execCtx, targetSessionID, 20)
 	prevTurnCount := len(beforeTurns)
 	prevLastTurnID := ""
 	if prevTurnCount > 0 {
 		prevLastTurnID = beforeTurns[prevTurnCount-1].TurnID
 	}
 
-	if err := e.exec.SendPrompt(ctx, targetSessionID, task.Prompt, task.Model, task.Effort, task.PermissionMode); err != nil {
-		e.finishRun(task, run, RunFailed, "发送提示词失败："+err.Error(), targetSessionID)
+	expandedPrompt := ExpandPrompt(task.Prompt, e.now(), e.loc, task.LastRunAt, task.LastSummary)
+	if err := e.exec.SendPrompt(execCtx, targetSessionID, expandedPrompt, task.Model, task.Effort, task.PermissionMode); err != nil {
+		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+			_ = e.exec.AbortSession(context.Background(), targetSessionID)
+			e.finishRun(task, run, RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟），已尝试中止当前会话", timeoutMin), targetSessionID)
+			return
+		}
+		e.finishRun(task, run, RunFailed, FailureExecution, "发送提示词失败："+err.Error(), targetSessionID)
 		return
 	}
 	e.exec.RecordPluginActivity(context.Background(), task.PluginID, fmt.Sprintf("定时任务「%s」向会话 %s 发送提示词", task.Name, targetSessionID))
 
-	status, msg := e.observeTurnOutcome(ctx, targetSessionID, prevTurnCount, prevLastTurnID)
-	e.finishRun(task, run, status, msg, targetSessionID)
+	status, failureKind, msg := e.observeTurnOutcome(execCtx, ctx, targetSessionID, prevTurnCount, prevLastTurnID, timeoutMin, task.MaxTurns)
+	e.finishRun(task, run, status, failureKind, msg, targetSessionID)
 }
 
 func (e *Engine) waitForSessionIdle(ctx context.Context, task Task, run *RunRecord) (bool, error) {
@@ -829,31 +1078,71 @@ func (e *Engine) waitForSessionIdle(ctx context.Context, task Task, run *RunReco
 	}
 }
 
-func (e *Engine) observeTurnOutcome(ctx context.Context, sessionID string, prevTurnCount int, prevLastTurnID string) (string, string) {
+func countNewTurns(turns []TurnInfo, prevLastTurnID string, prevTurnCount int) int {
+	if len(turns) == 0 {
+		return 0
+	}
+	if prevLastTurnID != "" {
+		for i := len(turns) - 1; i >= 0; i-- {
+			if turns[i].TurnID == prevLastTurnID {
+				return len(turns) - 1 - i
+			}
+		}
+	}
+	if len(turns) > prevTurnCount {
+		return len(turns) - prevTurnCount
+	}
+	return 0
+}
+
+func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionID string, prevTurnCount int, prevLastTurnID string, timeoutMin, maxTurns int) (string, string, string) {
 	sawBusy := false
 	idlePolls := 0
 	for {
-		sess, err := e.exec.GetSession(ctx, sessionID)
-		if err != nil {
-			if ctx.Err() != nil {
-				return RunSkipped, "任务已取消或插件已停用"
-			}
-			return RunFailed, "读取会话执行状态失败：" + err.Error()
+		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+			_ = e.exec.AbortSession(context.Background(), sessionID)
+			return RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟），已尝试中止当前会话", timeoutMin)
 		}
-		turns, tErr := e.exec.GetSessionTurns(ctx, sessionID, 20)
+		if parentCtx.Err() != nil {
+			return RunSkipped, FailureCancelled, "任务已取消或插件已停用"
+		}
+
+		sess, err := e.exec.GetSession(execCtx, sessionID)
+		if err != nil {
+			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+				_ = e.exec.AbortSession(context.Background(), sessionID)
+				return RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟），已尝试中止当前会话", timeoutMin)
+			}
+			if parentCtx.Err() != nil {
+				return RunSkipped, FailureCancelled, "任务已取消或插件已停用"
+			}
+			return RunFailed, FailureExecution, "读取会话执行状态失败：" + err.Error()
+		}
+		pageSize := 20
+		if maxTurns > 0 && prevTurnCount+maxTurns+5 > pageSize {
+			pageSize = prevTurnCount + maxTurns + 5
+		}
+		turns, tErr := e.exec.GetSessionTurns(execCtx, sessionID, pageSize)
 		if tErr == nil {
+			if maxTurns > 0 {
+				added := countNewTurns(turns, prevLastTurnID, prevTurnCount)
+				if added > maxTurns {
+					_ = e.exec.AbortSession(context.Background(), sessionID)
+					return RunFailed, FailureMaxTurns, fmt.Sprintf("已超过单次最大回合数限制（%d 回合），已尝试中止本次运行", maxTurns)
+				}
+			}
 			for _, turn := range turns {
 				if turn.HasApproval {
 					detail := "会话出现待批准操作，无人值守模式不会自动批准，请打开会话处理"
 					if turn.ApprovalTitle != "" {
 						detail = fmt.Sprintf("会话正在等待批准（%s），无人值守模式不会自动批准，请打开会话处理", turn.ApprovalTitle)
 					}
-					return RunAwaitingApproval, detail
+					return RunAwaitingApproval, FailureNone, detail
 				}
 			}
 		}
 		if sess.PendingInteraction != "" && sess.PendingInteraction != "none" {
-			return RunAwaitingApproval, fmt.Sprintf("会话处于等待交互状态（%s），无人值守模式不会自动批准，请打开会话处理", sess.PendingInteraction)
+			return RunAwaitingApproval, FailureNone, fmt.Sprintf("会话处于等待交互状态（%s），无人值守模式不会自动批准，请打开会话处理", sess.PendingInteraction)
 		}
 		if sess.Busy || sess.MainTurnActive {
 			sawBusy = true
@@ -871,28 +1160,33 @@ func (e *Engine) observeTurnOutcome(ctx context.Context, sessionID string, prevT
 				}
 			}
 			if latestErr != "" {
-				return RunFailed, "执行失败：" + latestErr
+				return RunFailed, FailureExecution, "执行失败：" + latestErr
 			}
 			idlePolls++
 			if sawBusy || newTurnSeen || idlePolls >= 2 {
-				return RunCompleted, "已完成"
+				return RunCompleted, FailureNone, "已完成"
 			}
 		}
 		select {
-		case <-ctx.Done():
-			return RunSkipped, "任务已取消或插件已停用"
+		case <-execCtx.Done():
+			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+				_ = e.exec.AbortSession(context.Background(), sessionID)
+				return RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟），已尝试中止当前会话", timeoutMin)
+			}
+			return RunSkipped, FailureCancelled, "任务已取消或插件已停用"
 		case <-time.After(e.pollInterval):
 		}
 	}
 }
 
-func (e *Engine) finishRun(task Task, run RunRecord, status, message, sessionID string) {
+func (e *Engine) finishRun(task Task, run RunRecord, status, failureKind, message, sessionID string) {
 	now := e.now().UTC()
 	finished := storage.SortableTime(now)
 	if sessionID != "" {
 		run.SessionID = sessionID
 	}
 	run.Status = status
+	run.FailureKind = failureKind
 	run.Message = message
 	run.FinishedAt = finished
 	prefs := e.store.GetPrefs(context.Background(), task.PluginID)
@@ -904,6 +1198,21 @@ func (e *Engine) finishRun(task Task, run RunRecord, status, message, sessionID 
 	_ = e.store.UpdateRun(context.Background(), run)
 	_ = e.store.UpdateTaskLastResult(context.Background(), task.ID, finished, status, message, run.SessionID, now)
 	e.publishScheduleUpdate(task.PluginID, "run.finished", run.ID)
+	e.maybePublishNotification(run)
+}
+
+func (e *Engine) maybePublishNotification(run RunRecord) {
+	notif, ok := BuildNotification(run)
+	if !ok {
+		return
+	}
+	e.exec.PublishEvent("schedule", map[string]any{
+		"pluginId":     run.PluginID,
+		"kind":         "run.notify",
+		"id":           run.ID,
+		"at":           storage.SortableTime(e.now().UTC()),
+		"notification": notif,
+	})
 }
 
 func (e *Engine) publishScheduleUpdate(pluginID, kind, targetID string) {
@@ -913,6 +1222,34 @@ func (e *Engine) publishScheduleUpdate(pluginID, kind, targetID string) {
 		"id":       targetID,
 		"at":       storage.SortableTime(e.now().UTC()),
 	})
+}
+
+func (e *Engine) shouldArchiveRun(ctx context.Context, pluginID string, run RunRecord) bool {
+	if run.Mode != ModeNewSession || strings.TrimSpace(run.SessionID) == "" || run.Archived {
+		return false
+	}
+	task, err := e.store.GetTask(ctx, pluginID, run.TaskID)
+	if err != nil {
+		return false
+	}
+	return task.ArchiveOnRead
+}
+
+func (e *Engine) archiveRunSession(ctx context.Context, pluginID string, run RunRecord) (bool, string) {
+	if strings.TrimSpace(run.SessionID) == "" || run.Mode != ModeNewSession {
+		return false, ""
+	}
+	if run.Archived {
+		return true, ""
+	}
+	if err := e.exec.ArchiveSession(ctx, run.SessionID); err != nil {
+		msg := "已标为已读，但归档官方会话失败：" + err.Error()
+		_ = e.store.MarkRunArchived(ctx, pluginID, run.ID, false, msg)
+		return false, msg
+	}
+	_ = e.store.MarkRunArchived(ctx, pluginID, run.ID, true, "")
+	e.exec.RecordPluginActivity(context.Background(), pluginID, fmt.Sprintf("定时任务「%s」会话 %s 已归档", run.TaskName, run.SessionID))
+	return true, ""
 }
 
 func (e *Engine) SchedulerAction(ctx context.Context, pluginID, action string, payload json.RawMessage) (any, error) {
@@ -933,6 +1270,7 @@ func (e *Engine) Action(ctx context.Context, pluginID, action string, payload js
 			"runningTaskIds": e.runningTaskIDs(pluginID),
 			"unreadCount":    unread,
 			"prefs":          e.store.GetPrefs(ctx, pluginID),
+			"autoAttach":     e.exec.AutoAttachStatus(ctx),
 		}, nil
 
 	case "schedule.list":
@@ -950,6 +1288,7 @@ func (e *Engine) Action(ctx context.Context, pluginID, action string, payload js
 			"runningTaskIds": e.runningTaskIDs(pluginID),
 			"unreadCount":    unread,
 			"prefs":          e.store.GetPrefs(ctx, pluginID),
+			"autoAttach":     e.exec.AutoAttachStatus(ctx),
 		}, nil
 
 	case "schedule.save":
@@ -1014,29 +1353,121 @@ func (e *Engine) Action(ctx context.Context, pluginID, action string, payload js
 
 	case "schedule.markRead":
 		var input struct {
-			ID   string `json:"id"`
-			Read *bool  `json:"read"`
+			ID      string `json:"id"`
+			Read    *bool  `json:"read"`
+			Archive *bool  `json:"archive"`
 		}
 		if err := json.Unmarshal(payload, &input); err != nil || strings.TrimSpace(input.ID) == "" {
 			return nil, errors.New("缺少运行记录 ID")
 		}
+		runID := strings.TrimSpace(input.ID)
 		read := true
 		if input.Read != nil {
 			read = *input.Read
 		}
-		if err := e.store.MarkRunRead(ctx, pluginID, strings.TrimSpace(input.ID), read); err != nil {
+		allowArchive := true
+		if input.Archive != nil {
+			allowArchive = *input.Archive
+		}
+		run, err := e.store.GetRun(ctx, pluginID, runID)
+		if err != nil {
 			return nil, err
 		}
+		if err := e.store.MarkRunRead(ctx, pluginID, runID, read); err != nil {
+			return nil, err
+		}
+		archived := run.Archived
+		archiveErr := ""
+		if read && allowArchive && e.shouldArchiveRun(ctx, pluginID, run) {
+			archived, archiveErr = e.archiveRunSession(ctx, pluginID, run)
+		}
 		unread, _ := e.store.UnreadCount(ctx, pluginID)
-		e.publishScheduleUpdate(pluginID, "runs.read", strings.TrimSpace(input.ID))
-		return map[string]any{"unreadCount": unread}, nil
+		e.publishScheduleUpdate(pluginID, "runs.read", runID)
+		return map[string]any{
+			"unreadCount":  unread,
+			"archived":     archived,
+			"archiveError": archiveErr,
+		}, nil
+
+	case "schedule.archiveRun":
+		var input struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(payload, &input); err != nil || strings.TrimSpace(input.ID) == "" {
+			return nil, errors.New("缺少运行记录 ID")
+		}
+		runID := strings.TrimSpace(input.ID)
+		run, err := e.store.GetRun(ctx, pluginID, runID)
+		if err != nil {
+			return nil, err
+		}
+		if run.Mode != ModeNewSession || strings.TrimSpace(run.SessionID) == "" {
+			return nil, errors.New("只有新开会话的运行记录支持归档对应会话")
+		}
+		archived, archiveErr := e.archiveRunSession(ctx, pluginID, run)
+		e.publishScheduleUpdate(pluginID, "runs.archived", runID)
+		if !archived && archiveErr != "" {
+			return nil, errors.New(archiveErr)
+		}
+		return map[string]any{"archived": archived, "id": runID, "sessionId": run.SessionID}, nil
 
 	case "schedule.markAllRead":
+		unreadRuns, err := e.store.ListUnreadRuns(ctx, pluginID)
+		if err != nil {
+			return nil, err
+		}
 		if err := e.store.MarkAllRead(ctx, pluginID); err != nil {
 			return nil, err
 		}
+		tasks, _ := e.store.ListTasks(ctx, pluginID)
+		archiveEnabledByTask := map[string]bool{}
+		for _, t := range tasks {
+			archiveEnabledByTask[t.ID] = t.ArchiveOnRead
+		}
+		eligibleRuns := []RunRecord{}
+		sessionIDs := []string{}
+		seenSession := map[string]bool{}
+		for _, run := range unreadRuns {
+			if run.Mode != ModeNewSession || strings.TrimSpace(run.SessionID) == "" || run.Archived {
+				continue
+			}
+			if !archiveEnabledByTask[run.TaskID] {
+				continue
+			}
+			eligibleRuns = append(eligibleRuns, run)
+			if !seenSession[run.SessionID] {
+				seenSession[run.SessionID] = true
+				sessionIDs = append(sessionIDs, run.SessionID)
+			}
+		}
+		archivedCount := 0
+		archiveErr := ""
+		if len(sessionIDs) > 0 {
+			var err error
+			if len(sessionIDs) == 1 {
+				err = e.exec.ArchiveSession(ctx, sessionIDs[0])
+			} else {
+				err = e.exec.ArchiveSessions(ctx, sessionIDs)
+			}
+			if err != nil {
+				archiveErr = "已全部标为已读，但批量归档官方会话失败：" + err.Error()
+				for _, run := range eligibleRuns {
+					_ = e.store.MarkRunArchived(ctx, pluginID, run.ID, false, archiveErr)
+				}
+			} else {
+				archivedCount = len(sessionIDs)
+				for _, run := range eligibleRuns {
+					_ = e.store.MarkRunArchived(ctx, pluginID, run.ID, true, "")
+				}
+				e.exec.RecordPluginActivity(context.Background(), pluginID, fmt.Sprintf("批量归档 %d 个定时任务会话", archivedCount))
+			}
+		}
 		e.publishScheduleUpdate(pluginID, "runs.readAll", "")
-		return map[string]any{"unreadCount": 0}, nil
+		return map[string]any{
+			"unreadCount":   0,
+			"archivedCount": archivedCount,
+			"archiveError":  archiveErr,
+		}, nil
 
 	case "schedule.prefs":
 		if len(payload) > 0 && string(payload) != "null" {
@@ -1044,18 +1475,53 @@ func (e *Engine) Action(ctx context.Context, pluginID, action string, payload js
 			if err := json.Unmarshal(payload, &raw); err != nil {
 				return nil, errors.New("偏好设置格式无效")
 			}
+			cur := e.store.GetPrefs(ctx, pluginID)
+			changed := false
 			if val, has := raw["autoMarkRead"]; has {
 				autoRead, ok := val.(bool)
 				if !ok {
 					return nil, errors.New("autoMarkRead 必须是布尔值")
 				}
-				if err := e.store.SetPrefs(ctx, pluginID, Prefs{AutoMarkRead: autoRead}); err != nil {
+				cur.AutoMarkRead = autoRead
+				changed = true
+			}
+			if val, has := raw["maxConcurrent"]; has {
+				num, ok := val.(float64)
+				if !ok || int(num) < 1 || int(num) > MaxAllowedConcurrent {
+					return nil, fmt.Errorf("全局并发上限必须是 1–%d 的整数", MaxAllowedConcurrent)
+				}
+				cur.MaxConcurrent = int(num)
+				changed = true
+			}
+			if val, has := raw["minQuotaPercent"]; has {
+				num, ok := val.(float64)
+				if !ok || int(num) < 0 || int(num) > 95 {
+					return nil, errors.New("额度跳过阈值必须是 0–95 之间的百分比（0 表示关闭）")
+				}
+				cur.MinQuotaPercent = int(num)
+				cur.MinQuotaPercentSet = true
+				changed = true
+			}
+			if changed {
+				if err := e.store.SetPrefs(ctx, pluginID, cur); err != nil {
 					return nil, err
 				}
+				e.wakeSlotWaiters()
 				e.publishScheduleUpdate(pluginID, "prefs.updated", "")
 			}
 		}
 		return e.store.GetPrefs(ctx, pluginID), nil
+
+	case "schedule.checkGit":
+		var input struct {
+			CWD string `json:"cwd"`
+		}
+		if len(payload) > 0 && string(payload) != "null" {
+			if err := json.Unmarshal(payload, &input); err != nil {
+				return nil, errors.New("目录参数格式无效")
+			}
+		}
+		return e.gitChecker(ctx, strings.TrimSpace(input.CWD)), nil
 
 	default:
 		return nil, fmt.Errorf("未知的定时任务动作：%s", action)

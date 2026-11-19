@@ -101,6 +101,8 @@ const ACTION_CAPABILITY: Record<string, string> = {
   "schedule.markRead": "schedule:manage",
   "schedule.markAllRead": "schedule:manage",
   "schedule.prefs": "schedule:manage",
+  "schedule.checkGit": "schedule:manage",
+  "schedule.archiveRun": "schedule:manage",
 };
 
 export function createBridge(options: BridgeOptions): Bridge {

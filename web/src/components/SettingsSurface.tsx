@@ -83,7 +83,7 @@ export function SettingsWindow({
             </p>
           </>
         )}
-        <PluginSettings embedded onDetailChange={setPluginDetailOpen} />
+        <PluginSettings embedded host={host} onDetailChange={setPluginDetailOpen} />
       </section>
 
       {!pluginDetailOpen && fallbacks.account ? (
@@ -247,12 +247,23 @@ function DiagnosticsSection({
     void reload();
   }, [reload]);
 
+  useEffect(() => {
+    const onAttachChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ source?: string }>).detail;
+      if (detail?.source === "diagnostics") return;
+      void reload();
+    };
+    window.addEventListener("ekd:attach-changed", onAttachChanged);
+    return () => window.removeEventListener("ekd:attach-changed", onAttachChanged);
+  }, [reload]);
+
   async function toggle(next: boolean) {
     setBusy(true);
     setError("");
     try {
       await host.request(next ? "attach.enable" : "attach.disable", next ? { allowDailyInstance: consent } : {});
       await reload();
+      window.dispatchEvent(new CustomEvent("ekd:attach-changed", { detail: { source: "diagnostics" } }));
     } catch (cause) {
       setError(errorText(cause));
     } finally {

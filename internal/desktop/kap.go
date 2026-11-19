@@ -219,6 +219,10 @@ func (k *KAPClient) endpoint() (string, string, error) {
 }
 
 func (k *KAPClient) Request(ctx context.Context, method, path string, body any) (json.RawMessage, error) {
+	return k.requestWithPrefix(ctx, NativeAPI, method, path, body)
+}
+
+func (k *KAPClient) requestWithPrefix(ctx context.Context, prefix, method, path string, body any) (json.RawMessage, error) {
 	if !strings.HasPrefix(path, "/") || strings.Contains(path, "..") {
 		return nil, errors.New("官方接口路径无效")
 	}
@@ -230,7 +234,7 @@ func (k *KAPClient) Request(ctx context.Context, method, path string, body any) 
 		}
 		payload = encoded
 	}
-	raw, err := k.send(ctx, method, path, payload)
+	raw, err := k.sendWithPrefix(ctx, prefix, method, path, payload)
 	if err == nil {
 		return raw, nil
 	}
@@ -238,7 +242,7 @@ func (k *KAPClient) Request(ctx context.Context, method, path string, body any) 
 		return nil, err
 	}
 	k.invalidate()
-	return k.send(ctx, method, path, payload)
+	return k.sendWithPrefix(ctx, prefix, method, path, payload)
 }
 
 // retryableRequest allows exactly one re-resolve-and-retry. A rejected token or
@@ -264,6 +268,10 @@ func retryableRequest(ctx context.Context, method string, err error) bool {
 }
 
 func (k *KAPClient) send(ctx context.Context, method, path string, payload []byte) (json.RawMessage, error) {
+	return k.sendWithPrefix(ctx, NativeAPI, method, path, payload)
+}
+
+func (k *KAPClient) sendWithPrefix(ctx context.Context, prefix, method, path string, payload []byte) (json.RawMessage, error) {
 	base, token, err := k.endpoint()
 	if err != nil {
 		return nil, err
@@ -274,7 +282,7 @@ func (k *KAPClient) send(ctx context.Context, method, path string, payload []byt
 	}
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, base+NativeAPI+path, reader)
+	req, err := http.NewRequestWithContext(ctx, method, base+prefix+path, reader)
 	if err != nil {
 		return nil, err
 	}
@@ -413,6 +421,58 @@ func (k *KAPClient) UndoSession(ctx context.Context, sessionID, turnID, agentID 
 		_ = json.Unmarshal(raw, &out)
 	}
 	return out.RemovedTurnIDs, nil
+}
+
+func (k *KAPClient) ArchiveSession(ctx context.Context, sessionID string) error {
+	id := strings.TrimSpace(sessionID)
+	if id == "" {
+		return errors.New("归档会话缺少会话 ID")
+	}
+	_, err := k.Request(ctx, http.MethodPost, "/sessions/"+url.PathEscape(id)+":archive", map[string]any{})
+	return err
+}
+
+func (k *KAPClient) ArchiveSessions(ctx context.Context, sessionIDs []string) error {
+	cleaned := make([]string, 0, len(sessionIDs))
+	seen := map[string]bool{}
+	for _, raw := range sessionIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		cleaned = append(cleaned, id)
+	}
+	if len(cleaned) == 0 {
+		return nil
+	}
+	if len(cleaned) == 1 {
+		return k.ArchiveSession(ctx, cleaned[0])
+	}
+	_, err := k.requestWithPrefix(ctx, "/api/v2", http.MethodPost, "/sessions:archive", map[string]any{"ids": cleaned})
+	if err == nil {
+		return nil
+	}
+	var native *NativeError
+	if errors.As(err, &native) && (native.Status == http.StatusNotFound || native.Status == http.StatusMethodNotAllowed || native.Status == http.StatusNotImplemented) {
+		var firstErr error
+		for _, id := range cleaned {
+			if singleErr := k.ArchiveSession(ctx, id); singleErr != nil && firstErr == nil {
+				firstErr = singleErr
+			}
+		}
+		return firstErr
+	}
+	return err
+}
+
+func (k *KAPClient) AbortSession(ctx context.Context, sessionID string) error {
+	id := strings.TrimSpace(sessionID)
+	if id == "" {
+		return errors.New("中止会话缺少会话 ID")
+	}
+	_, err := k.Request(ctx, http.MethodPost, "/sessions/"+url.PathEscape(id)+":abort", map[string]any{})
+	return err
 }
 
 func (k *KAPClient) Sessions(ctx context.Context) ([]NativeSession, error) {

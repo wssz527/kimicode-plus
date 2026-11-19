@@ -49,6 +49,26 @@ export const RUN_STATUS_LABELS = {
   skipped: "已跳过",
 };
 
+export const FAILURE_KIND_LABELS = {
+  preflight_failed: "校验失败",
+  quota_insufficient: "额度不足",
+  concurrency_limit: "并发上限",
+  timeout: "运行超时",
+  max_turns: "超过最大回合",
+  overlap: "重叠跳过",
+  missed: "错过跳过",
+  busy_timeout: "忙碌超时",
+  cancelled: "已取消",
+  execution_failed: "执行失败",
+};
+
+export const PROMPT_VARIABLES = [
+  { token: "{{date}}", label: "当前日期", hint: "YYYY-MM-DD" },
+  { token: "{{time}}", label: "当前时间", hint: "HH:MM" },
+  { token: "{{last_run_at}}", label: "上次运行时间", hint: "YYYY-MM-DD HH:MM 或暂无" },
+  { token: "{{last_run_summary}}", label: "上次运行摘要", hint: "上次结果摘要或暂无" },
+];
+
 export const TRIGGER_LABELS = {
   scheduled: "定时",
   catchup: "补跑",
@@ -139,6 +159,39 @@ export function keepAliveStatusText(task) {
     return `${base} · ${windowNote}`;
   }
   return base;
+}
+
+export function hasPromptVariables(template) {
+  return /\{\{(date|time|last_run_at|last_run_summary)\}\}/.test(String(template || ""));
+}
+
+export function previewPromptTemplate(template, context = {}) {
+  const source = String(template || "");
+  if (!source) return "";
+  const now = context.now instanceof Date && !Number.isNaN(context.now.getTime()) ? context.now : new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  let lastRunAtText = "暂无";
+  const rawLastAt = typeof context.lastRunAt === "string" ? context.lastRunAt.trim() : "";
+  if (rawLastAt) {
+    const parsed = new Date(rawLastAt);
+    if (!Number.isNaN(parsed.getTime())) {
+      lastRunAtText = `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}-${String(parsed.getDate()).padStart(2, "0")} ${String(parsed.getHours()).padStart(2, "0")}:${String(parsed.getMinutes()).padStart(2, "0")}`;
+    } else {
+      lastRunAtText = rawLastAt;
+    }
+  }
+  const rawSummary = typeof context.lastRunSummary === "string" ? context.lastRunSummary.trim() : "";
+  const values = {
+    date: `${yyyy}-${mm}-${dd}`,
+    time: `${hh}:${min}`,
+    last_run_at: lastRunAtText,
+    last_run_summary: rawSummary || "暂无",
+  };
+  return source.replace(/\{\{(date|time|last_run_at|last_run_summary)\}\}/g, (_, key) => values[key]);
 }
 
 function localDateOffset(days = 0) {
@@ -302,6 +355,18 @@ export function defaultDraft(prefill = {}) {
     effort: prefill.effort || "",
     permissionMode: prefill.permissionMode || "manual",
     missedPolicy: prefill.missedPolicy || "catchup",
+    archiveOnRead: prefill.archiveOnRead !== undefined
+      ? Boolean(prefill.archiveOnRead)
+      : (prefill.mode || (prefill.sessionId ? "bound_session" : "new_session")) === "new_session",
+    timeoutMinutes: typeof prefill.timeoutMinutes === "number" && prefill.timeoutMinutes >= 1
+      ? Math.round(prefill.timeoutMinutes)
+      : 30,
+    maxTurns: typeof prefill.maxTurns === "number" && prefill.maxTurns >= 0
+      ? Math.round(prefill.maxTurns)
+      : 0,
+    confirmDirtyYolo: Boolean(prefill.allowDirtyYolo),
+    lastRunAt: prefill.lastRunAt || "",
+    lastSummary: prefill.lastSummary || "",
     enabled: prefill.enabled !== undefined ? Boolean(prefill.enabled) : true,
     scheduleKind,
     date: prefill.schedule?.date || localDateOffset(0),
@@ -733,6 +798,79 @@ button,input,select,textarea,.sched-tab{
   border-color:var(--sched-accent);
   background:var(--sched-accent-soft);
 }
+.sched-banner-row{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  flex-wrap:wrap;
+}
+.sched-info-strip{
+  margin:10px 20px 0;
+  padding:8px 12px;
+  border-radius:8px;
+  border:1px solid var(--sched-line);
+  background:var(--sched-fill);
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  flex-wrap:wrap;
+  font-size:12px;
+  line-height:1.5;
+  color:var(--sched-muted);
+}
+.sched-shell.compact .sched-info-strip{margin:10px 14px 0}
+.sched-link-btn{
+  border:0;
+  padding:0;
+  background:transparent;
+  color:var(--sched-accent);
+  font:inherit;
+  font-size:12px;
+  font-weight:500;
+  cursor:pointer;
+  white-space:nowrap;
+}
+.sched-link-btn:hover{text-decoration:underline}
+.sched-guardrails-bar{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px 14px;
+  flex-wrap:wrap;
+  padding:9px 12px;
+  border:1px solid var(--sched-line);
+  border-radius:10px;
+  background:var(--sched-fill);
+  font-size:12px;
+  color:var(--sched-muted);
+}
+.sched-guardrails-group{
+  display:flex;
+  align-items:center;
+  gap:8px 14px;
+  flex-wrap:wrap;
+}
+.sched-guardrail-item{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+}
+.sched-guardrail-item input{
+  width:64px;
+  height:27px;
+  padding:0 7px;
+  font-variant-numeric:tabular-nums;
+}
+.sched-card.highlighted{
+  border-color:var(--sched-accent);
+  box-shadow:0 0 0 2px var(--sched-accent-soft);
+}
+.sched-meta-warn{
+  color:var(--sched-warn);
+  font-weight:500;
+}
 `;
 
 const DIALOG_CSS = `
@@ -746,6 +884,8 @@ const DIALOG_CSS = `
   --sched-accent:var(--color-accent, var(--blue, #1783ff));
   --sched-accent-soft:var(--color-accent-soft, var(--soft, color-mix(in srgb, var(--sched-accent) 14%, transparent)));
   --sched-danger:var(--color-danger, var(--red, var(--danger, #dc2626)));
+  --sched-ok:var(--color-done, var(--success, #16a34a));
+  --sched-warn:var(--warn, #d97706);
   position:fixed;
   z-index:9999;
   -webkit-app-region:no-drag;
@@ -928,6 +1068,65 @@ const DIALOG_CSS = `
   background:color-mix(in srgb, var(--sched-danger) 12%, transparent);color:var(--sched-danger);
   font-size:12.5px;
 }
+.ekd-sd-var-bar{
+  display:flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:6px;
+}
+.ekd-sd-var-preview{
+  padding:8px 10px;
+  border:1px solid var(--sched-line);
+  border-radius:7px;
+  background:var(--sched-fill);
+  font-size:12px;
+  line-height:1.5;
+  color:var(--sched-text);
+  white-space:pre-wrap;
+  word-break:break-word;
+  max-height:110px;
+  overflow-y:auto;
+}
+.ekd-sd-var-preview.empty{
+  color:var(--sched-muted);
+}
+.ekd-sd-warn{
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  padding:9px 11px;
+  border:1px solid color-mix(in srgb, var(--sched-warn) 45%, transparent);
+  border-radius:8px;
+  background:color-mix(in srgb, var(--sched-warn) 12%, transparent);
+  color:var(--sched-text);
+  font-size:12px;
+  line-height:1.5;
+}
+.ekd-sd-warn-sample{
+  margin:0;
+  padding:6px 8px;
+  border-radius:6px;
+  background:color-mix(in srgb, var(--sched-bg) 70%, transparent);
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:11px;
+  white-space:pre-wrap;
+  color:var(--sched-muted);
+}
+.ekd-sd-ok-hint{
+  font-size:12px;
+  color:var(--sched-ok);
+  margin:0;
+}
+.ekd-sd-check{
+  display:inline-flex;
+  align-items:flex-start;
+  gap:7px;
+  font-size:12.5px;
+  line-height:1.45;
+  color:var(--sched-text);
+  cursor:pointer;
+}
+.ekd-sd-check input{margin-top:2px;flex:none}
 .ekd-sd-foot{
   display:flex;align-items:center;gap:8px;flex-wrap:wrap;
   padding:12px 20px 16px;
@@ -968,7 +1167,10 @@ export async function activate(ctx) {
     kapReason: "",
     runningTaskIds: [],
     unreadCount: 0,
-    prefs: { autoMarkRead: false },
+    prefs: { autoMarkRead: false, maxConcurrent: 2, minQuotaPercent: 10 },
+    autoAttach: null,
+    highlightRunId: "",
+    prefsNotice: "",
     models: [],
     sessions: [],
     rightPanelSessionId: "",
@@ -997,7 +1199,13 @@ export async function activate(ctx) {
       state.kapReason = taskRes?.kapReason || "";
       state.runningTaskIds = Array.isArray(taskRes?.runningTaskIds) ? taskRes.runningTaskIds : [];
       state.unreadCount = Number(taskRes?.unreadCount || 0);
-      state.prefs = taskRes?.prefs || { autoMarkRead: false };
+      const rawPrefs = taskRes?.prefs || {};
+      state.prefs = {
+        autoMarkRead: Boolean(rawPrefs.autoMarkRead),
+        maxConcurrent: typeof rawPrefs.maxConcurrent === "number" && rawPrefs.maxConcurrent >= 1 ? rawPrefs.maxConcurrent : 2,
+        minQuotaPercent: typeof rawPrefs.minQuotaPercent === "number" && rawPrefs.minQuotaPercent >= 0 ? rawPrefs.minQuotaPercent : 10,
+      };
+      state.autoAttach = taskRes?.autoAttach && typeof taskRes.autoAttach === "object" ? taskRes.autoAttach : null;
       state.runs = Array.isArray(runRes?.items) ? runRes.items : [];
       state.models = Array.isArray(modelList) ? modelList : [];
       state.sessions = Array.isArray(sessRes?.items) ? sessRes.items : [];
@@ -1024,8 +1232,21 @@ export async function activate(ctx) {
   const onActiveSessionChange = () => {
     closeMainArea();
   };
+  const onOpenRunsEvent = event => {
+    const detail = event && typeof event === "object" ? event.detail : null;
+    if (detail && typeof detail === "object") {
+      state.runFilterTaskId = typeof detail.taskId === "string" ? detail.taskId : "";
+      state.highlightRunId = typeof detail.runId === "string" ? detail.runId : "";
+    }
+    openMainArea("runs");
+  };
+  const onAttachChanged = () => {
+    void refreshAll();
+  };
   if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
     window.addEventListener("ekd:active-session", onActiveSessionChange);
+    window.addEventListener("ekd:scheduler-open-runs", onOpenRunsEvent);
+    window.addEventListener("ekd:attach-changed", onAttachChanged);
   }
 
   function closeDialog() {
@@ -1062,6 +1283,70 @@ export async function activate(ctx) {
     let dirPickerHint = "";
     let pendingTime = "12:00";
     let errorMsg = "";
+    let gitChecking = false;
+    let gitStatus = null;
+    let gitCheckSeq = 0;
+    let gitCheckTimer = null;
+
+    function effectiveYoloCwd() {
+      if (draft.cwd && draft.cwd.trim()) return draft.cwd.trim();
+      if (draft.mode === "bound_session" && draft.sessionId) {
+        const matched = state.sessions.find(s => s.id === draft.sessionId);
+        if (matched?.cwd) return String(matched.cwd).trim();
+      }
+      return "";
+    }
+
+    async function runGitCheck(targetCwd) {
+      const seq = ++gitCheckSeq;
+      if (!targetCwd) {
+        gitChecking = false;
+        gitStatus = null;
+        renderDialog();
+        return;
+      }
+      gitChecking = true;
+      renderDialog();
+      try {
+        const res = await ctx.core.request("schedule.checkGit", { cwd: targetCwd });
+        if (disposed || seq !== gitCheckSeq || dialogEl !== dialog) return;
+        gitStatus = res && typeof res === "object" ? res : null;
+      } catch (err) {
+        if (disposed || seq !== gitCheckSeq || dialogEl !== dialog) return;
+        gitStatus = { isGitRepo: false, clean: true, error: err instanceof Error ? err.message : String(err) };
+      } finally {
+        if (!disposed && seq === gitCheckSeq && dialogEl === dialog) {
+          gitChecking = false;
+          renderDialog();
+        }
+      }
+    }
+
+    function scheduleGitCheck(immediate = false) {
+      if (gitCheckTimer) {
+        clearTimeout(gitCheckTimer);
+        gitCheckTimer = null;
+      }
+      if (draft.permissionMode !== "yolo") {
+        gitChecking = false;
+        gitStatus = null;
+        return;
+      }
+      const targetCwd = effectiveYoloCwd();
+      if (!targetCwd) {
+        gitChecking = false;
+        gitStatus = null;
+        return;
+      }
+      if (immediate) {
+        void runGitCheck(targetCwd);
+      } else {
+        gitCheckTimer = setTimeout(() => {
+          gitCheckTimer = null;
+          void runGitCheck(effectiveYoloCwd());
+        }, 320);
+      }
+    }
 
     const dialog = doc.createElement("dialog");
     dialog.className = "ekd-sched-dialog";
@@ -1200,14 +1485,79 @@ export async function activate(ctx) {
         }),
       ]));
 
+      const promptPreviewEl = el(doc, "div", {
+        class: `ekd-sd-var-preview${draft.prompt.trim() ? "" : " empty"}`,
+        "data-ekd-prompt-preview": "true",
+        text: draft.prompt.trim()
+          ? previewPromptTemplate(draft.prompt, { lastRunAt: draft.lastRunAt, lastRunSummary: draft.lastSummary })
+          : "支持插入下方变量；输入提示词后在此实时预览实际发送内容。",
+      });
+      const updatePromptPreview = () => {
+        if (draft.prompt.trim()) {
+          promptPreviewEl.className = "ekd-sd-var-preview";
+          promptPreviewEl.textContent = previewPromptTemplate(draft.prompt, {
+            lastRunAt: draft.lastRunAt,
+            lastRunSummary: draft.lastSummary,
+          });
+        } else {
+          promptPreviewEl.className = "ekd-sd-var-preview empty";
+          promptPreviewEl.textContent = "支持插入下方变量；输入提示词后在此实时预览实际发送内容。";
+        }
+      };
+
+      const promptTextarea = el(doc, "textarea", {
+        class: "ekd-sd-textarea",
+        placeholder: "任务到点后将自动发送此提示词…",
+        value: draft.prompt,
+        onInput: e => {
+          draft.prompt = e.target.value;
+          updatePromptPreview();
+        },
+      });
+
+      const varBar = el(doc, "div", { class: "ekd-sd-var-bar", role: "group", "aria-label": "插入提示词变量" }, [
+        el(doc, "span", { class: "ekd-sd-hint", text: "插入变量：" }),
+        ...PROMPT_VARIABLES.map(variable => el(doc, "button", {
+          type: "button",
+          class: "ekd-sd-chip",
+          text: `${variable.token} ${variable.label}`,
+          title: `${variable.label}（${variable.hint}）`,
+          "data-ekd-var-token": variable.token,
+          onClick: () => {
+            const current = String(draft.prompt || "");
+            const hasSelection = typeof promptTextarea.selectionStart === "number" && typeof promptTextarea.selectionEnd === "number";
+            if (hasSelection) {
+              const start = promptTextarea.selectionStart;
+              const end = promptTextarea.selectionEnd;
+              const next = current.slice(0, start) + variable.token + current.slice(end);
+              draft.prompt = next;
+              promptTextarea.value = next;
+              const caret = start + variable.token.length;
+              if (typeof promptTextarea.setSelectionRange === "function") {
+                promptTextarea.setSelectionRange(caret, caret);
+              }
+              if (typeof promptTextarea.focus === "function") {
+                promptTextarea.focus();
+              }
+            } else {
+              const next = current ? `${current}${current.endsWith(" ") || current.endsWith("\n") ? "" : " "}${variable.token}` : variable.token;
+              draft.prompt = next;
+              promptTextarea.value = next;
+            }
+            updatePromptPreview();
+          },
+        })),
+      ]);
+
       bodyChildren.push(el(doc, "div", { class: "ekd-sd-field" }, [
-        el(doc, "label", { class: "ekd-sd-label" }, [el(doc, "strong", { text: "提示词" })]),
-        el(doc, "textarea", {
-          class: "ekd-sd-textarea",
-          placeholder: "任务到点后将自动发送此提示词…",
-          value: draft.prompt,
-          onInput: e => { draft.prompt = e.target.value; },
-        }),
+        el(doc, "label", { class: "ekd-sd-label" }, [
+          el(doc, "strong", { text: "提示词" }),
+          el(doc, "span", { class: "ekd-sd-hint", text: "运行前自动展开变量" }),
+        ]),
+        promptTextarea,
+        varBar,
+        el(doc, "span", { class: "ekd-sd-hint", text: "提示词展开预览" }),
+        promptPreviewEl,
       ]));
 
       const modeSeg = el(doc, "div", { class: "ekd-sd-seg", role: "group", "aria-label": "执行方式" }, [
@@ -1221,13 +1571,18 @@ export async function activate(ctx) {
               draft.cwd = resolveDefaultCwd("", state.sessions, draft.sessionId, activeSessionId);
             }
             renderDialog();
+            scheduleGitCheck(true);
           },
         }),
         el(doc, "button", {
           type: "button",
           text: "绑定已有会话",
           "aria-pressed": draft.mode === "bound_session" ? "true" : "false",
-          onClick: () => { draft.mode = "bound_session"; renderDialog(); },
+          onClick: () => {
+            draft.mode = "bound_session";
+            renderDialog();
+            scheduleGitCheck(true);
+          },
         }),
       ]);
 
@@ -1243,7 +1598,14 @@ export async function activate(ctx) {
           class: "ekd-sd-input",
           placeholder: "/path/to/project",
           value: draft.cwd,
-          onInput: e => { draft.cwd = e.target.value; },
+          onInput: e => {
+            const nextCwd = e.target.value;
+            if (nextCwd.trim() !== draft.cwd.trim()) {
+              draft.confirmDirtyYolo = false;
+            }
+            draft.cwd = nextCwd;
+            scheduleGitCheck(false);
+          },
         });
         const pickBtn = canPickDirectory
           ? el(doc, "button", {
@@ -1261,6 +1623,9 @@ export async function activate(ctx) {
                     defaultPath: draft.cwd || undefined,
                   });
                   if (typeof picked === "string" && picked.trim()) {
+                    if (picked.trim() !== draft.cwd.trim()) {
+                      draft.confirmDirtyYolo = false;
+                    }
                     draft.cwd = picked.trim();
                   }
                 } catch (err) {
@@ -1274,6 +1639,7 @@ export async function activate(ctx) {
                 } finally {
                   pickingDir = false;
                   renderDialog();
+                  scheduleGitCheck(true);
                 }
               },
             }, [
@@ -1290,6 +1656,18 @@ export async function activate(ctx) {
             : !canPickDirectory
               ? el(doc, "p", { class: "ekd-sd-hint", text: "请输入或粘贴本机项目文件夹的绝对路径。" })
               : null,
+          el(doc, "label", { class: "ekd-sd-check" }, [
+            el(doc, "input", {
+              type: "checkbox",
+              checked: draft.archiveOnRead,
+              onChange: e => { draft.archiveOnRead = e.target.checked; },
+            }),
+            "运行记录标为已读后，自动归档对应会话到官方「已归档的会话」",
+          ]),
+          el(doc, "p", {
+            class: "ekd-sd-hint",
+            text: "新开会话标题将自动加上「[定时] 」前缀；不需要自动归档时可取消勾选。",
+          }),
         ]));
       } else {
         const sessSelect = el(doc, "select", {
@@ -1297,7 +1675,13 @@ export async function activate(ctx) {
           onChange: e => {
             draft.sessionId = e.target.value;
             const found = state.sessions.find(s => s.id === draft.sessionId);
-            if (found?.cwd && !draft.cwd) draft.cwd = found.cwd;
+            if (found?.cwd) {
+              if (found.cwd.trim() !== draft.cwd.trim()) {
+                draft.confirmDirtyYolo = false;
+              }
+              draft.cwd = found.cwd;
+            }
+            scheduleGitCheck(true);
           },
         }, [
           el(doc, "option", { value: "", text: state.sessions.length ? "选择目标会话" : "当前没有可选会话" }),
@@ -1349,15 +1733,94 @@ export async function activate(ctx) {
 
       const permSelect = el(doc, "select", {
         class: "ekd-sd-select",
-        onChange: e => { draft.permissionMode = e.target.value; renderDialog(); },
+        onChange: e => {
+          draft.permissionMode = e.target.value;
+          if (draft.permissionMode !== "yolo") {
+            draft.confirmDirtyYolo = false;
+          }
+          renderDialog();
+          scheduleGitCheck(true);
+        },
       }, PERMISSION_MODES.map(m => el(doc, "option", { value: m.value, text: m.label })));
       permSelect.value = draft.permissionMode;
       const permNote = PERMISSION_MODES.find(m => m.value === draft.permissionMode)?.note || "";
+
+      const yoloNodes = [];
+      if (draft.permissionMode === "yolo") {
+        if (gitChecking) {
+          yoloNodes.push(el(doc, "p", { class: "ekd-sd-hint", text: "正在检查项目目录的 Git 工作区状态…" }));
+        } else if (gitStatus?.isGitRepo && !gitStatus.clean) {
+          const sampleText = Array.isArray(gitStatus.sample) && gitStatus.sample.length > 0
+            ? gitStatus.sample.join("\n")
+            : "";
+          yoloNodes.push(el(doc, "div", { class: "ekd-sd-warn", "data-ekd-yolo-dirty": "true", role: "alert" }, [
+            el(doc, "div", {
+              text: `项目目录是 Git 仓库，且当前存在 ${Math.max(1, Number(gitStatus.dirtyCount || 0))} 处未提交改动。使用「始终允许（免审批）」可能直接修改或覆盖这些文件，建议先清理工作区。`,
+            }),
+            sampleText ? el(doc, "pre", { class: "ekd-sd-warn-sample", text: sampleText }) : null,
+            el(doc, "label", { class: "ekd-sd-check" }, [
+              el(doc, "input", {
+                type: "checkbox",
+                checked: draft.confirmDirtyYolo,
+                "data-ekd-confirm-dirty-yolo": "true",
+                onChange: e => {
+                  draft.confirmDirtyYolo = e.target.checked;
+                  errorMsg = "";
+                  renderDialog();
+                },
+              }),
+              "我已了解风险，确认允许在未清理的 Git 工作区中使用免审批模式",
+            ]),
+          ]));
+        } else if (gitStatus?.isGitRepo && gitStatus.clean) {
+          yoloNodes.push(el(doc, "p", { class: "ekd-sd-ok-hint", text: "Git 工作区干净，可以使用免审批模式。" }));
+        } else if (gitStatus?.error) {
+          yoloNodes.push(el(doc, "p", { class: "ekd-sd-hint", text: `Git 状态检查提示：${gitStatus.error}` }));
+        }
+      }
 
       bodyChildren.push(el(doc, "div", { class: "ekd-sd-field" }, [
         el(doc, "label", { class: "ekd-sd-label" }, [el(doc, "strong", { text: "权限模式" })]),
         permSelect,
         el(doc, "p", { class: "ekd-sd-hint", text: permNote }),
+        ...yoloNodes,
+      ]));
+
+      bodyChildren.push(el(doc, "div", { class: "ekd-sd-grid2" }, [
+        el(doc, "div", { class: "ekd-sd-field" }, [
+          el(doc, "label", { class: "ekd-sd-label" }, [el(doc, "strong", { text: "单次超时（分钟）" })]),
+          el(doc, "input", {
+            type: "number",
+            min: "1",
+            max: "1440",
+            class: "ekd-sd-input",
+            style: "font-variant-numeric:tabular-nums",
+            "aria-label": "单次超时（分钟）",
+            value: String(draft.timeoutMinutes),
+            onInput: e => {
+              const parsed = Number.parseInt(e.target.value, 10);
+              if (Number.isFinite(parsed) && parsed >= 1) draft.timeoutMinutes = Math.min(1440, parsed);
+            },
+          }),
+          el(doc, "p", { class: "ekd-sd-hint", text: "默认 30 分钟；超时将自动中止任务并记为失败。" }),
+        ]),
+        el(doc, "div", { class: "ekd-sd-field" }, [
+          el(doc, "label", { class: "ekd-sd-label" }, [el(doc, "strong", { text: "最大回合数" })]),
+          el(doc, "input", {
+            type: "number",
+            min: "0",
+            max: "500",
+            class: "ekd-sd-input",
+            style: "font-variant-numeric:tabular-nums",
+            "aria-label": "最大回合数",
+            value: String(draft.maxTurns),
+            onInput: e => {
+              const parsed = Number.parseInt(e.target.value, 10);
+              if (Number.isFinite(parsed) && parsed >= 0) draft.maxTurns = Math.min(500, parsed);
+            },
+          }),
+          el(doc, "p", { class: "ekd-sd-hint", text: "0 表示不限；达到上限后自动中止并记为失败。" }),
+        ]),
       ]));
 
       const previewTextEl = el(doc, "span", { text: formatSchedulePreview(draft) });
@@ -1744,10 +2207,17 @@ export async function activate(ctx) {
 
       async function submit(andRunNow) {
         if (busy) return;
+        if (draft.permissionMode === "yolo" && gitStatus?.isGitRepo && !gitStatus.clean && !draft.confirmDirtyYolo) {
+          errorMsg = "项目目录存在未提交的 Git 改动，请先清理工作区或勾选上方风险确认后再保存。";
+          renderDialog();
+          return;
+        }
         busy = true;
         errorMsg = "";
         renderDialog();
         try {
+          const timeoutMinutes = Math.max(1, Math.min(1440, Number.parseInt(String(draft.timeoutMinutes || 30), 10) || 30));
+          const maxTurns = Math.max(0, Math.min(500, Number.parseInt(String(draft.maxTurns ?? 0), 10) || 0));
           const payload = {
             id: draft.id || undefined,
             name: draft.name,
@@ -1759,6 +2229,10 @@ export async function activate(ctx) {
             effort: draft.effort,
             permissionMode: draft.permissionMode,
             missedPolicy: draft.missedPolicy,
+            archiveOnRead: draft.mode === "new_session" ? Boolean(draft.archiveOnRead) : false,
+            timeoutMinutes,
+            maxTurns,
+            confirmDirtyYolo: Boolean(draft.confirmDirtyYolo),
             enabled: draft.enabled,
             schedule: buildScheduleRule(draft),
           };
@@ -1813,6 +2287,10 @@ export async function activate(ctx) {
 
     renderDialog();
     dialog.addEventListener("close", () => {
+      if (gitCheckTimer) {
+        clearTimeout(gitCheckTimer);
+        gitCheckTimer = null;
+      }
       if (dialogEl === dialog) {
         dialogEl = null;
         dialog.remove();
@@ -1824,6 +2302,9 @@ export async function activate(ctx) {
       dialog.showModal();
     } else {
       dialog.setAttribute("open", "true");
+    }
+    if (draft.permissionMode === "yolo") {
+      scheduleGitCheck(true);
     }
   }
 
@@ -1838,6 +2319,12 @@ export async function activate(ctx) {
       class: "sched-pill",
       text: task.mode === "bound_session" ? "绑定会话" : "新开会话",
     });
+    const yoloPill = task.permissionMode === "yolo"
+      ? el(doc, "span", {
+          class: "sched-pill warn",
+          text: task.allowDirtyYolo ? "免审批·允许脏工作区" : "免审批",
+        })
+      : null;
 
     const toggleBtn = el(doc, "button", {
       type: "button",
@@ -1874,6 +2361,15 @@ export async function activate(ctx) {
     } else if (task.cwd) {
       metaRows.push(el(doc, "div", {}, [el(doc, "strong", { text: "目录：" }), task.cwd]));
     }
+    const timeoutLabel = `超时 ${task.timeoutMinutes > 0 ? task.timeoutMinutes : 30} 分钟`;
+    const turnsLabel = task.maxTurns > 0 ? `最多 ${task.maxTurns} 回合` : "回合不限";
+    const archiveLabel = task.mode === "new_session"
+      ? (task.archiveOnRead ? " · 已读自动归档" : " · 已读不归档")
+      : "";
+    metaRows.push(el(doc, "div", {}, [
+      el(doc, "strong", { text: "护栏与归档：" }),
+      `${timeoutLabel} · ${turnsLabel}${archiveLabel}`,
+    ]));
     if (task.lastStatus) {
       const label = RUN_STATUS_LABELS[task.lastStatus] || task.lastStatus;
       metaRows.push(el(doc, "div", {}, [
@@ -1939,6 +2435,7 @@ export async function activate(ctx) {
       el(doc, "div", { class: "sched-card-top" }, [
         el(doc, "span", { class: "sched-card-title", text: task.name }),
         modePill,
+        yoloPill,
         statusPill,
         toggleBtn,
       ]),
@@ -1953,7 +2450,19 @@ export async function activate(ctx) {
     if (run.status === "completed") pillClass += " ok";
     else if (run.status === "awaiting_approval") pillClass += " warn";
     else if (run.status === "failed") pillClass += " danger";
+    else if (run.status === "skipped" && (run.failureKind === "quota_insufficient" || run.failureKind === "concurrency_limit" || run.failureKind === "busy_timeout")) pillClass += " warn";
     else if (run.status === "running" || run.status === "queued") pillClass += " accent";
+
+    const failureLabel = run.failureKind ? (FAILURE_KIND_LABELS[run.failureKind] || run.failureKind) : "";
+    const failurePill = failureLabel
+      ? el(doc, "span", {
+          class: `sched-pill ${run.status === "failed" ? "danger" : "warn"}`,
+          text: failureLabel,
+        })
+      : null;
+    const archivedPill = run.archived
+      ? el(doc, "span", { class: "sched-pill ok", text: "已归档" })
+      : null;
 
     const meta = [
       el(doc, "div", {}, [
@@ -1962,11 +2471,17 @@ export async function activate(ctx) {
         run.finishedAt ? ` → ${formatDateTime(run.finishedAt)}` : "",
       ]),
     ];
+    if (run.sessionTitle) {
+      meta.push(el(doc, "div", {}, [el(doc, "strong", { text: "会话：" }), run.sessionTitle]));
+    }
     if (run.message) {
       meta.push(el(doc, "div", {}, [el(doc, "strong", { text: "说明：" }), run.message]));
     }
+    if (run.archiveError) {
+      meta.push(el(doc, "div", { class: "sched-meta-warn", text: run.archiveError }));
+    }
     if (run.status === "awaiting_approval") {
-      meta.push(el(doc, "div", { style: "color:#b45309;font-weight:500", text: "等待人工批准：无人值守不会自动批准，请点击「打开会话」前往处理。" }));
+      meta.push(el(doc, "div", { class: "sched-meta-warn", text: "等待人工批准：请点击「打开会话」前往处理。" }));
     }
 
     const actions = [];
@@ -1978,7 +2493,7 @@ export async function activate(ctx) {
         onClick: async () => {
           try {
             if (run.unread) {
-              await ctx.core.request("schedule.markRead", { id: run.id, read: true });
+              await ctx.core.request("schedule.markRead", { id: run.id, read: true, archive: false });
             }
             closeMainArea();
             await ctx.sessions?.open(run.sessionId);
@@ -1997,7 +2512,27 @@ export async function activate(ctx) {
         text: "标为已读",
         onClick: async () => {
           try {
-            await ctx.core.request("schedule.markRead", { id: run.id, read: true });
+            const res = await ctx.core.request("schedule.markRead", { id: run.id, read: true });
+            await refreshAll();
+            if (res?.archiveError) {
+              state.error = res.archiveError;
+              notify();
+            }
+          } catch (error) {
+            state.error = error instanceof Error ? error.message : String(error);
+            notify();
+          }
+        },
+      }));
+    }
+    if (run.mode === "new_session" && run.sessionId && !run.archived) {
+      actions.push(el(doc, "button", {
+        type: "button",
+        class: "sched-btn",
+        text: "归档会话",
+        onClick: async () => {
+          try {
+            await ctx.core.request("schedule.archiveRun", { id: run.id });
             await refreshAll();
           } catch (error) {
             state.error = error instanceof Error ? error.message : String(error);
@@ -2007,12 +2542,18 @@ export async function activate(ctx) {
       }));
     }
 
-    return el(doc, "div", { class: `sched-card${run.unread ? " unread" : ""}` }, [
+    const highlighted = Boolean(state.highlightRunId && state.highlightRunId === run.id);
+    return el(doc, "div", {
+      class: `sched-card${run.unread ? " unread" : ""}${highlighted ? " highlighted" : ""}`,
+      "data-ekd-run-id": run.id,
+    }, [
       el(doc, "div", { class: "sched-card-top" }, [
         run.unread ? el(doc, "span", { class: "sched-unread-dot", title: "未读" }) : null,
         el(doc, "span", { class: "sched-card-title", text: run.taskName }),
         el(doc, "span", { class: "sched-pill", text: TRIGGER_LABELS[run.triggerKind] || run.triggerKind }),
         el(doc, "span", { class: pillClass, text: statusLabel }),
+        failurePill,
+        archivedPill,
       ]),
       el(doc, "div", { class: "sched-meta" }, meta),
       actions.length ? el(doc, "div", { class: "sched-actions" }, actions) : null,
@@ -2094,6 +2635,50 @@ export async function activate(ctx) {
           text: "官方客户端当前未连接。定时任务会在恢复连接后，按每个任务的「错过的运行」设置自动补跑一次或跳过。",
         }));
       }
+      if (state.autoAttach && state.autoAttach.available !== false && !state.autoAttach.enabled) {
+        banners.push(el(doc, "div", { class: "sched-banner warn", "data-ekd-autoattach-banner": "true" }, [
+          el(doc, "div", { class: "sched-banner-row" }, [
+            el(doc, "span", {
+              text: "尚未开启「随 Kimi Code 自动接入」。Kimi Code 重启后，定时任务需要等您手动接入才会继续运行。",
+            }),
+            typeof ctx.ui?.openSettings === "function"
+              ? el(doc, "button", {
+                  type: "button",
+                  class: "sched-btn",
+                  text: "前往设置开启",
+                  onClick: async () => {
+                    try {
+                      await ctx.ui.openSettings("");
+                    } catch (error) {
+                      state.error = error instanceof Error ? error.message : String(error);
+                      notify();
+                    }
+                  },
+                })
+              : null,
+          ]),
+        ]));
+      }
+      banners.push(el(doc, "div", { class: "sched-info-strip", "data-ekd-sleep-note": "true" }, [
+        el(doc, "span", {
+          text: "运行期间是否防止休眠，取决于官方设置里的「防止休眠」；系统通知遵循官方「通用 → 系统通知」开关（仅补发运行失败、校验失败与被跳过）。",
+        }),
+        typeof ctx.ui?.openSettings === "function"
+          ? el(doc, "button", {
+              type: "button",
+              class: "sched-link-btn",
+              text: "打开官方设置 →",
+              onClick: async () => {
+                try {
+                  await ctx.ui.openSettings("general");
+                } catch (error) {
+                  state.error = error instanceof Error ? error.message : String(error);
+                  notify();
+                }
+              },
+            })
+          : null,
+      ]));
       if (state.error) {
         banners.push(el(doc, "div", { class: "sched-banner error", role: "alert", text: state.error }));
       }
@@ -2102,6 +2687,68 @@ export async function activate(ctx) {
       if (state.loading) {
         bodyChildren.push(el(doc, "div", { class: "sched-banner", text: "正在加载定时任务与运行记录…" }));
       } else if (state.activeTab === "tasks") {
+        let maxConcurrentDraft = state.prefs.maxConcurrent;
+        let minQuotaDraft = state.prefs.minQuotaPercent;
+        const guardrailsBar = el(doc, "div", { class: "sched-guardrails-bar", "data-ekd-global-guardrails": "true" }, [
+          el(doc, "div", { class: "sched-guardrails-group" }, [
+            el(doc, "strong", { style: "color:var(--sched-text);font-weight:600", text: "全局护栏" }),
+            el(doc, "label", { class: "sched-guardrail-item" }, [
+              "并发上限",
+              el(doc, "input", {
+                type: "number",
+                min: "1",
+                max: "10",
+                class: "sched-input",
+                "aria-label": "全局并发上限",
+                value: String(maxConcurrentDraft),
+                onInput: e => {
+                  const parsed = Number.parseInt(e.target.value, 10);
+                  if (Number.isFinite(parsed)) maxConcurrentDraft = parsed;
+                },
+              }),
+            ]),
+            el(doc, "label", { class: "sched-guardrail-item" }, [
+              "额度低于",
+              el(doc, "input", {
+                type: "number",
+                min: "0",
+                max: "95",
+                class: "sched-input",
+                "aria-label": "额度跳过阈值（%）",
+                value: String(minQuotaDraft),
+                onInput: e => {
+                  const parsed = Number.parseInt(e.target.value, 10);
+                  if (Number.isFinite(parsed)) minQuotaDraft = parsed;
+                },
+              }),
+              "% 时跳过（0 为关闭）",
+            ]),
+          ]),
+          el(doc, "div", { class: "sched-guardrails-group" }, [
+            state.prefsNotice ? el(doc, "span", { style: "color:var(--sched-ok)", text: state.prefsNotice }) : null,
+            el(doc, "button", {
+              type: "button",
+              class: "sched-btn",
+              text: "保存护栏",
+              onClick: async () => {
+                try {
+                  state.prefsNotice = "";
+                  await ctx.core.request("schedule.prefs", {
+                    maxConcurrent: Math.max(1, Math.min(10, Number(maxConcurrentDraft) || 2)),
+                    minQuotaPercent: Math.max(0, Math.min(95, Number(minQuotaDraft) || 0)),
+                  });
+                  state.prefsNotice = "已保存";
+                  await refreshAll();
+                } catch (error) {
+                  state.error = error instanceof Error ? error.message : String(error);
+                  notify();
+                }
+              },
+            }),
+          ]),
+        ]);
+        bodyChildren.push(guardrailsBar);
+
         if (state.tasks.length === 0) {
           bodyChildren.push(el(doc, "div", { class: "sched-empty" }, [
             el(doc, "strong", { text: "还没有定时任务" }),
@@ -2157,8 +2804,12 @@ export async function activate(ctx) {
             text: "全部标为已读",
             onClick: async () => {
               try {
-                await ctx.core.request("schedule.markAllRead", {});
+                const res = await ctx.core.request("schedule.markAllRead", {});
                 await refreshAll();
+                if (res?.archiveError) {
+                  state.error = res.archiveError;
+                  notify();
+                }
               } catch (error) {
                 state.error = error instanceof Error ? error.message : String(error);
                 notify();
@@ -2347,6 +2998,8 @@ export async function activate(ctx) {
     disposed = true;
     if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
       window.removeEventListener("ekd:active-session", onActiveSessionChange);
+      window.removeEventListener("ekd:scheduler-open-runs", onOpenRunsEvent);
+      window.removeEventListener("ekd:attach-changed", onAttachChanged);
     }
     unsubSchedule.dispose();
     closeDialog();

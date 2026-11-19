@@ -17,6 +17,12 @@ import (
 type fakeExecutor struct {
 	mu           sync.Mutex
 	connected    bool
+	accountValid bool
+	accountErr   string
+	quotaRem     float64
+	quotaKnown   bool
+	quotaDetail  string
+	autoAttach   AutoAttachInfo
 	models       []ModelInfo
 	sessions     map[string]SessionInfo
 	turns        map[string][]TurnInfo
@@ -24,9 +30,14 @@ type fakeExecutor struct {
 	keepAliveOn  bool
 	keepAliveMin int
 	events       []string
+	rawEvents    []any
 	activities   []string
 	createdSeq   int
 	sentPrompts  []string
+	archivedIDs  []string
+	batchArchIDs [][]string
+	abortedIDs   []string
+	archiveErr   error
 
 	onCreate func(ctx context.Context, cwd, title, model, effort, permissionMode string)
 	onPrompt func(ctx context.Context, sessionID, text, model, effort, permissionMode string)
@@ -34,7 +45,8 @@ type fakeExecutor struct {
 
 func newFakeExecutor() *fakeExecutor {
 	return &fakeExecutor{
-		connected: true,
+		connected:    true,
+		accountValid: true,
 		models: []ModelInfo{
 			{ID: "kimi/k2", Name: "Kimi K2", SupportEfforts: []string{"low", "medium", "high"}},
 		},
@@ -113,6 +125,53 @@ func (f *fakeExecutor) SendPrompt(ctx context.Context, sessionID, text, model, e
 	return nil
 }
 
+func (f *fakeExecutor) ArchiveSession(_ context.Context, sessionID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.archiveErr != nil {
+		return f.archiveErr
+	}
+	f.archivedIDs = append(f.archivedIDs, sessionID)
+	return nil
+}
+
+func (f *fakeExecutor) ArchiveSessions(_ context.Context, sessionIDs []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.archiveErr != nil {
+		return f.archiveErr
+	}
+	cp := append([]string(nil), sessionIDs...)
+	f.batchArchIDs = append(f.batchArchIDs, cp)
+	f.archivedIDs = append(f.archivedIDs, cp...)
+	return nil
+}
+
+func (f *fakeExecutor) AbortSession(_ context.Context, sessionID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.abortedIDs = append(f.abortedIDs, sessionID)
+	return nil
+}
+
+func (f *fakeExecutor) CheckAccount(context.Context) (bool, string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.accountValid, f.accountErr
+}
+
+func (f *fakeExecutor) QuotaRemainingPercent(context.Context) (float64, bool, string, string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.quotaRem, f.quotaKnown, "fake", f.quotaDetail
+}
+
+func (f *fakeExecutor) AutoAttachStatus(context.Context) AutoAttachInfo {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.autoAttach
+}
+
 func (f *fakeExecutor) SessionCacheStats(_ context.Context, sessionIDs []string) (map[string]SessionCacheStat, bool, int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -125,9 +184,10 @@ func (f *fakeExecutor) SessionCacheStats(_ context.Context, sessionIDs []string)
 	return out, f.keepAliveOn, f.keepAliveMin
 }
 
-func (f *fakeExecutor) PublishEvent(scope string, _ any) {
+func (f *fakeExecutor) PublishEvent(scope string, value any) {
 	f.mu.Lock()
 	f.events = append(f.events, scope)
+	f.rawEvents = append(f.rawEvents, value)
 	f.mu.Unlock()
 }
 

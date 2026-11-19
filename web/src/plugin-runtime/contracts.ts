@@ -1,6 +1,6 @@
 export type ContractProbeStatus = "available" | "disabled" | "untested";
 
-export type OfficialSettingsTabKey = "account" | "agent" | "providers" | "lab" | "archived";
+export type OfficialSettingsTabKey = "general" | "account" | "agent" | "providers" | "lab" | "archived";
 
 export interface DOMContractProbe {
   id: string;
@@ -42,6 +42,7 @@ const OFFICIAL_KEY_FALLBACKS: Record<string, readonly string[]> = {
   "header.sessionInfo": ["会话信息", "Session Info"],
   "header.sessionInfoAvailableTabs": ["可打开", "Available to open"],
   "header.toggleSideChat": ["侧边聊天", "Side chat", "Side Chat"],
+  "settings.tabs.general": ["通用", "General"],
   "settings.tabs.account": ["账户", "Account"],
   "settings.tabs.agent": ["智能体与会话", "Agent & Sessions"],
   "settings.tabs.providers": ["模型供应商", "Model Providers"],
@@ -53,7 +54,7 @@ const OFFICIAL_KEY_FALLBACKS: Record<string, readonly string[]> = {
 };
 
 const TAB_PROBE_META: Record<
-  Exclude<OfficialSettingsTabKey, "archived">,
+  Exclude<OfficialSettingsTabKey, "archived" | "general">,
   { id: string; label: string; title: string }
 > = {
   account: { id: "dom.settings_account", label: "官方「账户」设置页内容区", title: "账户" },

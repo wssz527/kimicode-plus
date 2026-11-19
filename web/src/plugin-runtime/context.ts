@@ -282,6 +282,7 @@ export interface PluginContext {
     ): Disposable;
     theme(): PluginTheme;
     pickDirectory?(options?: { title?: string; defaultPath?: string }): Promise<string | null>;
+    openSettings?(tab?: string): Promise<void>;
   };
   net: { fetch(url: string, init?: ProxyRequestInit): Promise<ProxyResponse> };
   storage: {

@@ -62,6 +62,8 @@ export interface RuntimeOptions {
   pickFiles?: () => Promise<Array<{ path: string; name: string }>>;
   /** Native directory picker for workspace/project selection. */
   pickDirectory?: (options?: { title?: string; defaultPath?: string }) => Promise<string | null>;
+  /** Navigates to the official settings dialog (optional tab key such as "general"). */
+  openSettings?: (tab?: string) => Promise<void>;
   openSession?: (id: string) => Promise<void>;
   activeSession?: () => string;
   windowHost?: { popout(pluginId: string): Promise<void>; close(): Promise<void> };
@@ -544,6 +546,15 @@ export function createPluginRuntime(options: RuntimeOptions) {
           }
           const chosen = await options.pickDirectory(pickerOptions);
           return typeof chosen === "string" && chosen.trim() ? chosen.trim() : null;
+        },
+        openSettings: async (tab?: string) => {
+          if (!granted.includes("ui:main-area") && !granted.includes("ui:sidebar-nav") && !granted.includes("schedule:manage")) {
+            throw new PluginError(403, "PLUGIN_CAPABILITY_DENIED", "插件没有打开设置的能力");
+          }
+          if (!options.openSettings) {
+            throw new PluginError(409, "PLUGIN_SETTINGS_UNAVAILABLE", "当前宿主无法直接打开设置页");
+          }
+          await options.openSettings(typeof tab === "string" ? tab : "");
         },
       },
       net: { fetch: (url, init) => bridge.fetch(url, init) },
