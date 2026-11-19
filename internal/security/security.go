@@ -40,6 +40,27 @@ func New(host string) *Guard {
 	return &Guard{host: host, pairing: Random(), grants: make(map[string]grant)}
 }
 func (g *Guard) PairingToken() string { return g.pairing }
+func (g *Guard) Host() string         { return g.host }
+func (g *Guard) IssueSessionToken(requested []string) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := time.Now()
+	for token, v := range g.grants {
+		if now.After(v.expires) {
+			delete(g.grants, token)
+		}
+	}
+	if len(requested) == 0 {
+		requested = Permissions
+	}
+	scopes := make(map[string]bool, len(requested))
+	for _, p := range requested {
+		scopes[p] = true
+	}
+	token := Random()
+	g.grants[token] = grant{scopes, now.Add(12 * time.Hour)}
+	return token
+}
 func equal(a, b string) bool          { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
 func (g *Guard) permitted(token, permission string) bool {
 	if equal(token, g.pairing) {
@@ -95,6 +116,8 @@ func permission(r *http.Request) string {
 		category = "settings"
 	case p == "adapter" && write:
 		category = "adapter"
+	case p == "desktop/bridge-session":
+		return "adapter:write"
 	case strings.HasPrefix(p, "desktop/actions/"):
 		return nativeActionPermission(strings.TrimPrefix(p, "desktop/actions/"))
 	}

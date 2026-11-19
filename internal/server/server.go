@@ -62,6 +62,7 @@ type App struct {
 	planner       *chat.PlannerService
 	scheduler     *scheduler.Engine
 	kctMigration  *kctmigration.Service
+	winBridge     *windowsBridge
 	gatewayErr    string
 	gatewayBase   string
 }
@@ -407,7 +408,8 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 		}
 		files.ServeHTTP(w, r)
 	})
-	app.Handler = recoverer(guard.Wrap(mux))
+	app.registerWindowsBridgeRoutes(mux, guard)
+	app.Handler = recoverer(app.wrapWindowsBridge(guard, guard.Wrap(mux)))
 	return app, nil
 }
 func (a *App) Close() error {

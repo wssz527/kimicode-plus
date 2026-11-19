@@ -14,8 +14,41 @@ import (
 )
 
 // hostPlatformSupported gates the surfaces that would otherwise take over a
-// host process. Only macOS has a verified runtime path.
-const hostPlatformSupported = true
+// host process. macOS and Windows have native host integration paths.
+const (
+	hostPlatformSupported = true
+	hostPlatformName      = "darwin"
+	hostAutoAttachKind    = "launch_agent"
+)
+
+func discoverHostPlatform(ctx context.Context, profile, _ string) (map[string]any, error) {
+	return discoverHostDarwin(ctx, profile)
+}
+
+func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachResult, error) {
+	return attachNativeDarwin(ctx, options)
+}
+
+func autoAttachStatusPlatform(_ string) LaunchAgentState {
+	return LaunchAgentStatus()
+}
+
+func enableAutoAttachPlatform(config AttachConfig, allowDaily bool) (LaunchAgentState, error) {
+	return InstallLaunchAgent(LaunchAgentConfig{
+		DataDir: config.DataDir, KimiHome: config.KimiHome, Profile: config.Profile,
+		AllowDailyInstance: allowDaily, Executable: config.Executable,
+		CoreURL: config.CoreURL, PairingToken: config.PairingToken,
+	})
+}
+
+func disableAutoAttachPlatform(_ string) (LaunchAgentState, error) {
+	return UninstallLaunchAgent()
+}
+
+// RunWindowsLauncherPlatform is only available on Windows hosts.
+func RunWindowsLauncherPlatform(context.Context, WindowsLaunchOptions) (*WindowsLaunchResult, error) {
+	return nil, ErrUnsupportedPlatform
+}
 
 // verifyRuntimeImage compares the mapped text image of the running host with the
 // executable on disk. lsof reports inode numbers, so a replaced application

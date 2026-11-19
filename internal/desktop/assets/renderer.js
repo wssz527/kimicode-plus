@@ -2,6 +2,38 @@ async function installNativeRenderer(options) {
   if (window.__ekdNativeUI) await window.__ekdNativeUI.remove();
   const transport = {
     async request(action, payload = {}) {
+      if (options.transport === 'windows-cdp-loopback') {
+        if (action === 'window.openSettings') {
+          window.__ekdNativeUI?.openSettings?.(typeof payload?.tab === 'string' ? payload.tab : '');
+          return {};
+        }
+        if (action === 'host.openSession') {
+          window.__ekdNativeUI?.openOfficial?.(payload?.id);
+          return {};
+        }
+        if (action === 'host.activateSession') {
+          window.__ekdNativeUI?.activateSession?.(payload?.id);
+          return {};
+        }
+        if (action === 'host.pickSession') {
+          return window.__ekdNativeUI?.pickSession?.(payload?.exclude || []);
+        }
+        if (action === 'host.pickDirectory' && typeof window.kimiDesktop?.showOpenDialog === 'function') {
+          const res = await window.kimiDesktop.showOpenDialog({
+            title: typeof payload?.title === 'string' && payload.title.trim() ? payload.title.trim() : '选择项目文件夹',
+            properties: ['openDirectory', 'createDirectory'],
+            defaultPath: typeof payload?.defaultPath === 'string' && payload.defaultPath.trim() ? payload.defaultPath.trim() : undefined,
+          });
+          return { path: res?.canceled ? '' : (res?.filePaths?.[0] || '') };
+        }
+        if (action === 'host.pickFiles' && typeof window.kimiDesktop?.showOpenDialog === 'function') {
+          const res = await window.kimiDesktop.showOpenDialog({
+            title: '添加附件',
+            properties: ['openFile', 'multiSelections'],
+          });
+          return res?.canceled ? [] : (res?.filePaths || []).map(p => ({ path: p, name: String(p).split(/[\\/]/).pop() || p }));
+        }
+      }
       const id = typeof globalThis.crypto?.randomUUID === 'function'
         ? globalThis.crypto.randomUUID()
         : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;

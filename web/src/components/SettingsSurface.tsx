@@ -131,6 +131,8 @@ export function SettingsWindow({
 }
 
 type AttachStatus = {
+  platform?: string;
+  autoAttachKind?: string;
   host: {
     running?: boolean;
     reason?: string;
@@ -143,9 +145,24 @@ type AttachStatus = {
     consentRequired?: boolean;
     appVersion?: string;
     electron?: string;
+    debugPort?: number;
+    debugPortWarning?: string;
   };
-  agent: { enabled: boolean; path?: string; error?: string };
-  last?: { status?: string; error?: string; consentRequired?: boolean; hostPid?: number; appVersion?: string; electron?: string; verified?: boolean; versionNote?: string; daily?: boolean };
+  agent: { enabled: boolean; path?: string; error?: string; shortcutCount?: number; backupDir?: string };
+  last?: {
+    status?: string;
+    error?: string;
+    consentRequired?: boolean;
+    hostPid?: number;
+    appVersion?: string;
+    electron?: string;
+    verified?: boolean;
+    versionNote?: string;
+    daily?: boolean;
+    platform?: string;
+    debugPort?: number;
+    debugPortWarning?: string;
+  };
   available: boolean;
   unavailableReason?: string;
 };
@@ -253,6 +270,8 @@ function DiagnosticsSection({
   const notices = diagnostics?.notices;
   const detectedVersion = contracts?.appVersion || status.host.appVersion || status.last?.appVersion || "未知";
   const versionNote = contracts?.versionNote || status.last?.versionNote || "";
+  const isWindowsLauncher = status.autoAttachKind === "windows_launcher" || status.platform === "windows";
+  const debugPortWarning = status.host.debugPortWarning || status.last?.debugPortWarning || "";
   const domProbes = (contracts?.probes ?? []).filter(probe => probe.group === "dom");
   const apiProbes = (contracts?.probes ?? []).filter(probe => probe.group === "api");
   return <div className="ekds-body">
@@ -275,9 +294,20 @@ function DiagnosticsSection({
         <div><dt>进程号</dt><dd className="num">{status.host.pid ?? "—"}</dd></div>
         <div><dt>客户端版本</dt><dd>{detectedVersion}{versionNote ? `（${versionNote}）` : ""}</dd></div>
         <div><dt>调试开关</dt><dd>{FUSE_TEXT[status.host.fuse ?? ""] ?? "未知"}</dd></div>
-        <div><dt>临时调试端口</dt><dd>{status.host.inspectorBusy ? "已被占用，本次不会接入" : "空闲"}</dd></div>
+        {isWindowsLauncher && status.host.debugPort ? (
+          <div><dt>本机调试端口</dt><dd className="num">127.0.0.1:{status.host.debugPort}</dd></div>
+        ) : (
+          <div><dt>临时调试端口</dt><dd>{status.host.inspectorBusy ? "已被占用，本次不会接入" : "空闲"}</dd></div>
+        )}
         {status.host.debugInstance ? <div><dt>启动参数</dt><dd>带调试参数的实例，不会自动接入</dd></div> : null}
       </dl> : null}
+      {debugPortWarning ? <div className="ekds-row" data-ekd-debug-port-warning="true">
+        <span className="ekds-row-label">
+          <strong>调试端口安全告警</strong>
+          <small>{debugPortWarning}</small>
+        </span>
+        <span className="ekds-state is-faulted">告警</span>
+      </div> : null}
       {versionNote ? <div className="ekds-row" data-ekd-unverified-version="true">
         <span className="ekds-row-label">
           <strong>版本验证状态</strong>
@@ -287,8 +317,16 @@ function DiagnosticsSection({
       </div> : null}
       <div className="ekds-row">
         <span className="ekds-row-label">
-          <strong>重启后自动恢复</strong>
-          <small>{status.available ? "由系统在客户端文件变化时触发，安装后默认只在当前用户生效。" : status.unavailableReason}</small>
+          <strong>{isWindowsLauncher ? "随 Kimi Code 启动自动接入" : "重启后自动恢复"}</strong>
+          <small>
+            {status.available
+              ? (isWindowsLauncher
+                ? (status.agent.enabled
+                  ? `已通过固定路径启动器接管开始菜单与桌面快捷方式（已备份 ${status.agent.shortcutCount ?? 0} 个原快捷方式，关闭即可一键恢复）。`
+                  : "开启后会先备份开始菜单和桌面上的 Kimi Code 快捷方式，再改为指向固定路径启动器；关闭可一键恢复原快捷方式。")
+                : "由系统在客户端文件变化时触发，安装后默认只在当前用户生效。")
+              : status.unavailableReason}
+          </small>
         </span>
         <button
           type="button"
@@ -298,7 +336,7 @@ function DiagnosticsSection({
           disabled={busy || !status.available}
           onClick={() => void toggle(!status.agent.enabled)}
         >
-          {busy ? "处理中…" : status.agent.enabled ? "已开启" : "已关闭"}
+          {busy ? "处理中…" : status.agent.enabled ? (isWindowsLauncher ? "关闭并恢复" : "已开启") : "已关闭"}
         </button>
       </div>
       {daily && !status.agent.enabled ? <div className="ekds-row">

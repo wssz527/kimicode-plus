@@ -32,6 +32,11 @@ func Acquire(dir string) (*Instance, error) {
 	if runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0 {
 		return nil, fmt.Errorf("data directory must have private permissions (0700)")
 	}
+	if runtime.GOOS == "windows" {
+		if err = ensurePrivateDirACL(abs); err != nil {
+			return nil, fmt.Errorf("data directory ACL enforcement failed: %w", err)
+		}
+	}
 	abs, err = filepath.EvalSymlinks(abs)
 	if err != nil {
 		return nil, err

@@ -141,11 +141,14 @@ func AttachArguments(config LaunchAgentConfig) []string {
 	return args
 }
 
-// LaunchAgentState is what the settings surface reports.
+// LaunchAgentState is what the settings surface reports (for macOS LaunchAgent
+// and Windows fixed-path launcher + shortcut management).
 type LaunchAgentState struct {
-	Enabled bool   `json:"enabled"`
-	Path    string `json:"path,omitempty"`
-	Error   string `json:"error,omitempty"`
+	Enabled       bool   `json:"enabled"`
+	Path          string `json:"path,omitempty"`
+	Error         string `json:"error,omitempty"`
+	ShortcutCount int    `json:"shortcutCount,omitempty"`
+	BackupDir     string `json:"backupDir,omitempty"`
 }
 
 type launchController interface {
@@ -259,6 +262,20 @@ func RecordAttach(dataDir string, value any) error {
 		payload["status"] = result.Status
 		payload["hostPid"] = result.HostPID
 		payload["appVersion"] = result.AppVersion
+		payload["electron"] = result.Electron
+		payload["verified"] = result.Verified
+		if result.VersionNote != "" {
+			payload["versionNote"] = result.VersionNote
+		}
+		if result.Platform != "" {
+			payload["platform"] = result.Platform
+		}
+		if result.DebugPort > 0 {
+			payload["debugPort"] = result.DebugPort
+		}
+		if result.DebugPortWarning != "" {
+			payload["debugPortWarning"] = result.DebugPortWarning
+		}
 		payload["daily"] = result.Daily
 	} else if err, ok := value.(error); ok && err != nil {
 		payload["status"] = "error"

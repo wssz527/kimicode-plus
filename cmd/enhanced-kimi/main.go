@@ -50,6 +50,9 @@ func run() error {
 	if len(os.Args) > 1 && os.Args[1] == "attach" {
 		return runAttach(os.Args[2:])
 	}
+	if len(os.Args) > 1 && os.Args[1] == "launch" {
+		return runLaunch(os.Args[2:])
+	}
 	dir := flag.String("data-dir", "", "independent data directory (default: OS user config/EnhancedKimiDesktop)")
 	port := flag.Int("port", 0, "loopback port (0 selects an available port)")
 	safe := flag.Bool("safe-mode", false, "persist safe mode and disable task/plugin effects")
@@ -66,8 +69,16 @@ func run() error {
 	if *port < 0 || *port > 65535 {
 		return fmt.Errorf("port out of range")
 	}
-	if (*hostProfile == "") != (*kimiHome == "") {
-		return fmt.Errorf("--host-profile and --kimi-home must be provided together")
+	if *hostProfile != "" && *kimiHome == "" {
+		return fmt.Errorf("--host-profile requires --kimi-home")
+	}
+	effectiveKimiHome := *kimiHome
+	if effectiveKimiHome == "" && *hostProfile == "" && *allowDaily {
+		if envHome := os.Getenv("KIMI_CODE_HOME"); envHome != "" {
+			effectiveKimiHome = envHome
+		} else if userHome, homeErr := os.UserHomeDir(); homeErr == nil && userHome != "" {
+			effectiveKimiHome = filepath.Join(userHome, ".kimi-code")
+		}
 	}
 	if *dir == "" {
 		defaultDir, err := platform.DefaultDataDir()
@@ -115,7 +126,7 @@ func run() error {
 		return err
 	}
 	app, err := server.NewWithNative(db, guard, *safe, gatewayToken, server.NativeOptions{
-		Home: *kimiHome, CWD: cwd, DataDir: instance.Dir, Executable: executable,
+		Home: effectiveKimiHome, CWD: cwd, DataDir: instance.Dir, Executable: executable,
 		Profile: *hostProfile, CoreURL: "http://" + listener.Addr().String(), PairingToken: guard.PairingToken(),
 	})
 	if err != nil {
@@ -145,7 +156,7 @@ func run() error {
 	hostError := ""
 	if *hostProfile != "" || *allowDaily {
 		attachCtx, attachCancel := context.WithTimeout(ctx, 90*time.Second)
-		hostResult, err = desktop.AttachNative(attachCtx, desktop.AttachOptions{Profile: *hostProfile, CoreURL: base, PairingToken: guard.PairingToken(), AllowDailyInstance: *allowDaily})
+		hostResult, err = desktop.AttachNative(attachCtx, desktop.AttachOptions{DataDir: instance.Dir, Profile: *hostProfile, CoreURL: base, PairingToken: guard.PairingToken(), AllowDailyInstance: *allowDaily})
 		attachCancel()
 		if err != nil {
 			hostError = err.Error()

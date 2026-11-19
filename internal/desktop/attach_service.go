@@ -35,26 +35,30 @@ func (s *NativeService) attachStatus(ctx context.Context) map[string]any {
 	config := s.attachConfig()
 	host := map[string]any{"running": false, "reason": "未配置 Kimi Code 数据目录，无法发现宿主"}
 	if !hostPlatformSupported {
-		// Discovery itself depends on the macOS process tools, so an unsupported
+		// Discovery itself depends on platform host tools, so an unsupported
 		// platform reports the support boundary instead of pretending a probe ran.
 		host = map[string]any{"running": false, "reason": ErrUnsupportedPlatform.Error()}
-	} else if config.KimiHome != "" {
-		if discovered, err := DiscoverHost(ctx, config.Profile); err == nil {
+	} else if config.KimiHome != "" || hostPlatformName == "windows" {
+		if discovered, err := DiscoverHostWithDataDir(ctx, config.Profile, config.DataDir); err == nil {
 			host = discovered
 		} else {
 			host = map[string]any{"running": false, "reason": err.Error()}
 		}
 	}
-	agent := LaunchAgentStatus()
-	payload := map[string]any{"host": host, "agent": agent}
+	agent := autoAttachStatusPlatform(config.DataDir)
+	payload := map[string]any{
+		"host":           host,
+		"agent":          agent,
+		"platform":       hostPlatformName,
+		"autoAttachKind": hostAutoAttachKind,
+	}
 	if state := ReadAttachState(config.DataDir); state != nil {
 		payload["last"] = state
 	}
 	// The agent cannot be offered when the core does not know its own binary or
-	// the pairing details a launchd run needs. It is also never offered on a
-	// platform whose host runtime has not been verified: the LaunchAgent it would
-	// install could only fail, or take over a host nothing knows how to address.
-	payload["available"] = hostPlatformSupported && config.Executable != "" && config.CoreURL != "" && len(config.PairingToken) >= 32
+	// the pairing details a background run needs. It is also never offered on a
+	// platform whose host runtime has not been verified.
+	payload["available"] = hostPlatformSupported && config.Executable != "" && (hostPlatformName == "windows" || (config.CoreURL != "" && len(config.PairingToken) >= 32))
 	if !payload["available"].(bool) {
 		payload["unavailableReason"] = "后台接入需要在带核心地址和配对凭据的增强核心中启用"
 		if !hostPlatformSupported {
@@ -64,15 +68,14 @@ func (s *NativeService) attachStatus(ctx context.Context) map[string]any {
 	return payload
 }
 
-// enableAttach installs the agent only after the user explicitly asks for it.
-// The daily-instance consent is a separate flag so choosing "auto attach" never
-// silently implies taking over the client the user is working in.
+// enableAttach installs auto-attach (LaunchAgent on macOS, fixed launcher +
+// backed-up Start Menu/Desktop shortcuts on Windows) only after explicit consent.
 func (s *NativeService) enableAttach(ctx context.Context, input map[string]any) (map[string]any, error) {
 	if !hostPlatformSupported {
 		return nil, ErrUnsupportedPlatform
 	}
 	config := s.attachConfig()
-	if config.Executable == "" || config.CoreURL == "" || len(config.PairingToken) < AttachTokenMinLength {
+	if config.Executable == "" || (hostPlatformName != "windows" && (config.CoreURL == "" || len(config.PairingToken) < AttachTokenMinLength)) {
 		return nil, errors.New("后台接入需要核心地址和配对凭据，请从完整的增强核心中启用")
 	}
 	allowDaily, _ := input["allowDailyInstance"].(bool)
@@ -81,12 +84,7 @@ func (s *NativeService) enableAttach(ctx context.Context, input map[string]any) 
 	if config.Profile == "" && !allowDaily {
 		return nil, ErrConsentRequired
 	}
-	state, err := InstallLaunchAgent(LaunchAgentConfig{
-		DataDir: config.DataDir, KimiHome: config.KimiHome, Profile: config.Profile,
-		AllowDailyInstance: allowDaily, Executable: config.Executable,
-		// Without these the agent wakes, finds no core and fails every time.
-		CoreURL: config.CoreURL, PairingToken: config.PairingToken,
-	})
+	state, err := enableAutoAttachPlatform(config, allowDaily)
 	if err != nil {
 		return nil, err
 	}
@@ -94,9 +92,38 @@ func (s *NativeService) enableAttach(ctx context.Context, input map[string]any) 
 }
 
 func (s *NativeService) disableAttach() (map[string]any, error) {
-	state, err := UninstallLaunchAgent()
+	state, err := disableAutoAttachPlatform(s.attachConfig().DataDir)
 	if err != nil {
 		return nil, err
 	}
 	return map[string]any{"agent": state}, nil
+}
+
+// HostPlatformName reports the compiled native attach target ("darwin", "windows", or "other").
+func HostPlatformName() string {
+	return hostPlatformName
+}
+
+// AutoAttachStatus reports the current platform auto-attach state (LaunchAgent
+// on macOS, fixed launcher + backed-up shortcuts on Windows).
+func AutoAttachStatus(dataDir string) LaunchAgentState {
+	return autoAttachStatusPlatform(dataDir)
+}
+
+// EnableAutoAttach installs the platform auto-attach mechanism.
+func EnableAutoAttach(config LaunchAgentConfig) (LaunchAgentState, error) {
+	return enableAutoAttachPlatform(AttachConfig{
+		DataDir:      config.DataDir,
+		KimiHome:     config.KimiHome,
+		Profile:      config.Profile,
+		CoreURL:      config.CoreURL,
+		PairingToken: config.PairingToken,
+		Executable:   config.Executable,
+	}, config.AllowDailyInstance)
+}
+
+// DisableAutoAttach removes auto-attach (unloads LaunchAgent on macOS, restores
+// backed-up Start Menu & Desktop shortcuts on Windows).
+func DisableAutoAttach(dataDir string) (LaunchAgentState, error) {
+	return disableAutoAttachPlatform(dataDir)
 }

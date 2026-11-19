@@ -171,7 +171,7 @@ func CommandLine(ctx context.Context, pid int) (string, error) {
 // Only the macOS host path has been verified end to end; the other targets are
 // compile-only, so they must refuse instead of signalling a process or claiming
 // a successful attach.
-var ErrUnsupportedPlatform = errors.New("增强宿主接入目前只支持 macOS 宿主；本平台仅保证编译通过，不会向任何进程发送信号")
+var ErrUnsupportedPlatform = errors.New("增强宿主接入目前只支持 macOS 与 Windows 宿主；本平台仅保证编译通过，不会向任何进程发送信号")
 
 // VerifyLiveProcess confirms the running process still executes the verified
 // binary. The platform-specific runtime image check catches a replaced
@@ -432,7 +432,7 @@ func (c *CDP) read() {
 	}
 }
 
-func (c *CDP) Evaluate(ctx context.Context, expression string) (json.RawMessage, error) {
+func (c *CDP) call(ctx context.Context, method string, params map[string]any) (json.RawMessage, error) {
 	c.mu.Lock()
 	c.next++
 	id := c.next
@@ -444,7 +444,7 @@ func (c *CDP) Evaluate(ctx context.Context, expression string) (json.RawMessage,
 		delete(c.pending, id)
 		c.mu.Unlock()
 	}()
-	payload, _ := json.Marshal(map[string]any{"id": id, "method": "Runtime.evaluate", "params": map[string]any{"expression": expression, "returnByValue": true, "awaitPromise": true}})
+	payload, _ := json.Marshal(map[string]any{"id": id, "method": method, "params": params})
 	c.writeMu.Lock()
 	err := c.conn.Write(ctx, websocket.MessageText, payload)
 	c.writeMu.Unlock()
@@ -463,28 +463,36 @@ func (c *CDP) Evaluate(ctx context.Context, expression string) (json.RawMessage,
 		if response.Error != nil {
 			return nil, errors.New(response.Error.Message)
 		}
-		var result struct {
-			Result struct {
-				Value json.RawMessage `json:"value"`
-			} `json:"result"`
-			ExceptionDetails *struct {
-				Text      string `json:"text"`
-				Exception struct {
-					Description string `json:"description"`
-				} `json:"exception"`
-			} `json:"exceptionDetails"`
-		}
-		if err := json.Unmarshal(response.Result, &result); err != nil {
-			return nil, err
-		}
-		if result.ExceptionDetails != nil {
-			if result.ExceptionDetails.Exception.Description != "" {
-				return nil, errors.New(result.ExceptionDetails.Exception.Description)
-			}
-			return nil, errors.New(result.ExceptionDetails.Text)
-		}
-		return result.Result.Value, nil
+		return response.Result, nil
 	}
+}
+
+func (c *CDP) Evaluate(ctx context.Context, expression string) (json.RawMessage, error) {
+	raw, err := c.call(ctx, "Runtime.evaluate", map[string]any{"expression": expression, "returnByValue": true, "awaitPromise": true})
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Result struct {
+			Value json.RawMessage `json:"value"`
+		} `json:"result"`
+		ExceptionDetails *struct {
+			Text      string `json:"text"`
+			Exception struct {
+				Description string `json:"description"`
+			} `json:"exception"`
+		} `json:"exceptionDetails"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	if result.ExceptionDetails != nil {
+		if result.ExceptionDetails.Exception.Description != "" {
+			return nil, errors.New(result.ExceptionDetails.Exception.Description)
+		}
+		return nil, errors.New(result.ExceptionDetails.Text)
+	}
+	return result.Result.Value, nil
 }
 
 // Close detaches and confirms the temporary inspector really closed. A port left

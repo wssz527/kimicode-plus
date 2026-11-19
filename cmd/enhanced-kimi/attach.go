@@ -18,7 +18,9 @@ import (
 type attachOptions struct {
 	dataDir            string
 	kimiHome           string
+	kimiExe            string
 	profile            string
+	debugPort          int
 	allowDailyInstance bool
 	appVersionOverride string
 	coreURL            string
@@ -36,19 +38,21 @@ func runAttach(args []string) error {
 	set := flag.NewFlagSet("attach", flag.ContinueOnError)
 	set.StringVar(&options.dataDir, "data-dir", "", "independent data directory")
 	set.StringVar(&options.kimiHome, "kimi-home", "", "KIMI_CODE_HOME of the host")
+	set.StringVar(&options.kimiExe, "kimi-exe", "", "explicit path to Kimi Code.exe on Windows")
 	set.StringVar(&options.profile, "host-profile", "", "isolated Kimi Code profile (empty: the running client)")
+	set.IntVar(&options.debugPort, "debug-port", 0, "optional loopback debugging port on Windows")
 	set.BoolVar(&options.allowDailyInstance, "allow-daily-instance", false, "attach to the client you actually use")
 	set.StringVar(&options.appVersionOverride, "app-version-override", "", "override reported host version on isolated profile for contract acceptance")
 	set.StringVar(&options.coreURL, "core-url", "", "core base URL to report to")
 	set.StringVar(&options.pairingToken, "pairing-token", "", "core pairing token")
-	set.BoolVar(&options.install, "install", false, "install and load the WatchPaths LaunchAgent")
-	set.BoolVar(&options.uninstall, "uninstall", false, "unload and remove the LaunchAgent")
+	set.BoolVar(&options.install, "install", false, "install auto-attach (LaunchAgent on macOS, launcher & shortcuts on Windows)")
+	set.BoolVar(&options.uninstall, "uninstall", false, "remove auto-attach and restore backed-up Windows shortcuts")
 	set.BoolVar(&options.status, "status", false, "print the current attach state")
 	if err := set.Parse(args); err != nil {
 		return err
 	}
 	if options.status {
-		state := desktop.LaunchAgentStatus()
+		state := desktop.AutoAttachStatus(options.dataDir)
 		payload := map[string]any{"agent": state, "last": desktop.ReadAttachState(options.dataDir)}
 		return json.NewEncoder(os.Stdout).Encode(payload)
 	}
@@ -65,7 +69,7 @@ func runAttach(args []string) error {
 	}
 	switch {
 	case options.uninstall:
-		removed, err := desktop.UninstallLaunchAgent()
+		removed, err := desktop.DisableAutoAttach(options.dataDir)
 		if err != nil {
 			return err
 		}
@@ -75,8 +79,10 @@ func runAttach(args []string) error {
 		// worse than no agent, because the settings surface reports it as enabled
 		// while every wake-up fails. The same argument builder renders the plist,
 		// so a passing check here is the contract the installed agent will run.
-		if err = validateAgentArguments(desktop.AttachArguments(config)); err != nil {
-			return fmt.Errorf("后台接入参数校验失败，未写入接入定义：%w", err)
+		if desktop.HostPlatformName() != "windows" {
+			if err = validateAgentArguments(desktop.AttachArguments(config)); err != nil {
+				return fmt.Errorf("后台接入参数校验失败，未写入接入定义：%w", err)
+			}
 		}
 		installed, err := installLaunchAgent(config)
 		if err != nil {
@@ -90,6 +96,7 @@ func runAttach(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	result, attachErr := desktop.AttachOnce(ctx, desktop.AttachOptions{
+		DataDir: options.dataDir, KimiExecutable: options.kimiExe, DebugPort: options.debugPort,
 		Profile: options.profile, CoreURL: options.coreURL, PairingToken: options.pairingToken,
 		AllowDailyInstance: options.allowDailyInstance,
 		AppVersionOverride: options.appVersionOverride,
@@ -107,7 +114,7 @@ func runAttach(args []string) error {
 // installLaunchAgent is the install step, indirected so a test can prove
 // --install validates before it writes anything without touching the real
 // LaunchAgents directory.
-var installLaunchAgent = desktop.InstallLaunchAgent
+var installLaunchAgent = desktop.EnableAutoAttach
 
 // validateAgentArguments parses the agent's argument list with the same flag set
 // the subcommand uses. This is the guard against the plist and the CLI drifting
