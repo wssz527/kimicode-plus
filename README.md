@@ -14,19 +14,46 @@
   - 官方「智能体与会话」页：配置权限规则与危险命令护栏、子代理模型池、子代理时限与单轮步数上限。
   - 官方「实验室」页：提供实验性「会话并排」开关。
   - 官方设置内新增「KimiCode+」标签页：平铺展示「缓存」「增强插件」「状态与诊断」三节；若官方页探针失效，对应内容自动回落至本页。
-- **预装增强插件（均默认关闭，按需启停）**：与官方插件市场相互独立，具备能力门禁与故障隔离——
+- **预装增强插件（均默认关闭，按需启停）**：与官方插件市场相互独立，具备独立能力门禁、故障隔离与许可证查看入口——
   - **定时任务（Scheduler）**：单次/每日多时刻/每周/间隔调度、错过补跑或跳过、提示词变量插入与预览、标题 `[定时] ` 前缀、已读后走官方 `:archive` 归档、仅补缺官方未覆盖的失败/跳过系统通知（跟随官方系统通知与提示音开关）、单任务与全局成本护栏、运行前校验及 `yolo` 脏仓库二次确认。
-  - **Monitor**：复刻侧栏模块化面板与 Rive 蓝球形象，合并展示 Kimi Code 5h/每周额度、加油包及官方已配置外部供应商余额（DeepSeek、Moonshot、BigModel、Magpie 等），读取失败绝不伪造为 0。
+  - **Monitor**：基于开源项目 [bfjnbvf/kimi-code-monitor](https://github.com/bfjnbvf/kimi-code-monitor)（MIT）适配的侧栏模块化面板与 Rive 蓝球形象，合并展示 Kimi Code 5h/每周额度、加油包及官方已配置外部供应商余额（DeepSeek、Moonshot、BigModel、Magpie 等），读取失败绝不伪造为 0。
   - **规划（Planner）**：本地持久化规划线程与网页规划交接，支持多选消息、编辑预览后发送到新建或已有 Code 会话。
-  - **思考内容翻译（KCT）**：流式翻译并展示模型思考块内容。
+  - **思考内容翻译（KCT）**：适配自独立版 [wssz527/kimi-cot-translate](https://github.com/wssz527/kimi-cot-translate)（MIT），流式翻译并展示模型思考块内容。
+- **第三方增强插件**。`apiVersion: 2` 支持左侧栏导航、主聊天区整页或分栏、右侧面板、会话入口和网页视图等挂载点，也提供会话、命令、附件、规划和定时任务接口。平台限制以安装预览和[增强插件开发文档](docs/PLUGINS.md)为准。从本地文件夹或 ZIP 安装时可逐项授权，高权限能力需要二次确认。插件包发生变化后须重新预览。
+- **GitHub Releases 自更新**。在「KimiCode+ → 状态与诊断」检查新版、查看更新说明并下载与版本和平台匹配的安装包。核心校验 SHA-256，并在新版通过健康检查后确认成功。启动失败会尝试恢复旧核心，诊断页会显示结果。
 
-最新完整验证证据与已知边界见 [docs/VALIDATION.md](docs/VALIDATION.md)。
+下载与版本说明见 [GitHub Releases](https://github.com/wssz527/kimicode-plus/releases)。验证记录与已知边界见 [docs/VALIDATION.md](docs/VALIDATION.md)。
+
+## 第三方增强插件：安装与开发
+
+### 如何安装第三方插件
+
+1. 打开 Kimi Code 设置 → **KimiCode+ → 增强插件** → 点击 **安装本地增强插件**。
+2. 点击 **选择文件夹** 或 **选择 .zip 包**（也可直接粘贴本地路径），点击 **检查增强插件包**。
+3. 核对插件信息、上游来源（如有）与申请的能力列表，按需勾选授权；若包含高权限能力，需勾选风险确认框后完成安装。
+4. 新安装的插件默认处于停用状态，确认无误后点击 **启用增强插件** 即可生效，详情页可随时查看该插件自带的 `LICENSE`、`NOTICE` 与活动记录。
+
+### 最小插件结构与开放挂载点
+
+```text
+my-plugin/
+  plugin.json      # 必填：id（发布者.名称）、version、apiVersion（1 或 2）、hostVersions、entry、capabilities
+  renderer.js      # 必填：ES module，导出 activate(ctx)
+  settings.js      # 可选：ES module，导出 renderSettings(ctx, element)
+  assets/          # 可选：插件私有静态资源
+  LICENSE          # 必填：开源或使用许可文件
+  NOTICE           # 可选：上游来源与版权说明（详情页可直接展开查看）
+```
+
+Windows 支持本地 ZIP 和文件夹安装、插件命令、右侧标签和会话信息入口。独立网页视图、插件弹出窗和宿主独立的右侧「+」浮层暂不可用。
+
+可复制 [plugins/example-hello/](plugins/example-hello/) 开始开发。能力清单和挂载示例见 [增强插件开发文档](docs/PLUGINS.md)。
 
 ## 快速开始
 
 ### 构建单文件二进制
 
-开发需要 Go 1.27+、Node.js 24+、npm 与 Python 3（纯 Go SQLite，`CGO_ENABLED=0`）：
+构建需要 Go 1.26+、Node.js 24+、npm 与 Python 3。SQLite 构建使用纯 Go，设置 `CGO_ENABLED=0`。
 
 ```bash
 sh scripts/build.sh        # 构建前端并生成本机 dist/enhanced-kimi
@@ -102,11 +129,27 @@ go run ./cmd/enhanced-kimi --data-dir ./work/development --port 43125
 | `internal/quota` | Kimi Code 订阅与加油包额度、DeepSeek / Moonshot / BigModel / 本机 Magpie 余额读取与身份级回退 |
 | `internal/scheduler` | 持久化定时任务调度引擎、错过补跑/跳过判定、单任务互斥与运行记录 |
 | `internal/future` | 会话引用、Worktree、策略、浏览器隔离数据和权限 |
-| `internal/plugins`、`plugins` | 可信 Go 插件能力门禁、生命周期、官方摘要校验与内嵌预装插件（Monitor、KCT、规划、定时任务） |
+| `internal/plugins`、`plugins` | 可信 Go 插件能力门禁、安装期摘要固化、开源声明读取与内嵌预装插件（Monitor、KCT、规划、定时任务） |
+| `internal/updater` | GitHub Releases 检查、SHA-256 校验、跨平台安全自替换与重启 |
 | `adapters` | 浏览器兼容 TypeScript 适配契约与夹具 |
 | `web/src/host-entry.tsx` | 独立管理页与原生 surface 的可装配 ES 模块 |
 | `internal/desktop/assets` | 宿主入口、面板/设置窗口、WebContentsView 与正式本地 RPC |
 | `web`、`internal/webassets` | React 源码与 Go 内嵌资源 |
-| `scripts`、`.github/workflows` | 构建、验收、测量与 CI |
+| `scripts`、`.github/workflows` | 构建、打包、验收、测量、CI 与自动发布 Release |
 
-[API 契约](docs/API_CONTRACT.md) · [架构](docs/ARCHITECTURE.md) · [验证结果与修复记录](docs/VALIDATION.md) · [原生接入门槛](docs/NATIVE_INTEGRATION.md)
+## 开源协议、上游声明与致谢
+
+本项目以 [MIT License](LICENSE) 开源。每个平台的发布包都附带项目的 `LICENSE` 和依赖及上游声明 `THIRD_PARTY_NOTICES.txt`。在「KimiCode+ → 状态与诊断 → 开源许可」可查看第三方声明，在增强插件详情页可查看对应插件的 `LICENSE` 和 `NOTICE`。
+
+### 上游适配说明
+
+- **Monitor 增强插件（`kimicode-plus.monitor`）**：界面结构、样式、交互与中文文案基于开源项目 [bfjnbvf/kimi-code-monitor](https://github.com/bfjnbvf/kimi-code-monitor)（commit `1d529f0b424a708971cfac097238df444f3b5beb`，MIT License）二次适配，**感谢原作者十叶**。Rive 运行时与 `kimi_avatar_web-PnsTWI-X.riv` 沿用上游分发方式；余额数据层与核心通信接口为 KimiCode+ 独立实现（源码见 `internal/quota/`）。完整版权与说明见 [plugins/monitor/LICENSE](plugins/monitor/LICENSE) 与 [plugins/monitor/NOTICE](plugins/monitor/NOTICE)。如遇到本适配版的问题，请在本仓库提交 Issue。
+- **思考内容翻译插件（KCT，`kimicode-plus.kct`）**：适配自独立版仓库 [wssz527/kimi-cot-translate](https://github.com/wssz527/kimi-cot-translate)（MIT License），将原有独立注入形态迁移为 KimiCode+ 插件运行时实现。完整说明见 [plugins/kct/LICENSE](plugins/kct/LICENSE) 与 [plugins/kct/NOTICE.md](plugins/kct/NOTICE.md)。
+
+### 非官方与商标声明
+
+KimiCode+ 是非官方社区开源工具，与 Moonshot AI / Kimi 无隶属、赞助或背书关系，不修改官方程序安装包。`Kimi`、`Kimi Code` 及 Monitor 中沿用的官方 Rive 蓝球形象均归其各自权利人所有，此处仅用于说明互操作与界面适配对象。
+
+---
+
+[插件开发文档](docs/PLUGINS.md) · [API 契约](docs/API_CONTRACT.md) · [架构](docs/ARCHITECTURE.md) · [验证结果与修复记录](docs/VALIDATION.md) · [原生接入门槛](docs/NATIVE_INTEGRATION.md)

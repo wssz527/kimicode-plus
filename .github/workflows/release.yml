@@ -1,0 +1,106 @@
+name: Release KimiCode+
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional version confirmation matching the selected release tag'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify and build the frontend
+        working-directory: web
+        run: npm ci && npm run typecheck && npm test && npm run build && npm run build:host
+      - name: Embed frontend assets
+        run: |
+          rm -rf internal/webassets/dist
+          mkdir -p internal/webassets/dist/host
+          cp -R web/dist/. internal/webassets/dist/
+          cp -R web/dist-host/. internal/webassets/dist/host/
+      - name: Verify the core
+        run: go vet ./... && go test ./...
+      - name: Resolve release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          sys.path.insert(0, 'scripts')
+          from package import release_version
+
+          tag = os.environ['GITHUB_REF_NAME']
+          if os.environ['GITHUB_REF_TYPE'] != 'tag' or not tag.startswith('v'):
+              raise SystemExit('Select an existing v-prefixed release tag for this workflow')
+          version = release_version(tag)
+          value = os.environ.get('INPUT_VERSION')
+          if value and release_version(value) != version:
+              raise SystemExit('The specified version does not match the selected tag')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              print(f'version={version}', file=output)
+          PY
+      - name: Refuse to overwrite an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(jq -rn --arg tag "$GITHUB_REF_NAME" '$tag | @uri')
+          set +e
+          result=$(gh api --include "repos/$GITHUB_REPOSITORY/releases/tags/$tag" 2>&1)
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo 'This tag already has a release. Use a new version to publish.' >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$result" | grep -q '^HTTP/[^ ]* 404'; then
+            echo 'Could not verify whether the release exists.' >&2
+            exit 1
+          fi
+      - name: Cross-build and package
+        env:
+          VER: ${{ steps.version.outputs.version }}
+        run: |
+          VERSION="$VER" sh scripts/crossbuild.sh
+          python3 scripts/notices.py
+          python3 scripts/package.py --version "$VER"
+      - name: Publish the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ github.repository }}
+          tag_name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/release/*.tar.gz
+            dist/release/*.zip
+            dist/release/SHA256SUMS
+            dist/release/manifest.json
+            dist/THIRD_PARTY_NOTICES.txt

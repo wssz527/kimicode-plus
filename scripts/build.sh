@@ -8,5 +8,9 @@ touch internal/webassets/dist/.gitkeep
 cp -R web/dist/. internal/webassets/dist/
 mkdir -p internal/webassets/dist/host
 cp -R web/dist-host/. internal/webassets/dist/host/
-CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags='-s -w' -o dist/enhanced-kimi ./cmd/enhanced-kimi
+ldflags='-s -w'
+if [ -n "${VERSION:-}" ]; then
+  ldflags="$ldflags -X enhancedkimi/internal/server.Version=${VERSION#v}"
+fi
+CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags="$ldflags" -o dist/enhanced-kimi ./cmd/enhanced-kimi
 python3 scripts/notices.py
