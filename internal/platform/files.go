@@ -26,5 +26,5 @@ func AtomicPrivateFile(path string, data []byte) error {
 	if err = f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(f.Name(), path)
+	return RetryFileOperation(func() error { return os.Rename(f.Name(), path) })
 }

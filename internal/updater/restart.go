@@ -78,7 +78,7 @@ func writeUpdateJSON(path string, value any) error {
 	if err != nil {
 		return err
 	}
-	return retryFileOperation(func() error { return platform.AtomicPrivateFile(path, data) })
+	return platform.AtomicPrivateFile(path, data)
 }
 
 func startupLockPath(dir string) string {

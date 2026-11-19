@@ -33,8 +33,6 @@ func watchParent(pid int) (func(context.Context) error, func(), error) {
 	}, func() {}, nil
 }
 
-func retryFileOperation(action func() error) error { return action() }
-
 func cleanupSupervisor(stage string) {
 	_ = os.RemoveAll(stage)
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run isolated acceptance against the actual Go executable."""
 import argparse
+import http.client
 import json
 import os
 from pathlib import Path
@@ -9,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
+import urllib.parse
 import urllib.request
 from scenarios import verify_bridge, verify_plugin_safe_mode, verify_plugins, verify_registry_usage
 
@@ -18,40 +19,61 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 class Core:
     def __init__(self, binary, folder):
         self.folder = Path(folder)
-        self.process = subprocess.Popen([str(binary), '--data-dir', str(folder)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.connection = None
+        self.stderr_path = self.folder / 'core.stderr.log'
+        with self.stderr_path.open('wb') as stderr:
+            self.process = subprocess.Popen([str(binary), '--data-dir', str(folder)],
+                                            stdout=subprocess.DEVNULL, stderr=stderr)
         runtime = self.folder / 'runtime.json'
         deadline = time.monotonic() + 15
-        while True:
-            if self.process.poll() is not None:
-                raise AssertionError(self.process.stderr.read())
-            if runtime.exists():
+        last_read_error = None
+        try:
+            while True:
+                if self.process.poll() is not None:
+                    raise AssertionError('core exited before readiness')
                 try:
-                    data = json.loads(runtime.read_text())
+                    data = json.loads(runtime.read_text(encoding='utf-8'))
                     if data.get('pid') == self.process.pid:
                         break
-                except (FileNotFoundError, json.JSONDecodeError):
-                    pass
-            if time.monotonic() > deadline:
-                self.process.kill()
-                raise AssertionError('core readiness timeout')
-            time.sleep(.01)
+                except (FileNotFoundError, PermissionError, json.JSONDecodeError) as error:
+                    last_read_error = error
+                if time.monotonic() > deadline:
+                    raise AssertionError('core readiness timeout') from last_read_error
+                time.sleep(.01)
+        except Exception as error:
+            diagnostics = self.diagnostics()
+            self.stop(hard=True)
+            raise AssertionError(f'{error}\n{diagnostics}') from error
         self.base, self.token = data['url'], data['pairingToken']
+        address = urllib.parse.urlsplit(self.base)
+        self.connection = http.client.HTTPConnection(address.hostname, address.port, timeout=15)
+
+    def diagnostics(self):
+        status = self.process.poll()
+        with self.stderr_path.open('rb') as stderr:
+            stderr.seek(max(0, os.fstat(stderr.fileno()).st_size - 4096))
+            output = stderr.read(4096).decode('utf-8', errors='replace').strip()
+        return f'core pid={self.process.pid} exit={status}\ncore stderr: {output or "(empty)"}'
 
     def request(self, path, body=None, method=None, token=True, headers=None, expected=200):
         values = {'Content-Type': 'application/json'}
         if token:
             values['Authorization'] = 'Bearer ' + self.token
         values.update(headers or {})
-        request = urllib.request.Request(self.base + '/enhance/v1' + path, data=None if body is None else json.dumps(body).encode(), method=method or ('GET' if body is None else 'POST'), headers=values)
+        method = method or ('GET' if body is None else 'POST')
+        payload = None if body is None else json.dumps(body).encode('utf-8')
         try:
-            response = OPENER.open(request, timeout=15)
-        except urllib.error.HTTPError as error:
-            response = error
-        data = json.loads(response.read())
+            self.connection.request(method, '/enhance/v1' + path, body=payload, headers=values)
+            with self.connection.getresponse() as response:
+                data = json.loads(response.read())
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as error:
+            raise AssertionError(f'{method} {path}: {error}\n{self.diagnostics()}') from error
         assert response.status == expected, (path, response.status, data)
         return data
 
     def stop(self, hard=False):
+        if self.connection is not None:
+            self.connection.close()
         if self.process.poll() is None:
             if hard:
                 self.process.kill()
@@ -59,7 +81,7 @@ class Core:
                 self.process.terminate()
             else:
                 self.process.send_signal(signal.SIGTERM)
-            self.process.communicate(timeout=15)
+        self.process.wait(timeout=15)
 
 def run(binary):
     Path('work').mkdir(exist_ok=True)

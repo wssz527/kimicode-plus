@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 	"unicode/utf16"
 
 	"golang.org/x/sys/windows"
@@ -40,15 +39,6 @@ func watchParent(pid int) (func(context.Context) error, func(), error) {
 		}
 		return ctx.Err()
 	}, func() { _ = windows.CloseHandle(process) }, nil
-}
-
-func retryFileOperation(action func() error) error {
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(250 * time.Millisecond) {
-		err := action()
-		if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) && !errors.Is(err, windows.ERROR_ACCESS_DENIED) || time.Now().After(deadline) {
-			return err
-		}
-	}
 }
 
 func cleanupSupervisor(stage string) {

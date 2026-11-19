@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"enhancedkimi/internal/platform"
 	"enhancedkimi/internal/security"
 
 	"github.com/gofrs/flock"
@@ -396,11 +397,11 @@ func checkCoreHealth(ctx context.Context, client *http.Client, runtimePath, base
 }
 
 func updateFile(source, destination string, mode os.FileMode) error {
-	return retryFileOperation(func() error { return atomicCopy(source, destination, mode) })
+	return platform.RetryFileOperation(func() error { return atomicCopy(source, destination, mode) })
 }
 
 func removeUpdateFile(path string) error {
-	return retryFileOperation(func() error {
+	return platform.RetryFileOperation(func() error {
 		if err := os.Remove(path); !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
