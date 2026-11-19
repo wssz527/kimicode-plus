@@ -126,12 +126,12 @@ export function PluginCredentials({ plugin }: { plugin: PluginRecord }) {
   return (
     <Panel title="凭据">
       <p className="panel-note">
-        这是插件声明要用的凭据。明文只在核心，界面只显示是否已设置；添加、替换和删除都在这里完成。
+        这是增强插件声明要用的凭据。明文只在核心，界面只显示是否已设置；添加、替换和删除都在这里完成。
       </p>
       {ungranted.length > 0 ? (
         <InfoNote tone="warn">
           <p>
-            {ungranted.join("、")} 声明了但你没有授予凭据能力，插件无法使用。重新安装这个插件并勾选对应能力后才能生效。
+            {ungranted.join("、")} 声明了但你没有授予凭据能力，增强插件无法使用。重新安装这个增强插件并勾选对应能力后才能生效。
           </p>
         </InfoNote>
       ) : null}

@@ -34,6 +34,8 @@ export interface SettingsDialogParts {
 const ENTRY_ATTRIBUTE = "data-ekd-entry";
 const NAV_ATTRIBUTE = "data-ekd-sidebar-nav";
 const SETTINGS_TAB_ATTRIBUTE = "data-ekd-settings-tab";
+const OFFICIAL_SECTION_ATTRIBUTE = "data-ekd-official-section";
+const SETTINGS_MOUNT_CLASS = "ekd-settings-mount";
 
 const OFFICIAL_KEY_FALLBACKS: Record<string, readonly string[]> = {
   "sidebar.newChat": ["新建会话", "New Session", "New Chat"],
@@ -45,6 +47,8 @@ const OFFICIAL_KEY_FALLBACKS: Record<string, readonly string[]> = {
   "settings.tabs.providers": ["模型供应商", "Model Providers"],
   "settings.tabs.lab": ["实验室", "Lab"],
   "settings.tabs.archived": ["已归档的会话", "已归档", "Archived Sessions", "Archived"],
+  "settings.agentDefaults": ["Agent 默认值", "Agent Defaults", "智能体默认值"],
+  "settings.secondaryModelSection": ["子智能体", "Subagents", "Secondary Model"],
   "settings.title": ["设置", "Settings"],
 };
 
@@ -275,21 +279,73 @@ export function isOfficialSettingsTabSelected(tab: Element | null): boolean {
   return tab.getAttribute("aria-selected") === "true" || tab.classList.contains("on");
 }
 
+function isInjectedSettingsNode(element: Element): boolean {
+  if (
+    element.hasAttribute(OFFICIAL_SECTION_ATTRIBUTE) ||
+    element.classList.contains(SETTINGS_MOUNT_CLASS)
+  ) {
+    return true;
+  }
+  return Boolean(element.closest(`[${OFFICIAL_SECTION_ATTRIBUTE}], .${SETTINGS_MOUNT_CLASS}`));
+}
+
+function isElementHidden(element: Element, stopAt?: Element | null): boolean {
+  let current: Element | null = element;
+  while (current && current !== stopAt) {
+    if (current.hasAttribute("hidden")) return true;
+    const inlineDisplay = (current as HTMLElement).style?.display;
+    if (inlineDisplay === "none") return true;
+    const styleAttr = current.getAttribute("style");
+    if (styleAttr && /(?:^|;)\s*display\s*:\s*none\b/i.test(styleAttr)) return true;
+    const view = current.ownerDocument?.defaultView;
+    if (view && typeof view.getComputedStyle === "function") {
+      try {
+        if (view.getComputedStyle(current).display === "none") return true;
+      } catch {
+        // ignore synthetic document errors
+      }
+    }
+    current = current.parentElement;
+  }
+  return false;
+}
+
+function firstVisibleCandidate(container: Element, selectors: readonly string[]): Element | null {
+  for (const selector of selectors) {
+    for (const candidate of Array.from(container.querySelectorAll(selector))) {
+      if (isInjectedSettingsNode(candidate)) continue;
+      if (!isElementHidden(candidate, container)) return candidate;
+    }
+  }
+  return null;
+}
+
 export function findOfficialSettingsPanel(document: Document, key: Exclude<OfficialSettingsTabKey, "archived">): Element | null {
   const parts = findSettingsDialogParts(document);
   if (!parts?.body) return null;
   const tab = findOfficialSettingsTab(document, key);
   if (!isOfficialSettingsTabSelected(tab)) return null;
   if (key === "providers") {
-    return parts.body.querySelector(".pf")
-      ?? parts.body.querySelector(".panel-sections")
-      ?? parts.body.querySelector(".panel")
-      ?? null;
+    return firstVisibleCandidate(parts.body, [".pf", ".panel-sections", ".panel"]);
   }
-  return parts.body.querySelector(".panel-sections")
-    ?? parts.body.querySelector(".panel")
-    ?? parts.body.querySelector(".sec")
-    ?? null;
+  return firstVisibleCandidate(parts.body, [".panel", ".panel-sections", ".sec"]);
+}
+
+export function findOfficialSettingsSection(
+  panel: Element,
+  document: Document,
+  key: "settings.agentDefaults" | "settings.secondaryModelSection",
+): Element | null {
+  const candidates = resolveOfficialTexts(document, key);
+  for (const section of Array.from(panel.querySelectorAll("section.sec, .sec"))) {
+    if (isInjectedSettingsNode(section)) continue;
+    if (isElementHidden(section, panel)) continue;
+    const heading = section.querySelector(".sec-title, h3, h4");
+    if (matchesAnyLabel(elementText(heading), candidates)) {
+      return section;
+    }
+  }
+  return null;
 }
 
 export function findSidebarFooter(document: Document): Element | null {
@@ -302,6 +358,33 @@ export function findAccountMenuAnchor(document: Document): Element | null {
     ?? document.querySelector(".side-footer-account")
     ?? document.querySelector(".user-menu")
     ?? null;
+}
+
+export interface SettingsProbeSummary {
+  id: string;
+  status: string;
+  reason?: string;
+  detail?: string;
+}
+
+export interface SettingsFallbackState<T extends SettingsProbeSummary = SettingsProbeSummary> {
+  account: T | null;
+  agent: T | null;
+  lab: T | null;
+}
+
+export function resolveSettingsFallbacks<T extends SettingsProbeSummary>(
+  probes: readonly T[] | null | undefined,
+): SettingsFallbackState<T> {
+  const findDisabled = (id: string): T | null => {
+    const probe = probes?.find(item => item.id === id) ?? null;
+    return probe && probe.status === "disabled" ? probe : null;
+  };
+  return {
+    account: findDisabled("dom.settings_account"),
+    agent: findDisabled("dom.settings_agent"),
+    lab: findDisabled("dom.settings_lab"),
+  };
 }
 
 export function evaluateDOMContracts(document: Document, previous?: DOMContractState): DOMContractEvaluation {

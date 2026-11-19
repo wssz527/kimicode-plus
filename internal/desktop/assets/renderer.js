@@ -50,6 +50,9 @@ async function installNativeRenderer(options) {
     settingsHandle: null,
     settingsActive: false,
     settingsRelease: null,
+    settingsObserver: null,
+    officialSections: new Map(),
+    unsubscribeConfig: null,
     removed: false,
     pluginEntries: new Map(),
     pluginSidebarNav: new Map(),
@@ -157,7 +160,7 @@ async function installNativeRenderer(options) {
     state.sessionSidebarRelease = null;
   }
   async function mountSessions(extraIds) {
-    if (!state.features.multiSession) throw new Error('多屏会话是附加功能，请先在 KimiCode+ 设置中开启');
+    if (!state.features.multiSession) throw new Error('会话并排已关闭，请先在「实验室」设置中开启');
     closeSessions();
     const chat = document.querySelector('.chat');
     const composer = document.querySelector('.composer');
@@ -173,6 +176,121 @@ async function installNativeRenderer(options) {
     const host = makeHost(closeSessions);
     state.sessionHandle = mount(element, 'sessions', host, { initialExtraIds: extraIds, onNativeRestore: closeSessions });
   }
+  function unmountOfficialSection(key) {
+    const entry = state.officialSections.get(key);
+    if (!entry) return;
+    state.officialSections.delete(key);
+    unmountHandle(entry.handle);
+    entry.hostEl.remove();
+  }
+  function unmountAllOfficialSections() {
+    for (const key of [...state.officialSections.keys()]) unmountOfficialSection(key);
+    for (const stale of document.querySelectorAll('[data-ekd-official-section]')) stale.remove();
+  }
+  function placeOfficialSection(panel, key, surface, placement) {
+    let entry = state.officialSections.get(key);
+    for (const extra of document.querySelectorAll(`[data-ekd-official-section="${key}"]`)) {
+      if (!entry || extra !== entry.hostEl) extra.remove();
+    }
+    if (!entry) {
+      const hostEl = document.createElement('div');
+      hostEl.className = 'ekd-official-section';
+      hostEl.dataset.ekdOfficialSection = key;
+      const handle = mount(hostEl, surface, makeHost(() => {}));
+      entry = { key, surface, hostEl, handle };
+      state.officialSections.set(key, entry);
+    }
+    const { hostEl } = entry;
+    if (placement.kind === 'prepend') {
+      if (hostEl.parentElement !== panel || panel.firstElementChild !== hostEl) {
+        panel.insertBefore(hostEl, panel.firstChild);
+      }
+      return entry;
+    }
+    if (placement.kind === 'after' && placement.anchor && placement.anchor.parentElement === panel) {
+      if (hostEl.parentElement !== panel || placement.anchor.nextElementSibling !== hostEl) {
+        placement.anchor.after(hostEl);
+      }
+      return entry;
+    }
+    if (hostEl.parentElement !== panel || panel.lastElementChild !== hostEl) {
+      panel.append(hostEl);
+    }
+    return entry;
+  }
+  function syncOfficialSettingsSections(evaluation) {
+    if (!state.settingsDialog || state.settingsActive || evaluation.byId['dom.settings_dialog']?.status === 'disabled') {
+      unmountAllOfficialSections();
+      return;
+    }
+    const desired = new Set();
+    if (evaluation.byId['dom.settings_account']?.status !== 'disabled') {
+      const accountPanel = module.findOfficialSettingsPanel(document, 'account');
+      if (accountPanel) {
+        desired.add('account');
+        placeOfficialSection(accountPanel, 'account', 'settings-account', { kind: 'prepend' });
+      }
+    }
+    if (evaluation.byId['dom.settings_agent']?.status !== 'disabled') {
+      const agentPanel = module.findOfficialSettingsPanel(document, 'agent');
+      if (agentPanel) {
+        const agentDefaults = module.findOfficialSettingsSection(agentPanel, document, 'settings.agentDefaults');
+        const secondarySection = module.findOfficialSettingsSection(agentPanel, document, 'settings.secondaryModelSection');
+        desired.add('agent-permissions');
+        const permEntry = placeOfficialSection(
+          agentPanel,
+          'agent-permissions',
+          'settings-agent-permissions',
+          agentDefaults ? { kind: 'after', anchor: agentDefaults } : { kind: 'append' },
+        );
+        desired.add('agent-subagent');
+        placeOfficialSection(
+          agentPanel,
+          'agent-subagent',
+          'settings-agent-subagent',
+          secondarySection
+            ? { kind: 'after', anchor: secondarySection }
+            : permEntry?.hostEl?.parentElement === agentPanel
+              ? { kind: 'after', anchor: permEntry.hostEl }
+              : { kind: 'append' },
+        );
+      }
+    }
+    if (evaluation.byId['dom.settings_lab']?.status !== 'disabled') {
+      const labPanel = module.findOfficialSettingsPanel(document, 'lab');
+      if (labPanel) {
+        desired.add('lab');
+        placeOfficialSection(labPanel, 'lab', 'settings-lab', { kind: 'append' });
+      }
+    }
+    for (const key of [...state.officialSections.keys()]) {
+      if (!desired.has(key)) unmountOfficialSection(key);
+    }
+    for (const stale of document.querySelectorAll('[data-ekd-official-section]')) {
+      const key = stale.dataset.ekdOfficialSection;
+      const active = key ? state.officialSections.get(key) : null;
+      if (!active || active.hostEl !== stale) stale.remove();
+    }
+  }
+  function attachSettingsObserver(dialog) {
+    state.settingsObserver?.disconnect();
+    state.settingsObserver = null;
+    if (!dialog || state.removed) return;
+    state.settingsObserver = new MutationObserver(records => {
+      const relevant = records.some(record => {
+        const target = record.target;
+        if (!(target instanceof Element)) return true;
+        return !target.closest('[data-ekd-official-section], .ekd-settings-mount, [data-ekd-settings-tab]');
+      });
+      if (relevant) ensure();
+    });
+    state.settingsObserver.observe(dialog, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['style', 'aria-selected', 'class'],
+    });
+  }
   function deactivateSettings() {
     state.settingsActive = false;
     unmountHandle(state.settingsHandle);
@@ -185,6 +303,9 @@ async function installNativeRenderer(options) {
     state.settingsButton?.setAttribute('aria-selected', 'false');
   }
   function detachSettings() {
+    state.settingsObserver?.disconnect();
+    state.settingsObserver = null;
+    unmountAllOfficialSections();
     state.settingsButton?.remove();
     state.settingsDialog = null;
     state.settingsList = null;
@@ -200,6 +321,7 @@ async function installNativeRenderer(options) {
   }
   function activateSettings() {
     if (!state.settingsBody || state.settingsActive) return;
+    unmountAllOfficialSections();
     state.settingsActive = true;
     markSettingsActive();
     state.settingsRelease = contain(state.settingsBody, 'settings');
@@ -216,21 +338,24 @@ async function installNativeRenderer(options) {
       if (!button) throw new Error('官方设置入口未就绪');
       button.click();
     }
+    const officialTabs = new Set(['account', 'agent', 'providers', 'lab', 'archived']);
+    const wantOfficial = typeof tab === 'string' && officialTabs.has(tab);
     const findOfficialTab = key => module.findOfficialSettingsTab(document, key);
     const deadline = Date.now() + 10000;
-    while (!state.settingsBody || !state.settingsButton || (tab === 'providers' && !findOfficialTab('providers'))) {
+    while (!state.settingsBody || !state.settingsButton || (wantOfficial && !findOfficialTab(tab))) {
       syncSettingsTab();
-      if (state.settingsBody && state.settingsButton && (tab !== 'providers' || findOfficialTab('providers'))) break;
+      if (state.settingsBody && state.settingsButton && (!wantOfficial || findOfficialTab(tab))) break;
       if (Date.now() >= deadline) throw new Error('官方设置对话框契约未就绪');
       await new Promise(resolve => setTimeout(resolve, 50));
     }
-    if (tab === 'providers') {
+    if (wantOfficial) {
       if (state.settingsActive) deactivateSettings();
-      const providerTab = findOfficialTab('providers');
-      if (!providerTab) throw new Error('官方模型供应商标签未找到');
-      providerTab.click();
-      providerTab.classList.add('on');
-      providerTab.setAttribute('aria-selected', 'true');
+      const targetTab = findOfficialTab(tab);
+      if (!targetTab) throw new Error(`官方「${tab}」标签未找到`);
+      targetTab.click();
+      targetTab.classList.add('on');
+      targetTab.setAttribute('aria-selected', 'true');
+      setTimeout(() => ensure(), 40);
       return;
     }
     await activateSettings();
@@ -256,6 +381,7 @@ async function installNativeRenderer(options) {
       deactivateSettings();
       detachSettings();
       state.settingsDialog = dialog;
+      attachSettingsObserver(dialog);
     }
     if (state.settingsList !== list) {
       state.settingsButton?.remove();
@@ -384,6 +510,8 @@ async function installNativeRenderer(options) {
        scripted scrolling. flex:1 1 auto covers a flex body, max-height:100% covers
        a block body; both resolve against the body's definite height. */
     .ekd-settings-mount{display:block;width:100%;min-width:0;min-height:0;flex:1 1 auto;max-height:100%;box-sizing:border-box;overflow-y:auto;overscroll-behavior:contain}
+    .ekd-official-section{display:block;width:100%;min-width:0;box-sizing:border-box;padding:var(--space-4,16px) 0}
+    .panel>.ekd-official-section:first-child{padding-top:0}
     .ekd-native-entry{position:relative}
     .ekd-session-picker{width:min(520px,calc(100vw - 40px));max-height:min(680px,calc(100vh - 60px));padding:0;border:1px solid var(--color-line,#8884);border-radius:8px;background:var(--color-bg,#121212);color:var(--color-text,#eee);font:13px/1.5 var(--font-ui,system-ui);box-shadow:0 16px 50px rgba(0,0,0,.24)}
     .ekd-session-picker::backdrop{background:rgba(0,0,0,.36)}
@@ -558,6 +686,7 @@ async function installNativeRenderer(options) {
       detachSettings();
     } else {
       syncSettingsTab();
+      syncOfficialSettingsSections(evaluation);
     }
     if (evaluation.byId['dom.settings_providers']?.status === 'disabled') {
       state.providerEnhance?.clearDecorations?.();
@@ -589,19 +718,34 @@ async function installNativeRenderer(options) {
   function ensure() {
     if (state.removed) return;
     state.observer?.disconnect();
+    state.settingsObserver?.disconnect();
     try {
       syncNativeEntries();
     } finally {
-      if (!state.removed) state.observer?.observe(document.body, { childList: true, subtree: true });
+      if (!state.removed) {
+        state.observer?.observe(document.body, { childList: true, subtree: true });
+        if (state.settingsDialog?.isConnected && state.settingsObserver) {
+          state.settingsObserver.observe(state.settingsDialog, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['style', 'aria-selected', 'class'],
+          });
+        }
+      }
     }
   }
   state.remove = async () => {
     if (state.removed) return;
     state.removed = true;
     state.observer?.disconnect();
+    state.settingsObserver?.disconnect();
+    state.settingsObserver = null;
     state.unsubscribeSession?.();
+    state.unsubscribeConfig?.();
     state.unsubscribeFeatures?.();
     state.unsubscribePlugins?.();
+    window.removeEventListener('ekd:config-saved', onConfigSaved);
     document.removeEventListener('visibilitychange', pluginRefresh);
     window.removeEventListener('focus', pluginRefresh);
     for (const release of [...state.pluginReleases.values()]) release();
@@ -680,7 +824,7 @@ async function installNativeRenderer(options) {
   document.addEventListener('scroll', settingsScroll, true);
   if (options.surface === 'plugin') {
     document.documentElement.dataset.colorScheme = options.theme || 'dark';
-    document.title = 'KimiCode+ 插件';
+    document.title = 'KimiCode+ 增强插件';
     document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:var(--color-bg,#121212);color:var(--color-text,#eee)';
     state.popoutRoot = document.createElement('div');
     state.popoutRoot.style.cssText = 'height:100vh;min-height:0;overflow:hidden';
@@ -746,6 +890,23 @@ async function installNativeRenderer(options) {
     void syncActiveSessionWatch(id);
     window.dispatchEvent(new CustomEvent('ekd:active-session', { detail: id }));
   }, { detached: true, flush: 'sync' });
+  const configStore = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia?._s?.get('kimi.config');
+  let lastConfigSnapshot = JSON.stringify(configStore?.config ?? null);
+  state.unsubscribeConfig = configStore?.$subscribe?.(() => {
+    const nextSnapshot = JSON.stringify(configStore?.config ?? null);
+    if (nextSnapshot === lastConfigSnapshot) return;
+    lastConfigSnapshot = nextSnapshot;
+    window.dispatchEvent(new CustomEvent('ekd:official-config-changed'));
+  }, { detached: true });
+  const onConfigSaved = () => {
+    const store = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia?._s?.get('kimi.config');
+    if (typeof store?.loadConfig === 'function') {
+      void store.loadConfig().then(() => {
+        lastConfigSnapshot = JSON.stringify(store?.config ?? null);
+      });
+    }
+  };
+  window.addEventListener('ekd:config-saved', onConfigSaved);
   ensure();
   state.observer = new MutationObserver(ensure);
   state.observer.observe(document.body, { childList: true, subtree: true });

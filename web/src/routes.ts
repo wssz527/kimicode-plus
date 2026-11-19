@@ -40,10 +40,10 @@ export const ROUTES: RouteDefinition[] = [
   },
   {
     path: "/plugins",
-    label: "插件",
-    shortLabel: "插件",
+    label: "增强插件",
+    shortLabel: "增强插件",
     icon: "plugins",
-    summary: "可信 Go 处理组件与故障隔离",
+    summary: "管理 KimiCode+ 增强插件、授权能力与运行状态",
   },
   {
     path: "/settings",

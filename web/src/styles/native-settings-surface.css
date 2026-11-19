@@ -140,6 +140,83 @@
   gap: 12px;
 }
 
+/* ---------- 官方风格平铺分节 ---------- */
+
+.ekds-flat {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.ekds-sec {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: var(--space-4, 16px) 0;
+}
+
+.ekds-sec:first-child {
+  padding-top: 0;
+}
+
+.ekds-sec[hidden] {
+  display: none;
+}
+
+.ekds-sec-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3, 12px);
+  margin: 0;
+}
+
+.ekds-sec-title {
+  margin: 0;
+  color: var(--ekds-text);
+  font-family: var(--font-ui, var(--font-sans));
+  font-size: var(--text-base, 14px);
+  font-weight: var(--weight-medium, 500);
+  line-height: 1.4;
+  letter-spacing: 0;
+}
+
+.ekds-sec-desc {
+  margin: -4px 0 2px;
+  color: var(--ekds-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.ekds-official-sec {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3, 12px);
+  padding: 0;
+}
+
+.ekds-fallback-note {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--warning, #b7791f) 38%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--warning, #b7791f) 10%, transparent);
+  color: var(--ekds-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ekds-fallback-note strong {
+  font-weight: 500;
+}
+
+.ekds-fallback-note span {
+  color: var(--ekds-muted);
+}
+
 /* ---------- 内容页 ---------- */
 
 .ekds-subpage {

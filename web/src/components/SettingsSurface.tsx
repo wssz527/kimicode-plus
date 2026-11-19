@@ -1,159 +1,133 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "../auth";
 import { Icon } from "./Icon";
 import { CacheSettings } from "./CacheSettings";
 import { PluginSettings } from "./PluginSettings";
 import { errorText } from "./workbench/pieces";
 import { NativeSettings } from "./NativeSettings";
-import { Badge, Spinner } from "./ui";
-import { addonFeatureKeys, readAddonFeatures, writeAddonFeatures, type AddonFeatures, type NativeHost } from "../native";
+import { AccountSettingsSection, FallbackNotice, LabSettingsSection } from "./OfficialSettingsSections";
+import { resolveSettingsFallbacks } from "../plugin-runtime/contracts";
+import type { NativeHost } from "../native";
 import "../styles/native-settings-surface.css";
 
-const SECTIONS = [
-  { id: "cache", label: "缓存与额度", hint: "保活、自动压缩与恢复续跑" },
-  { id: "native", label: "Kimi Code 配置", hint: "子代理、步数上限与权限规则" },
-  { id: "plugins", label: "插件", hint: "Monitor 与故障隔离" },
-  { id: "addons", label: "附加功能", hint: "会话并排，实验性" },
-  { id: "diagnostics", label: "状态与诊断", hint: "接入状态、日志与开源许可" },
-] as const;
-type SectionId = typeof SECTIONS[number]["id"];
-
-/**
- * The settings sheet is one list of real destinations. Models are configured on
- * the official provider form and credentials belong to the plugin that asks for
- * them, so every row opens a section inside this sheet.
- */
-export function SettingsWindow({ host }: { host: NativeHost }) {
-  const [openId, setOpenId] = useState<SectionId | null>(null);
-  const returnTo = useRef<SectionId | null>(null);
-  const backRef = useRef<HTMLButtonElement>(null);
-  const rows = useRef(new Map<SectionId, HTMLButtonElement>());
-
-  useEffect(() => {
-    if (openId) backRef.current?.focus();
-    else if (returnTo.current) rows.current.get(returnTo.current)?.focus();
-  }, [openId]);
-
-  if (!openId) {
-    return <div className="ekds">
-      <div className="ekds-group" role="group" aria-label="KimiCode+ 设置">
-        {SECTIONS.map(item => <button
-          key={item.id}
-          type="button"
-          className="ekds-row ekds-row-button"
-          ref={node => { if (node) rows.current.set(item.id, node); else rows.current.delete(item.id); }}
-          onClick={() => setOpenId(item.id)}
-        >
-          <span className="ekds-row-label"><strong>{item.label}</strong><small>{item.hint}</small></span>
-          <Icon name="arrowRight" size={15} className="ekds-chevron" />
-        </button>)}
-      </div>
-    </div>;
-  }
-
-  const section = SECTIONS.find(item => item.id === openId) ?? SECTIONS[0];
-  return <div className="ekds">
-    <div className="ekds-subpage">
-      <button
-        type="button"
-        className="ekds-back"
-        ref={backRef}
-        onClick={() => { returnTo.current = openId; setOpenId(null); }}
-      >
-        <Icon name="arrowRight" size={14} />返回
-      </button>
-      <header className="ekds-subpage-head">
-        <h2>{section.label}</h2>
-        <p>{section.hint}</p>
-      </header>
-      <div className="ekds-body">
-        {openId === "cache" ? <CacheSettings host={host} /> : null}
-        {openId === "native" ? <NativeSettings embedded /> : null}
-        {openId === "plugins" ? <PluginsSection /> : null}
-        {openId === "addons" ? <AddonsSection host={host} /> : null}
-        {openId === "diagnostics" ? <DiagnosticsSection host={host} /> : null}
-      </div>
-    </div>
-  </div>;
+export interface ContractProbe {
+  id: string;
+  group: "dom" | "api" | string;
+  label: string;
+  status: "available" | "disabled" | "untested" | string;
+  reason?: string;
+  detail?: string;
+  checkedAt?: string;
 }
 
-function PluginsSection() {
-  return <>
-    <p className="ekds-note">插件按清单申请的能力取用核心功能，停用后不影响核心与其他模块。</p>
-    <PluginSettings embedded />
-  </>;
+export interface ContractReport {
+  appVersion?: string;
+  electron?: string;
+  verified: boolean;
+  versionNote?: string;
+  updatedAt?: string;
+  probes: ContractProbe[];
 }
 
-const ADDON_COPY = {
-  multiSession: {
-    title: "会话并排",
-    purpose: "在同一个聊天区最多并排三个已有会话，用于对照和交叉引用。",
-  },
-};
-
 /**
- * Addon switches save immediately and the panel state is taken from the host's
- * echoed value, so a failed write leaves the switch where the core really is.
- * Turning one off unloads its panel through the existing features event.
+ * The KimiCode+ settings tab renders three flat sections (缓存, 增强插件,
+ * 状态与诊断). Features that belong to official tabs (账户, 智能体与会话,
+ * 实验室) mount directly into those official tabs and only fall back here when
+ * their corresponding DOM probe is disabled.
  */
-function AddonsSection({ host }: { host: NativeHost }) {
-  const [features, setFeatures] = useState<AddonFeatures | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+export function SettingsWindow({
+  host,
+  initialContracts = null,
+}: {
+  host: NativeHost;
+  initialContracts?: ContractReport | null;
+}) {
+  const [contracts, setContracts] = useState<ContractReport | null>(initialContracts);
+  const [pluginDetailOpen, setPluginDetailOpen] = useState(false);
 
-  useEffect(() => {
-    let alive = true;
-    readAddonFeatures(host)
-      .then(next => { if (alive) setFeatures(next); })
-      .catch(cause => { if (alive) setError(errorText(cause)); });
-    return () => { alive = false; };
+  const loadContracts = useCallback(async () => {
+    try {
+      const next = await host.request<ContractReport>("contracts.status");
+      if (next && typeof next === "object") setContracts(next);
+    } catch {
+      // DiagnosticsSection reports any transport errors directly.
+    }
   }, [host]);
 
-  async function toggle(key: (typeof addonFeatureKeys)[number], value: boolean) {
-    if (!features) return;
-    setBusy(key);
-    setError(null);
-    try {
-      setFeatures(await writeAddonFeatures(host, { ...features, [key]: value }));
-    } catch (cause) {
-      setError(errorText(cause));
-      setFeatures(await readAddonFeatures(host).catch(() => features));
-    } finally {
-      setBusy(null);
-    }
-  }
+  useEffect(() => {
+    void loadContracts();
+  }, [loadContracts]);
 
-  return <>
-    <p className="ekds-note">会话并排是实验功能，默认关闭。关闭后入口和已打开的面板都会移除，官方界面恢复原样。</p>
-    {error ? <p className="ekds-note is-error">{error}</p> : null}
-    <div className="ekds-group">
-      {(["multiSession"] as const).map(key => {
-        const copy = ADDON_COPY[key];
-        const on = features?.[key] === true;
-        return <div className="ekds-row" key={key}>
-          <span className="ekds-row-label">
-            <strong>{copy.title}</strong>
-            <small>{copy.purpose}</small>
-          </span>
-          <span className="ekds-row-controls">
-            <Badge tone="warn">实验</Badge>
-            <button
-              type="button"
-              className="ekds-btn"
-              role="switch"
-              aria-checked={on}
-              aria-label={copy.title}
-              disabled={!features || busy === key}
-              onClick={() => void toggle(key, !on)}
-            >
-              {busy === key ? <Spinner size={12} /> : on ? "已开启" : "已关闭"}
-            </button>
-          </span>
-        </div>;
-      })}
+  const fallbacks = resolveSettingsFallbacks(contracts?.probes);
+
+  return (
+    <div className="ekds ekds-flat" data-ekd-settings-root="flat">
+      <section className="ekds-sec" data-ekd-section="cache" hidden={pluginDetailOpen}>
+        <div className="ekds-sec-head">
+          <h2 className="ekds-sec-title">缓存</h2>
+        </div>
+        <p className="ekds-sec-desc">
+          查看本机缓存命中、会话空闲时长和实际用量，配置保活、空闲压缩与额度恢复。
+        </p>
+        <CacheSettings host={host} />
+      </section>
+
+      <section className="ekds-sec" data-ekd-section="plugins">
+        {pluginDetailOpen ? null : (
+          <>
+            <div className="ekds-sec-head">
+              <h2 className="ekds-sec-title">增强插件</h2>
+            </div>
+            <p className="ekds-sec-desc">
+              管理 KimiCode+ 的本地增强插件、授权能力与运行状态，与官方插件市场相互独立。
+            </p>
+          </>
+        )}
+        <PluginSettings embedded onDetailChange={setPluginDetailOpen} />
+      </section>
+
+      {!pluginDetailOpen && fallbacks.account ? (
+        <section className="ekds-sec" data-ekd-fallback="account">
+          <AccountSettingsSection
+            host={host}
+            fallbackReason={fallbacks.account.reason || "官方「账户」设置页结构已变"}
+          />
+        </section>
+      ) : null}
+
+      {!pluginDetailOpen && fallbacks.agent ? (
+        <section className="ekds-sec" data-ekd-fallback="agent">
+          <div className="ekds-sec-head">
+            <h2 className="ekds-sec-title">智能体与会话</h2>
+          </div>
+          <FallbackNotice
+            label="智能体与会话"
+            reason={fallbacks.agent.reason || "官方「智能体与会话」设置页结构已变"}
+          />
+          <NativeSettings embedded mode="all" />
+        </section>
+      ) : null}
+
+      {!pluginDetailOpen && fallbacks.lab ? (
+        <section className="ekds-sec" data-ekd-fallback="lab">
+          <LabSettingsSection
+            host={host}
+            fallbackReason={fallbacks.lab.reason || "官方「实验室」设置页结构已变"}
+          />
+        </section>
+      ) : null}
+
+      <section className="ekds-sec" data-ekd-section="diagnostics" hidden={pluginDetailOpen}>
+        <div className="ekds-sec-head">
+          <h2 className="ekds-sec-title">状态与诊断</h2>
+        </div>
+        <p className="ekds-sec-desc">
+          查看增强核心与官方客户端的接入状态、各项契约检测结果、接入日志与开源许可。
+        </p>
+        <DiagnosticsSection host={host} contracts={contracts} onContractsChange={setContracts} />
+      </section>
     </div>
-    {features === null && !error ? <p className="ekds-note">正在读取附加功能状态…</p> : null}
-  </>;
+  );
 }
 
 type AttachStatus = {
@@ -174,25 +148,6 @@ type AttachStatus = {
   last?: { status?: string; error?: string; consentRequired?: boolean; hostPid?: number; appVersion?: string; electron?: string; verified?: boolean; versionNote?: string; daily?: boolean };
   available: boolean;
   unavailableReason?: string;
-};
-
-type ContractProbe = {
-  id: string;
-  group: "dom" | "api" | string;
-  label: string;
-  status: "available" | "disabled" | "untested" | string;
-  reason?: string;
-  detail?: string;
-  checkedAt?: string;
-};
-
-type ContractReport = {
-  appVersion?: string;
-  electron?: string;
-  verified: boolean;
-  versionNote?: string;
-  updatedAt?: string;
-  probes: ContractProbe[];
 };
 
 const CONTRACT_STATUS_TEXT: Record<string, string> = {
@@ -237,11 +192,18 @@ function byteText(bytes: number | undefined): string {
  * that explain a failed attach. The file excerpts come from the core with
  * secrets already stripped; the surface never claims a log it did not read.
  */
-function DiagnosticsSection({ host }: { host: NativeHost }) {
+function DiagnosticsSection({
+  host,
+  contracts,
+  onContractsChange,
+}: {
+  host: NativeHost;
+  contracts: ContractReport | null;
+  onContractsChange: (next: ContractReport | null) => void;
+}) {
   const { health } = useAuth();
   const [status, setStatus] = useState<AttachStatus | null>(null);
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
-  const [contracts, setContracts] = useState<ContractReport | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [consent, setConsent] = useState(false);
@@ -257,12 +219,12 @@ function DiagnosticsSection({ host }: { host: NativeHost }) {
       ]);
       setStatus(next);
       setDiagnostics(files);
-      setContracts(contractReport);
+      if (contractReport) onContractsChange(contractReport);
       setError("");
     } catch (cause) {
       setError(errorText(cause));
     }
-  }, [host]);
+  }, [host, onContractsChange]);
 
   useEffect(() => {
     void reload();
@@ -293,7 +255,7 @@ function DiagnosticsSection({ host }: { host: NativeHost }) {
   const versionNote = contracts?.versionNote || status.last?.versionNote || "";
   const domProbes = (contracts?.probes ?? []).filter(probe => probe.group === "dom");
   const apiProbes = (contracts?.probes ?? []).filter(probe => probe.group === "api");
-  return <>
+  return <div className="ekds-body">
     <div className="ekds-group">
       <div className="ekds-row">
         <span className="ekds-row-label">
@@ -365,7 +327,7 @@ function DiagnosticsSection({ host }: { host: NativeHost }) {
         <h3>契约检测</h3>
         <button type="button" className="ekds-btn" onClick={() => void reload()}>重新检测</button>
       </div>
-      <p className="ekds-note">按界面注入点与官方本地接口逐项检测，单项失效只停用对应功能，其余功能照常运行。</p>
+      <p className="ekds-note">按界面注入点与官方本地接口逐项检测，单项失效只停用对应功能，官方页探针不通过时对应内容会自动回落到本页。</p>
       {domProbes.length > 0 ? <div className="ekds-group">
         {domProbes.map(probe => <div className="ekds-row" key={probe.id} data-ekd-probe={probe.id}>
           <span className="ekds-row-label">
@@ -442,5 +404,5 @@ function DiagnosticsSection({ host }: { host: NativeHost }) {
       </div>
       <p className="ekds-note">日志由后台接入器写入，内容在核心侧脱敏后才会到达这里。系统日志里仍可能有未脱敏的原始行。</p>
     </section>
-  </>;
+  </div>;
 }

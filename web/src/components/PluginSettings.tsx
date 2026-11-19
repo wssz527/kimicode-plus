@@ -17,16 +17,16 @@ const CAPABILITY_LABELS: Record<string, { title: string; detail: string }> = {
   "config:read": { title: "读取 Kimi Code 配置", detail: "读取本机 Kimi Code 的配置项。" },
   "config:write": { title: "修改 Kimi Code 配置", detail: "可以直接改动本机 Kimi Code 配置，每次修改都会记录。" },
   "ui:sidebar": { title: "在侧栏显示内容", detail: "在官方侧栏底部挂载插件自己的界面。" },
-  "ui:settings": { title: "在插件页提供设置", detail: "在插件详情里增加一个设置子页。" },
+  "ui:settings": { title: "在增强插件页提供设置", detail: "在增强插件详情里增加一个设置子页。" },
   "ui:thinking": { title: "装饰思考内容块", detail: "可以读取并改写思考块的显示。" },
   "ui:message": { title: "装饰消息块", detail: "可以读取并改写消息块的显示。" },
   "ui:entry": { title: "在会话信息中显示入口", detail: "在会话信息的「可打开」和右侧面板列表添加快捷入口。" },
   "ui:sidebar-nav": { title: "在左侧栏显示入口", detail: "在左侧栏「新建会话」下方添加导航入口。" },
-  "ui:main-area": { title: "在主聊天区旁打开面板", detail: "在主聊天区旁打开插件专属分栏界面。" },
-  "ui:right-panel": { title: "在右侧面板打开标签页", detail: "在右侧面板打开插件标签页。" },
+  "ui:main-area": { title: "在主聊天区旁打开面板", detail: "在主聊天区旁打开增强插件专属分栏界面。" },
+  "ui:right-panel": { title: "在右侧面板打开标签页", detail: "在右侧面板打开增强插件标签页。" },
   "models:read": { title: "读取可用模型列表", detail: "读取官方已配置的模型与推理强度选项。" },
   "schedule:manage": { title: "管理定时任务", detail: "创建、启停、立即运行和删除定时任务，查看运行记录与未读状态。" },
-  storage: { title: "使用插件私有存储", detail: "只有该插件可读写的本地键值存储。" },
+  storage: { title: "使用增强插件私有存储", detail: "只有该增强插件可读写的本地键值存储。" },
 };
 
 function capabilityLabel(name: string): { title: string; detail: string } {
@@ -39,9 +39,9 @@ function capabilityLabel(name: string): { title: string; detail: string } {
   }
   if (name.startsWith("credentials:")) {
     const ref = name.slice("credentials:".length);
-    return { title: `使用凭据 ${ref}`, detail: "在出站请求中由核心注入凭据明文，插件本身拿不到明文。" };
+    return { title: `使用凭据 ${ref}`, detail: "在出站请求中由核心注入凭据明文，增强插件本身拿不到明文。" };
   }
-  return CAPABILITY_LABELS[name] ?? { title: name, detail: "未识别的能力，请核对插件清单。" };
+  return CAPABILITY_LABELS[name] ?? { title: name, detail: "未识别的能力，请核对增强插件清单。" };
 }
 
 /** The bundled KCT adapter, whose enable is gated by the standalone handover. */
@@ -76,25 +76,25 @@ const PLAIN_STATE: Record<string, string> = {
 };
 
 const FAULT_REASONS: Record<string, string> = {
-  PLUGIN_ACTIVATION_FAILED: "插件启动失败",
-  PLUGIN_MOUNT_FAILED: "插件界面挂载失败",
-  PLUGIN_DECORATE_FAILED: "插件装饰宿主内容失败",
-  PLUGIN_EVENT_FAILED: "插件处理事件失败",
-  PLUGIN_EVENT_POLL_FAILED: "插件事件订阅中断",
-  PLUGIN_SETTINGS_FAILED: "插件设置页加载失败",
-  RENDERER_ERROR: "插件运行时报错",
+  PLUGIN_ACTIVATION_FAILED: "增强插件启动失败",
+  PLUGIN_MOUNT_FAILED: "增强插件界面挂载失败",
+  PLUGIN_DECORATE_FAILED: "增强插件装饰宿主内容失败",
+  PLUGIN_EVENT_FAILED: "增强插件处理事件失败",
+  PLUGIN_EVENT_POLL_FAILED: "增强插件事件订阅中断",
+  PLUGIN_SETTINGS_FAILED: "增强插件设置页加载失败",
+  RENDERER_ERROR: "增强插件运行时报错",
 };
 
 function describeFault(reason: string): { title: string; detail: string; code: string | null } {
   const trimmed = reason.trim();
   const match = /^([A-Z][A-Z0-9_]{2,}):\s*([\s\S]*)$/.exec(trimmed);
   if (!match) {
-    return { title: trimmed || "插件已停止", detail: trimmed, code: null };
+    return { title: trimmed || "增强插件已停止", detail: trimmed, code: null };
   }
   const code = match[1] ?? "";
   const detail = (match[2] ?? "").trim() || trimmed;
   return {
-    title: FAULT_REASONS[code] ?? "插件已停止",
+    title: FAULT_REASONS[code] ?? "增强插件已停止",
     detail,
     code: code || null,
   };
@@ -108,7 +108,7 @@ function PluginFaultNotice({ reason }: { reason: string }) {
       <div className="notice-copy">
         <strong>{fault.title}</strong>
         <p>{fault.detail}</p>
-        <p className="notice-recovery">插件已停用。修正文件或更换插件后可以重新启用。</p>
+        <p className="notice-recovery">增强插件已停用。修正文件或更换增强插件后可以重新启用。</p>
         {fault.code ? (
           <details className="notice-diagnostics">
             <summary>诊断信息</summary>
@@ -166,13 +166,13 @@ function PluginSettingsPanel({ plugin }: { plugin: PluginRecord }) {
   }, [plugin.id]);
 
   return (
-    <Panel title="插件设置">
+    <Panel title="增强插件设置">
       {state === "unavailable" ? (
-        <p className="panel-note">插件设置只在 Kimi Code 宿主内可用。当前页面没有运行插件运行时。</p>
+        <p className="panel-note">增强插件设置只在 Kimi Code 宿主内可用。当前页面没有运行增强插件运行时。</p>
       ) : state === "loading" ? (
         <SkeletonRows rows={2} cols={1} />
       ) : state === "failed" ? (
-        <ErrorNotice message={message || "插件设置页加载失败。"} recovery="停用再启用插件后重试；仍然失败时检查插件文件是否为最新版本。" />
+        <ErrorNotice message={message || "增强插件设置页加载失败。"} recovery="停用再启用增强插件后重试；仍然失败时检查增强插件文件是否为最新版本。" />
       ) : null}
       <div className="ekdp-settings-mount" ref={hostRef} hidden={state !== "ready"} />
     </Panel>
@@ -215,7 +215,7 @@ function KctMigrationPanel({ show }: { show: boolean }) {
       <Panel title="独立版迁移">
         <ErrorNotice
           message={errorMessage(report.error)}
-          recovery="插件在完成迁移前不能启用。稍后重试；仍然失败时确认核心服务正在运行。"
+          recovery="增强插件在完成迁移前不能启用。稍后重试；仍然失败时确认核心服务正在运行。"
         />
       </Panel>
     );
@@ -229,18 +229,18 @@ function KctMigrationPanel({ show }: { show: boolean }) {
       {migrated ? (
         <>
           <p className="panel-note">
-            独立版的后台加载器已停用{state?.migratedAt ? `（${fmtDateTime(state.migratedAt)}）` : ""}。继续使用这里的插件即可，思考内容只会被注入一次。
+            独立版的后台加载器已停用{state?.migratedAt ? `（${fmtDateTime(state.migratedAt)}）` : ""}。继续使用这里的增强插件即可，思考内容只会被注入一次。
           </p>
           {state?.dataDirPresent ? (
             <p className="panel-note">
-              独立版的历史数据仍保留在 <code>{state.dataDir}</code>，插件不会读取它。确认不再需要后可以自行删除。
+              独立版的历史数据仍保留在 <code>{state.dataDir}</code>，增强插件不会读取它。确认不再需要后可以自行删除。
             </p>
           ) : null}
         </>
       ) : (
         <>
           <p>
-            检测到独立版 KCT 仍在后台运行。它和这个插件都会改写思考内容，两套同时工作会让同一段内容被注入两次。确认迁移后，核心会停用它的后台加载器，并把目标语言和翻译服务带过来。
+            检测到独立版 KCT 仍在后台运行。它和这个增强插件都会改写思考内容，两套同时工作会让同一段内容被注入两次。确认迁移后，核心会停用它的后台加载器，并把目标语言和翻译服务带过来。
           </p>
           <dl className="rail-facts">
             <div>
@@ -263,7 +263,7 @@ function KctMigrationPanel({ show }: { show: boolean }) {
             </div>
           </dl>
           <InfoNote tone="warn">
-            <p>迁移只停用 com.user.kimi-cot-translate.runtime 这一个启动项，不会删除独立版的文件和数据。密钥不会迁移：独立版的密钥在它自己的界面里，本插件需要重新保存。</p>
+            <p>迁移只停用 com.user.kimi-cot-translate.runtime 这一个启动项，不会删除独立版的文件和数据。密钥不会迁移：独立版的密钥在它自己的界面里，本增强插件需要重新保存。</p>
           </InfoNote>
           <div className="inline-actions">
             <ActionButton variant="primary" icon="check" onClick={() => void confirm()} busy={action.busy}>
@@ -273,7 +273,7 @@ function KctMigrationPanel({ show }: { show: boolean }) {
               重新检测
             </ActionButton>
           </div>
-          <p className="panel-note">不确认也可以：插件保持停用，独立版继续工作，两边不会同时注入。</p>
+          <p className="panel-note">不确认也可以：增强插件保持停用，独立版继续工作，两边不会同时注入。</p>
         </>
       )}
       {action.error ? (
@@ -292,11 +292,16 @@ function KctMigrationPanel({ show }: { show: boolean }) {
 export interface PluginSettingsProps {
   /** Rendered inside the settings dialog, where the page header is the dialog's. */
   embedded?: boolean;
+  /** Notifies the host settings surface when entering or leaving a single-plugin detail subpage. */
+  onDetailChange?: (active: boolean) => void;
 }
 
-export function PluginSettings({ embedded = false }: PluginSettingsProps) {
+export function PluginSettings({ embedded = false, onDetailChange }: PluginSettingsProps) {
   const plugins = useResource("plugins/list", () => api.plugins.list());
   const [selected, setSelected] = useState<string | null>(null);
+  const returnToRef = useRef<string | null>(null);
+  const backRef = useRef<HTMLButtonElement>(null);
+  const rowRefs = useRef(new Map<string, HTMLButtonElement>());
   const [flash, setFlash] = useState<string | null>(null);
   const [installOpen, setInstallOpen] = useState(false);
   const [installPath, setInstallPath] = useState("");
@@ -318,6 +323,51 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
 
   const items = plugins.data?.items ?? [];
   const current = useMemo(() => items.find(item => item.id === selected) ?? null, [items, selected]);
+  const detailActive = Boolean(current);
+
+  useEffect(() => {
+    onDetailChange?.(detailActive);
+  }, [detailActive, onDetailChange]);
+
+  useEffect(() => {
+    if (detailActive) {
+      let currentNode: Node | null = backRef.current;
+      while (currentNode) {
+        if (currentNode instanceof HTMLElement) {
+          if (currentNode.scrollTop > 0) {
+            currentNode.scrollTop = 0;
+          }
+          if (currentNode.classList.contains("settings-dialog")) break;
+        }
+        if (currentNode.parentElement) {
+          currentNode = currentNode.parentElement;
+        } else {
+          const root = currentNode.getRootNode?.();
+          currentNode = root && "host" in root ? (root as ShadowRoot).host : null;
+        }
+      }
+      backRef.current?.focus({ preventScroll: true });
+    } else if (returnToRef.current) {
+      const target = rowRefs.current.get(returnToRef.current);
+      target?.scrollIntoView?.({ block: "nearest" });
+      target?.focus();
+      returnToRef.current = null;
+    }
+  }, [detailActive]);
+
+  function openDetail(id: string) {
+    returnToRef.current = id;
+    setConfirmForce(false);
+    setConfirmUninstall(false);
+    setSelected(id);
+  }
+
+  function closeDetail() {
+    if (selected) returnToRef.current = selected;
+    setConfirmForce(false);
+    setConfirmUninstall(false);
+    setSelected(null);
+  }
   const activity = useResource<PluginActivity[]>(
     `plugins/activity/${selected ?? ""}`,
     async () => (selected ? (await api.plugins.activity(selected)).items : []),
@@ -343,8 +393,8 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
         setSelected(null);
         setFlash(
           options?.deleteData
-            ? "插件及其定时任务数据已卸载并删除。卸载后的预装插件不会自动恢复。"
-            : "插件已卸载，相关任务数据已保留。卸载后的预装插件不会自动恢复。",
+            ? "增强插件及其定时任务数据已卸载并删除。卸载后的预装增强插件不会自动恢复。"
+            : "增强插件已卸载，相关任务数据已保留。卸载后的预装增强插件不会自动恢复。",
         );
         plugins.reload();
       }
@@ -374,7 +424,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
     setInstallError(null);
     setPreview(null);
     if (!installPath.trim()) {
-      setInstallError("请填写插件文件夹或 zip 的完整路径。");
+      setInstallError("请填写增强插件文件夹或 zip 的完整路径。");
       return;
     }
     setPreviewBusy(true);
@@ -383,7 +433,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
       setPreview(result);
       setGranted(result.capabilities);
     } catch (error) {
-      setInstallError(errorMessage(error) || "无法读取这个插件包。");
+      setInstallError(errorMessage(error) || "无法读取这个增强插件包。");
     } finally {
       setPreviewBusy(false);
     }
@@ -395,7 +445,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
     const installed = (await action.run(() => api.plugins.install(installPath.trim(), granted))) as PluginRecord | null;
     if (installed) {
       closeInstall();
-      setSelected(installed.id);
+      openDetail(installed.id);
       setFlash(`已安装「${installed.name}」。它保持停用，确认能力后再启用。`);
       plugins.reload();
     } else {
@@ -418,7 +468,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
     const result = await action.run(() => api.plugins.restore(id));
     if (result && "state" in result) {
       await syncHost();
-      setFlash(`预装插件「${result.name || result.id}」已恢复，保持停用。`);
+      setFlash(`预装增强插件「${result.name || result.id}」已恢复，保持停用。`);
       plugins.reload();
       activity.reload();
     }
@@ -430,7 +480,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
       <ErrorNotice
         title="侧栏尚未同步"
         message={syncError}
-        recovery="核心已保存这次变更。重试只刷新插件界面，不会重复写入。"
+        recovery="核心已保存这次变更。重试只刷新增强插件界面，不会重复写入。"
       />
       <ActionButton icon="refresh" onClick={() => void syncHost()} busy={syncing}>
         重新同步侧栏
@@ -440,11 +490,11 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
 
   if (current && current.state === "UNINSTALLED") {
     return (
-      <div className={embedded ? "ekds-plugins" : "page"}>
+      <div className={embedded ? "ekds-plugins ekds-subpage" : "page"} data-ekd-plugin-detail={current.id}>
+        <button type="button" className="ekds-back" ref={backRef} onClick={closeDetail}>
+          <Icon name="arrowRight" size={14} />返回增强插件
+        </button>
         <div className="plugins-detail-head">
-          <ActionButton variant="quiet" icon="arrowRight" onClick={() => setSelected(null)}>
-            返回插件列表
-          </ActionButton>
           <div className="plugins-detail-title">
             <h2>{current.name || current.id}</h2>
             <span className="num">{current.id} · v{current.version}</span>
@@ -463,10 +513,10 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
         ) : null}
         <Panel title="预装副本">
           <p className="panel-note">
-            这个插件随应用一起提供，已被卸载。恢复会重新释放内置副本；它不会自动回到列表，也不会自动启用。
+            这个增强插件随应用一起提供，已被卸载。恢复会重新释放内置副本；它不会自动回到列表，也不会自动启用。
           </p>
           <ActionButton icon="refresh" onClick={() => void restore(current.id)} busy={action.busy || syncing}>
-            恢复预装插件
+            恢复预装增强插件
           </ActionButton>
         </Panel>
       </div>
@@ -477,11 +527,11 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
     const capabilities = current.capabilities ?? [];
     const ungranted = (current.declaredCapabilities ?? []).filter(name => !capabilities.includes(name));
     return (
-      <div className={embedded ? "ekds-plugins" : "page"}>
+      <div className={embedded ? "ekds-plugins ekds-subpage" : "page"} data-ekd-plugin-detail={current.id}>
+        <button type="button" className="ekds-back" ref={backRef} onClick={closeDetail}>
+          <Icon name="arrowRight" size={14} />返回增强插件
+        </button>
         <div className="plugins-detail-head">
-          <ActionButton variant="quiet" icon="arrowRight" onClick={() => setSelected(null)}>
-            返回插件列表
-          </ActionButton>
           <div className="plugins-detail-title">
             <h2>{current.name || current.id}</h2>
             <span className="num">{current.id} · v{current.version}</span>
@@ -505,7 +555,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
         <div className="plugins-detail-grid">
           <Panel title="能力">
             {capabilities.length === 0 ? (
-              <p className="panel-note">这个插件没有获得任何能力，只能显示自己的界面。</p>
+              <p className="panel-note">这个增强插件没有获得任何能力，只能显示自己的界面。</p>
             ) : (
               <ul className="capability-list">
                 {capabilities.map(name => {
@@ -525,7 +575,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
             {ungranted.length > 0 ? (
               <InfoNote tone="warn">
                 <p>
-                  清单还申请了 {ungranted.map(name => capabilityLabel(name).title).join("、")}，但你没有授予。插件无法使用这些能力。
+                  清单还申请了 {ungranted.map(name => capabilityLabel(name).title).join("、")}，但你没有授予。增强插件无法使用这些能力。
                 </p>
               </InfoNote>
             ) : null}
@@ -563,7 +613,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
             <div className="plugins-detail-actions">
               {current.enabled ? (
                 <ActionButton icon="power" onClick={() => void run(current.id, "disable")} busy={action.busy || syncing}>
-                  停用插件
+                  停用增强插件
                 </ActionButton>
               ) : (
                 <ActionButton
@@ -573,7 +623,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
                   busy={action.busy || syncing}
                   disabled={safeMode}
                 >
-                  启用插件
+                  启用增强插件
                 </ActionButton>
               )}
               {!current.enabled && !current.compatible ? (
@@ -599,9 +649,9 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
               </ActionButton>
             </div>
             {confirmUninstall ? (
-              <div className="plugin-confirm" role="dialog" aria-modal="true" aria-label="确认卸载插件">
+              <div className="plugin-confirm" role="dialog" aria-modal="true" aria-label="确认卸载增强插件">
                 <p>
-                  卸载「{current.name || current.id}」时，是否同时删除该插件创建的定时任务和运行记录？
+                  卸载「{current.name || current.id}」时，是否同时删除该增强插件创建的定时任务和运行记录？
                 </p>
                 <div className="inline-actions">
                   <ActionButton variant="danger" icon="trash" onClick={() => void run(current.id, "uninstall", { deleteData: true })} busy={action.busy || syncing}>
@@ -618,13 +668,13 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
             ) : null}
             {!current.enabled && !current.compatible ? (
               <InfoNote tone="warn">
-                <p>这个插件没有声明当前宿主版本，默认不会启用。强制启用后它会以未验证状态运行。</p>
+                <p>这个增强插件没有声明当前宿主版本，默认不会启用。强制启用后它会以未验证状态运行。</p>
               </InfoNote>
             ) : null}
             {confirmForce ? (
               <div className="plugin-confirm" role="dialog" aria-modal="true" aria-label="确认强制启用">
                 <p>
-                  强制启用「{current.name || current.id}」意味着让一个没有在当前宿主版本验证过的插件运行。它可能读到你的会话内容。确认继续？
+                  强制启用「{current.name || current.id}」意味着让一个没有在当前宿主版本验证过的增强插件运行。它可能读到你的会话内容。确认继续？
                 </p>
                 <div className="inline-actions">
                   <ActionButton variant="danger" icon="check" onClick={() => void forceEnable(current.id)} busy={action.busy || syncing}>
@@ -636,7 +686,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
                 </div>
               </div>
             ) : null}
-            <p className="panel-note">卸载会删除插件文件和它的私有存储。预装插件卸载后不会自动恢复，会以"已卸载"留在列表里，可以从那里恢复。</p>
+            <p className="panel-note">卸载会删除增强插件文件和它的私有存储。预装增强插件卸载后不会自动恢复，会以"已卸载"留在列表里，可以从那里恢复。</p>
           </Panel>
           <PluginCredentials plugin={current} />
           {current.hasSettings && current.enabled ? <PluginSettingsPanel plugin={current} /> : null}
@@ -644,8 +694,8 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
             <KctMigrationPanel show={!current.enabled || current.state === "BLOCKED"} />
           ) : null}
           {current.hasSettings && !current.enabled ? (
-            <Panel title="插件设置">
-              <p className="panel-note">启用插件后可以在这里打开它的设置页。</p>
+            <Panel title="增强插件设置">
+              <p className="panel-note">启用增强插件后可以在这里打开它的设置页。</p>
             </Panel>
           ) : null}
         </div>
@@ -656,7 +706,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
           ) : activity.error ? (
             <PageError error={activity.error} />
           ) : (activity.data ?? []).length === 0 ? (
-            <p className="panel-note">还没有记录。启用、停用和插件发起的动作都会记录在这里。</p>
+            <p className="panel-note">还没有记录。启用、停用和增强插件发起的动作都会记录在这里。</p>
           ) : (
             <ul className="activity-list">
               {(activity.data ?? []).map((item: PluginActivity) => (
@@ -677,16 +727,16 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
     <div className={embedded ? "ekds-plugins" : "page"}>
       <div className="plugins-list-head">
         <div>
-          {/* The settings dialog already prints this title above the subpage. */}
-          {embedded ? null : <h2>插件</h2>}
-          <p>插件运行在当前界面里，可以读取你看到的会话内容。只安装你信任的插件。</p>
+          {/* The settings dialog already prints this title above the section. */}
+          {embedded ? null : <h2>增强插件</h2>}
+          <p>增强插件运行在当前界面里，可以读取你看到的会话内容，与官方插件市场相互独立。只安装你信任的增强插件。</p>
         </div>
         <div className="plugins-list-actions">
           <ActionButton icon="refresh" onClick={plugins.reload} busy={plugins.loading}>
             刷新
           </ActionButton>
           <ActionButton variant="primary" icon="plus" onClick={() => setInstallOpen(open => !open)} disabled={safeMode}>
-            安装本地插件
+            安装本地增强插件
           </ActionButton>
         </div>
       </div>
@@ -701,7 +751,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
       {syncNotice}
       {safeMode ? (
         <InfoNote tone="warn">
-          <p>安全模式已开启。所有插件都已停用，安装与启用都会被拒绝。关闭安全模式后可以重新启用。</p>
+          <p>安全模式已开启。所有增强插件都已停用，安装与启用都会被拒绝。关闭安全模式后可以重新启用。</p>
         </InfoNote>
       ) : null}
 
@@ -711,7 +761,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
             <>
               <dl className="rail-facts">
                 <div>
-                  <dt>插件</dt>
+                  <dt>增强插件</dt>
                   <dd>{preview.name || preview.id}</dd>
                 </div>
                 <div>
@@ -733,19 +783,19 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
               </dl>
               {preview.installed ? (
                 <InfoNote tone="warn">
-                  <p>这个插件已经安装过。继续安装会替换它的文件，并按你下面勾选的能力重新授权；插件会保持停用，需要再手动启用。</p>
+                  <p>这个增强插件已经安装过。继续安装会替换它的文件，并按你下面勾选的能力重新授权；增强插件会保持停用，需要再手动启用。</p>
                 </InfoNote>
               ) : null}
               {!preview.compatible ? (
                 <InfoNote tone="warn">
-                  <p>插件没有声明当前宿主版本。安装后需要"强制启用"才能运行，请先确认它可信。</p>
+                  <p>增强插件没有声明当前宿主版本。安装后需要"强制启用"才能运行，请先确认它可信。</p>
                 </InfoNote>
               ) : null}
               {preview.capabilities.length === 0 ? (
-                <p className="panel-note">这个插件没有申请任何能力，只能显示自己的界面。</p>
+                <p className="panel-note">这个增强插件没有申请任何能力，只能显示自己的界面。</p>
               ) : (
                 <>
-                  <p className="panel-note">勾选你愿意授予的能力。未勾选的能力插件无法使用。</p>
+                  <p className="panel-note">勾选你愿意授予的能力。未勾选的能力增强插件无法使用。</p>
                   <ul className="capability-list">
                     {preview.capabilities.map(name => {
                       const label = capabilityLabel(name);
@@ -779,7 +829,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
               )}
             </>
           ) : (
-            <Field label="插件文件夹或 zip 路径" htmlFor="plugin-install-path" hint="只从你选择的本地位置安装。安装后插件保持停用，确认能力后再启用。">
+            <Field label="增强插件文件夹或 zip 路径" htmlFor="plugin-install-path" hint="只从你选择的本地位置安装。安装后增强插件保持停用，确认能力后再启用。">
               <input
                 id="plugin-install-path"
                 className="input"
@@ -788,7 +838,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
                 onKeyDown={event => {
                   if (event.key === "Enter") void inspect();
                 }}
-                placeholder="/Users/你/插件目录 或 插件.zip"
+                placeholder="/Users/你/增强插件目录 或 增强插件.zip"
               />
             </Field>
           )}
@@ -805,7 +855,7 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
               </>
             ) : (
               <ActionButton variant="primary" icon="check" onClick={() => void inspect()} busy={previewBusy}>
-                检查插件包
+                检查增强插件包
               </ActionButton>
             )}
             <ActionButton variant="quiet" onClick={closeInstall}>
@@ -820,14 +870,22 @@ export function PluginSettings({ embedded = false }: PluginSettingsProps) {
       ) : plugins.error ? (
         <PageError error={plugins.error} />
       ) : items.length === 0 ? (
-        <EmptyState icon="plugins" title="还没有插件">
-          安装一个本地插件，或检查内置示例插件是否被卸载。核心功能不依赖任何插件。
+        <EmptyState icon="plugins" title="还没有增强插件">
+          安装一个本地增强插件，或检查预装增强插件是否被卸载。核心功能不依赖任何增强插件。
         </EmptyState>
       ) : (
         <ul className="plugin-list">
           {items.map(plugin => (
             <li key={plugin.id} className={plugin.enabled ? "plugin" : "plugin muted"}>
-              <button type="button" className="plugin-open" onClick={() => setSelected(plugin.id)}>
+              <button
+                type="button"
+                className="plugin-open"
+                ref={node => {
+                  if (node) rowRefs.current.set(plugin.id, node);
+                  else rowRefs.current.delete(plugin.id);
+                }}
+                onClick={() => openDetail(plugin.id)}
+              >
                 <span className="plugin-glyph" aria-hidden="true">
                   <Icon name={plugin.state === "CORRUPT" || plugin.state === "FAULTED" ? "alert" : "plugins"} size={17} />
                 </span>

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { matchesModelPool, matchesPermissionRules } from "../src/native.js";
+import { matchesModelPool, matchesPermissionRules, readSubagentPoolState } from "../src/native.js";
 
 const pool = {
   models: { "demo-local": "演示实现与规划", "demo-fast": "快速执行" },
@@ -78,4 +78,38 @@ test("a rule list of another length or another shape does not match", () => {
   assert.equal(matchesPermissionRules({ permission: {} }, rules), false);
   assert.equal(matchesPermissionRules({}, rules), false);
   assert.equal(matchesPermissionRules({ permission: { rules: "read" } }, rules), false);
+});
+
+test("subagent pool reads empty when official single-select cleared secondary_model to null", () => {
+  const cleared = readSubagentPoolState({ secondary_model: null });
+  assert.deepEqual(cleared.entries, []);
+  assert.equal(cleared.existingDefaultModel, "");
+  assert.deepEqual(cleared.rest, {});
+
+  const omitted = readSubagentPoolState({});
+  assert.deepEqual(omitted.entries, []);
+  assert.equal(omitted.existingDefaultModel, "");
+});
+
+test("subagent pool shares secondary_model with official single-select without losing effort or order", () => {
+  const singleOnly = readSubagentPoolState({
+    secondaryModel: { defaultModel: "kimi/k2.5", defaultEffort: "high" },
+  });
+  assert.deepEqual(singleOnly.entries, [{ key: "kimi/k2.5", desc: "" }]);
+  assert.equal(singleOnly.existingDefaultModel, "kimi/k2.5");
+  assert.deepEqual(singleOnly.rest, { defaultEffort: "high" });
+
+  const sharedPool = readSubagentPoolState({
+    secondaryModel: {
+      defaultModel: "kimi/fast",
+      defaultEffort: "medium",
+      models: { "kimi/k2.5": "深度实现", "kimi/fast": "快速审查" },
+    },
+  });
+  assert.deepEqual(sharedPool.entries, [
+    { key: "kimi/k2.5", desc: "深度实现" },
+    { key: "kimi/fast", desc: "快速审查" },
+  ]);
+  assert.equal(sharedPool.existingDefaultModel, "kimi/fast");
+  assert.deepEqual(sharedPool.rest, { defaultEffort: "medium" });
 });

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { asConfigObject, commitNumberField, configMaxSteps, configSection, configField, configTimeoutMinutes, dangerousGuardPatch, matchesModelPool, matchesPermissionRules, readDangerousGuard, useHost } from "../native";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { asConfigObject, commitNumberField, configMaxSteps, configSection, configField, configTimeoutMinutes, dangerousGuardPatch, matchesModelPool, matchesPermissionRules, readDangerousGuard, readSubagentPoolState, useHost } from "../native";
 import { Icon } from "./Icon";
 import { Badge, ErrorNotice, Spinner } from "./ui";
 import "../styles/workbench.css";
@@ -65,28 +65,16 @@ function omit(source: Dic, keys: string[]): Dic {
   return rest;
 }
 
-function readPool(raw: Dic | null): PoolEditor {
-  const models = asConfigObject(configField(raw, ["models"]));
-  const entries: PoolEntry[] = Object.entries(models ?? {}).map(([key, desc]) => ({
-    id: nextId("pool"),
-    key,
-    desc: typeof desc === "string" ? desc : "",
-  }));
-  const explicitDefault = configField(raw, ["defaultModel", "default_model"]);
-  const legacyModel = configField(raw, ["model"]);
-  const existingDefaultModel =
-    typeof explicitDefault === "string"
-      ? explicitDefault.trim()
-      : typeof legacyModel === "string"
-        ? legacyModel.trim()
-        : "";
-  if (entries.length === 0 && existingDefaultModel) {
-    entries.push({ id: nextId("pool"), key: existingDefaultModel, desc: "" });
-  }
+function readPool(cfg: Dic | null): PoolEditor {
+  const parsed = readSubagentPoolState(cfg);
   return {
-    entries,
-    existingDefaultModel,
-    rest: omit(raw ?? {}, ["models", "defaultModel", "default_model", "model"]),
+    entries: parsed.entries.map((entry) => ({
+      id: nextId("pool"),
+      key: entry.key,
+      desc: entry.desc,
+    })),
+    existingDefaultModel: parsed.existingDefaultModel,
+    rest: parsed.rest,
   };
 }
 
@@ -249,7 +237,15 @@ function NumberField({
   );
 }
 
-export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}) {
+export type NativeSettingsMode = "all" | "subagent" | "permissions";
+
+export function NativeSettings({
+  embedded = false,
+  mode = "all",
+}: {
+  embedded?: boolean;
+  mode?: NativeSettingsMode;
+} = {}) {
   const host = useHost();
   const [config, setConfig] = useState<Dic | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -268,35 +264,47 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
   const [saving, setSaving] = useState<string | null>(null);
   const [saved, setSaved] = useState<{ key: string; timing: Timing; note?: string } | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const savingRef = useRef<string | null>(null);
+  savingRef.current = saving;
 
-  function applyConfig(cfg: Dic) {
+  const applyConfig = useCallback((cfg: Dic) => {
     setConfig(cfg);
-    setPool(readPool(configSection(cfg, ["secondary_model", "secondaryModel"])));
+    setPool(readPool(cfg));
     setTimeoutMin(configTimeoutMinutes(cfg));
     setMaxSteps(configMaxSteps(cfg));
     const permission = configSection(cfg, ["permission"]);
     setRules(readRules(configField(permission, ["rules"])));
     setGuard(readDangerousGuard(cfg));
-  }
+  }, []);
 
   useEffect(() => {
     if (!host) return;
     let alive = true;
-    host
-      .request<Dic>("config.get")
-      .then((next) => {
-        if (alive) applyConfig(asConfigObject(next) ?? {});
-      })
-      .catch((cause) => {
-        if (alive) setLoadError(errorText(cause));
-      })
-      .finally(() => {
-        if (alive) setLoading(false);
-      });
+    const refresh = () => {
+      if (savingRef.current !== null) return;
+      host
+        .request<Dic>("config.get")
+        .then((next) => {
+          if (alive) {
+            applyConfig(asConfigObject(next) ?? {});
+            setLoadError(null);
+          }
+        })
+        .catch((cause) => {
+          if (alive) setLoadError(errorText(cause));
+        })
+        .finally(() => {
+          if (alive) setLoading(false);
+        });
+    };
+    refresh();
+    const onOfficialChange = () => refresh();
+    window.addEventListener("ekd:official-config-changed", onOfficialChange);
     return () => {
       alive = false;
+      window.removeEventListener("ekd:official-config-changed", onOfficialChange);
     };
-  }, [host]);
+  }, [host, applyConfig]);
 
   // The pool is chosen from the official catalog, the same list handoff and the
   // chat page read. Keys are provider-qualified, so a bare alias can never be
@@ -376,6 +384,9 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
         return;
       }
       setSaved({ key, timing, note: options.note });
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("ekd:config-saved", { detail: { key } }));
+      }
     } catch (cause) {
       setSaveError(errorText(cause));
     } finally {
@@ -392,7 +403,7 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
     }
     const apply = (cfg: Dic) => {
       setConfig(cfg);
-      setPool(readPool(configSection(cfg, ["secondary_model", "secondaryModel"])));
+      setPool(readPool(cfg));
     };
     if (poolKeys.length === 0) {
       void save("pool", "derive", { secondary_model: null }, {
@@ -495,6 +506,9 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
         return;
       }
       setSaved({ key: "guard", timing: "now", note: "护栏已即时更新，下一次权限判定就使用新值。" });
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("ekd:config-saved", { detail: { key: "guard" } }));
+      }
     } catch (cause) {
       setGuard(previous);
       setSaveError(errorText(cause));
@@ -527,9 +541,20 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
   }
 
   const scopeChoices = SCOPES.map((scope) => scope.value);
+  const showSubagent = mode === "all" || mode === "subagent";
+  const showPermissions = mode === "all" || mode === "permissions";
+  const officialSectionTitle =
+    embedded && mode === "permissions"
+      ? "权限规则"
+      : embedded && mode === "subagent"
+        ? "子智能体模型池与运行上限"
+        : null;
 
   return (
-    <div className={embedded ? "wb ns ns-embedded" : "wb ns"}>
+    <div
+      className={embedded ? "wb ns ns-embedded" : "wb ns"}
+      data-ekd-native-mode={mode}
+    >
       {embedded ? null : <header className="wb-head">
         <span className="wb-mark" aria-hidden="true" />
         <h1>原生设置</h1>
@@ -541,16 +566,24 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
       </header>}
 
       <div className="wb-body ns-body">
-        <p className="ns-lede">
-          管理子代理模型池与优先级、子代理时限、单轮步数上限及权限规则。保存后均会通过官方接口重新读回核对。
-        </p>
+        {officialSectionTitle ? (
+          <div className="ekds-sec-head">
+            <h3 className="ekds-sec-title">{officialSectionTitle}</h3>
+          </div>
+        ) : (
+          <p className="ns-lede">
+            管理子代理模型池与优先级、子代理时限、单轮步数上限及权限规则。保存后均会通过官方接口重新读回核对。
+          </p>
+        )}
 
         {loadError ? (
           <ErrorNotice title="配置没有读到" message={loadError} recovery="确认官方核心在运行后重新打开此页。" />
         ) : null}
         {saveError ? <ErrorNotice title="保存没有完成" message={saveError} recovery="读回的值以官方核心为准，可以再改一次。" /> : null}
 
-        <SettingRow
+        {showSubagent ? (
+          <>
+            <SettingRow
           title="子代理模型池"
           purpose="子代理可按优先级顺序从这些模型里选择，用途说明写清它适合什么工作。拖动或调整顺位后点击保存；清空后子代理跟随调用方的模型。"
           timing="derive"
@@ -816,7 +849,10 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
           />
           {saved?.key === "steps" ? <p className="ns-saved">{saved.note}</p> : null}
         </SettingRow>
+          </>
+        ) : null}
 
+        {showPermissions ? (
         <SettingRow
           title="权限与危险命令"
           purpose="规则按工具名或参数决定直接允许、先询问还是拒绝；从上往下逐条判定。危险命令护栏对命中名单的命令先拦一次。"
@@ -976,6 +1012,7 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
           </label>
           {saved?.key === "guard" ? <p className="ns-saved">{saved.note}</p> : null}
         </SettingRow>
+        ) : null}
 
         {saved ? (
           <p className="ns-receipt" role="status">

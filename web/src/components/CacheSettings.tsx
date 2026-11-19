@@ -188,7 +188,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
   }, [host]);
 
   if (loading && !summary && !error) {
-    return <div className="eks-loading"><Spinner size={15} />正在读取缓存与额度数据</div>;
+    return <div className="eks-loading"><Spinner size={15} />正在读取缓存数据</div>;
   }
 
   const keepAliveOff = !policy.keepAlive.enabled;
@@ -198,7 +198,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
   const retentionBuckets = modelRetention?.idleBuckets ?? retention?.idleBuckets;
 
   return <div className="eks">
-    {error ? <ErrorNotice title="缓存与额度暂时不可用" message={error} recovery="可以继续使用官方客户端；修正后重新打开本页。" /> : null}
+    {error ? <ErrorNotice title="缓存数据暂时不可用" message={error} recovery="可以继续使用官方客户端；修正后重新打开本页。" /> : null}
 
     <Group title="概览" hint="数字来自本机会话记录，只读，不改动官方文件。">
       <div className="eks-metrics">

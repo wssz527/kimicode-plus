@@ -8,6 +8,8 @@ import { normalizeColorScheme, rewriteAssetURLs } from "./lib/embed";
 import { createCoreTransport, createEventChannel, createNativeHost, HostScopeContext, type DemoHost, type NativeHost, type HostScopeValue } from "./native";
 import { AuthProvider } from "./auth";
 import { SettingsWindow } from "./components/SettingsSurface";
+import { AccountSettingsSection, LabSettingsSection } from "./components/OfficialSettingsSections";
+import { NativeSettings } from "./components/NativeSettings";
 import { SessionGrid } from "./components/SessionGrid";
 import "./styles/surfaces.css";
 import "./styles/plugin-surfaces.css";
@@ -24,6 +26,7 @@ export {
   evaluateDOMContracts,
   findAccountMenuAnchor,
   findOfficialSettingsPanel,
+  findOfficialSettingsSection,
   findOfficialSettingsTab,
   findSettingsDialogParts,
   findSidebarFooter,
@@ -168,7 +171,13 @@ export function mountEnhancement(element: HTMLElement, options: MountOptions): E
   return handle;
 }
 
-export type SurfaceName = "sessions" | "settings";
+export type SurfaceName =
+  | "sessions"
+  | "settings"
+  | "settings-account"
+  | "settings-agent-permissions"
+  | "settings-agent-subagent"
+  | "settings-lab";
 export interface SurfaceMountOptions {
   host: NativeHost;
   stylesheetURL: string;
@@ -193,13 +202,25 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
   const observer = new MutationObserver(syncTheme);
   observer.observe(element.ownerDocument.documentElement, { attributes: true, attributeFilter: ["data-color-scheme"] });
   shadow.append(styles, container);
-  const releaseTransport = surface === "settings"
+  const needsSettingsTransport = surface === "settings" || surface.startsWith("settings-");
+  const releaseTransport = needsSettingsTransport
     ? acquireTransport(createCoreTransport(options.host), SETTINGS_PERMISSIONS)
     : null;
   const root = createRoot(container);
   const wrap = (children: React.ReactNode) => <HostScopeProvider host={options.host}>{children}</HostScopeProvider>;
-  if (surface === "sessions") root.render(wrap(<SessionGrid host={options.host} initialExtraIds={options.initialExtraIds ?? []} onNativeRestore={options.onNativeRestore ?? (() => options.host.close())} />));
-  else root.render(wrap(<AuthProvider><SettingsWindow host={options.host} /></AuthProvider>));
+  if (surface === "sessions") {
+    root.render(wrap(<SessionGrid host={options.host} initialExtraIds={options.initialExtraIds ?? []} onNativeRestore={options.onNativeRestore ?? (() => options.host.close())} />));
+  } else if (surface === "settings-account") {
+    root.render(wrap(<AccountSettingsSection host={options.host} />));
+  } else if (surface === "settings-agent-permissions") {
+    root.render(wrap(<div className="ekds ekds-official-sec"><NativeSettings embedded mode="permissions" /></div>));
+  } else if (surface === "settings-agent-subagent") {
+    root.render(wrap(<div className="ekds ekds-official-sec"><NativeSettings embedded mode="subagent" /></div>));
+  } else if (surface === "settings-lab") {
+    root.render(wrap(<LabSettingsSection host={options.host} />));
+  } else {
+    root.render(wrap(<AuthProvider><SettingsWindow host={options.host} /></AuthProvider>));
+  }
   let mounted = true;
   const handle: EnhancementHandle = {
     updateContext: () => {},

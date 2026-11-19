@@ -258,6 +258,50 @@ export function dangerousGuardPatch(enabled: boolean): Record<string, unknown> {
   return { permission: { dangerous_command_guard: enabled } };
 }
 
+export interface SubagentPoolEntry {
+  key: string;
+  desc: string;
+}
+
+export interface SubagentPoolState {
+  entries: SubagentPoolEntry[];
+  existingDefaultModel: string;
+  rest: Record<string, unknown>;
+}
+
+/**
+ * Reads the shared `secondary_model` / `secondaryModel` section without
+ * inventing defaults when the official single-select cleared it to null.
+ */
+export function readSubagentPoolState(config: unknown): SubagentPoolState {
+  const section = configSection(asConfigObject(config), ["secondary_model", "secondaryModel"]);
+  if (!section) {
+    return { entries: [], existingDefaultModel: "", rest: {} };
+  }
+  const models = asConfigObject(configField(section, ["models"]));
+  const entries: SubagentPoolEntry[] = Object.entries(models ?? {}).map(([key, desc]) => ({
+    key,
+    desc: typeof desc === "string" ? desc : "",
+  }));
+  const explicitDefault = configField(section, ["defaultModel", "default_model"]);
+  const legacyModel = configField(section, ["model"]);
+  const existingDefaultModel =
+    typeof explicitDefault === "string"
+      ? explicitDefault.trim()
+      : typeof legacyModel === "string"
+        ? legacyModel.trim()
+        : "";
+  if (entries.length === 0 && existingDefaultModel) {
+    entries.push({ key: existingDefaultModel, desc: "" });
+  }
+  const rest: Record<string, unknown> = { ...section };
+  delete rest.models;
+  delete rest.defaultModel;
+  delete rest.default_model;
+  delete rest.model;
+  return { entries, existingDefaultModel, rest };
+}
+
 /**
  * Compares the secondary model pool read back from the core against what was
  * submitted. `GET /config` answers with camelCase field names while the write
