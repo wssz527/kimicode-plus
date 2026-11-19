@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -139,6 +140,7 @@ def run(binary):
     print(json.dumps({'passed': len(results), 'failed': 0, 'binary': binary.name}, ensure_ascii=False))
 
 if __name__ == '__main__':
+    sys.stdout.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', required=True)
     args = parser.parse_args()
