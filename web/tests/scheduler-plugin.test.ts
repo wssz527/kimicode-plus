@@ -13,6 +13,10 @@ interface SchedulerModule {
   formatModelOptionLabel(model: unknown): string;
   effortOptionsForModel(model: unknown): { value: string; label: string }[];
   keepAliveStatusText(task: unknown): string;
+  normalizeClock(value: string, fallback?: string): string;
+  parseTimesList(timesOrText: unknown): string[];
+  resolveDefaultCwd(prefillCwd: unknown, sessions: unknown[], targetSessionId?: string, activeSessionId?: string): string;
+  formatSchedulePreview(draft: Record<string, unknown>): string;
   defaultDraft(prefill?: Record<string, unknown>): Record<string, unknown>;
   switchScheduleKind(draft: Record<string, unknown>, nextKind: string): Record<string, unknown>;
   buildScheduleRule(draft: Record<string, unknown>): Record<string, unknown>;
@@ -25,8 +29,14 @@ const scheduler = (await import(`data:text/javascript;base64,${Buffer.from(rende
 test("scheduler permission modes match KAP enum and exclude unsupported worktree option", () => {
   assert.deepEqual(
     scheduler.PERMISSION_MODES.map(m => m.value),
-    ["manual", "yolo", "auto"],
+    ["manual", "auto", "yolo"],
   );
+  assert.deepEqual(scheduler.PERMISSION_MODES, [
+    { value: "manual", label: "始终询问", note: "工具执行与文件修改前需人工批准" },
+    { value: "auto", label: "自动判断", note: "常规操作自动放行，高风险操作仍需人工批准" },
+    { value: "yolo", label: "始终允许（免审批）", note: "读写文件与终端命令自动执行，仅交互式提问时暂停" },
+  ]);
+  assert.equal(rendererSource.includes("无人值守出现任何审批请求时绝不自动批准"), false);
   const draft = scheduler.defaultDraft();
   assert.equal("worktree" in draft, false);
   assert.equal(draft.permissionMode, "manual");
@@ -302,4 +312,258 @@ test("scheduler opens mainArea in page mode and exposes back-to-chat exit", asyn
   assert.deepEqual(mountDefs, [{ mode: "page" }]);
   assert.equal(rendererSource.includes("返回聊天"), true);
   assert.equal(mainDisposed, 0);
+});
+
+test("formatSchedulePreview formats natural language plans and omits validity for once", () => {
+  assert.equal(
+    scheduler.formatSchedulePreview({ scheduleKind: "daily", time: "09:00" }),
+    "执行计划：每天 09:00 自动运行 · 立即生效，长期持续有效",
+  );
+  assert.equal(
+    scheduler.formatSchedulePreview({
+      scheduleKind: "weekly",
+      time: "09:30",
+      weekdays: [5, 1, 3],
+    }),
+    "执行计划：每周一、周三、周五 09:30 自动运行 · 立即生效，长期持续有效",
+  );
+  assert.equal(
+    scheduler.formatSchedulePreview({
+      scheduleKind: "times",
+      timesText: "18:00, 09:00, 14:00, 09:00",
+      weekdays: [],
+      startDate: "2026-11-20",
+    }),
+    "执行计划：每天 09:00、14:00、18:00 自动运行 · 2026-11-20 起生效，长期有效",
+  );
+  assert.equal(
+    scheduler.formatSchedulePreview({
+      scheduleKind: "interval",
+      intervalValue: 120,
+      intervalUnit: "minutes",
+    }),
+    "执行计划：每隔 120 分钟自动运行（每 2 小时） · 立即生效，长期持续有效",
+  );
+  assert.equal(
+    scheduler.formatSchedulePreview({
+      scheduleKind: "once",
+      date: "2026-11-20",
+      time: "14:30",
+      startDate: "2026-11-01",
+      endDate: "2026-12-31",
+    }),
+    "执行计划：2026-11-20 14:30 单次运行，执行后自动停用",
+  );
+  assert.deepEqual(
+    scheduler.buildScheduleRule({
+      scheduleKind: "once",
+      date: "2026-11-20",
+      time: "14:30",
+      startDate: "2026-11-01",
+      endDate: "2026-12-31",
+    }),
+    { kind: "once", date: "2026-11-20", time: "14:30" },
+  );
+  assert.deepEqual(scheduler.parseTimesList("18:00, 9:5, 18:00, invalid, 08:30"), ["08:30", "09:05", "18:00"]);
+});
+
+test("resolveDefaultCwd prefers explicit cwd, then active session, then first session", () => {
+  const sessions = [
+    { id: "s1", cwd: "/tmp/first" },
+    { id: "s2", cwd: "/tmp/active" },
+  ];
+  assert.equal(scheduler.resolveDefaultCwd("/tmp/explicit", sessions, "", "s2"), "/tmp/explicit");
+  assert.equal(scheduler.resolveDefaultCwd("", sessions, "s1", "s2"), "/tmp/first");
+  assert.equal(scheduler.resolveDefaultCwd("", sessions, "", "s2"), "/tmp/active");
+  assert.equal(scheduler.resolveDefaultCwd("", sessions, "", "missing"), "/tmp/first");
+  assert.equal(scheduler.resolveDefaultCwd("", [], "", ""), "");
+});
+
+test("scheduler dialog integrates pickDirectory, hides validity for once, and shows no-drag header", async () => {
+  class FakeNode {
+    tagName: string;
+    className = "";
+    textContent = "";
+    value = "";
+    checked = false;
+    disabled = false;
+    open = false;
+    style: Record<string, string> = {};
+    dataset: Record<string, string> = {};
+    attributes: Record<string, string> = {};
+    children: FakeNode[] = [];
+    listeners: Record<string, Array<(e: unknown) => void>> = {};
+    shadowRoot: FakeNode | null = null;
+    isConnected = true;
+
+    constructor(tagName: string) {
+      this.tagName = tagName;
+    }
+    setAttribute(name: string, val: string) {
+      this.attributes[name] = val;
+    }
+    getAttribute(name: string) {
+      return this.attributes[name];
+    }
+    append(...nodes: Array<FakeNode | string>) {
+      for (const n of nodes) {
+        if (typeof n === "string") {
+          const txt = new FakeNode("#text");
+          txt.textContent = n;
+          this.children.push(txt);
+        } else if (n) {
+          this.children.push(n);
+        }
+      }
+    }
+    replaceChildren(...nodes: Array<FakeNode | string>) {
+      this.children = [];
+      this.append(...nodes);
+    }
+    remove() {
+      this.isConnected = false;
+    }
+    attachShadow() {
+      this.shadowRoot = new FakeNode("#shadow");
+      return this.shadowRoot;
+    }
+    addEventListener(type: string, fn: (e: unknown) => void) {
+      if (!this.listeners[type]) this.listeners[type] = [];
+      this.listeners[type].push(fn);
+    }
+    dispatchEvent(type: string, event: Record<string, unknown> = {}) {
+      for (const fn of this.listeners[type] || []) {
+        fn({ target: this, ...event });
+      }
+    }
+    showModal() {
+      this.open = true;
+    }
+    close() {
+      this.open = false;
+    }
+  }
+
+  function findAll(root: FakeNode, pred: (n: FakeNode) => boolean): FakeNode[] {
+    const out: FakeNode[] = [];
+    const visit = (node: FakeNode) => {
+      if (pred(node)) out.push(node);
+      if (node.shadowRoot) visit(node.shadowRoot);
+      for (const child of node.children) visit(child);
+    };
+    visit(root);
+    return out;
+  }
+
+  function allText(node: FakeNode): string {
+    const parts: string[] = [];
+    const visit = (n: FakeNode) => {
+      if (n.textContent) parts.push(n.textContent);
+      if (n.shadowRoot) visit(n.shadowRoot);
+      for (const c of n.children) visit(c);
+    };
+    visit(node);
+    return parts.join(" ");
+  }
+
+  const fakeHead = new FakeNode("head");
+  const fakeBody = new FakeNode("body");
+  const fakeDoc = {
+    head: fakeHead,
+    body: fakeBody,
+    createElement: (tag: string) => new FakeNode(tag),
+    createElementNS: (_ns: string, tag: string) => new FakeNode(tag),
+    createTextNode: (text: string) => {
+      const t = new FakeNode("#text");
+      t.textContent = text;
+      return t;
+    },
+  };
+
+  const prevDocument = (globalThis as Record<string, unknown>).document;
+  (globalThis as Record<string, unknown>).document = fakeDoc;
+
+  try {
+    let mountedRender: ((el: FakeNode) => () => void) | null = null;
+    let sidebarOpen: (() => void) | null = null;
+    const pickCalls: Array<Record<string, unknown> | undefined> = [];
+
+    const ctx = {
+      core: {
+        request: async (action: string) => {
+          if (action === "schedule.list") return { items: [], kapConnected: true };
+          if (action === "schedule.runs") return { items: [] };
+          if (action === "sessions.list") {
+            return {
+              items: [
+                { id: "sess-1", title: "Session 1", cwd: "/Users/demo/first" },
+                { id: "sess-2", title: "Session 2", cwd: "/Users/demo/active" },
+              ],
+            };
+          }
+          return {};
+        },
+      },
+      events: { on: () => ({ dispose: () => {} }) },
+      sidebarNav: {
+        add: (def: { open: () => void }) => {
+          sidebarOpen = def.open;
+          return { dispose: () => {} };
+        },
+      },
+      mainArea: {
+        mount: (def: { render: (el: FakeNode) => () => void }) => {
+          mountedRender = def.render;
+          return { setWidth: () => {}, width: () => 800, dispose: () => {} };
+        },
+      },
+      ui: {
+        pickDirectory: async (opts?: Record<string, unknown>) => {
+          pickCalls.push(opts);
+          return "/Users/demo/picked-project";
+        },
+      },
+      sessions: { activeId: () => "sess-2", open: async () => {} },
+      models: { list: async () => [] },
+      onDispose: () => {},
+    };
+
+    await scheduler.activate(ctx);
+    sidebarOpen!();
+    const mainHost = new FakeNode("div") as FakeNode & { ownerDocument: typeof fakeDoc };
+    mainHost.ownerDocument = fakeDoc;
+    const cleanupMain = mountedRender!(mainHost);
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    const newTaskBtn = findAll(mainHost, n => n.tagName === "button" && allText(n).includes("+ 新建任务"))[0];
+    assert.ok(newTaskBtn);
+    newTaskBtn.dispatchEvent("click");
+
+    const dialog = fakeBody.children.find(n => n.tagName === "dialog");
+    assert.ok(dialog);
+
+    const cwdInputs = findAll(dialog, n => n.tagName === "input" && n.attributes.placeholder === "/path/to/project");
+    assert.equal(cwdInputs[0]?.value, "/Users/demo/active");
+
+    const pickBtn = findAll(dialog, n => n.tagName === "button" && allText(n).includes("选择文件夹…"))[0];
+    assert.ok(pickBtn);
+    pickBtn.dispatchEvent("click");
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.deepEqual(pickCalls, [{ title: "选择定时任务工作目录", defaultPath: "/Users/demo/active" }]);
+    const updatedCwdInputs = findAll(dialog, n => n.tagName === "input" && n.attributes.placeholder === "/path/to/project");
+    assert.equal(updatedCwdInputs[0]?.value, "/Users/demo/picked-project");
+
+    // Periodic schedule shows validity range; switching to once hides it.
+    assert.equal(allText(dialog).includes("有效期范围（可选）"), true);
+    const onceBtn = findAll(dialog, n => n.tagName === "button" && n.className === "ekd-sd-freq-btn" && allText(n).trim() === "单次执行")[0];
+    assert.ok(onceBtn);
+    onceBtn.dispatchEvent("click");
+    assert.equal(allText(dialog).includes("有效期范围（可选）"), false);
+    assert.equal(allText(dialog).includes("单次运行，执行后自动停用"), true);
+
+    assert.equal(rendererSource.includes("-webkit-app-region:no-drag"), true);
+    cleanupMain();
+  } finally {
+    (globalThis as Record<string, unknown>).document = prevDocument;
+  }
 });

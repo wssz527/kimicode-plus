@@ -98,7 +98,7 @@ v2 能力由构建时机制授权：`plugins/registry.go` 对每个嵌入插件�
 | `planner:run` | 本地规划引擎：线程、模型、流式、审批 | `planner.*` |
 | `handoff` | 交接预览与提交（新/已有会话，普通/Plan/Tower） | `handoff.preview`、`handoff.commit` |
 | `models:read` | 可用模型列表（含供应商、能力、自适应思考、上下文/输出上限与推理强度） | `models.list` |
-| `schedule:manage` | 核心持久化定时任务引擎：任务增删改停、立即运行、运行记录与未读状态 | `schedule.status/list/save/delete/toggle/runNow/runs/markRead/markAllRead/prefs` |
+| `schedule:manage` | 核心持久化定时任务引擎：任务增删改停、立即运行、运行记录与未读状态，以及 `ctx.ui.pickDirectory()` 原生工作目录选择 | `schedule.status/list/save/delete/toggle/runNow/runs/markRead/markAllRead/prefs` |
 | `commands` | 插件命令注册与跨插件调用 | `commands.register/unregister/list/invoke` |
 
 约束：

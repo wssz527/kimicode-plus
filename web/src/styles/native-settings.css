@@ -1,8 +1,5 @@
 /* ---------- 原生设置：结构化编辑器 ---------- */
 
-/* The tag list belonged to the removed Code tool controls; nothing renders it
-   now, so the rules went with the control. */
-
 .ns-number {
   display: inline-flex;
   align-items: center;
@@ -23,14 +20,180 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
-.ns-pool-list,
+/* ---------- 子代理模型池：可拖拽优先级卡片 ---------- */
+
+.ns-pool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ns-pool-card {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  transition:
+    border-color 120ms ease-out,
+    background 120ms ease-out,
+    opacity 120ms ease-out;
+}
+
+.ns-pool-card:hover {
+  border-color: var(--line-strong);
+}
+
+.ns-pool-card.is-dragging {
+  opacity: 0.45;
+  border-style: dashed;
+  border-color: var(--accent);
+}
+
+.ns-pool-card.is-drop-before {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 45%, var(--surface-sunken));
+  box-shadow: 0 -2px 0 0 var(--accent);
+}
+
+.ns-pool-card.is-drop-after {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 45%, var(--surface-sunken));
+  box-shadow: 0 2px 0 0 var(--accent);
+}
+
+.ns-pool-handle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.ns-grip {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 24px;
+  color: var(--ink-faint);
+  cursor: grab;
+  user-select: none;
+}
+
+.ns-pool-card:hover .ns-grip {
+  color: var(--ink-muted);
+}
+
+.ns-grip:active {
+  cursor: grabbing;
+  color: var(--ink);
+}
+
+.ns-rank {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--ink-strong);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.ns-pool-card:first-child .ns-rank {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+.ns-pool-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  align-items: center;
+}
+
+.ns-pool-model {
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ns-pool-model .select,
+.ns-pool-model .wb-select {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ns .wb-select.select {
+  background-color: var(--surface-raised);
+  border-color: var(--line-strong);
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    calc(100% - 12px) calc(50% - 1px),
+    calc(100% - 8px) calc(50% - 1px);
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+}
+
+.ns-pool-desc {
+  min-width: 0;
+  width: 100%;
+}
+
+.ns-pool-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+
+.ns-move-btn {
+  width: 24px;
+  height: 24px;
+}
+
+.ns-inline-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-ink);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.ns-inline-link:hover {
+  color: var(--accent);
+}
+
+/* ---------- 权限规则 ---------- */
+
 .ns-rule-list {
   display: grid;
 }
 
-.ns-pool-row,
 .ns-rule-row {
   display: grid;
   gap: 6px;
@@ -39,14 +202,8 @@
   border-bottom: 1px solid var(--line);
 }
 
-.ns-pool-row:last-child,
 .ns-rule-row:last-child {
   border-bottom: 0;
-}
-
-.ns-pool-row {
-  grid-template-columns: 56px minmax(0, 1fr) minmax(0, 1fr) 24px;
-  grid-template-areas: "default model desc remove";
 }
 
 .ns-rule-row {
@@ -60,44 +217,12 @@
   letter-spacing: 0.02em;
 }
 
-.ns-pool-headrow,
 .ns-rule-headrow {
   display: grid;
   gap: 6px;
   padding: 0 0 5px;
   border-bottom: 1px solid var(--line);
-}
-
-.ns-pool-headrow {
-  grid-template-columns: 56px minmax(0, 1fr) minmax(0, 1fr) 24px;
-}
-
-.ns-rule-headrow {
   grid-template-columns: 92px minmax(0, 1.2fr) 100px minmax(0, 1fr) 24px;
-}
-
-.ns-default {
-  grid-area: default;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11.5px;
-  color: var(--ink-muted);
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.ns-default input {
-  accent-color: var(--accent);
-  margin: 0;
-}
-
-.ns-pool-model {
-  grid-area: model;
-}
-
-.ns-pool-desc {
-  grid-area: desc;
 }
 
 .ns-rule-decision {
@@ -127,6 +252,11 @@
   color: var(--ink-muted);
 }
 
+.ns-empty-line p + p,
+.ns-empty-line .wb-btn {
+  margin-top: 6px;
+}
+
 .ns-rule-row > .ns-issue {
   grid-column: 1 / -1;
 }
@@ -141,16 +271,21 @@
 }
 
 @container (max-width: 560px) {
-  .ns-pool-headrow,
   .ns-rule-headrow {
     display: none;
   }
 
-  .ns-pool-row {
-    grid-template-columns: 56px minmax(0, 1fr) 24px;
-    grid-template-areas:
-      "default model remove"
-      "desc desc desc";
+  .ns-pool-card {
+    align-items: start;
+  }
+
+  .ns-pool-handle {
+    padding-top: 2px;
+  }
+
+  .ns-pool-fields {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
   }
 
   .ns-rule-row {
@@ -159,5 +294,11 @@
       "decision scope remove"
       "pattern pattern pattern"
       "reason reason reason";
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ns-pool-card {
+    transition: none;
   }
 }

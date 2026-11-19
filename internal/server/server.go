@@ -254,14 +254,16 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 					nativeService.Events().Publish("plugins", map[string]any{"at": time.Now().UTC().Format(time.RFC3339Nano)})
 				})
 			}
-			if chatReady && app.gateway != nil {
-				planner, plannerErr := chat.NewPlanner(db, app.gateway, native.CWD, nativeService.Events())
-				if plannerErr != nil {
-					app.modules = append(app.modules, Module{"planner", "FAULTED", "规划持久化初始化失败，其余模块仍可使用"})
-				} else {
-					nativeService.UsePlanner(planner)
-					app.planner = planner
-					app.modules = append(app.modules, Module{"planner", "READY", "持久化流式规划、工作区工具与逐次审批"})
+			if chatReady {
+				if generator := newPlannerGenerator(app.gateway, nativeService, cfg.Dispatch); generator != nil {
+					planner, plannerErr := chat.NewPlanner(db, generator, native.CWD, nativeService.Events())
+					if plannerErr != nil {
+						app.modules = append(app.modules, Module{"planner", "FAULTED", "规划持久化初始化失败，其余模块仍可使用"})
+					} else {
+						nativeService.UsePlanner(planner)
+						app.planner = planner
+						app.modules = append(app.modules, Module{"planner", "READY", "持久化流式规划、工作区工具与逐次审批"})
+					}
 				}
 			}
 			schedulerStore, schedStoreErr := scheduler.NewStore(db)

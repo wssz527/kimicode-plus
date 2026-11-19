@@ -3,7 +3,9 @@ package desktop
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -49,6 +51,8 @@ func (s *officialModelStore) handler() http.Handler {
 			encoded, _ := json.Marshal(raw)
 			s.mu.Lock()
 			s.bodies = append(s.bodies, string(encoded))
+			baseURL, _ := raw["base_url"].(string)
+			s.provider.BaseURL = baseURL
 			replaced := map[string]modelConfig{}
 			for key, model := range s.models {
 				if model.Provider != "r2-inspect" {
@@ -94,7 +98,7 @@ func modelFromBody(item map[string]any) modelConfig {
 		}
 	}
 	if flag, ok := item["adaptive_thinking"].(bool); ok {
-		model.AdaptiveThinking = flag
+		model.AdaptiveThinking = boolPtr(flag)
 	}
 	return model
 }
@@ -160,7 +164,7 @@ func TestUpdateProviderModelMergesOntoTheStoredModel(t *testing.T) {
 	if !sameStrings(actual.Capabilities, []string{"image_in", "tool_use", "always_thinking"}) {
 		t.Fatalf("capabilities not normalised: %v", actual.Capabilities)
 	}
-	if actual.AdaptiveThinking {
+	if actual.AdaptiveThinking != nil && *actual.AdaptiveThinking {
 		t.Fatalf("adaptive thinking survived a non-toggle mode: %#v", actual)
 	}
 	if !sameStrings(actual.SupportEfforts, []string{"high", "low"}) {
@@ -207,7 +211,7 @@ func TestUpdateProviderModelKeepsTheStoredThinkingWhenTheDialogSaysToggle(t *tes
 	if !sameStrings(actual.Capabilities, []string{"thinking"}) {
 		t.Fatalf("toggle mode did not store a switchable thinking capability: %v", actual.Capabilities)
 	}
-	if !actual.AdaptiveThinking {
+	if actual.AdaptiveThinking == nil || !*actual.AdaptiveThinking {
 		t.Fatalf("adaptive thinking was dropped in toggle mode: %#v", actual)
 	}
 	if actual.MaxOutputSize == nil || *actual.MaxOutputSize != 4096 {
@@ -259,7 +263,7 @@ func TestUpdateProviderModelRefusesManagedAndForeignModels(t *testing.T) {
 func TestUpdateProviderModelReportsAFieldTheServerSilentlyDropped(t *testing.T) {
 	models := inspectModels()
 	alpha := models["r2-inspect/alpha"]
-	alpha.AdaptiveThinking = false
+	alpha.AdaptiveThinking = boolPtr(false)
 	models["r2-inspect/alpha"] = alpha
 	store := newOfficialModelStore(models)
 	service, _ := newAutomationTestService(t, store.handler())
@@ -293,10 +297,10 @@ func TestMergeModelThinkingModes(t *testing.T) {
 		}
 	}
 	// Adaptive thinking is a property of a switchable model only.
-	if mergeModel(base, ModelEdit{Thinking: "always", AdaptiveThinking: true}).AdaptiveThinking {
+	if got := mergeModel(base, ModelEdit{Thinking: "always", AdaptiveThinking: boolPtr(true)}).AdaptiveThinking; got != nil && *got {
 		t.Fatal("adaptive thinking survived always-on mode")
 	}
-	if !mergeModel(base, ModelEdit{Thinking: "toggle", AdaptiveThinking: true}).AdaptiveThinking {
+	if got := mergeModel(base, ModelEdit{Thinking: "toggle", AdaptiveThinking: boolPtr(true)}).AdaptiveThinking; got == nil || !*got {
 		t.Fatal("adaptive thinking was dropped in toggle mode")
 	}
 }
@@ -325,7 +329,7 @@ func TestModelBodyOmitsWhatClearsAField(t *testing.T) {
 	output := int64(1024)
 	full := modelBody(modelConfig{
 		Model: "alpha", DisplayName: "Alpha", MaxContextSize: 8192, MaxOutputSize: &output,
-		Capabilities: []string{"image_in"}, SupportEfforts: []string{"low"}, AdaptiveThinking: true,
+		Capabilities: []string{"image_in"}, SupportEfforts: []string{"low"}, AdaptiveThinking: boolPtr(true),
 	})
 	if full["display_name"] != "Alpha" || full["max_output_size"] != int64(1024) || full["adaptive_thinking"] != true {
 		t.Fatalf("complete model was not rendered: %#v", full)
@@ -361,18 +365,18 @@ func TestCompareModelNamesEachMismatch(t *testing.T) {
 	output := int64(10)
 	base := modelConfig{
 		Capabilities: []string{"image_in"}, MaxContextSize: 100, MaxOutputSize: &output,
-		SupportEfforts: []string{"low"}, AdaptiveThinking: true,
+		SupportEfforts: []string{"low"}, AdaptiveThinking: boolPtr(true),
 	}
 	if err := compareModel(base, base); err != nil {
 		t.Fatalf("identical models did not match: %v", err)
 	}
 	other := int64(20)
 	mismatches := map[string]modelConfig{
-		"capabilities":      {MaxContextSize: 100, MaxOutputSize: &output, SupportEfforts: []string{"low"}, AdaptiveThinking: true},
+		"capabilities":      {MaxContextSize: 100, MaxOutputSize: &output, SupportEfforts: []string{"low"}, AdaptiveThinking: boolPtr(true)},
 		"adaptive_thinking": {Capabilities: []string{"image_in"}, MaxContextSize: 100, MaxOutputSize: &output, SupportEfforts: []string{"low"}},
-		"max_context_size":  {Capabilities: []string{"image_in"}, MaxContextSize: 1, MaxOutputSize: &output, SupportEfforts: []string{"low"}, AdaptiveThinking: true},
-		"max_output_size":   {Capabilities: []string{"image_in"}, MaxContextSize: 100, MaxOutputSize: &other, SupportEfforts: []string{"low"}, AdaptiveThinking: true},
-		"support_efforts":   {Capabilities: []string{"image_in"}, MaxContextSize: 100, MaxOutputSize: &output, AdaptiveThinking: true},
+		"max_context_size":  {Capabilities: []string{"image_in"}, MaxContextSize: 1, MaxOutputSize: &output, SupportEfforts: []string{"low"}, AdaptiveThinking: boolPtr(true)},
+		"max_output_size":   {Capabilities: []string{"image_in"}, MaxContextSize: 100, MaxOutputSize: &other, SupportEfforts: []string{"low"}, AdaptiveThinking: boolPtr(true)},
+		"support_efforts":   {Capabilities: []string{"image_in"}, MaxContextSize: 100, MaxOutputSize: &output, AdaptiveThinking: boolPtr(true)},
 	}
 	for field, actual := range mismatches {
 		err := compareModel(base, actual)
@@ -394,5 +398,433 @@ func TestModelKeysRoundTrip(t *testing.T) {
 	provider, model := splitModelKey("r2-inspect/alpha")
 	if provider != "r2-inspect" || model != "alpha" {
 		t.Fatalf("unexpected split: %q / %q", provider, model)
+	}
+}
+
+func TestUpdateProviderModelAcceptsBareStoredModelEntry(t *testing.T) {
+	store := newOfficialModelStore(map[string]modelConfig{
+		"alpha": {
+			Provider: "r2-inspect", Model: "alpha", DisplayName: "Bare Alpha",
+			MaxContextSize: 128000, Capabilities: []string{"tool_use"},
+		},
+	})
+	service, _ := newAutomationTestService(t, store.handler())
+	value, err := updateModelAction(t, service, `{"providerId":"r2-inspect","model":"r2-inspect/alpha","edit":{
+		"capabilities":["image_in","tool_use"],"thinking":"toggle","adaptive_thinking":true,
+		"max_context_size":200000,"support_efforts":["medium","high"]}}`)
+	if err != nil {
+		t.Fatalf("updateModel on bare stored key: %v", err)
+	}
+	actual := savedModel(t, value)
+	if actual.AdaptiveThinking == nil || !*actual.AdaptiveThinking || actual.MaxContextSize != 200000 {
+		t.Fatalf("unexpected saved model: %#v", actual)
+	}
+}
+
+func TestConfigGetAndSavePreserveSecondaryModelKeyOrder(t *testing.T) {
+	const orderedPatch = `{"secondary_model":{"defaultModel":"p/z-first","models":{"p/z-first":"1st","p/a-second":"2nd","p/m-third":"3rd"}}}`
+	var receivedBody string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/config"):
+			raw, _ := io.ReadAll(r.Body)
+			receivedBody = string(raw)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":` + orderedPatch + `}`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":` + orderedPatch + `}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	service, _ := newAutomationTestService(t, handler)
+	saved, err := service.Action(context.Background(), "config.save", json.RawMessage(`{"patch":`+orderedPatch+`}`))
+	if err != nil {
+		t.Fatalf("config.save: %v", err)
+	}
+	if !strings.Contains(receivedBody, `"p/z-first":"1st","p/a-second":"2nd","p/m-third":"3rd"`) {
+		t.Fatalf("config.save reordered keys before forwarding: %s", receivedBody)
+	}
+	savedBytes, err := json.Marshal(saved)
+	if err != nil {
+		t.Fatalf("marshal saved: %v", err)
+	}
+	if !strings.Contains(string(savedBytes), `"p/z-first":"1st","p/a-second":"2nd","p/m-third":"3rd"`) {
+		t.Fatalf("config.save response reordered keys: %s", string(savedBytes))
+	}
+	got, err := service.Action(context.Background(), "config.get", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("config.get: %v", err)
+	}
+	gotBytes, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal got: %v", err)
+	}
+	if !strings.Contains(string(gotBytes), `"p/z-first":"1st","p/a-second":"2nd","p/m-third":"3rd"`) {
+		t.Fatalf("config.get response reordered keys: %s", string(gotBytes))
+	}
+}
+
+func TestUpdateProviderModelPreservesSnakeCaseBaseURL(t *testing.T) {
+	store := newOfficialModelStore(map[string]modelConfig{
+		"r2-inspect/m-alpha": {
+			Provider:       "r2-inspect",
+			Model:          "m-alpha",
+			MaxContextSize: 256000,
+			Capabilities:   []string{"tool_use"},
+		},
+	})
+	service, _ := newAutomationTestService(t, store.handler())
+	_, err := updateModelAction(t, service, `{
+		"providerId":"r2-inspect",
+		"model":"r2-inspect/m-alpha",
+		"edit":{
+			"capabilities":["tool_use"],
+			"thinking":"toggle",
+			"adaptive_thinking":false,
+			"max_context_size":512000,
+			"support_efforts":["medium","high"]
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("providers.updateModel: %v", err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.provider.BaseURL != "https://example.invalid/v1" {
+		t.Fatalf("provider base_url was wiped: got %q", store.provider.BaseURL)
+	}
+}
+
+func TestConfigRoundTripPreservesAllProviderAndModelFields(t *testing.T) {
+	type storedProvider struct {
+		raw       map[string]any
+		apiKey    string
+		apiKeyEnv string
+	}
+
+	var mu sync.Mutex
+	providers := map[string]*storedProvider{
+		"snake-prov": {
+			apiKey: "sk-snake-secret",
+			raw: map[string]any{
+				"type":           "anthropic",
+				"base_url":       "https://anthropic.example.invalid/v1",
+				"default_model":  "snake-prov/claude-opus-4-6",
+				"custom_headers": map[string]any{"X-Tenant": "team-a", "X-Trace": "1"},
+				"env":            map[string]any{"HTTP_PROXY": "http://127.0.0.1:7890"},
+				"model_source":   "static",
+				"x_provider_tag": "preserve-me",
+				"has_api_key":    true,
+			},
+		},
+		"camel-prov": {
+			apiKeyEnv: "CAMEL_PROVIDER_KEY",
+			raw: map[string]any{
+				"type":          "openai_responses",
+				"baseUrl":       "https://openai.example.invalid/v1",
+				"defaultModel":  "camel-prov/gpt-budget",
+				"api_key_env":   "CAMEL_PROVIDER_KEY",
+				"customHeaders": map[string]any{"X-Org": "org-camel"},
+				"env":           map[string]any{"NO_PROXY": "localhost"},
+				"x_camel_extra": map[string]any{"tier": "pro"},
+				"has_api_key":   true,
+			},
+		},
+	}
+	models := map[string]map[string]any{
+		"snake-prov/claude-opus-4-6": {
+			"provider":          "snake-prov",
+			"model":             "claude-opus-4-6",
+			"display_name":      "Claude Opus 4.6",
+			"max_context_size":  json.Number("200000"),
+			"max_output_size":   json.Number("32768"),
+			"capabilities":      []any{"image_in", "tool_use", "thinking", "dynamically_loaded_tools"},
+			"adaptive_thinking": true,
+			"support_efforts":   []any{"low", "medium", "high", "max"},
+			"default_effort":    "high",
+			"custom_headers":    map[string]any{"X-Beta": "adaptive-1"},
+			"env":               map[string]any{"MODEL_FLAG": "on"},
+			"protocol":          "anthropic",
+			"betaApi":           true,
+			"x_model_extra":     "keep-snake",
+		},
+		"snake-prov/claude-default-adaptive": {
+			"provider":         "snake-prov",
+			"model":            "claude-default-adaptive",
+			"display_name":     "Claude Omitted Adaptive",
+			"max_context_size": json.Number("200000"),
+			"capabilities":     []any{"tool_use", "thinking"},
+			"support_efforts":  []any{"low", "high"},
+		},
+		"camel-prov/gpt-budget": {
+			"provider":         "camel-prov",
+			"model":            "gpt-budget",
+			"displayName":      "GPT Budget",
+			"maxContextSize":   json.Number("262144"),
+			"maxOutputSize":    json.Number("16384"),
+			"capabilities":     []any{"image_in", "video_in", "tool_use", "thinking"},
+			"adaptiveThinking": false,
+			"supportEfforts":   []any{"low", "medium", "high"},
+			"defaultEffort":    "medium",
+			"offEffort":        "none",
+			"customHeaders":    map[string]any{"X-Mode": "budget"},
+			"env":              map[string]any{"REGION": "us"},
+			"reasoningKey":     "reasoning_content",
+			"x_camel_flag":     true,
+		},
+	}
+
+	var putBodies []string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config"):
+			mu.Lock()
+			provResp := map[string]any{}
+			for id, item := range providers {
+				provResp[id] = item.raw
+			}
+			modelResp := map[string]any{}
+			for key, item := range models {
+				modelResp[key] = item
+			}
+			mu.Unlock()
+			writeNativeTestEnvelope(w, map[string]any{"providers": provResp, "models": modelResp})
+
+		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/providers/"):
+			_, providerID, _ := strings.Cut(r.URL.Path, "/providers/")
+			bodyBytes, _ := io.ReadAll(r.Body)
+			decoder := json.NewDecoder(strings.NewReader(string(bodyBytes)))
+			decoder.UseNumber()
+			raw := map[string]any{}
+			if err := decoder.Decode(&raw); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if _, hasKey := raw["api_key"]; hasKey {
+				http.Error(w, "api_key must not be sent", http.StatusBadRequest)
+				return
+			}
+			if _, hasEnv := raw["api_key_env"]; hasEnv {
+				http.Error(w, "api_key_env must not be sent", http.StatusBadRequest)
+				return
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			putBodies = append(putBodies, string(bodyBytes))
+			existing, ok := providers[providerID]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+
+			submittedModels := rawSlice(raw["models"])
+			modelSet := map[string]bool{}
+			for _, item := range submittedModels {
+				id, _ := item["model"].(string)
+				modelSet[id] = true
+			}
+			if dm, ok := raw["default_model"].(string); ok && dm != "" {
+				if !modelSet[dm] {
+					http.Error(w, "default_model must be one of models[].model", http.StatusBadRequest)
+					return
+				}
+			}
+
+			// Strict replace: only fields present in PUT survive (except server-side credentials).
+			replacedProv := map[string]any{"has_api_key": existing.apiKey != "" || existing.apiKeyEnv != ""}
+			if existing.apiKeyEnv != "" {
+				replacedProv["api_key_env"] = existing.apiKeyEnv
+			}
+			for key, val := range raw {
+				if key == "models" {
+					continue
+				}
+				if key == "default_model" {
+					if dm, ok := val.(string); ok && dm != "" {
+						replacedProv["default_model"] = providerID + "/" + dm
+					}
+					continue
+				}
+				replacedProv[key] = val
+			}
+			existing.raw = replacedProv
+
+			for key, item := range models {
+				if item["provider"] == providerID {
+					delete(models, key)
+				}
+			}
+			for _, item := range submittedModels {
+				next := map[string]any{"provider": providerID}
+				for k, v := range item {
+					next[k] = v
+				}
+				models[providerID+"/"+item["model"].(string)] = next
+			}
+			writeNativeTestEnvelope(w, map[string]any{"provider": providerID})
+
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	service, _ := newAutomationTestService(t, handler)
+	before, err := service.readConfig(context.Background())
+	if err != nil {
+		t.Fatalf("readConfig before: %v", err)
+	}
+
+	// Save every model of every provider unchanged using the exact fields read from /config.
+	for _, key := range []string{
+		"snake-prov/claude-opus-4-6",
+		"snake-prov/claude-default-adaptive",
+		"camel-prov/gpt-budget",
+	} {
+		providerID, _ := splitModelKey(key)
+		model := before.Models[key]
+		thinking := "none"
+		for _, capToken := range model.Capabilities {
+			if capToken == "always_thinking" {
+				thinking = "always"
+				break
+			}
+			if capToken == "thinking" {
+				thinking = "toggle"
+			}
+		}
+		if thinking == "none" && ((model.AdaptiveThinking != nil && *model.AdaptiveThinking) || len(model.SupportEfforts) > 0) {
+			thinking = "toggle"
+		}
+		edit := map[string]any{
+			"capabilities":     model.Capabilities,
+			"thinking":         thinking,
+			"max_context_size": model.MaxContextSize,
+			"support_efforts":  model.SupportEfforts,
+		}
+		if model.MaxOutputSize != nil {
+			edit["max_output_size"] = *model.MaxOutputSize
+		}
+		if model.AdaptiveThinking != nil {
+			edit["adaptive_thinking"] = *model.AdaptiveThinking
+		}
+		payload, err := json.Marshal(map[string]any{
+			"providerId": providerID,
+			"model":      key,
+			"edit":       edit,
+		})
+		if err != nil {
+			t.Fatalf("marshal payload for %s: %v", key, err)
+		}
+		if _, err := service.Action(context.Background(), "providers.updateModel", payload); err != nil {
+			t.Fatalf("round-trip updateModel(%s): %v", key, err)
+		}
+	}
+
+	after, err := service.readConfig(context.Background())
+	if err != nil {
+		t.Fatalf("readConfig after: %v", err)
+	}
+	if !reflect.DeepEqual(before.Providers, after.Providers) {
+		t.Fatalf("providers changed after round-trip:\nbefore=%#v\nafter =%#v", before.Providers, after.Providers)
+	}
+	if !reflect.DeepEqual(before.Models, after.Models) {
+		t.Fatalf("models changed after round-trip:\nbefore=%#v\nafter =%#v", before.Models, after.Models)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if providers["snake-prov"].apiKey != "sk-snake-secret" {
+		t.Fatalf("snake-prov apiKey was modified: %q", providers["snake-prov"].apiKey)
+	}
+	if providers["camel-prov"].apiKeyEnv != "CAMEL_PROVIDER_KEY" {
+		t.Fatalf("camel-prov apiKeyEnv was modified: %q", providers["camel-prov"].apiKeyEnv)
+	}
+	if len(putBodies) != 3 {
+		t.Fatalf("expected 3 PUT calls, got %d", len(putBodies))
+	}
+	for i, body := range putBodies {
+		if strings.Contains(body, "api_key") || strings.Contains(body, "sk-snake-secret") {
+			t.Fatalf("PUT[%d] leaked credentials: %s", i, body)
+		}
+	}
+}
+
+func TestThinkingNoDisablesThinkingAndNeverWritesLiteralNo(t *testing.T) {
+	models := map[string]modelConfig{
+		"r2-inspect/claude": {
+			Provider:         "r2-inspect",
+			Model:            "claude",
+			DisplayName:      "Claude Opus",
+			MaxContextSize:   200000,
+			Capabilities:     []string{"image_in", "tool_use", "thinking", "dynamically_loaded_tools"},
+			AdaptiveThinking: boolPtr(true),
+			SupportEfforts:   []string{"low", "medium", "high"},
+		},
+	}
+	store := newOfficialModelStore(models)
+	service, _ := newAutomationTestService(t, store.handler())
+
+	// 1. Omitting adaptive_thinking in toggle mode preserves stored adaptive_thinking=true and strips literal "no".
+	value, err := updateModelAction(t, service, `{
+		"providerId":"r2-inspect",
+		"model":"r2-inspect/claude",
+		"edit":{
+			"capabilities":["image_in","tool_use","thinking"],
+			"thinking":"toggle",
+			"max_context_size":200000,
+			"support_efforts":["no","high","NO","max"]
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("toggle update with preserved adaptive_thinking: %v", err)
+	}
+	toggled := savedModel(t, value)
+	if toggled.AdaptiveThinking == nil || !*toggled.AdaptiveThinking {
+		t.Fatalf("stored adaptive_thinking=true was wiped: %#v", toggled)
+	}
+	if !sameStrings(toggled.SupportEfforts, []string{"high", "max"}) {
+		t.Fatalf("literal no leaked into support_efforts: %v", toggled.SupportEfforts)
+	}
+	if !sameStrings(toggled.Capabilities, []string{"image_in", "tool_use", "thinking", "dynamically_loaded_tools"}) {
+		t.Fatalf("extra capability lost: %v", toggled.Capabilities)
+	}
+
+	// 2. Selecting "no" (thinking=none) disables thinking completely: removes thinking/always_thinking,
+	// clears adaptive_thinking=true, clears support_efforts, and never writes literal "no".
+	value, err = updateModelAction(t, service, `{
+		"providerId":"r2-inspect",
+		"model":"r2-inspect/claude",
+		"edit":{
+			"capabilities":["image_in","tool_use","thinking"],
+			"thinking":"none",
+			"max_context_size":200000,
+			"support_efforts":["no","high"]
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("disable thinking (no): %v", err)
+	}
+	disabled := savedModel(t, value)
+	if !sameStrings(disabled.Capabilities, []string{"image_in", "tool_use", "dynamically_loaded_tools"}) {
+		t.Fatalf("thinking capability was not removed: %v", disabled.Capabilities)
+	}
+	if disabled.AdaptiveThinking != nil && *disabled.AdaptiveThinking {
+		t.Fatalf("adaptive_thinking=true survived thinking=none: %#v", disabled)
+	}
+	if len(disabled.SupportEfforts) != 0 {
+		t.Fatalf("support_efforts was not cleared for thinking=none: %v", disabled.SupportEfforts)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	lastBody := store.bodies[len(store.bodies)-1]
+	if strings.Contains(lastBody, `"support_efforts"`) || strings.Contains(lastBody, `"no"`) {
+		t.Fatalf("PUT body wrote support_efforts or literal no when thinking is disabled: %s", lastBody)
+	}
+	if strings.Contains(lastBody, `"adaptive_thinking":true`) {
+		t.Fatalf("PUT body kept adaptive_thinking=true when thinking is disabled: %s", lastBody)
 	}
 }

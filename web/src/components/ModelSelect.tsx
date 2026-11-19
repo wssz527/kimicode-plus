@@ -13,6 +13,7 @@ export function ModelSelect({
   ariaLabel = "模型",
   placeholder = "选择模型",
   disabled = false,
+  className,
 }: {
   id?: string;
   options: ModelOption[];
@@ -21,13 +22,21 @@ export function ModelSelect({
   ariaLabel?: string;
   placeholder?: string;
   disabled?: boolean;
+  className?: string;
 }) {
   const known = options.some(option => option.key === value);
   const missing = value !== "" && !known;
   return (
     <select
       id={id}
-      className="select"
+      className={className ? `select ${className}` : "select"}
+      style={{
+        width: "100%",
+        minWidth: 0,
+        maxWidth: "100%",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+      }}
       aria-label={ariaLabel}
       value={value}
       disabled={disabled}

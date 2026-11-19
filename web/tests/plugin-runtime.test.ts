@@ -1002,3 +1002,44 @@ test("a plugin is told its own manifest apiVersion, not the host's newest", asyn
   ]);
   runtime.dispose();
 });
+
+test("ui.pickDirectory requires workspace capability and handles selection and cancellation", async () => {
+  const receivedOptions: Array<{ title?: string; defaultPath?: string } | undefined> = [];
+  let nextReturn: string | null = "  /tmp/project-alpha  ";
+  const runtime = createPluginRuntime({
+    slots: {},
+    request: async () => ({ value: {} }),
+    pickDirectory: async opts => {
+      receivedOptions.push(opts);
+      return nextReturn;
+    },
+  });
+
+  let denied: unknown = null;
+  await runtime.activate(
+    {
+      activate: async context => {
+        denied = await context.ui.pickDirectory!({ title: "选目录" }).catch(error => error);
+      },
+    },
+    { id: "test.unprivileged", version: "1.0.0", apiVersion: 2, granted: ["ui:sidebar"], token: "t-denied" },
+  );
+  assert.match(String(denied), /打开目录选择器的能力/);
+
+  let picked: string | null = null;
+  let canceled: string | null = "not-null";
+  await runtime.activate(
+    {
+      activate: async context => {
+        picked = await context.ui.pickDirectory!({ title: "选择任务目录", defaultPath: "/tmp" });
+        nextReturn = "";
+        canceled = await context.ui.pickDirectory!({});
+      },
+    },
+    { id: "test.scheduler", version: "1.0.1", apiVersion: 2, granted: ["schedule:manage"], token: "t-sched" },
+  );
+  assert.equal(picked, "/tmp/project-alpha");
+  assert.equal(canceled, null);
+  assert.deepEqual(receivedOptions, [{ title: "选择任务目录", defaultPath: "/tmp" }, {}]);
+  runtime.dispose();
+});

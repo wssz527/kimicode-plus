@@ -7,9 +7,9 @@ import { ControlMenu } from "./ControlMenu";
 
 type Attachment = { path: string; name: string };
 type PermissionMode = "" | "manual" | "auto" | "yolo";
+type SessionRecoveryHint = { enabled: boolean; nextAt?: string; note?: string };
 
-export type SendMode = "normal" | "plan" | "tower";
-type SessionInput = { draft?: string; mode?: SendMode; model?: string; permission?: PermissionMode; attachments?: Attachment[] };
+type SessionInput = { draft?: string; model?: string; permission?: PermissionMode; attachments?: Attachment[] };
 type SessionInputs = Record<string, SessionInput>;
 const SessionInputContext = createContext<[SessionInputs, Dispatch<SetStateAction<SessionInputs>>] | null>(null);
 export function SessionInputProvider({ children }: { children: ReactNode }) {
@@ -23,6 +23,7 @@ export function SessionPane({
   sessions,
   models,
   sessionId,
+  recovery,
   onSessionId,
   onSessions,
   onAdd,
@@ -35,6 +36,7 @@ export function SessionPane({
   sessions: NativeSession[];
   models: { id: string; name: string }[];
   sessionId: string;
+  recovery?: SessionRecoveryHint | null;
   onSessionId: (id: string) => void;
   onSessions: (next: NativeSession[]) => void;
   onAdd?: () => void;
@@ -52,14 +54,12 @@ export function SessionPane({
   const [replying, setReplying] = useState<string | null>(null);
   const sid = sessionId;
   const draft = inputs[sid]?.draft ?? "";
-  const mode = inputs[sid]?.mode ?? "normal";
   const model = inputs[sid]?.model ?? "";
   const permission = inputs[sid]?.permission ?? "";
   const attachments = inputs[sid]?.attachments ?? [];
   const updateInput = (value: Partial<SessionInput>) => setInputs(current => ({ ...current, [sid]: { ...current[sid], ...value } }));
   const setAttachments = (value: Attachment[]) => updateInput({ attachments: value });
   const setDraft = (value: string) => updateInput({ draft: value });
-  const setMode = (value: SendMode) => updateInput({ mode: value });
   const setModel = (value: string) => updateInput({ model: value });
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -118,7 +118,7 @@ export function SessionPane({
       await host.request("session.send", {
         id: sid,
         text,
-        mode,
+        mode: "normal",
         ...(model ? { model } : {}),
         ...(permission ? { permissionMode: permission } : {}),
         ...(attachments.length ? { attachments: attachments.map(item => item.path) } : {}),
@@ -178,6 +178,17 @@ export function SessionPane({
         <p className="wb-goal">
           目标 <span className="wb-hint">{String(view.goal.status ?? "进行中")}</span>
           <span className="wb-hint"> · 消耗受目标预算限制</span>
+        </p>
+      ) : null}
+
+      {recovery ? (
+        <p className="wb-exec-recovery" role="status" title={recovery.note || undefined}>
+          <Icon name="clock" size={12} />
+          <span>
+            {recovery.enabled
+              ? `等待额度恢复自动继续${recovery.nextAt ? ` · 下次检测 ${fmtClock(recovery.nextAt)}` : ""}`
+              : "因限流暂停，未开启自动继续"}
+          </span>
         </p>
       ) : null}
 
@@ -258,16 +269,6 @@ export function SessionPane({
           hint={
             <>
               <label className="wb-permission" title="发送时应用所选权限；跟随权限会保留会话当前设置"><Icon name="shield" size={13} /><select className="wb-select wb-select-inline" aria-label="发送权限" value={permission} onChange={event => updateInput({ permission: event.target.value as PermissionMode })}><option value="">跟随权限</option><option value="manual">始终询问</option><option value="auto">自动判断</option><option value="yolo">始终允许</option></select></label>
-              <select
-                className="wb-select wb-select-inline"
-                aria-label="发送方式"
-                value={mode}
-                onChange={(event) => setMode(event.target.value as SendMode)}
-              >
-                <option value="normal">普通</option>
-                <option value="plan">Plan</option>
-                <option value="tower">Tower</option>
-              </select>
               <label className="wb-model"><Icon name="models" size={13} /><select
                 className="wb-select wb-select-inline"
                 aria-label="会话模型"
@@ -286,156 +287,5 @@ export function SessionPane({
         />
       </div>
     </section>
-  );
-}
-
-export function RecoveryPanel({
-  host,
-  state,
-  onState,
-  watchSession,
-}: {
-  host: DemoHost;
-  state: { enabled: boolean; intervalSeconds: number; entries: { id: string; kind: string; title: string; status: string; nextAt?: string }[] } | null;
-  onState: (next: { enabled: boolean; intervalSeconds: number; entries: { id: string; kind: string; title: string; status: string; nextAt?: string }[] }) => void;
-  watchSession: string;
-}) {
-  const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [checkedAt, setCheckedAt] = useState<string | null>(null);
-  const [open, setOpen] = useState(false);
-
-  useEffect(() => host.subscribe<NonNullable<typeof state>>("recovery", next => onState(next)), [host, onState]);
-
-  async function toggle(enabled: boolean) {
-    setBusy("toggle");
-    setError(null);
-    try {
-      const next = await host.request<typeof state>("recovery.set", {
-        enabled,
-        intervalSeconds: state?.intervalSeconds ?? 60,
-      });
-      if (next) onState(next);
-    } catch (cause) {
-      setError(errorText(cause));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function checkNow() {
-    setBusy("check");
-    setError(null);
-    try {
-      await host.request("recovery.check", {});
-      const next = await host.request<typeof state>("recovery.get", {});
-      if (next) onState(next);
-      setCheckedAt(new Date().toISOString());
-    } catch (cause) {
-      setError(errorText(cause));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function watch() {
-    if (!watchSession) return;
-    setBusy("watch");
-    setError(null);
-    try {
-      await host.request("recovery.watch", { id: watchSession, kind: "session" });
-      const next = await host.request<typeof state>("recovery.get", {});
-      if (next) onState(next);
-    } catch (cause) {
-      setError(errorText(cause));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function unwatch() {
-    if (!watchSession) return;
-    setBusy("watch");
-    setError(null);
-    try {
-      const next = await host.request<typeof state>("recovery.unwatch", { id: watchSession, kind: "session" });
-      if (next) onState(next);
-    } catch (cause) {
-      setError(errorText(cause));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  const entries = state?.entries ?? [];
-  const watching = entries.some(entry => entry.id === `session:${watchSession}`);
-  const nextAt = entries.find((entry) => entry.nextAt)?.nextAt;
-
-  return (
-    <div className="wb-recovery">
-      <button type="button" className="wb-recovery-head" aria-expanded={open} onClick={() => setOpen(!open)}>
-        <Icon name="clock" size={14} />
-        <span>额度恢复自动继续</span>
-        <span className={`wb-state is-${state?.enabled ? "success" : "neutral"}`}>
-          {state?.enabled ? "已开启" : "未开启"}
-        </span>
-        <Icon name={open ? "chevronUp" : "chevronDown"} size={14} />
-      </button>
-      {open ? (
-        <div className="wb-recovery-body">
-          <label className="wb-switch">
-            <input
-              type="checkbox"
-              checked={Boolean(state?.enabled)}
-              disabled={busy !== null}
-              onChange={(event) => void toggle(event.target.checked)}
-            />
-            <span className="wb-switch-track" aria-hidden="true">
-              <span />
-            </span>
-            <span className="wb-switch-copy">
-              我明确开启自动继续
-              <small>只针对账号额度，不突破你设定的目标预算。</small>
-            </span>
-          </label>
-          <dl className="wb-facts">
-            <div>
-              <dt>等待项</dt>
-              <dd>{entries.length ? `${entries.length} 个监听或等待项` : "当前没有监听或等待项"}</dd>
-            </div>
-            <div>
-              <dt>检测间隔</dt>
-              <dd className="num">{state?.intervalSeconds ?? 60} 秒</dd>
-            </div>
-            <div>
-              <dt>下次检测</dt>
-              <dd className="num">{nextAt ? fmtClock(nextAt) : "未排定"}</dd>
-            </div>
-            {checkedAt ? (
-              <div>
-                <dt>刚刚检查</dt>
-                <dd className="num">{fmtClock(checkedAt)}</dd>
-              </div>
-            ) : null}
-          </dl>
-          <div className="wb-web-row">
-            <button type="button" className="wb-btn" onClick={() => void checkNow()} disabled={busy !== null}>
-              {busy === "check" ? <Spinner size={13} /> : <Icon name="refresh" size={14} />}
-              立即检查
-            </button>
-            <button type="button" className="wb-btn is-quiet" onClick={() => void watch()} disabled={!watchSession || busy !== null}>
-              {busy === "watch" ? <Spinner size={13} /> : null}
-              监听当前会话
-            </button>
-            {watching ? <button type="button" className="wb-btn is-quiet" onClick={() => void unwatch()} disabled={busy !== null}>停止监听当前会话</button> : null}
-          </div>
-          {error ? (
-            <p className="wb-error" role="alert">
-              {error}
-            </p>
-          ) : null}
-        </div>
-      ) : null}
-    </div>
   );
 }

@@ -1843,3 +1843,207 @@ test("local planner reads the official catalog first and handoff picks only list
   assert.equal(pickHandoffModel("legacy-planner", [{ id: "kimi-k2", name: "Kimi K2" }]), "");
   assert.equal(pickHandoffModel("kimi-k2", [{ id: "kimi-k2", name: "Kimi K2" }]), "kimi-k2");
 });
+
+test("site adapters cover Doubao, Qwen, Yuanbao and strip persistent UI chrome and noise lines", async () => {
+  const { stripWebNoise } = planner as unknown as { stripWebNoise(raw: unknown, site?: string): string };
+
+  assert.equal(matchSite("https://www.doubao.com/chat/123"), "doubao");
+  assert.equal(matchSite("https://tongyi.aliyun.com/qianwen/"), "qwen");
+  assert.equal(matchSite("https://www.qianwen.com/chat"), "qwen");
+  assert.equal(matchSite("https://yuanbao.tencent.com/chat"), "yuanbao");
+
+  const cleaned = stripWebNoise([
+    "复制",
+    "已深度思考（用时 12 秒）",
+    "## 规划方案",
+    "1. 第一步：拆分模块",
+    "```ts",
+    "// 代码块内的 Copy 不应被误删",
+    "Copy",
+    "```",
+    "重试",
+    "内容由 AI 大模型生成，请仔细甄别",
+  ].join("\n"), "kimi");
+  assert.equal(
+    cleaned,
+    [
+      "## 规划方案",
+      "1. 第一步：拆分模块",
+      "```ts",
+      "// 代码块内的 Copy 不应被误删",
+      "Copy",
+      "```",
+    ].join("\n"),
+  );
+
+  // Sidebar/composer nodes matching excluded selectors are skipped by site adapter
+  const sidebarParent = fakeNode("ASIDE", {}, "历史会话列表");
+  const sidebarItem = fakeNode("DIV", { "data-message-author-role": "assistant" }, "旧会话标题（侧边栏噪音）", { closestNode: sidebarParent });
+  const realTurn = fakeNode(
+    "DIV",
+    { "data-message-author-role": "assistant", "data-message-id": "turn-2" },
+    "复制\n## 实施步骤\n1. 收敛模型供应商展开面板\n2. 增加网页规划双入口\nChatGPT 也可能会犯错。请核实重要信息。",
+  );
+  const parsed = await runAdapter(SITE_ADAPTERS.chatgpt, {
+    "[data-message-author-role]": [sidebarItem, realTurn],
+  });
+  assert.equal(parsed.messages.length, 1);
+  assert.equal(parsed.messages[0]?.role, "assistant");
+  assert.ok(!parsed.messages[0]?.text.includes("侧边栏噪音"));
+  assert.ok(!parsed.messages[0]?.text.includes("复制"));
+  assert.ok(!parsed.messages[0]?.text.includes("可能会犯错"));
+  assert.ok(parsed.messages[0]?.text.includes("## 实施步骤"));
+});
+
+test("generic page adapter and chooseExtraction strip nav/sidebar/buttons and selectPlanningIds focuses planning replies", async () => {
+  const {
+    GENERIC_PAGE_ADAPTER_SOURCE,
+    isPlanningMessage,
+    selectPlanningIds,
+  } = planner as unknown as {
+    GENERIC_PAGE_ADAPTER_SOURCE: string;
+    isPlanningMessage(msg: Message): boolean;
+    selectPlanningIds(messages: Message[]): Set<string>;
+  };
+
+  const navHost = fakeNode("NAV", {}, "顶栏导航");
+  const navTurn = fakeNode("DIV", { "data-message-id": "nav-1" }, "新建对话 · 历史记录", { closestNode: navHost });
+  const userTurn = fakeNode("DIV", { "data-message-author-role": "user" }, "你好，帮我想一下这个需求怎么做");
+  const greetTurn = fakeNode("DIV", { "data-message-author-role": "assistant" }, "好的，没问题！");
+  const planTurn = fakeNode(
+    "DIV",
+    { "data-message-author-role": "assistant" },
+    "## 网页提取与模型归纳方案\n1. 针对不同网站剔除常驻侧栏与导航栏\n2. 提供不经模型归纳的直接提取入口与可选的模型归纳入口",
+  );
+
+  const genericRaw = await runAdapter(GENERIC_PAGE_ADAPTER_SOURCE, {
+    "[data-message-author-role]": [userTurn, greetTurn, planTurn],
+    "[data-message-id]": [navTurn],
+  }) as unknown as { kind: string; messages: Message[]; truncated: boolean };
+
+  assert.equal(genericRaw.kind, "chat");
+  assert.equal(genericRaw.messages.length, 3, "nav/sidebar items must be excluded");
+
+  const chosen = chooseExtraction({
+    site: "",
+    adapter: null,
+    genericAdapter: genericRaw,
+    pageText: "整页含大量侧边栏与页脚无关噪音",
+  });
+  assert.equal(chosen.mode, "adapter");
+  assert.equal(chosen.messages.length, 3);
+  assert.ok(!chosen.messages.some(m => m.text.includes("侧边栏")));
+
+  assert.equal(isPlanningMessage(chosen.messages[0]!), false);
+  assert.equal(isPlanningMessage(chosen.messages[1]!), false);
+  assert.equal(isPlanningMessage(chosen.messages[2]!), true);
+
+  const selected = selectPlanningIds(chosen.messages);
+  assert.deepEqual([...selected], [chosen.messages[2]!.id], "only substantive assistant planning messages are checked by default");
+});
+
+test("runWebSummarization distills web content in a temporary pure thread, cleans up, and supports cancellation", async () => {
+  const { runWebSummarization } = planner as unknown as {
+    runWebSummarization(
+      apis: unknown,
+      options: { model: string; text: string; site?: string; onProgress?: (partial: string) => void },
+    ): Promise<string>;
+  };
+
+  const createdThreads: Array<Record<string, unknown>> = [];
+  const deletedIds: string[] = [];
+  const stoppedIds: string[] = [];
+  const progressSnapshots: string[] = [];
+
+  const result = await runWebSummarization(
+    {
+      planner: {
+        async create(input: Record<string, unknown>) {
+          createdThreads.push(input);
+          return { id: "tmp-sum-1" };
+        },
+        async send(threadId: string, text: string) {
+          assert.equal(threadId, "tmp-sum-1");
+          assert.ok(text.includes("结构化规划方案"));
+          return {
+            id: "tmp-sum-1",
+            status: "idle",
+            messages: [
+              { role: "user", text },
+              { role: "assistant", text: "## 目标与范围\n- 仅保留核心规划步骤\n\n## 实施步骤\n1. 直接提取入口\n2. 可选模型归纳入口" },
+            ],
+          };
+        },
+        async get() {
+          return { id: "tmp-sum-1", status: "idle", messages: [] };
+        },
+        async remove(id: string) {
+          deletedIds.push(id);
+        },
+      },
+      events: {
+        on(topic: string, handler: (ev: unknown) => void) {
+          assert.equal(topic, "planner:tmp-sum-1");
+          handler({
+            id: "tmp-sum-1",
+            status: "running",
+            messages: [{ role: "assistant", text: "## 目标与范围" }],
+          });
+          return { dispose() {} };
+        },
+      },
+    },
+    {
+      model: "kimi-k2",
+      text: "原始对话内容：我们要做网页去噪提取和可选模型归纳",
+      site: "kimi",
+      onProgress: partial => progressSnapshots.push(partial),
+    },
+  );
+
+  assert.equal(createdThreads.length, 1);
+  assert.deepEqual(createdThreads[0]?.options, { context: false, skills: false, tools: false, readOnly: true });
+  assert.ok(progressSnapshots.includes("## 目标与范围"));
+  assert.ok(result.includes("## 实施步骤"));
+  assert.deepEqual(deletedIds, ["tmp-sum-1"], "temporary summarization thread must be deleted afterwards");
+
+  // Cancellation path
+  let cancelFn = null as (() => Promise<void>) | null;
+  let notifyEvent = null as ((ev: unknown) => void) | null;
+  const pendingSummary = runWebSummarization(
+    {
+      onCancelReady(fn: () => Promise<void>) {
+        cancelFn = fn;
+      },
+      planner: {
+        async create() {
+          return { id: "tmp-cancel-1" };
+        },
+        async send() {
+          return { id: "tmp-cancel-1", status: "running", messages: [] };
+        },
+        async stop(id: string) {
+          stoppedIds.push(id);
+          notifyEvent?.({ id, status: "stopped", messages: [] });
+        },
+        async remove(id: string) {
+          deletedIds.push(id);
+        },
+      },
+      events: {
+        on(_topic: string, handler: (ev: unknown) => void) {
+          notifyEvent = handler;
+          return { dispose() {} };
+        },
+      },
+    },
+    { model: "kimi-k2", text: "待取消的长规划内容" },
+  );
+
+  await new Promise(r => setTimeout(r, 10));
+  if (!cancelFn) throw new Error("cancel callback should be registered");
+  await cancelFn();
+  await assert.rejects(pendingSummary, /已取消模型归纳/);
+  assert.deepEqual(stoppedIds, ["tmp-cancel-1"]);
+  assert.ok(deletedIds.includes("tmp-cancel-1"));
+});

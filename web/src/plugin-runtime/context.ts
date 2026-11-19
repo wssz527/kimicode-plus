@@ -281,6 +281,7 @@ export interface PluginContext {
       decorator: (block: HTMLElement, info: BlockInfo) => Cleanup | DecorationHandle | void,
     ): Disposable;
     theme(): PluginTheme;
+    pickDirectory?(options?: { title?: string; defaultPath?: string }): Promise<string | null>;
   };
   net: { fetch(url: string, init?: ProxyRequestInit): Promise<ProxyResponse> };
   storage: {

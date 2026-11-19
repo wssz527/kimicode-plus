@@ -28,7 +28,7 @@ interface PoolEntry {
 
 interface PoolEditor {
   entries: PoolEntry[];
-  defaultId: string;
+  existingDefaultModel: string;
   rest: Dic;
 }
 
@@ -72,17 +72,40 @@ function readPool(raw: Dic | null): PoolEditor {
     key,
     desc: typeof desc === "string" ? desc : "",
   }));
-  const single = configField(raw, ["defaultModel", "default_model", "model"]);
-  const defaultModel = typeof single === "string" ? single : "";
-  if (entries.length === 0 && defaultModel) {
-    entries.push({ id: nextId("pool"), key: defaultModel, desc: "" });
+  const explicitDefault = configField(raw, ["defaultModel", "default_model"]);
+  const legacyModel = configField(raw, ["model"]);
+  const existingDefaultModel =
+    typeof explicitDefault === "string"
+      ? explicitDefault.trim()
+      : typeof legacyModel === "string"
+        ? legacyModel.trim()
+        : "";
+  if (entries.length === 0 && existingDefaultModel) {
+    entries.push({ id: nextId("pool"), key: existingDefaultModel, desc: "" });
   }
-  const chosen = entries.find((entry) => entry.key === defaultModel) ?? entries[0];
   return {
     entries,
-    defaultId: chosen ? chosen.id : "",
+    existingDefaultModel,
     rest: omit(raw ?? {}, ["models", "defaultModel", "default_model", "model"]),
   };
+}
+
+function reorderPoolEntries(
+  entries: PoolEntry[],
+  sourceId: string,
+  targetId: string,
+  position: "before" | "after",
+): PoolEntry[] {
+  const fromIndex = entries.findIndex((item) => item.id === sourceId);
+  const toIndex = entries.findIndex((item) => item.id === targetId);
+  if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex) return entries;
+  const next = [...entries];
+  const [moved] = next.splice(fromIndex, 1);
+  if (!moved) return entries;
+  const rawTarget = position === "after" ? toIndex + 1 : toIndex;
+  const insertIndex = fromIndex < rawTarget ? rawTarget - 1 : rawTarget;
+  next.splice(Math.max(0, Math.min(next.length, insertIndex)), 0, moved);
+  return next;
 }
 
 function readRules(raw: unknown): RuleRow[] {
@@ -145,6 +168,19 @@ function SaveButton({ busy, disabled, onClick }: { busy: boolean; disabled: bool
       {busy ? <Spinner size={12} /> : null}
       保存
     </button>
+  );
+}
+
+function GripIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false">
+      <circle cx="5.5" cy="3.5" r="1.15" />
+      <circle cx="10.5" cy="3.5" r="1.15" />
+      <circle cx="5.5" cy="8" r="1.15" />
+      <circle cx="10.5" cy="8" r="1.15" />
+      <circle cx="5.5" cy="12.5" r="1.15" />
+      <circle cx="10.5" cy="12.5" r="1.15" />
+    </svg>
   );
 }
 
@@ -219,7 +255,11 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const [pool, setPool] = useState<PoolEditor>({ entries: [], defaultId: "", rest: {} });
+  const [pool, setPool] = useState<PoolEditor>({ entries: [], existingDefaultModel: "", rest: {} });
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{ id: string; position: "before" | "after" } | null>(null);
+  const [dragBlockedId, setDragBlockedId] = useState<string | null>(null);
+
   const [timeoutMin, setTimeoutMin] = useState("");
   const [maxSteps, setMaxSteps] = useState("");
   const [rules, setRules] = useState<RuleRow[]>([]);
@@ -267,9 +307,18 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
     if (!host) return;
     let alive = true;
     fetchModelOptions(host.request)
-      .then((next) => { if (alive) { setModelOptions(next); setModelOptionsError(null); } })
-      .catch((cause) => { if (alive) setModelOptionsError(errorText(cause)); });
-    return () => { alive = false; };
+      .then((next) => {
+        if (alive) {
+          setModelOptions(next);
+          setModelOptionsError(null);
+        }
+      })
+      .catch((cause) => {
+        if (alive) setModelOptionsError(errorText(cause));
+      });
+    return () => {
+      alive = false;
+    };
   }, [host]);
 
   const poolKeys = useMemo(
@@ -283,6 +332,24 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
   }, [pool.entries.length, poolKeys]);
 
   const ruleIssues = rules.map((rule) => patternIssue(rule.pattern));
+
+  function movePoolEntry(id: string, delta: -1 | 1) {
+    setPool((current) => {
+      const index = current.entries.findIndex((item) => item.id === id);
+      const target = index + delta;
+      if (index === -1 || target < 0 || target >= current.entries.length) return current;
+      const entries = [...current.entries];
+      const [moved] = entries.splice(index, 1);
+      if (!moved) return current;
+      entries.splice(target, 0, moved);
+      return { ...current, entries };
+    });
+  }
+
+  function openProvidersSettings() {
+    if (!host) return;
+    void host.openSettings("providers").catch((cause: unknown) => setModelOptionsError(errorText(cause)));
+  }
 
   /**
    * Writes are only reported as saved after a fresh GET agrees. A 200 from
@@ -323,7 +390,10 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
       const key = entry.key.trim();
       if (key) models[key] = entry.desc.trim();
     }
-    const apply = (cfg: Dic) => setPool(readPool(configSection(cfg, ["secondary_model", "secondaryModel"])));
+    const apply = (cfg: Dic) => {
+      setConfig(cfg);
+      setPool(readPool(configSection(cfg, ["secondary_model", "secondaryModel"])));
+    };
     if (poolKeys.length === 0) {
       void save("pool", "derive", { secondary_model: null }, {
         note: "模型池已清空，子代理改为跟随调用方的模型。",
@@ -332,15 +402,21 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
       });
       return;
     }
-    const chosen = pool.entries.find((entry) => entry.id === pool.defaultId);
-    const defaultModel = chosen && models[chosen.key.trim()] !== undefined ? chosen.key.trim() : poolKeys[0]!;
+    const defaultModel =
+      pool.existingDefaultModel && models[pool.existingDefaultModel] !== undefined
+        ? pool.existingDefaultModel
+        : poolKeys[0]!;
     const verify = (cfg: Dic) => matchesModelPool(cfg, { models, defaultModel });
     const full: Dic = { ...pool.rest, models, defaultModel };
     const current = configSection(config, ["secondary_model", "secondaryModel"]);
     const currentKeys = Object.keys(asConfigObject(configField(current, ["models"])) ?? {});
+    const nextKeys = Object.keys(models);
     const removed = currentKeys.filter((key) => models[key] === undefined);
     const legacy = configField(current, ["model"]) !== undefined;
-    if (removed.length === 0 && !legacy) {
+    const orderChanged =
+      currentKeys.length !== nextKeys.length ||
+      currentKeys.some((key, index) => key !== nextKeys[index]);
+    if (removed.length === 0 && !legacy && !orderChanged) {
       void save("pool", "derive", { secondary_model: full }, {
         note: "下次派生生效，已在运行的子代理保持旧模型。",
         apply,
@@ -356,7 +432,9 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
         note:
           removed.length > 0
             ? `已整体替换模型池，移除的 ${removed.length} 个条目不再保留；下次派生生效。`
-            : "已整体替换模型池，旧的单模型设置不再保留；下次派生生效。",
+            : legacy
+              ? "已整体替换模型池，旧的单模型设置不再保留；下次派生生效。"
+              : "已按当前优先级顺序保存模型池；下次派生生效。",
         apply,
         verify,
       },
@@ -464,7 +542,7 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
 
       <div className="wb-body ns-body">
         <p className="ns-lede">
-          这四项管的是子代理的模型与时限、单轮步数上限，以及权限规则。数字在离开输入框时保存，保存后用官方接口重新读回核对。
+          管理子代理模型池与优先级、子代理时限、单轮步数上限及权限规则。保存后均会通过官方接口重新读回核对。
         </p>
 
         {loadError ? (
@@ -474,7 +552,7 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
 
         <SettingRow
           title="子代理模型池"
-          purpose="子代理可以从这些模型里选。用途说明写清它适合什么工作；选中的默认模型是所有子代理的落点。清空后子代理跟随调用方的模型。"
+          purpose="子代理可按优先级顺序从这些模型里选择，用途说明写清它适合什么工作。拖动或调整顺位后点击保存；清空后子代理跟随调用方的模型。"
           timing="derive"
           footer={
             <>
@@ -484,7 +562,7 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
           }
         >
           <div className="ns-list-head">
-            <span className="wb-label">池内模型</span>
+            <span className="wb-label">池内模型（按优先级从高到低）</span>
             <button
               type="button"
               className="wb-btn is-quiet is-compact"
@@ -505,41 +583,95 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
               <div className="ns-empty-line">
                 <p>还没有可选的模型，请先在 Kimi Code 设置 → 供应商中添加。</p>
                 {modelOptionsError ? <p>读取失败：{modelOptionsError}</p> : null}
-                {host ? (
-                  <button
-                    type="button"
-                    className="wb-btn is-quiet is-compact"
-                    onClick={() => { void host.openSettings("providers").catch((cause: unknown) => setModelOptionsError(errorText(cause))); }}
-                  >
-                    打开官方供应商页
-                  </button>
-                ) : null}
+                <button
+                  type="button"
+                  className="wb-btn is-quiet is-compact"
+                  onClick={openProvidersSettings}
+                >
+                  打开官方供应商页
+                </button>
               </div>
             ) : (
               <p className="ns-empty-line">还没有池内模型，保存后子代理跟随调用方的模型。</p>
             )
           ) : (
-            <>
-              <div className="ns-pool-headrow" aria-hidden="true">
-                <span className="ns-head-cell">默认</span>
-                <span className="ns-head-cell">模型</span>
-                <span className="ns-head-cell">用途说明</span>
-                <span />
-              </div>
-              <div className="ns-pool-list">
-                {pool.entries.map((entry) => (
-                  <div className="ns-pool-row" key={entry.id}>
-                    <label className="ns-default">
-                      <input
-                        type="radio"
-                        name="ns-pool-default"
-                        checked={pool.defaultId === entry.id}
-                        onChange={() => setPool((current) => ({ ...current, defaultId: entry.id }))}
-                      />
-                      默认
-                    </label>
-                    <div className="ns-pool-model">
+            <div className="ns-pool-list" role="list" aria-label="子代理模型优先级列表">
+              {pool.entries.map((entry, index) => (
+                <div
+                  role="listitem"
+                  className={[
+                    "ns-pool-card",
+                    draggingId === entry.id ? "is-dragging" : "",
+                    dropTarget?.id === entry.id && dropTarget.position === "before" ? "is-drop-before" : "",
+                    dropTarget?.id === entry.id && dropTarget.position === "after" ? "is-drop-after" : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                  key={entry.id}
+                  draggable={dragBlockedId !== entry.id}
+                  onDragStart={(event) => {
+                    setDraggingId(entry.id);
+                    event.dataTransfer.effectAllowed = "move";
+                    event.dataTransfer.setData("text/plain", entry.id);
+                  }}
+                  onDragOver={(event) => {
+                    if (!draggingId || draggingId === entry.id) return;
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = "move";
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    const position = event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+                    setDropTarget((current) =>
+                      current?.id === entry.id && current.position === position ? current : { id: entry.id, position },
+                    );
+                  }}
+                  onDragLeave={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                      setDropTarget((current) => (current?.id === entry.id ? null : current));
+                    }
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    const sourceId = draggingId || event.dataTransfer.getData("text/plain");
+                    const position = dropTarget?.id === entry.id ? dropTarget.position : "before";
+                    if (sourceId && sourceId !== entry.id) {
+                      setPool((current) => ({
+                        ...current,
+                        entries: reorderPoolEntries(current.entries, sourceId, entry.id, position),
+                      }));
+                    }
+                    setDraggingId(null);
+                    setDropTarget(null);
+                  }}
+                  onDragEnd={() => {
+                    setDraggingId(null);
+                    setDropTarget(null);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.altKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+                      event.preventDefault();
+                      movePoolEntry(entry.id, event.key === "ArrowUp" ? -1 : 1);
+                    }
+                  }}
+                >
+                  <div className="ns-pool-handle">
+                    <span className="ns-grip" title="拖动调整优先级顺序（也支持 Alt+↑ / ↓）" aria-hidden="true">
+                      <GripIcon />
+                    </span>
+                    <span className="ns-rank" title={`优先级第 ${index + 1} 位`}>
+                      {index + 1}
+                    </span>
+                  </div>
+
+                  <div className="ns-pool-fields">
+                    <div
+                      className="ns-pool-model"
+                      onMouseEnter={() => setDragBlockedId(entry.id)}
+                      onMouseLeave={() => setDragBlockedId((current) => (current === entry.id ? null : current))}
+                      onFocusCapture={() => setDragBlockedId(entry.id)}
+                      onBlurCapture={() => setDragBlockedId((current) => (current === entry.id ? null : current))}
+                    >
                       <ModelSelect
+                        className="wb-select ns-pool-select"
                         options={modelOptions}
                         value={entry.key}
                         onChange={(key) =>
@@ -550,12 +682,18 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
                         }
                       />
                     </div>
-                    <div className="ns-pool-desc">
+                    <div
+                      className="ns-pool-desc"
+                      onMouseEnter={() => setDragBlockedId(entry.id)}
+                      onMouseLeave={() => setDragBlockedId((current) => (current === entry.id ? null : current))}
+                      onFocusCapture={() => setDragBlockedId(entry.id)}
+                      onBlurCapture={() => setDragBlockedId((current) => (current === entry.id ? null : current))}
+                    >
                       <input
                         className="wb-input"
                         aria-label={`${entry.key || "模型"} 的用途说明`}
                         value={entry.desc}
-                        placeholder="例如 日常实现"
+                        placeholder="用途说明（例如 日常实现）"
                         onChange={(event) =>
                           setPool((current) => ({
                             ...current,
@@ -566,32 +704,58 @@ export function NativeSettings({ embedded = false }: { embedded?: boolean } = {}
                         }
                       />
                     </div>
+                  </div>
+
+                  <div className="ns-pool-actions">
+                    <button
+                      type="button"
+                      className="wb-icon-btn ns-move-btn"
+                      disabled={index === 0}
+                      aria-label="上移优先级"
+                      title="上移优先级 (Alt+↑)"
+                      onClick={() => movePoolEntry(entry.id, -1)}
+                    >
+                      <Icon name="chevronUp" size={13} />
+                    </button>
+                    <button
+                      type="button"
+                      className="wb-icon-btn ns-move-btn"
+                      disabled={index === pool.entries.length - 1}
+                      aria-label="下移优先级"
+                      title="下移优先级 (Alt+↓)"
+                      onClick={() => movePoolEntry(entry.id, 1)}
+                    >
+                      <Icon name="chevronDown" size={13} />
+                    </button>
                     <button
                       type="button"
                       className="wb-icon-btn ns-row-remove"
+                      aria-label="移除这个模型"
                       title="移除这个模型"
                       onClick={() =>
-                        setPool((current) => {
-                          const entries = current.entries.filter((item) => item.id !== entry.id);
-                          return {
-                            ...current,
-                            entries,
-                            defaultId: current.defaultId === entry.id ? (entries[0]?.id ?? "") : current.defaultId,
-                          };
-                        })
+                        setPool((current) => ({
+                          ...current,
+                          entries: current.entries.filter((item) => item.id !== entry.id),
+                        }))
                       }
                     >
                       <Icon name="trash" size={13} />
                     </button>
                   </div>
-                ))}
-              </div>
-            </>
+                </div>
+              ))}
+            </div>
           )}
 
           {poolIssue ? <p className="ns-issue">{poolIssue}</p> : null}
           {pool.entries.length > 0 ? (
-            <p className="wb-hint">默认模型必须来自池内。删除条目后保存会整体替换模型池。</p>
+            <p className="wb-hint">
+              支持直接拖拽卡片或点击上下箭头调整 1、2、3… 顺位；保存后按当前顺序重写配置。单个模型的能力、思考强度与上下文长度统一在{" "}
+              <button type="button" className="ns-inline-link" onClick={openProvidersSettings}>
+                模型供应商
+              </button>{" "}
+              对应模型行展开修改。
+            </p>
           ) : null}
         </SettingRow>
 

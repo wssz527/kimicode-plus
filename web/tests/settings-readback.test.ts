@@ -44,6 +44,14 @@ test("a pool whose default model differs does not match", () => {
   assert.equal(matchesModelPool({ secondary_model: { models: pool.models } }, pool), false);
 });
 
+test("a pool with the same keys and descriptions in another order does not match", () => {
+  const reordered = {
+    models: { "demo-fast": "快速执行", "demo-local": "演示实现与规划" },
+    defaultModel: "demo-local",
+  };
+  assert.equal(matchesModelPool({ secondary_model: reordered }, pool), false);
+});
+
 test("permission rules read back unchanged match, field by field and in order", () => {
   assert.equal(matchesPermissionRules({ permission: { rules } }, rules), true);
   assert.equal(matchesPermissionRules({ permission: { rules, dangerousCommandGuard: false } }, rules), true);

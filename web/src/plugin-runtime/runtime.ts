@@ -60,6 +60,8 @@ export interface RuntimeOptions {
   browserHost?: BrowserHost;
   /** File picker for `attachments.pick`. Absent means the core dialog is used. */
   pickFiles?: () => Promise<Array<{ path: string; name: string }>>;
+  /** Native directory picker for workspace/project selection. */
+  pickDirectory?: (options?: { title?: string; defaultPath?: string }) => Promise<string | null>;
   openSession?: (id: string) => Promise<void>;
   activeSession?: () => string;
   windowHost?: { popout(pluginId: string): Promise<void>; close(): Promise<void> };
@@ -533,6 +535,16 @@ export function createPluginRuntime(options: RuntimeOptions) {
           );
         },
         theme,
+        async pickDirectory(pickerOptions?: { title?: string; defaultPath?: string }): Promise<string | null> {
+          if (!granted.some(cap => cap === "schedule:manage" || cap === "sessions:create" || cap === "handoff" || cap === "attachments" || cap === "planner:run")) {
+            throw new PluginError(403, "PLUGIN_CAPABILITY_DENIED", "插件没有打开目录选择器的能力");
+          }
+          if (!options.pickDirectory) {
+            throw new PluginError(409, "PLUGIN_DIRECTORY_PICKER_UNAVAILABLE", "当前宿主没有目录选择器");
+          }
+          const chosen = await options.pickDirectory(pickerOptions);
+          return typeof chosen === "string" && chosen.trim() ? chosen.trim() : null;
+        },
       },
       net: { fetch: (url, init) => bridge.fetch(url, init) },
       sessions: sessionsV2,

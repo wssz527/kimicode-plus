@@ -287,6 +287,17 @@ async function installNativeBootstrap(options) {
         const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(target), { title: '添加附件', properties: ['openFile', 'multiSelections'] });
         return result.canceled ? [] : result.filePaths.map(path => ({ path, name: req('node:path').basename(path) }));
       }
+      case 'host.pickDirectory': {
+        const dialogOptions = {
+          title: typeof payload.title === 'string' && payload.title.trim() ? payload.title.trim() : '选择项目文件夹',
+          properties: ['openDirectory', 'createDirectory'],
+        };
+        if (typeof payload.defaultPath === 'string' && payload.defaultPath.trim()) {
+          dialogOptions.defaultPath = payload.defaultPath.trim();
+        }
+        const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(target), dialogOptions);
+        return { path: result.canceled ? '' : (result.filePaths[0] || '') };
+      }
       case 'host.openBrowser': {
         const url = new URL(payload.url);
         if (!['http:','https:'].includes(url.protocol) || url.href.length > 2048) throw new Error('只允许有效的 http 或 https 地址');

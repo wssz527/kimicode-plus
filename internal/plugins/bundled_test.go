@@ -208,9 +208,9 @@ func TestBundledUpgradeRefreshesFilesPreservesStorageAndKeepsOfficialV2Grants(t 
 	}
 	defer db.Close()
 
-	oldPlannerManifest := strings.Replace(string(bundled["kimicode-plus.planner"]["plugin.json"]), `"version": "1.0.3"`, `"version": "1.0.2"`, 1)
+	oldPlannerManifest := strings.Replace(string(bundled["kimicode-plus.planner"]["plugin.json"]), `"version": "1.0.4"`, `"version": "1.0.2"`, 1)
 	if oldPlannerManifest == string(bundled["kimicode-plus.planner"]["plugin.json"]) {
-		t.Fatal("expected planner bundled version to be 1.0.3")
+		t.Fatal("expected planner bundled version to be 1.0.4")
 	}
 	oldMonitorManifest := strings.Replace(string(bundled["kimicode-plus.monitor"]["plugin.json"]), `"version": "1.1.0"`, `"version": "1.0.1"`, 1)
 	if oldMonitorManifest == string(bundled["kimicode-plus.monitor"]["plugin.json"]) {
@@ -273,8 +273,8 @@ func TestBundledUpgradeRefreshesFilesPreservesStorageAndKeepsOfficialV2Grants(t 
 	if err != nil {
 		t.Fatalf("enable upgraded planner: %v", err)
 	}
-	if !enabledPlanner.Official || enabledPlanner.Version != "1.0.3" {
-		t.Fatalf("planner = %+v, want official v1.0.3", enabledPlanner)
+	if !enabledPlanner.Official || enabledPlanner.Version != "1.0.4" {
+		t.Fatalf("planner = %+v, want official v1.0.4", enabledPlanner)
 	}
 	capSet := map[string]bool{}
 	for _, capName := range enabledPlanner.Capabilities {

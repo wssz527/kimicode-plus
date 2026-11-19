@@ -355,15 +355,18 @@ async function installNativeRenderer(options) {
   const nativeStyle = document.createElement('style');
   nativeStyle.textContent = `
     [data-ekd-containment=sessions]>:not(.ekd-session-host),[data-ekd-containment=settings]>:not(.ekd-settings-mount){display:none!important}
-    .ekd-session-host{display:flex;flex:1;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden}
+    .ekd-session-host{display:flex;flex:1;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden;padding-top:44px;box-sizing:border-box;-webkit-app-region:no-drag}
+    header.chat-header~.chat-layout .ekd-session-host,header.chat-header~.ekd-session-host{padding-top:0}
     .pt-body[data-ekdp-panel]>:not(.ekdp-panel-host){display:none!important}
     .pt-body[data-ekdp-panel]>.ekdp-panel-host[hidden]{display:none!important}
     .ekdp-panel-host{display:flex;flex:1;flex-direction:column;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden}
     .ekdp-main-split{display:flex;flex:1 1 auto;min-width:0;min-height:0;width:100%;overflow:hidden}
     .ekdp-main-split[data-ekdp-mode="page"]>.ekdp-main-native,.ekdp-main-split[data-ekdp-mode="page"]>.ekdp-main-splitter{display:none!important}
-    .ekdp-main-split[data-ekdp-mode="page"]>.ekdp-main-pane{flex:1 1 auto;width:100%}
+    .ekdp-main-split[data-ekdp-mode="page"]>.ekdp-main-pane{flex:1 1 auto;width:100%;padding-top:44px;box-sizing:border-box;-webkit-app-region:no-drag}
+    .ekdp-main-split[data-ekdp-mode="split"]>.ekdp-main-pane{padding-top:44px;box-sizing:border-box;-webkit-app-region:no-drag}
+    header.chat-header~.chat-layout .ekdp-main-split>.ekdp-main-pane,header.chat-header~.ekdp-main-split>.ekdp-main-pane{padding-top:0}
     .ekdp-main-native{display:flex;flex:1 1 auto;flex-direction:column;min-width:0;min-height:0}
-    .ekdp-main-pane{display:flex;flex:0 0 auto;flex-direction:column;min-width:0;min-height:0}
+    .ekdp-main-pane{display:flex;flex:0 0 auto;flex-direction:column;min-width:0;min-height:0;background:var(--color-bg,#121212)}
     .ekdp-main-splitter{flex:0 0 5px;cursor:col-resize;background:var(--color-line,#8884);opacity:.55;touch-action:none}
     .ekdp-main-splitter:hover,.ekdp-main-splitter:focus-visible,.ekdp-main-splitter.dragging{opacity:1;outline:none;background:var(--blue,#5b8def)}
     /* The official settings body is a fixed-height box that does not scroll. The
@@ -1269,6 +1272,7 @@ async function installNativeRenderer(options) {
         windowHost: pluginWindowHost,
         commandHost: pluginCommandHost,
         pickFiles: async () => (await transport.request('host.pickFiles', {})) || [],
+        pickDirectory: async opts => ((await transport.request('host.pickDirectory', opts || {}))?.path) || null,
         openSession: async id => { await transport.request('host.openSession', { id }); },
         activeSession,
       });

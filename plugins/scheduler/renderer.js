@@ -35,9 +35,9 @@ export const READONLY_TEMPLATES = [
 ];
 
 export const PERMISSION_MODES = [
-  { value: "manual", label: "每次询问（manual · 推荐）", note: "只读工具自动放行，写入与命令需人工批准。" },
-  { value: "yolo", label: "按需询问（yolo）", note: "常规编辑与命令自动执行，高风险操作与提问需批准。" },
-  { value: "auto", label: "完全自动（auto）", note: "除 Plan 审核外自动执行；无人值守如触发审批仍会暂停等待处理。" },
+  { value: "manual", label: "始终询问", note: "工具执行与文件修改前需人工批准" },
+  { value: "auto", label: "自动判断", note: "常规操作自动放行，高风险操作仍需人工批准" },
+  { value: "yolo", label: "始终允许（免审批）", note: "读写文件与终端命令自动执行，仅交互式提问时暂停" },
 ];
 
 export const RUN_STATUS_LABELS = {
@@ -55,14 +55,42 @@ export const TRIGGER_LABELS = {
   manual: "手动",
 };
 
-const WEEKDAY_LABELS = [
-  { value: 1, label: "周一" },
-  { value: 2, label: "周二" },
-  { value: 3, label: "周三" },
-  { value: 4, label: "周四" },
-  { value: 5, label: "周五" },
-  { value: 6, label: "周六" },
-  { value: 0, label: "周日" },
+const FOLDER_ICON = "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z";
+const REFRESH_ICON = "M4 4v5h5M20 20v-5h-5M4 9a9 9 0 0 1 14.85-3.36L20 7M20 15a9 9 0 0 1-14.85 3.36L4 17";
+const BACK_ICON = "M19 12H5m6-6-6 6 6 6";
+
+const WEEKDAY_ITEMS = [
+  { value: 1, short: "一", label: "周一" },
+  { value: 2, short: "二", label: "周二" },
+  { value: 3, short: "三", label: "周三" },
+  { value: 4, short: "四", label: "周四" },
+  { value: 5, short: "五", label: "周五" },
+  { value: 6, short: "六", label: "周六" },
+  { value: 0, short: "日", label: "周日" },
+];
+
+const SCHEDULE_TABS = [
+  { value: "daily", label: "每天" },
+  { value: "weekly", label: "每周" },
+  { value: "times", label: "每日多时点" },
+  { value: "interval", label: "固定间隔" },
+  { value: "once", label: "单次执行" },
+];
+
+const LEGACY_SCHEDULE_LABELS = {
+  hourly: "每小时",
+  weekdays: "工作日",
+  monthly: "每月",
+};
+
+const QUICK_TIMES = ["08:30", "09:00", "12:00", "18:00", "22:00"];
+const QUICK_MULTI_TIMES = ["08:30", "12:00", "14:00", "18:00", "21:00"];
+const INTERVAL_PRESETS = [
+  { label: "15 分钟", value: 15, unit: "minutes" },
+  { label: "30 分钟", value: 30, unit: "minutes" },
+  { label: "1 小时", value: 1, unit: "hours" },
+  { label: "2 小时", value: 2, unit: "hours" },
+  { label: "6 小时", value: 6, unit: "hours" },
 ];
 
 export function formatModelOptionLabel(model) {
@@ -113,14 +141,156 @@ export function keepAliveStatusText(task) {
   return base;
 }
 
+function localDateOffset(days = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+export function normalizeClock(value, fallback = "09:00") {
+  const match = /^(\d{1,2}):(\d{1,2})$/.exec(String(value || "").trim());
+  if (!match) return fallback;
+  const hh = Math.max(0, Math.min(23, Number.parseInt(match[1], 10)));
+  const mm = Math.max(0, Math.min(59, Number.parseInt(match[2], 10)));
+  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+}
+
+export function parseTimesList(timesOrText) {
+  const rawItems = Array.isArray(timesOrText)
+    ? timesOrText
+    : String(timesOrText || "").split(/[,，\s]+/);
+  const seen = new Set();
+  const valid = [];
+  for (const item of rawItems) {
+    const trimmed = String(item || "").trim();
+    if (!trimmed) continue;
+    const match = /^(\d{1,2}):(\d{1,2})$/.exec(trimmed);
+    if (!match) continue;
+    const hh = Number.parseInt(match[1], 10);
+    const mm = Number.parseInt(match[2], 10);
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59) continue;
+    const norm = `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+    if (!seen.has(norm)) {
+      seen.add(norm);
+      valid.push(norm);
+    }
+  }
+  valid.sort();
+  return valid;
+}
+
+export function resolveDefaultCwd(prefillCwd, sessions = [], targetSessionId = "", activeSessionId = "") {
+  const explicit = typeof prefillCwd === "string" ? prefillCwd.trim() : "";
+  if (explicit) return explicit;
+  const list = Array.isArray(sessions) ? sessions : [];
+  if (list.length === 0) return "";
+  const preferredId = targetSessionId || activeSessionId || "";
+  if (preferredId) {
+    const matched = list.find(s => s && s.id === preferredId && typeof s.cwd === "string" && s.cwd.trim());
+    if (matched) return matched.cwd.trim();
+  }
+  const firstWithCwd = list.find(s => s && typeof s.cwd === "string" && s.cwd.trim());
+  return firstWithCwd ? firstWithCwd.cwd.trim() : "";
+}
+
+function formatWeekdaysText(weekdays) {
+  const selected = new Set(Array.isArray(weekdays) ? weekdays : []);
+  const ordered = WEEKDAY_ITEMS.filter(item => selected.has(item.value));
+  return ordered.map(item => item.label);
+}
+
+export function formatSchedulePreview(draft = {}) {
+  const kind = draft.scheduleKind || "daily";
+  const clock = normalizeClock(draft.time, "09:00");
+  let core = "";
+  switch (kind) {
+    case "once": {
+      const dateStr = String(draft.date || "").trim() || "未选日期";
+      return `执行计划：${dateStr} ${clock} 单次运行，执行后自动停用`;
+    }
+    case "daily":
+      core = `每天 ${clock} 自动运行`;
+      break;
+    case "weekdays":
+      core = `每个工作日（周一至周五）${clock} 自动运行`;
+      break;
+    case "hourly": {
+      const min = Math.max(0, Math.min(59, Number.parseInt(String(draft.minute ?? 0), 10) || 0));
+      core = `每小时第 ${String(min).padStart(2, "0")} 分自动运行`;
+      break;
+    }
+    case "weekly": {
+      const names = formatWeekdaysText(draft.weekdays);
+      if (names.length === 0) {
+        core = `每周（请选择至少一天）${clock} 自动运行`;
+      } else if (names.length === 7) {
+        core = `每天（周一至周日）${clock} 自动运行`;
+      } else {
+        core = `每${names.join("、")} ${clock} 自动运行`;
+      }
+      break;
+    }
+    case "monthly": {
+      const days = String(draft.daysText || "")
+        .split(/[,，\s]+/)
+        .map(item => Number.parseInt(item, 10))
+        .filter(n => Number.isFinite(n) && n >= 1 && n <= 31);
+      const parts = days.map(d => `${d} 日`);
+      if (draft.lastDay) parts.push("最后一天");
+      core = `每月 ${parts.length ? parts.join("、") : "指定日期"} ${clock} 自动运行`;
+      break;
+    }
+    case "interval": {
+      const val = Math.max(1, Number.parseInt(String(draft.intervalValue || 1), 10) || 1);
+      const unit = draft.intervalUnit === "hours" ? "小时" : "分钟";
+      let note = "";
+      if (draft.intervalUnit !== "hours" && val >= 60 && val % 60 === 0) {
+        note = `（每 ${val / 60} 小时）`;
+      }
+      if (draft.testMode) {
+        note += "（测试模式）";
+      }
+      core = `每隔 ${val} ${unit}自动运行${note}`;
+      break;
+    }
+    case "times": {
+      const times = parseTimesList(Array.isArray(draft.times) ? draft.times : draft.timesText);
+      const names = formatWeekdaysText(draft.weekdays);
+      const prefix = names.length === 0 || names.length === 7 ? "每天" : `每${names.join("、")}`;
+      if (times.length === 0) {
+        core = `${prefix}多时点（请添加至少一个执行时间）`;
+      } else {
+        core = `${prefix} ${times.join("、")} 自动运行`;
+      }
+      break;
+    }
+    default:
+      core = `${kind} 自动运行`;
+  }
+
+  const startDate = String(draft.startDate || "").trim();
+  const endDate = String(draft.endDate || "").trim();
+  let validity = "立即生效，长期持续有效";
+  if (startDate && endDate) {
+    validity = `${startDate} 至 ${endDate} 生效`;
+  } else if (startDate) {
+    validity = `${startDate} 起生效，长期有效`;
+  } else if (endDate) {
+    validity = `立即生效，至 ${endDate} 止`;
+  }
+  return `执行计划：${core} · ${validity}`;
+}
+
 export function defaultDraft(prefill = {}) {
-  const today = new Date();
-  const yyyy = today.getFullYear();
-  const mm = String(today.getMonth() + 1).padStart(2, "0");
-  const dd = String(today.getDate()).padStart(2, "0");
   const scheduleKind = prefill.schedule?.kind || "daily";
   const hasExplicitWeekdays = Array.isArray(prefill.schedule?.weekdays);
   const weekdaysAutoDefault = !hasExplicitWeekdays && scheduleKind === "weekly";
+  const initialTimes = Array.isArray(prefill.schedule?.times) && prefill.schedule.times.length
+    ? parseTimesList(prefill.schedule.times)
+    : ["09:00", "18:00"];
   return {
     id: prefill.id || "",
     name: prefill.name || "",
@@ -134,8 +304,8 @@ export function defaultDraft(prefill = {}) {
     missedPolicy: prefill.missedPolicy || "catchup",
     enabled: prefill.enabled !== undefined ? Boolean(prefill.enabled) : true,
     scheduleKind,
-    date: prefill.schedule?.date || `${yyyy}-${mm}-${dd}`,
-    time: prefill.schedule?.time || "09:00",
+    date: prefill.schedule?.date || localDateOffset(0),
+    time: normalizeClock(prefill.schedule?.time, "09:00"),
     minute: typeof prefill.schedule?.minute === "number" ? prefill.schedule.minute : 0,
     weekdays: hasExplicitWeekdays
       ? [...prefill.schedule.weekdays]
@@ -150,9 +320,7 @@ export function defaultDraft(prefill = {}) {
     intervalValue: prefill.schedule?.intervalValue || 30,
     intervalUnit: prefill.schedule?.intervalUnit || "minutes",
     testMode: Boolean(prefill.schedule?.testMode),
-    timesText: Array.isArray(prefill.schedule?.times) && prefill.schedule.times.length
-      ? prefill.schedule.times.join(", ")
-      : "09:00, 18:00",
+    timesText: (initialTimes.length ? initialTimes : ["09:00", "18:00"]).join(", "),
     startDate: prefill.schedule?.startDate || "",
     endDate: prefill.schedule?.endDate || "",
   };
@@ -174,26 +342,28 @@ export function switchScheduleKind(draft, nextKind) {
 
 export function buildScheduleRule(draft) {
   const rule = { kind: draft.scheduleKind || "daily" };
-  if (draft.startDate) rule.startDate = String(draft.startDate).trim();
-  if (draft.endDate) rule.endDate = String(draft.endDate).trim();
+  if (rule.kind !== "once") {
+    if (draft.startDate) rule.startDate = String(draft.startDate).trim();
+    if (draft.endDate) rule.endDate = String(draft.endDate).trim();
+  }
   switch (rule.kind) {
     case "once":
       rule.date = String(draft.date || "").trim();
-      rule.time = String(draft.time || "09:00").trim();
+      rule.time = normalizeClock(draft.time, "09:00");
       break;
     case "hourly":
       rule.minute = Math.max(0, Math.min(59, Number.parseInt(String(draft.minute ?? 0), 10) || 0));
       break;
     case "daily":
     case "weekdays":
-      rule.time = String(draft.time || "09:00").trim();
+      rule.time = normalizeClock(draft.time, "09:00");
       break;
     case "weekly":
-      rule.time = String(draft.time || "09:00").trim();
+      rule.time = normalizeClock(draft.time, "09:00");
       rule.weekdays = Array.isArray(draft.weekdays) ? [...draft.weekdays] : [];
       break;
     case "monthly": {
-      rule.time = String(draft.time || "09:00").trim();
+      rule.time = normalizeClock(draft.time, "09:00");
       const rawDays = String(draft.daysText || "")
         .split(/[,，\s]+/)
         .map(item => Number.parseInt(item, 10))
@@ -207,15 +377,22 @@ export function buildScheduleRule(draft) {
       rule.intervalUnit = draft.intervalUnit === "hours" ? "hours" : "minutes";
       rule.testMode = Boolean(draft.testMode);
       break;
-    case "times":
-      rule.times = String(draft.timesText || "")
-        .split(/[,，\s]+/)
-        .map(item => item.trim())
-        .filter(Boolean);
+    case "times": {
+      const source = Array.isArray(draft.times) ? draft.times : draft.timesText;
+      const parsed = parseTimesList(source);
+      if (parsed.length > 0) {
+        rule.times = parsed;
+      } else {
+        rule.times = String(draft.timesText || "")
+          .split(/[,，\s]+/)
+          .map(item => item.trim())
+          .filter(Boolean);
+      }
       if (Array.isArray(draft.weekdays) && draft.weekdays.length > 0) {
         rule.weekdays = [...draft.weekdays];
       }
       break;
+    }
   }
   return rule;
 }
@@ -299,29 +476,75 @@ const SHARED_CSS = `
   flex:1 1 auto;
   min-height:0;
   background:var(--sched-bg);
+  -webkit-app-region:no-drag;
+  position:relative;
+  z-index:1;
+}
+button,input,select,textarea,.sched-tab{
+  -webkit-app-region:no-drag;
+  position:relative;
+  z-index:1;
 }
 .sched-head{
   display:flex;
   align-items:center;
-  gap:8px;
-  padding:12px 14px 10px;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  gap:10px 16px;
+  padding:14px 20px 12px;
   border-bottom:1px solid var(--sched-line);
+  background:var(--sched-bg);
+  -webkit-app-region:no-drag;
+  position:relative;
+  z-index:1;
 }
-.sched-title{margin:0;font-size:15px;font-weight:600;letter-spacing:-0.01em}
-.sched-head-actions{margin-left:auto;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.sched-head-main{
+  display:flex;
+  flex-direction:column;
+  gap:2px;
+  min-width:0;
+  flex:1 1 220px;
+}
+.sched-head-title-row{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+  min-width:0;
+}
+.sched-title{margin:0;font-size:16px;font-weight:600;letter-spacing:-0.01em}
+.sched-subtitle{margin:0;font-size:12px;color:var(--sched-muted);line-height:1.45}
+.sched-head-actions{
+  margin-left:auto;
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+  flex-shrink:0;
+  -webkit-app-region:no-drag;
+  position:relative;
+  z-index:1;
+}
+.sched-shell.compact .sched-head{padding:12px 14px 10px;gap:8px 10px}
+.sched-shell.compact .sched-title{font-size:14.5px}
+.sched-shell.compact .sched-tabs{padding:8px 14px 0}
+.sched-shell.compact .sched-banner{margin:10px 14px 0}
+.sched-shell.compact .sched-body{padding:12px 14px 18px}
 .sched-tabs{
   display:flex;
   align-items:center;
-  gap:4px;
-  padding:8px 14px 0;
+  gap:6px;
+  padding:8px 20px 0;
   border-bottom:1px solid var(--sched-line);
 }
 .sched-tab{
   position:relative;
+  z-index:1;
+  -webkit-app-region:no-drag;
   display:inline-flex;
   align-items:center;
   gap:6px;
-  padding:6px 10px 8px;
+  padding:7px 12px 9px;
   border:0;
   border-bottom:2px solid transparent;
   background:transparent;
@@ -354,8 +577,8 @@ const SHARED_CSS = `
   color:var(--color-text-on-accent, #fff);
 }
 .sched-banner{
-  margin:10px 14px 0;
-  padding:8px 11px;
+  margin:10px 20px 0;
+  padding:9px 12px;
   border-radius:8px;
   border:1px solid var(--sched-line);
   background:var(--sched-fill);
@@ -377,7 +600,7 @@ const SHARED_CSS = `
   flex:1 1 auto;
   min-height:0;
   overflow-y:auto;
-  padding:12px 14px 18px;
+  padding:14px 20px 20px;
   display:flex;
   flex-direction:column;
   gap:10px;
@@ -394,7 +617,7 @@ const SHARED_CSS = `
   display:flex;
   flex-direction:column;
   gap:8px;
-  padding:11px 12px;
+  padding:12px 14px;
   border:1px solid var(--sched-line);
   border-radius:10px;
   background:var(--sched-fill);
@@ -402,7 +625,7 @@ const SHARED_CSS = `
 .sched-card.unread{
   border-color:var(--sched-accent);
 }
-.sched-card-top{display:flex;align-items:center;gap:8px;min-width:0}
+.sched-card-top{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}
 .sched-card-title{font-weight:600;font-size:13.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sched-pill{
   display:inline-flex;
@@ -434,37 +657,51 @@ const SHARED_CSS = `
   align-items:center;
   justify-content:center;
   gap:5px;
-  height:27px;
-  padding:0 10px;
+  height:30px;
+  padding:0 11px;
   border:1px solid var(--sched-line);
-  border-radius:6px;
+  border-radius:7px;
   background:transparent;
   color:var(--sched-text);
   font:inherit;
-  font-size:12px;
+  font-size:12.5px;
+  font-weight:500;
+  white-space:nowrap;
+  flex-shrink:0;
   cursor:pointer;
 }
+.sched-shell.compact .sched-btn{height:27px;padding:0 9px;font-size:12px}
 .sched-btn:hover:not([disabled]){background:var(--sched-hover)}
 .sched-btn[disabled]{opacity:.48;cursor:not-allowed}
 .sched-btn.primary{
   border-color:transparent;
   background:var(--sched-accent);
   color:var(--color-text-on-accent, #fff);
+  font-weight:600;
 }
+.sched-btn.primary:hover:not([disabled]){filter:brightness(1.06)}
 .sched-btn.danger{color:var(--sched-danger)}
-.sched-btn.quiet{border-color:transparent}
+.sched-btn.quiet{
+  border-color:transparent;
+  background:var(--sched-fill);
+  color:var(--sched-muted);
+}
+.sched-btn.quiet:hover:not([disabled]){
+  background:var(--sched-hover);
+  color:var(--sched-text);
+}
 .sched-select,.sched-input{
-  height:28px;
-  padding:0 8px;
+  height:30px;
+  padding:0 9px;
   border:1px solid var(--sched-line);
-  border-radius:6px;
+  border-radius:7px;
   background:var(--sched-bg);
   color:var(--sched-text);
   font:inherit;
   font-size:12.5px;
 }
 .sched-empty{
-  padding:22px 14px;
+  padding:24px 16px;
   border:1px dashed var(--sched-line);
   border-radius:10px;
   text-align:center;
@@ -474,7 +711,7 @@ const SHARED_CSS = `
   gap:10px;
   color:var(--sched-muted);
 }
-.sched-empty p{margin:0;font-size:12.5px;max-width:340px;line-height:1.55}
+.sched-empty p{margin:0;font-size:12.5px;max-width:360px;line-height:1.55}
 .sched-tpl-row{display:flex;flex-wrap:wrap;gap:6px;justify-content:center}
 .sched-unread-dot{
   width:7px;height:7px;border-radius:50%;
@@ -509,8 +746,11 @@ const DIALOG_CSS = `
   --sched-accent:var(--color-accent, var(--blue, #1783ff));
   --sched-accent-soft:var(--color-accent-soft, var(--soft, color-mix(in srgb, var(--sched-accent) 14%, transparent)));
   --sched-danger:var(--color-danger, var(--red, var(--danger, #dc2626)));
-  width:min(620px,calc(100vw - 36px));
-  max-height:min(820px,calc(100vh - 48px));
+  position:fixed;
+  z-index:9999;
+  -webkit-app-region:no-drag;
+  width:min(660px,calc(100vw - 36px));
+  max-height:min(860px,calc(100vh - 48px));
   padding:0;
   border:1px solid var(--sched-line);
   border-radius:12px;
@@ -519,7 +759,12 @@ const DIALOG_CSS = `
   font:13.5px/1.5 var(--font-ui,system-ui,-apple-system,sans-serif);
   box-shadow:0 24px 64px rgba(0,0,0,.32);
 }
-.ekd-sched-dialog::backdrop{background:rgba(0,0,0,.42)}
+.ekd-sched-dialog::backdrop{background:rgba(0,0,0,.44)}
+.ekd-sched-dialog button,.ekd-sched-dialog input,.ekd-sched-dialog select,.ekd-sched-dialog textarea{
+  -webkit-app-region:no-drag;
+  position:relative;
+  z-index:1;
+}
 .ekd-sd-head{
   display:flex;align-items:flex-start;gap:12px;
   padding:16px 20px 12px;
@@ -536,12 +781,12 @@ const DIALOG_CSS = `
   display:flex;flex-direction:column;gap:14px;
   padding:16px 20px;
   overflow-y:auto;
-  max-height:min(64vh,580px);
+  max-height:min(68vh,620px);
 }
 .ekd-sd-field{display:flex;flex-direction:column;gap:5px}
-.ekd-sd-label{display:flex;align-items:baseline;gap:8px;font-size:12.5px}
+.ekd-sd-label{display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:12.5px}
 .ekd-sd-label strong{font-weight:600}
-.ekd-sd-hint{font-size:12px;color:var(--sched-muted);margin:0}
+.ekd-sd-hint{font-size:12px;color:var(--sched-muted);margin:0;line-height:1.45}
 .ekd-sd-input,.ekd-sd-select,.ekd-sd-textarea{
   width:100%;padding:7px 10px;
   border:1px solid var(--sched-line);
@@ -553,17 +798,32 @@ const DIALOG_CSS = `
 .ekd-sd-textarea{min-height:84px;resize:vertical;line-height:1.5}
 .ekd-sd-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .ekd-sd-grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.ekd-sd-path-row{display:flex;align-items:center;gap:8px}
+.ekd-sd-path-row .ekd-sd-input{flex:1 1 auto;min-width:0}
+.ekd-sd-pick-btn{
+  display:inline-flex;align-items:center;gap:6px;
+  height:34px;padding:0 12px;
+  border:1px solid var(--sched-line);border-radius:7px;
+  background:var(--sched-fill);color:var(--sched-text);
+  font:inherit;font-size:12.5px;font-weight:500;
+  cursor:pointer;white-space:nowrap;flex:none;
+}
+.ekd-sd-pick-btn:hover:not([disabled]){background:var(--sched-hover)}
+.ekd-sd-pick-btn[disabled]{opacity:.55;cursor:not-allowed}
 .ekd-sd-chips{display:flex;flex-wrap:wrap;gap:6px}
 .ekd-sd-chip{
   height:26px;padding:0 11px;
   border:1px solid var(--sched-line);
-  border-radius:999px;background:transparent;color:inherit;
+  border-radius:999px;background:var(--sched-bg);color:inherit;
   font:inherit;font-size:12px;cursor:pointer;
+  font-variant-numeric:tabular-nums;
 }
 .ekd-sd-chip:hover{background:var(--sched-hover)}
 .ekd-sd-chip[aria-pressed="true"]{
   border-color:var(--sched-accent);
   background:var(--sched-accent-soft);
+  color:var(--sched-accent);
+  font-weight:600;
 }
 .ekd-sd-seg{
   display:inline-flex;gap:2px;padding:2px;border-radius:999px;
@@ -577,6 +837,92 @@ const DIALOG_CSS = `
 .ekd-sd-seg button[aria-pressed="true"]{
   background:var(--sched-bg);font-weight:600;box-shadow:0 0 0 1px var(--sched-line);
 }
+.ekd-sd-sched-card{
+  display:flex;flex-direction:column;gap:12px;
+  padding:13px 14px;
+  border:1px solid var(--sched-line);
+  border-radius:10px;
+  background:color-mix(in srgb, var(--sched-fill) 70%, transparent);
+}
+.ekd-sd-preview{
+  display:flex;align-items:flex-start;gap:8px;
+  padding:9px 11px;
+  border-radius:8px;
+  border:1px solid color-mix(in srgb, var(--sched-accent) 30%, var(--sched-line));
+  background:var(--sched-accent-soft);
+  color:var(--sched-text);
+  font-size:12.5px;font-weight:500;line-height:1.45;
+  font-variant-numeric:tabular-nums;
+}
+.ekd-sd-preview svg{flex:none;margin-top:2px;color:var(--sched-accent)}
+.ekd-sd-freq-seg{
+  display:flex;flex-wrap:wrap;gap:4px;padding:3px;
+  border-radius:9px;background:var(--sched-fill);border:1px solid var(--sched-line);
+}
+.ekd-sd-freq-btn{
+  flex:1 1 auto;min-width:72px;height:29px;padding:0 10px;
+  border:0;border-radius:6px;background:transparent;
+  color:var(--sched-muted);font:inherit;font-size:12.5px;cursor:pointer;white-space:nowrap;
+}
+.ekd-sd-freq-btn:hover{color:var(--sched-text)}
+.ekd-sd-freq-btn[aria-pressed="true"]{
+  background:var(--sched-bg);color:var(--sched-text);font-weight:600;
+  box-shadow:0 1px 2px rgba(0,0,0,.08),0 0 0 1px var(--sched-line);
+}
+.ekd-sd-subblock{display:flex;flex-direction:column;gap:7px}
+.ekd-sd-sublabel{font-size:12px;font-weight:600;color:var(--sched-text)}
+.ekd-sd-time-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.ekd-sd-time-picker{
+  display:inline-flex;align-items:center;gap:2px;padding:2px 6px;
+  border:1px solid var(--sched-line);border-radius:8px;background:var(--sched-bg);
+}
+.ekd-sd-time-seg{
+  width:58px;height:28px;padding:0 4px;border:0;border-radius:5px;
+  background:transparent;color:var(--sched-text);
+  font:inherit;font-size:13px;font-weight:500;
+  font-variant-numeric:tabular-nums;text-align:center;cursor:pointer;
+}
+.ekd-sd-time-colon{font-weight:600;color:var(--sched-muted);font-variant-numeric:tabular-nums;user-select:none}
+.ekd-sd-day-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.ekd-sd-days{display:inline-flex;align-items:center;gap:5px;flex-wrap:wrap}
+.ekd-sd-day-btn{
+  width:31px;height:31px;padding:0;
+  border:1px solid var(--sched-line);border-radius:999px;
+  background:var(--sched-bg);color:var(--sched-text);
+  font:inherit;font-size:12px;font-weight:500;cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;
+}
+.ekd-sd-day-btn:hover{background:var(--sched-hover)}
+.ekd-sd-day-btn[aria-pressed="true"]{
+  border-color:var(--sched-accent);background:var(--sched-accent);
+  color:var(--color-text-on-accent,#fff);font-weight:600;
+}
+.ekd-sd-times-list{display:flex;flex-wrap:wrap;gap:6px}
+.ekd-sd-time-tag{
+  display:inline-flex;align-items:center;gap:5px;height:27px;padding:0 6px 0 10px;
+  border:1px solid color-mix(in srgb, var(--sched-accent) 32%, var(--sched-line));
+  border-radius:999px;background:var(--sched-bg);
+  font-size:12.5px;font-weight:500;font-variant-numeric:tabular-nums;
+}
+.ekd-sd-time-remove{
+  width:18px;height:18px;padding:0;border:0;border-radius:999px;
+  background:transparent;color:var(--sched-muted);cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;font-size:13px;line-height:1;
+}
+.ekd-sd-time-remove:hover{background:var(--sched-hover);color:var(--sched-danger)}
+.ekd-sd-validity{
+  display:flex;flex-direction:column;gap:8px;
+  padding-top:10px;border-top:1px solid var(--sched-line);
+}
+.ekd-sd-date-wrap{display:flex;align-items:center;gap:6px}
+.ekd-sd-date-wrap .ekd-sd-input{flex:1 1 auto;min-width:0}
+.ekd-sd-mini-btn{
+  height:26px;padding:0 9px;
+  border:1px solid var(--sched-line);border-radius:6px;
+  background:var(--sched-bg);color:var(--sched-muted);
+  font:inherit;font-size:11.5px;cursor:pointer;white-space:nowrap;flex:none;
+}
+.ekd-sd-mini-btn:hover{background:var(--sched-hover);color:var(--sched-text)}
 .ekd-sd-error{
   padding:8px 10px;border-radius:7px;
   background:color-mix(in srgb, var(--sched-danger) 12%, transparent);color:var(--sched-danger);
@@ -592,7 +938,7 @@ const DIALOG_CSS = `
   height:30px;padding:0 14px;
   border:1px solid var(--sched-line);
   border-radius:6px;background:transparent;color:inherit;
-  font:inherit;font-size:12.5px;cursor:pointer;
+  font:inherit;font-size:12.5px;cursor:pointer;white-space:nowrap;
 }
 .ekd-sd-btn:hover:not([disabled]){background:var(--sched-hover)}
 .ekd-sd-btn[disabled]{opacity:.5;cursor:not-allowed}
@@ -600,6 +946,7 @@ const DIALOG_CSS = `
   border-color:transparent;
   background:var(--sched-accent);
   color:var(--color-text-on-accent,#fff);
+  font-weight:600;
 }
 `;
 
@@ -705,16 +1052,113 @@ export async function activate(ctx) {
     ensureDialogStyle();
     const doc = document;
     const draft = defaultDraft(prefill);
-    if (!draft.cwd && state.sessions.length > 0) {
-      const matched = state.sessions.find(s => s.id === draft.sessionId) || state.sessions[0];
-      if (matched?.cwd) draft.cwd = matched.cwd;
+    const activeSessionId = ctx.sessions?.activeId?.() || ctx.activeSessionId?.() || state.rightPanelSessionId || "";
+    if (!draft.cwd) {
+      draft.cwd = resolveDefaultCwd(prefill.cwd, state.sessions, draft.sessionId, activeSessionId);
     }
     let busy = false;
+    let pickingDir = false;
+    let dirPickerUnavailable = false;
+    let dirPickerHint = "";
+    let pendingTime = "12:00";
     let errorMsg = "";
 
     const dialog = doc.createElement("dialog");
     dialog.className = "ekd-sched-dialog";
     dialog.setAttribute("aria-label", draft.id ? "编辑定时任务" : "新建定时任务");
+
+    function createTimePicker(value, onChange) {
+      const normalized = normalizeClock(value, "09:00");
+      const [initH, initM] = normalized.split(":");
+      const hourOptions = [];
+      for (let h = 0; h < 24; h += 1) {
+        const str = String(h).padStart(2, "0");
+        hourOptions.push(el(doc, "option", { value: str, text: str }));
+      }
+      const minuteOptions = [];
+      for (let m = 0; m < 60; m += 1) {
+        const str = String(m).padStart(2, "0");
+        minuteOptions.push(el(doc, "option", { value: str, text: str }));
+      }
+      const hourSel = el(doc, "select", {
+        class: "ekd-sd-time-seg",
+        "aria-label": "小时",
+      }, hourOptions);
+      hourSel.value = initH;
+      const minSel = el(doc, "select", {
+        class: "ekd-sd-time-seg",
+        "aria-label": "分钟",
+      }, minuteOptions);
+      minSel.value = initM;
+      const emit = () => onChange(`${hourSel.value}:${minSel.value}`);
+      hourSel.addEventListener("change", emit);
+      minSel.addEventListener("change", emit);
+      return el(doc, "div", { class: "ekd-sd-time-picker" }, [
+        hourSel,
+        el(doc, "span", { class: "ekd-sd-time-colon", text: ":" }),
+        minSel,
+      ]);
+    }
+
+    function createWeekdayPicker(options = {}) {
+      const allowEmpty = Boolean(options.allowEmpty);
+      const selected = new Set(Array.isArray(draft.weekdays) ? draft.weekdays : []);
+      const dayButtons = el(doc, "div", { class: "ekd-sd-days", role: "group", "aria-label": "选择星期" }, WEEKDAY_ITEMS.map(wd => {
+        const active = selected.has(wd.value);
+        return el(doc, "button", {
+          type: "button",
+          class: "ekd-sd-day-btn",
+          text: wd.short,
+          title: wd.label,
+          "aria-label": wd.label,
+          "aria-pressed": active ? "true" : "false",
+          onClick: () => {
+            draft.weekdaysAutoDefault = false;
+            if (active) draft.weekdays = draft.weekdays.filter(v => v !== wd.value);
+            else draft.weekdays = [...draft.weekdays, wd.value];
+            renderDialog();
+          },
+        });
+      }));
+
+      const quickBtns = [
+        el(doc, "button", {
+          type: "button",
+          class: "ekd-sd-mini-btn",
+          text: "工作日",
+          onClick: () => {
+            draft.weekdaysAutoDefault = false;
+            draft.weekdays = [1, 2, 3, 4, 5];
+            renderDialog();
+          },
+        }),
+        el(doc, "button", {
+          type: "button",
+          class: "ekd-sd-mini-btn",
+          text: "周末",
+          onClick: () => {
+            draft.weekdaysAutoDefault = false;
+            draft.weekdays = [0, 6];
+            renderDialog();
+          },
+        }),
+        el(doc, "button", {
+          type: "button",
+          class: "ekd-sd-mini-btn",
+          text: allowEmpty ? "不限（每天）" : "全选",
+          onClick: () => {
+            draft.weekdaysAutoDefault = false;
+            draft.weekdays = allowEmpty ? [] : [1, 2, 3, 4, 5, 6, 0];
+            renderDialog();
+          },
+        }),
+      ];
+
+      return el(doc, "div", { class: "ekd-sd-day-row" }, [
+        dayButtons,
+        el(doc, "div", { class: "ekd-sd-chips" }, quickBtns),
+      ]);
+    }
 
     function renderDialog() {
       const selectedModel = state.models.find(m => m.id === draft.model) || null;
@@ -771,7 +1215,13 @@ export async function activate(ctx) {
           type: "button",
           text: "新开会话",
           "aria-pressed": draft.mode === "new_session" ? "true" : "false",
-          onClick: () => { draft.mode = "new_session"; renderDialog(); },
+          onClick: () => {
+            draft.mode = "new_session";
+            if (!draft.cwd) {
+              draft.cwd = resolveDefaultCwd("", state.sessions, draft.sessionId, activeSessionId);
+            }
+            renderDialog();
+          },
         }),
         el(doc, "button", {
           type: "button",
@@ -787,15 +1237,59 @@ export async function activate(ctx) {
       ]));
 
       if (draft.mode === "new_session") {
+        const canPickDirectory = typeof ctx.ui?.pickDirectory === "function" && !dirPickerUnavailable;
+        const cwdInput = el(doc, "input", {
+          type: "text",
+          class: "ekd-sd-input",
+          placeholder: "/path/to/project",
+          value: draft.cwd,
+          onInput: e => { draft.cwd = e.target.value; },
+        });
+        const pickBtn = canPickDirectory
+          ? el(doc, "button", {
+              type: "button",
+              class: "ekd-sd-pick-btn",
+              disabled: pickingDir || busy,
+              onClick: async () => {
+                if (pickingDir || busy) return;
+                pickingDir = true;
+                dirPickerHint = "";
+                renderDialog();
+                try {
+                  const picked = await ctx.ui.pickDirectory({
+                    title: "选择定时任务工作目录",
+                    defaultPath: draft.cwd || undefined,
+                  });
+                  if (typeof picked === "string" && picked.trim()) {
+                    draft.cwd = picked.trim();
+                  }
+                } catch (err) {
+                  const code = err && typeof err === "object" ? err.code : "";
+                  if (code === "PLUGIN_DIRECTORY_PICKER_UNAVAILABLE") {
+                    dirPickerUnavailable = true;
+                    dirPickerHint = "当前环境不支持访达目录选择器，请直接输入或粘贴项目路径。";
+                  } else {
+                    dirPickerHint = err instanceof Error ? err.message : String(err);
+                  }
+                } finally {
+                  pickingDir = false;
+                  renderDialog();
+                }
+              },
+            }, [
+              makeSvg(doc, FOLDER_ICON, 14),
+              pickingDir ? "选择中…" : "选择文件夹…",
+            ])
+          : null;
+
         bodyChildren.push(el(doc, "div", { class: "ekd-sd-field" }, [
           el(doc, "label", { class: "ekd-sd-label" }, [el(doc, "strong", { text: "项目目录" })]),
-          el(doc, "input", {
-            type: "text",
-            class: "ekd-sd-input",
-            placeholder: "/path/to/project",
-            value: draft.cwd,
-            onInput: e => { draft.cwd = e.target.value; },
-          }),
+          el(doc, "div", { class: "ekd-sd-path-row" }, [cwdInput, pickBtn]),
+          dirPickerHint
+            ? el(doc, "p", { class: "ekd-sd-hint", text: dirPickerHint })
+            : !canPickDirectory
+              ? el(doc, "p", { class: "ekd-sd-hint", text: "请输入或粘贴本机项目文件夹的绝对路径。" })
+              : null,
         ]));
       } else {
         const sessSelect = el(doc, "select", {
@@ -863,145 +1357,365 @@ export async function activate(ctx) {
       bodyChildren.push(el(doc, "div", { class: "ekd-sd-field" }, [
         el(doc, "label", { class: "ekd-sd-label" }, [el(doc, "strong", { text: "权限模式" })]),
         permSelect,
-        el(doc, "p", { class: "ekd-sd-hint", text: `${permNote} 无人值守出现任何审批请求时绝不自动批准，会暂停并记为「等待批准」。` }),
+        el(doc, "p", { class: "ekd-sd-hint", text: permNote }),
       ]));
 
-      const kindSelect = el(doc, "select", {
-        class: "ekd-sd-select",
-        onChange: e => { switchScheduleKind(draft, e.target.value); renderDialog(); },
-      }, [
-        el(doc, "option", { value: "daily", text: "每天一次（默认）" }),
-        el(doc, "option", { value: "weekdays", text: "每个工作日（周一至周五）" }),
-        el(doc, "option", { value: "hourly", text: "每小时一次" }),
-        el(doc, "option", { value: "weekly", text: "每周（自选星期）" }),
-        el(doc, "option", { value: "monthly", text: "每月（指定日期 / 月末）" }),
-        el(doc, "option", { value: "once", text: "单次（指定日期时间）" }),
-        el(doc, "option", { value: "interval", text: "自定义间隔（分钟 / 小时）" }),
-        el(doc, "option", { value: "times", text: "自定义一天多时点" }),
+      const previewTextEl = el(doc, "span", { text: formatSchedulePreview(draft) });
+      const previewBar = el(doc, "div", { class: "ekd-sd-preview", role: "status", "aria-live": "polite" }, [
+        makeSvg(doc, SCHEDULER_ICON, 15),
+        previewTextEl,
       ]);
-      kindSelect.value = draft.scheduleKind;
+      const updatePreview = () => {
+        previewTextEl.textContent = formatSchedulePreview(draft);
+      };
+
+      const tabItems = [...SCHEDULE_TABS];
+      if (LEGACY_SCHEDULE_LABELS[draft.scheduleKind]) {
+        tabItems.push({ value: draft.scheduleKind, label: LEGACY_SCHEDULE_LABELS[draft.scheduleKind] });
+      }
+      const freqTabs = el(doc, "div", { class: "ekd-sd-freq-seg", role: "group", "aria-label": "调度频率" }, tabItems.map(item =>
+        el(doc, "button", {
+          type: "button",
+          class: "ekd-sd-freq-btn",
+          text: item.label,
+          "aria-pressed": draft.scheduleKind === item.value ? "true" : "false",
+          onClick: () => {
+            switchScheduleKind(draft, item.value);
+            renderDialog();
+          },
+        }),
+      ));
 
       const schedDetails = [];
-      if (draft.scheduleKind === "once") {
-        schedDetails.push(el(doc, "div", { class: "ekd-sd-grid2" }, [
-          el(doc, "input", { type: "date", class: "ekd-sd-input", value: draft.date, onInput: e => { draft.date = e.target.value; } }),
-          el(doc, "input", { type: "time", class: "ekd-sd-input", value: draft.time, onInput: e => { draft.time = e.target.value; } }),
-        ]));
-      } else if (draft.scheduleKind === "hourly") {
-        schedDetails.push(el(doc, "div", { class: "ekd-sd-row" }, [
-          el(doc, "span", { text: "每小时第" }),
-          el(doc, "input", {
-            type: "number", min: "0", max: "59", class: "ekd-sd-input",
-            style: "width:84px",
-            value: String(draft.minute),
-            onInput: e => { draft.minute = Number.parseInt(e.target.value, 10) || 0; },
-          }),
-          el(doc, "span", { text: "分执行" }),
-        ]));
-      } else if (draft.scheduleKind === "daily" || draft.scheduleKind === "weekdays") {
-        schedDetails.push(el(doc, "div", { class: "ekd-sd-row" }, [
-          el(doc, "span", { text: "执行时间" }),
-          el(doc, "input", { type: "time", class: "ekd-sd-input", style: "width:140px", value: draft.time, onInput: e => { draft.time = e.target.value; } }),
+      if (draft.scheduleKind === "daily" || draft.scheduleKind === "weekdays") {
+        const quickChips = QUICK_TIMES.map(t => el(doc, "button", {
+          type: "button",
+          class: "ekd-sd-chip",
+          text: t,
+          "aria-pressed": normalizeClock(draft.time) === t ? "true" : "false",
+          onClick: () => {
+            draft.time = t;
+            renderDialog();
+          },
+        }));
+        schedDetails.push(el(doc, "div", { class: "ekd-sd-subblock" }, [
+          el(doc, "span", { class: "ekd-sd-sublabel", text: "执行时间" }),
+          el(doc, "div", { class: "ekd-sd-time-row" }, [
+            createTimePicker(draft.time, next => {
+              draft.time = next;
+              renderDialog();
+            }),
+            el(doc, "div", { class: "ekd-sd-chips" }, quickChips),
+          ]),
         ]));
       } else if (draft.scheduleKind === "weekly") {
-        const dayChips = el(doc, "div", { class: "ekd-sd-chips" }, WEEKDAY_LABELS.map(wd => {
-          const active = draft.weekdays.includes(wd.value);
+        const quickChips = QUICK_TIMES.map(t => el(doc, "button", {
+          type: "button",
+          class: "ekd-sd-chip",
+          text: t,
+          "aria-pressed": normalizeClock(draft.time) === t ? "true" : "false",
+          onClick: () => {
+            draft.time = t;
+            renderDialog();
+          },
+        }));
+        schedDetails.push(
+          el(doc, "div", { class: "ekd-sd-subblock" }, [
+            el(doc, "span", { class: "ekd-sd-sublabel", text: "重复星期" }),
+            createWeekdayPicker({ allowEmpty: false }),
+          ]),
+          el(doc, "div", { class: "ekd-sd-subblock" }, [
+            el(doc, "span", { class: "ekd-sd-sublabel", text: "执行时间" }),
+            el(doc, "div", { class: "ekd-sd-time-row" }, [
+              createTimePicker(draft.time, next => {
+                draft.time = next;
+                renderDialog();
+              }),
+              el(doc, "div", { class: "ekd-sd-chips" }, quickChips),
+            ]),
+          ]),
+        );
+      } else if (draft.scheduleKind === "times") {
+        const currentTimes = parseTimesList(draft.timesText);
+        const timeTagNodes = currentTimes.map(t => el(doc, "span", { class: "ekd-sd-time-tag" }, [
+          t,
+          el(doc, "button", {
+            type: "button",
+            class: "ekd-sd-time-remove",
+            "aria-label": `移除 ${t}`,
+            text: "×",
+            onClick: () => {
+              const next = currentTimes.filter(item => item !== t);
+              draft.timesText = next.join(", ");
+              renderDialog();
+            },
+          }),
+        ]));
+        const multiQuickChips = QUICK_MULTI_TIMES.map(t => {
+          const exists = currentTimes.includes(t);
           return el(doc, "button", {
             type: "button",
             class: "ekd-sd-chip",
-            text: wd.label,
-            "aria-pressed": active ? "true" : "false",
+            text: t,
+            "aria-pressed": exists ? "true" : "false",
             onClick: () => {
-              draft.weekdaysAutoDefault = false;
-              if (active) draft.weekdays = draft.weekdays.filter(v => v !== wd.value);
-              else draft.weekdays = [...draft.weekdays, wd.value];
+              const next = exists
+                ? currentTimes.filter(item => item !== t)
+                : parseTimesList([...currentTimes, t]);
+              draft.timesText = next.join(", ");
               renderDialog();
             },
           });
-        }));
-        schedDetails.push(dayChips, el(doc, "div", { class: "ekd-sd-row" }, [
-          el(doc, "span", { text: "执行时间" }),
-          el(doc, "input", { type: "time", class: "ekd-sd-input", style: "width:140px", value: draft.time, onInput: e => { draft.time = e.target.value; } }),
-        ]));
-      } else if (draft.scheduleKind === "monthly") {
-        schedDetails.push(el(doc, "div", { class: "ekd-sd-grid2" }, [
-          el(doc, "input", {
-            type: "text", class: "ekd-sd-input", placeholder: "每月几号，如 1, 15, 31",
-            value: draft.daysText,
-            onInput: e => { draft.daysText = e.target.value; },
-          }),
-          el(doc, "input", { type: "time", class: "ekd-sd-input", value: draft.time, onInput: e => { draft.time = e.target.value; } }),
-        ]));
-        schedDetails.push(el(doc, "label", { class: "sched-check" }, [
-          el(doc, "input", { type: "checkbox", checked: draft.lastDay, onChange: e => { draft.lastDay = e.target.checked; } }),
-          "包含每月最后一天（自动适配 28/29/30/31 日）",
-        ]));
+        });
+        schedDetails.push(
+          el(doc, "div", { class: "ekd-sd-subblock" }, [
+            el(doc, "span", { class: "ekd-sd-sublabel", text: "已添加时点" }),
+            currentTimes.length
+              ? el(doc, "div", { class: "ekd-sd-times-list" }, timeTagNodes)
+              : el(doc, "p", { class: "ekd-sd-hint", text: "暂未添加执行时点，请在下方选择并添加。" }),
+          ]),
+          el(doc, "div", { class: "ekd-sd-subblock" }, [
+            el(doc, "span", { class: "ekd-sd-sublabel", text: "添加时点" }),
+            el(doc, "div", { class: "ekd-sd-time-row" }, [
+              createTimePicker(pendingTime, next => { pendingTime = next; }),
+              el(doc, "button", {
+                type: "button",
+                class: "ekd-sd-btn",
+                text: "+ 添加时点",
+                onClick: () => {
+                  const next = parseTimesList([...currentTimes, pendingTime]);
+                  draft.timesText = next.join(", ");
+                  renderDialog();
+                },
+              }),
+              el(doc, "div", { class: "ekd-sd-chips" }, multiQuickChips),
+            ]),
+          ]),
+          el(doc, "div", { class: "ekd-sd-subblock" }, [
+            el(doc, "span", { class: "ekd-sd-sublabel", text: "星期筛选（可选）" }),
+            createWeekdayPicker({ allowEmpty: true }),
+            el(doc, "p", {
+              class: "ekd-sd-hint",
+              text: draft.weekdays.length === 0
+                ? "不限星期（每天按上述时点运行）"
+                : "仅在所选星期按上述时点运行",
+            }),
+          ]),
+        );
       } else if (draft.scheduleKind === "interval") {
         const unitSel = el(doc, "select", {
           class: "ekd-sd-select",
-          style: "width:110px",
-          onChange: e => { draft.intervalUnit = e.target.value; renderDialog(); },
+          style: "width:96px",
+          onChange: e => {
+            const nextUnit = e.target.value === "hours" ? "hours" : "minutes";
+            const curVal = Math.max(1, Number.parseInt(String(draft.intervalValue || 1), 10) || 1);
+            if (draft.intervalUnit !== nextUnit) {
+              if (nextUnit === "hours") {
+                draft.intervalValue = curVal >= 60 && curVal % 60 === 0 ? curVal / 60 : Math.max(1, Math.round(curVal / 60));
+              } else {
+                draft.intervalValue = curVal * 60;
+              }
+              draft.intervalUnit = nextUnit;
+            }
+            renderDialog();
+          },
         }, [
           el(doc, "option", { value: "minutes", text: "分钟" }),
           el(doc, "option", { value: "hours", text: "小时" }),
         ]);
         unitSel.value = draft.intervalUnit;
-        schedDetails.push(el(doc, "div", { class: "ekd-sd-row" }, [
-          el(doc, "span", { text: "每隔" }),
-          el(doc, "input", {
-            type: "number", min: "1", class: "ekd-sd-input", style: "width:96px",
-            value: String(draft.intervalValue),
-            onInput: e => { draft.intervalValue = Number.parseInt(e.target.value, 10) || 1; },
-          }),
-          unitSel,
-        ]));
-        schedDetails.push(el(doc, "label", { class: "sched-check" }, [
-          el(doc, "input", { type: "checkbox", checked: draft.testMode, onChange: e => { draft.testMode = e.target.checked; } }),
-          "测试模式（允许低至每 1 分钟运行一次，建议仅用于短期验证）",
-        ]));
-      } else if (draft.scheduleKind === "times") {
-        const dayChips = el(doc, "div", { class: "ekd-sd-chips" }, WEEKDAY_LABELS.map(wd => {
-          const active = draft.weekdays.includes(wd.value);
+
+        const presetChips = INTERVAL_PRESETS.map(preset => {
+          const active = Number(draft.intervalValue) === preset.value && draft.intervalUnit === preset.unit;
           return el(doc, "button", {
             type: "button",
             class: "ekd-sd-chip",
-            text: wd.label,
+            text: preset.label,
             "aria-pressed": active ? "true" : "false",
             onClick: () => {
-              draft.weekdaysAutoDefault = false;
-              if (active) draft.weekdays = draft.weekdays.filter(v => v !== wd.value);
-              else draft.weekdays = [...draft.weekdays, wd.value];
+              draft.intervalValue = preset.value;
+              draft.intervalUnit = preset.unit;
               renderDialog();
             },
           });
+        });
+
+        schedDetails.push(
+          el(doc, "div", { class: "ekd-sd-subblock" }, [
+            el(doc, "span", { class: "ekd-sd-sublabel", text: "间隔周期" }),
+            el(doc, "div", { class: "ekd-sd-time-row" }, [
+              el(doc, "span", { text: "每隔" }),
+              el(doc, "input", {
+                type: "number",
+                min: "1",
+                class: "ekd-sd-input",
+                style: "width:90px;font-variant-numeric:tabular-nums",
+                value: String(draft.intervalValue),
+                onInput: e => {
+                  draft.intervalValue = Math.max(1, Number.parseInt(e.target.value, 10) || 1);
+                  updatePreview();
+                },
+              }),
+              unitSel,
+              el(doc, "div", { class: "ekd-sd-chips" }, presetChips),
+            ]),
+          ]),
+          el(doc, "label", { class: "sched-check" }, [
+            el(doc, "input", {
+              type: "checkbox",
+              checked: draft.testMode,
+              onChange: e => { draft.testMode = e.target.checked; updatePreview(); },
+            }),
+            "测试模式（允许低至每 1 分钟运行一次，建议仅用于短期验证）",
+          ]),
+        );
+      } else if (draft.scheduleKind === "once") {
+        const todayStr = localDateOffset(0);
+        const tomorrowStr = localDateOffset(1);
+        const quickChips = QUICK_TIMES.map(t => el(doc, "button", {
+          type: "button",
+          class: "ekd-sd-chip",
+          text: t,
+          "aria-pressed": normalizeClock(draft.time) === t ? "true" : "false",
+          onClick: () => {
+            draft.time = t;
+            renderDialog();
+          },
         }));
         schedDetails.push(
+          el(doc, "div", { class: "ekd-sd-subblock" }, [
+            el(doc, "span", { class: "ekd-sd-sublabel", text: "执行日期" }),
+            el(doc, "div", { class: "ekd-sd-time-row" }, [
+              el(doc, "input", {
+                type: "date",
+                class: "ekd-sd-input",
+                style: "width:168px",
+                value: draft.date,
+                onInput: e => { draft.date = e.target.value; updatePreview(); },
+              }),
+              el(doc, "div", { class: "ekd-sd-chips" }, [
+                el(doc, "button", {
+                  type: "button",
+                  class: "ekd-sd-chip",
+                  text: "今天",
+                  "aria-pressed": draft.date === todayStr ? "true" : "false",
+                  onClick: () => { draft.date = todayStr; renderDialog(); },
+                }),
+                el(doc, "button", {
+                  type: "button",
+                  class: "ekd-sd-chip",
+                  text: "明天",
+                  "aria-pressed": draft.date === tomorrowStr ? "true" : "false",
+                  onClick: () => { draft.date = tomorrowStr; renderDialog(); },
+                }),
+              ]),
+            ]),
+          ]),
+          el(doc, "div", { class: "ekd-sd-subblock" }, [
+            el(doc, "span", { class: "ekd-sd-sublabel", text: "执行时间" }),
+            el(doc, "div", { class: "ekd-sd-time-row" }, [
+              createTimePicker(draft.time, next => {
+                draft.time = next;
+                renderDialog();
+              }),
+              el(doc, "div", { class: "ekd-sd-chips" }, quickChips),
+            ]),
+          ]),
+        );
+      } else if (draft.scheduleKind === "hourly") {
+        schedDetails.push(el(doc, "div", { class: "ekd-sd-row" }, [
+          el(doc, "span", { text: "每小时第" }),
           el(doc, "input", {
-            type: "text", class: "ekd-sd-input",
-            placeholder: "多个时点用逗号分隔，如 09:00, 14:30, 18:00",
-            value: draft.timesText,
-            onInput: e => { draft.timesText = e.target.value; },
+            type: "number",
+            min: "0",
+            max: "59",
+            class: "ekd-sd-input",
+            style: "width:84px;font-variant-numeric:tabular-nums",
+            value: String(draft.minute),
+            onInput: e => { draft.minute = Number.parseInt(e.target.value, 10) || 0; updatePreview(); },
           }),
-          el(doc, "p", { class: "ekd-sd-hint", text: "可选限定星期几（不选表示每天）：" }),
-          dayChips,
+          el(doc, "span", { text: "分执行" }),
+        ]));
+      } else if (draft.scheduleKind === "monthly") {
+        schedDetails.push(
+          el(doc, "div", { class: "ekd-sd-grid2" }, [
+            el(doc, "input", {
+              type: "text",
+              class: "ekd-sd-input",
+              placeholder: "每月几号，如 1, 15, 31",
+              value: draft.daysText,
+              onInput: e => { draft.daysText = e.target.value; updatePreview(); },
+            }),
+            createTimePicker(draft.time, next => {
+              draft.time = next;
+              renderDialog();
+            }),
+          ]),
+          el(doc, "label", { class: "sched-check" }, [
+            el(doc, "input", {
+              type: "checkbox",
+              checked: draft.lastDay,
+              onChange: e => { draft.lastDay = e.target.checked; updatePreview(); },
+            }),
+            "包含每月最后一天（自动适配 28/29/30/31 日）",
+          ]),
         );
       }
 
-      schedDetails.push(el(doc, "div", { class: "ekd-sd-grid2" }, [
-        el(doc, "div", { class: "ekd-sd-field" }, [
-          el(doc, "span", { class: "ekd-sd-hint", text: "生效开始日期（可选）" }),
-          el(doc, "input", { type: "date", class: "ekd-sd-input", value: draft.startDate, onInput: e => { draft.startDate = e.target.value; } }),
-        ]),
-        el(doc, "div", { class: "ekd-sd-field" }, [
-          el(doc, "span", { class: "ekd-sd-hint", text: "生效结束日期（可选）" }),
-          el(doc, "input", { type: "date", class: "ekd-sd-input", value: draft.endDate, onInput: e => { draft.endDate = e.target.value; } }),
-        ]),
-      ]));
+      if (draft.scheduleKind !== "once") {
+        schedDetails.push(el(doc, "div", { class: "ekd-sd-validity" }, [
+          el(doc, "div", { class: "ekd-sd-subblock" }, [
+            el(doc, "span", { class: "ekd-sd-sublabel", text: "有效期范围（可选）" }),
+            el(doc, "p", { class: "ekd-sd-hint", text: "留空表示保存后立即开始、按上述周期长期生效；仅在需要限定起止日期时填写" }),
+          ]),
+          el(doc, "div", { class: "ekd-sd-grid2" }, [
+            el(doc, "div", { class: "ekd-sd-field" }, [
+              el(doc, "span", { class: "ekd-sd-hint", text: "开始日期" }),
+              el(doc, "div", { class: "ekd-sd-date-wrap" }, [
+                el(doc, "input", {
+                  type: "date",
+                  class: "ekd-sd-input",
+                  value: draft.startDate,
+                  onInput: e => { draft.startDate = e.target.value; updatePreview(); },
+                }),
+                el(doc, "button", {
+                  type: "button",
+                  class: "ekd-sd-mini-btn",
+                  text: "清空",
+                  disabled: !draft.startDate,
+                  onClick: () => { draft.startDate = ""; renderDialog(); },
+                }),
+              ]),
+            ]),
+            el(doc, "div", { class: "ekd-sd-field" }, [
+              el(doc, "span", { class: "ekd-sd-hint", text: "结束日期" }),
+              el(doc, "div", { class: "ekd-sd-date-wrap" }, [
+                el(doc, "input", {
+                  type: "date",
+                  class: "ekd-sd-input",
+                  value: draft.endDate,
+                  onInput: e => { draft.endDate = e.target.value; updatePreview(); },
+                }),
+                el(doc, "button", {
+                  type: "button",
+                  class: "ekd-sd-mini-btn",
+                  text: "清空",
+                  disabled: !draft.endDate,
+                  onClick: () => { draft.endDate = ""; renderDialog(); },
+                }),
+              ]),
+            ]),
+          ]),
+        ]));
+      }
 
       bodyChildren.push(el(doc, "div", { class: "ekd-sd-field" }, [
-        el(doc, "label", { class: "ekd-sd-label" }, [el(doc, "strong", { text: "调度频率（按本机时区计算）" })]),
-        kindSelect,
-        ...schedDetails,
+        el(doc, "div", { class: "ekd-sd-label" }, [el(doc, "strong", { text: "调度频率（按本机时区计算）" })]),
+        el(doc, "div", { class: "ekd-sd-sched-card" }, [
+          previewBar,
+          freqTabs,
+          ...schedDetails,
+        ]),
       ]));
 
       const missedSeg = el(doc, "div", { class: "ekd-sd-seg", role: "group", "aria-label": "错过的运行" }, [
@@ -1319,21 +2033,34 @@ export async function activate(ctx) {
 
     const draw = () => {
       const head = el(doc, "div", { class: "sched-head" }, [
-        el(doc, "h2", { class: "sched-title", text: "定时任务" }),
-        el(doc, "span", {
-          class: `sched-pill ${state.kapConnected ? "ok" : "warn"}`,
-          text: state.kapConnected ? "KAP 已连接" : "KAP 未连接",
-        }),
+        el(doc, "div", { class: "sched-head-main" }, [
+          el(doc, "div", { class: "sched-head-title-row" }, [
+            el(doc, "h2", { class: "sched-title", text: "定时任务" }),
+            el(doc, "span", {
+              class: `sched-pill ${state.kapConnected ? "ok" : "warn"}`,
+              text: state.kapConnected ? "KAP 已连接" : "KAP 未连接",
+            }),
+          ]),
+          el(doc, "p", {
+            class: "sched-subtitle",
+            text: "按本机时区自动向新会话或绑定会话投递任务，支持补跑与执行记录追踪。",
+          }),
+        ]),
         el(doc, "div", { class: "sched-head-actions" }, [
-          el(doc, "button", { type: "button", class: "sched-btn", text: "刷新", onClick: () => void refreshAll() }),
+          el(doc, "button", { type: "button", class: "sched-btn", onClick: () => void refreshAll() }, [
+            makeSvg(doc, REFRESH_ICON, 13),
+            "刷新",
+          ]),
           el(doc, "button", { type: "button", class: "sched-btn primary", text: "+ 新建任务", onClick: () => openTaskDialog() }),
           el(doc, "button", {
             type: "button",
             class: "sched-btn quiet",
             "aria-label": "返回聊天",
-            text: "返回聊天",
             onClick: closeMainArea,
-          }),
+          }, [
+            makeSvg(doc, BACK_ICON, 13),
+            "返回聊天",
+          ]),
         ]),
       ]);
 
@@ -1500,7 +2227,7 @@ export async function activate(ctx) {
     const style = doc.createElement("style");
     style.textContent = SHARED_CSS;
     const shell = doc.createElement("div");
-    shell.className = "sched-shell";
+    shell.className = "sched-shell compact";
     shadow.append(style, shell);
     element.append(host);
 
@@ -1510,7 +2237,10 @@ export async function activate(ctx) {
       const boundTasks = activeId ? state.tasks.filter(t => t.mode === "bound_session" && t.sessionId === activeId) : [];
 
       const head = el(doc, "div", { class: "sched-head" }, [
-        el(doc, "h2", { class: "sched-title", text: "本会话定时任务" }),
+        el(doc, "div", { class: "sched-head-main" }, [
+          el(doc, "h2", { class: "sched-title", text: "本会话定时任务" }),
+          el(doc, "p", { class: "sched-subtitle", text: "查看并管理绑定当前会话的定时任务" }),
+        ]),
         el(doc, "div", { class: "sched-head-actions" }, [
           el(doc, "button", {
             type: "button",

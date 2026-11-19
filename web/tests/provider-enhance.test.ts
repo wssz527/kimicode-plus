@@ -8,6 +8,7 @@ interface MiniNode {
   nodeType: number;
   textContent: string;
   className: string;
+  classList: { contains(token: string): boolean };
   disabled: boolean;
   value: string;
   dataset: Record<string, string>;
@@ -22,6 +23,7 @@ interface MiniNode {
   addEventListener(type: string, handler: (event: unknown) => void): void;
   click(): void;
   append(...nodes: Array<MiniNode | string>): void;
+  after(...nodes: Array<MiniNode | string>): void;
   replaceChildren(...nodes: Array<MiniNode | string>): void;
   remove(): void;
   showModal(): void;
@@ -37,6 +39,11 @@ function createMiniDocument() {
       nodeType: tagName === "#text" ? 3 : 1,
       textContent,
       className: "",
+      classList: {
+        contains(token: string) {
+          return node.className.split(/\s+/).includes(token);
+        },
+      },
       disabled: false,
       value: "",
       dataset: {},
@@ -71,6 +78,20 @@ function createMiniDocument() {
           item.isConnected = this.isConnected;
           this.children.push(item);
         }
+      },
+      after(...nodes: Array<MiniNode | string>) {
+        if (!this.parentElement) return;
+        const parent = this.parentElement;
+        const idx = parent.children.indexOf(this);
+        if (idx === -1) return;
+        const inserted: MiniNode[] = [];
+        for (const child of nodes) {
+          const item = typeof child === "string" ? makeNode("#text", child) : child;
+          item.parentElement = parent;
+          item.isConnected = parent.isConnected;
+          inserted.push(item);
+        }
+        parent.children.splice(idx + 1, 0, ...inserted);
       },
       replaceChildren(...nodes: Array<MiniNode | string>) {
         for (const old of this.children) {
@@ -110,11 +131,64 @@ function createMiniDocument() {
     return node;
   }
 
-  function matches(node: MiniNode, selector: string): boolean {
+  function matchesSingle(node: MiniNode, selector: string): boolean {
     if (node.nodeType !== 1) return false;
-    if (selector.startsWith(".")) return node.className.split(/\s+/).includes(selector.slice(1));
-    if (selector.startsWith("[") && selector.endsWith("]")) return node.attributes.has(selector.slice(1, -1));
-    return node.tagName === selector.toUpperCase();
+    const trimmed = selector.trim();
+    if (!trimmed) return false;
+    let rest = trimmed;
+    const tagMatch = rest.match(/^[a-zA-Z0-9_-]+/);
+    if (tagMatch) {
+      if (node.tagName !== tagMatch[0].toUpperCase()) return false;
+      rest = rest.slice(tagMatch[0].length);
+    }
+    while (rest.length > 0) {
+      if (rest.startsWith(".")) {
+        const clsMatch = rest.slice(1).match(/^[a-zA-Z0-9_-]+/);
+        if (!clsMatch) return false;
+        if (!node.className.split(/\s+/).includes(clsMatch[0])) return false;
+        rest = rest.slice(1 + clsMatch[0].length);
+      } else if (rest.startsWith("[")) {
+        const end = rest.indexOf("]");
+        if (end === -1) return false;
+        const inner = rest.slice(1, end);
+        const eq = inner.indexOf("=");
+        if (eq === -1) {
+          if (!node.attributes.has(inner)) return false;
+        } else {
+          const attr = inner.slice(0, eq).trim();
+          const rawVal = inner.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+          if (node.getAttribute(attr) !== rawVal) return false;
+        }
+        rest = rest.slice(end + 1);
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function hasAncestorMatching(node: MiniNode, parts: string[]): boolean {
+    if (parts.length === 0) return true;
+    const target = parts[parts.length - 1]!;
+    let cur = node.parentElement;
+    while (cur) {
+      if (matchesSingle(cur, target)) {
+        return hasAncestorMatching(cur, parts.slice(0, -1));
+      }
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+
+  function matches(node: MiniNode, selectorGroup: string): boolean {
+    for (const selector of selectorGroup.split(",")) {
+      const parts = selector.trim().split(/\s+/).filter(Boolean);
+      if (parts.length === 0) continue;
+      if (matchesSingle(node, parts[parts.length - 1]!) && hasAncestorMatching(node, parts.slice(0, -1))) {
+        return true;
+      }
+    }
+    return false;
   }
 
   const head = makeNode("head");
@@ -134,13 +208,16 @@ function createMiniDocument() {
 }
 
 interface ProviderEnhanceHandle {
+  formatSize(num: unknown): string;
+  parseSize(raw: unknown, allowEmpty?: boolean): { value: number | null; error: string };
   thinkingMode(model: Record<string, unknown>): "none" | "toggle" | "always";
   readThinkingState(model: Record<string, unknown>): { thinking: "none" | "toggle" | "always"; adaptiveThinking: boolean };
   applyThinkingState(
     baseCapabilities: string[],
     thinking: "none" | "toggle" | "always",
-    adaptiveThinking: boolean,
+    adaptiveThinking?: boolean,
   ): { capabilities: string[]; thinking: "none" | "toggle" | "always"; adaptive_thinking: boolean };
+  selectThinkingOption(draft: Record<string, unknown>, option: string): void;
   draftOf(model: Record<string, unknown>): {
     capabilities: Set<string>;
     thinking: "none" | "toggle" | "always";
@@ -149,9 +226,19 @@ interface ProviderEnhanceHandle {
     maxOutputSize: number | null;
     supportEfforts: string[];
   };
-  openPanel(context: { providerId: string; key: string; model: Record<string, unknown>; managed: boolean }): void;
+  openPanel(context: {
+    providerId: string;
+    key: string;
+    model: Record<string, unknown>;
+    managed: boolean;
+    row?: MiniNode;
+    button?: MiniNode;
+  }): void;
   closePanel(): void;
-  state: { panel: MiniNode | null };
+  scan(): void;
+  CONTEXT_PRESETS: Array<{ label: string; value: number }>;
+  THINKING_OPTIONS: Array<{ value: string; label: string; title: string }>;
+  state: { panel: MiniNode | null; panelRow: MiniNode | null; panelButton: MiniNode | null };
 }
 
 function loadProviderEnhance(request: (action: string, payload?: Record<string, unknown>) => Promise<unknown> = async () => ({})) {
@@ -170,8 +257,8 @@ function allText(node: MiniNode): string {
   return (node.textContent || "") + node.children.map(allText).join("");
 }
 
-function findButton(dialog: MiniNode, label: string): MiniNode {
-  const hit = dialog.querySelectorAll("button").find(button => allText(button) === label);
+function findButton(root: MiniNode, label: string): MiniNode {
+  const hit = root.querySelectorAll("button").find(button => allText(button).trim() === label);
   assert.ok(hit, `button ${label} not found`);
   return hit;
 }
@@ -180,10 +267,9 @@ function plain<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-test("bidirectional thinking mapping covers none, toggle, and always modes using provider_enhance.js", () => {
+test("bidirectional thinking mapping preserves stored adaptive_thinking and supports effort-driven toggle", () => {
   const { enhance } = loadProviderEnhance();
 
-  // 1. 不支持 (none)
   const noneStored = { capabilities: ["image_in", "tool_use"], adaptiveThinking: false };
   assert.deepEqual(plain(enhance.readThinkingState(noneStored)), { thinking: "none", adaptiveThinking: false });
   assert.deepEqual(plain(enhance.applyThinkingState(["tool_use", "image_in"], "none", true)), {
@@ -192,34 +278,38 @@ test("bidirectional thinking mapping covers none, toggle, and always modes using
     adaptive_thinking: false,
   });
 
-  // 2. 可开关 (toggle), with adaptive_thinking false and true
-  const toggleOffStored = { capabilities: ["image_in", "thinking"], adaptiveThinking: false };
-  assert.deepEqual(plain(enhance.readThinkingState(toggleOffStored)), { thinking: "toggle", adaptiveThinking: false });
-  assert.deepEqual(plain(enhance.applyThinkingState(["image_in"], "toggle", false)), {
-    capabilities: ["image_in", "thinking"],
-    thinking: "toggle",
-    adaptive_thinking: false,
-  });
+  const effortOnlyStored = { capabilities: ["tool_use"], supportEfforts: ["high", "low", "no"] };
+  const effortDraft = enhance.draftOf(effortOnlyStored);
+  assert.equal(effortDraft.thinking, "toggle");
+  assert.equal(effortDraft.adaptiveThinking, false);
+  assert.deepEqual(plain(effortDraft.supportEfforts), ["low", "high"]);
 
-  const toggleOnStored = { capabilities: ["video_in", "thinking"], adaptive_thinking: true };
-  assert.deepEqual(plain(enhance.readThinkingState(toggleOnStored)), { thinking: "toggle", adaptiveThinking: true });
-  assert.deepEqual(plain(enhance.applyThinkingState(["video_in"], "toggle", true)), {
-    capabilities: ["video_in", "thinking"],
-    thinking: "toggle",
-    adaptive_thinking: true,
-  });
-
-  // Legacy/implicit adaptiveThinking without explicit `thinking` token still resolves to toggle and round-trips cleanly.
-  const implicitToggle = { capabilities: ["tool_use"], adaptiveThinking: true };
-  const implicitDraft = enhance.draftOf(implicitToggle);
-  assert.equal(implicitDraft.thinking, "toggle");
-  assert.equal(implicitDraft.adaptiveThinking, true);
+  const adaptiveStored = { capabilities: ["video_in", "thinking"], adaptive_thinking: true };
+  const adaptiveDraft = enhance.draftOf(adaptiveStored);
+  assert.equal(adaptiveDraft.thinking, "toggle");
+  assert.equal(adaptiveDraft.adaptiveThinking, true);
   assert.deepEqual(
-    plain(enhance.applyThinkingState([...implicitDraft.capabilities], implicitDraft.thinking, implicitDraft.adaptiveThinking)),
-    { capabilities: ["tool_use", "thinking"], thinking: "toggle", adaptive_thinking: true },
+    plain(enhance.applyThinkingState([...adaptiveDraft.capabilities], adaptiveDraft.thinking, adaptiveDraft.adaptiveThinking)),
+    { capabilities: ["video_in", "thinking"], thinking: "toggle", adaptive_thinking: true },
   );
 
-  // 3. 始终开启 (always) clears `thinking` and forces adaptive_thinking=false
+  // Toggling efforts on an adaptive model preserves adaptive_thinking; clicking `no` disables thinking
+  enhance.selectThinkingOption(adaptiveDraft, "high");
+  assert.equal(adaptiveDraft.thinking, "toggle");
+  assert.equal(adaptiveDraft.adaptiveThinking, true);
+  assert.deepEqual(plain(adaptiveDraft.supportEfforts), ["high"]);
+
+  enhance.selectThinkingOption(adaptiveDraft, "no");
+  assert.equal(adaptiveDraft.thinking, "none");
+  assert.equal(adaptiveDraft.adaptiveThinking, false);
+  assert.deepEqual(plain(adaptiveDraft.supportEfforts), []);
+
+  // Re-enabling an effort before saving restores preserved adaptive_thinking
+  enhance.selectThinkingOption(adaptiveDraft, "medium");
+  assert.equal(adaptiveDraft.thinking, "toggle");
+  assert.equal(adaptiveDraft.adaptiveThinking, true);
+  assert.deepEqual(plain(adaptiveDraft.supportEfforts), ["medium"]);
+
   const alwaysStored = { capabilities: ["tool_use", "always_thinking", "thinking"], adaptiveThinking: true };
   assert.deepEqual(plain(enhance.readThinkingState(alwaysStored)), { thinking: "always", adaptiveThinking: false });
   assert.deepEqual(plain(enhance.applyThinkingState(["tool_use"], "always", true)), {
@@ -229,74 +319,112 @@ test("bidirectional thinking mapping covers none, toggle, and always modes using
   });
 });
 
-test("opening the dialog initializes thinking segment aria-pressed and adaptive disabled state", () => {
+test("inline panel exposes direct thinking options (no/low/medium/high/xhigh/max), omits adaptive thinking, and uses 256K-1M presets", () => {
   const { enhance } = loadProviderEnhance();
 
-  // none -> 不支持 pressed, 自适应思考 disabled
+  assert.deepEqual(
+    plain(enhance.THINKING_OPTIONS.map(item => [item.value, item.label])),
+    [
+      ["no", "no"],
+      ["low", "low"],
+      ["medium", "medium"],
+      ["high", "high"],
+      ["xhigh", "xhigh"],
+      ["max", "max"],
+    ],
+  );
+  assert.deepEqual(
+    plain(enhance.CONTEXT_PRESETS.map(item => [item.label, item.value])),
+    [
+      ["256K", 262144],
+      ["350K", 358400],
+      ["500K", 512000],
+      ["600K", 614400],
+      ["1M", 1048576],
+    ],
+  );
+  assert.deepEqual(plain(enhance.parseSize("1K", false)), { value: 1024, error: "" });
+  assert.deepEqual(plain(enhance.parseSize("1KB", false)), { value: 1024, error: "" });
+  assert.deepEqual(plain(enhance.parseSize("256K", false)), { value: 262144, error: "" });
+  assert.deepEqual(plain(enhance.parseSize("1M", false)), { value: 1048576, error: "" });
+  assert.deepEqual(plain(enhance.parseSize("1MB", false)), { value: 1048576, error: "" });
+
+  // No thinking -> `no` pressed, all efforts unpressed, no 自适应思考 anywhere
   enhance.openPanel({
     providerId: "custom",
     key: "custom/m-none",
-    model: { displayName: "None", maxContextSize: 32768, capabilities: ["tool_use"] },
+    model: { displayName: "NoThink", maxContextSize: 262144, capabilities: ["tool_use"] },
     managed: false,
   });
-  let dialog = enhance.state.panel!;
-  assert.equal(findButton(dialog, "不支持").getAttribute("aria-pressed"), "true");
-  assert.equal(findButton(dialog, "可开关").getAttribute("aria-pressed"), "false");
-  assert.equal(findButton(dialog, "始终开启").getAttribute("aria-pressed"), "false");
-  assert.equal(findButton(dialog, "自适应思考").disabled, true);
-  assert.equal(findButton(dialog, "自适应思考").getAttribute("aria-pressed"), "false");
+  let drawer = enhance.state.panel!;
+  assert.equal(drawer.tagName, "DIV");
+  assert.ok(!allText(drawer).includes("自适应思考"), "adaptive thinking must not appear");
+  const contextPresetsGroup = drawer.querySelectorAll(".ekd-px-presets")[0]!;
+  assert.deepEqual(
+    contextPresetsGroup.querySelectorAll("button").map(b => allText(b).trim()),
+    ["256K", "350K", "500K", "600K", "1M"],
+  );
+  assert.equal(findButton(drawer, "no").getAttribute("aria-pressed"), "true");
+  assert.equal(findButton(drawer, "medium").getAttribute("aria-pressed"), "false");
+  assert.equal(findButton(drawer, "256K").getAttribute("aria-pressed"), "true");
+  assert.equal(drawer.querySelectorAll(".ekd-px-limits").length, 1, "context and output limits share one horizontal grid");
 
-  // toggle + adaptiveThinking -> 可开关 pressed, 自适应思考 enabled and pressed
+  // Configured efforts -> `no` unpressed, selected efforts pressed
   enhance.openPanel({
     providerId: "custom",
-    key: "custom/m-toggle",
-    model: { displayName: "Toggle", maxContextSize: 131072, capabilities: ["thinking"], adaptiveThinking: true },
+    key: "custom/m-efforts",
+    model: {
+      displayName: "ThinkModel",
+      maxContextSize: 1048576,
+      capabilities: ["thinking"],
+      supportEfforts: ["medium", "xhigh", "max"],
+    },
     managed: false,
   });
-  dialog = enhance.state.panel!;
-  assert.equal(findButton(dialog, "不支持").getAttribute("aria-pressed"), "false");
-  assert.equal(findButton(dialog, "可开关").getAttribute("aria-pressed"), "true");
-  assert.equal(findButton(dialog, "始终开启").getAttribute("aria-pressed"), "false");
-  assert.equal(findButton(dialog, "自适应思考").disabled, false);
-  assert.equal(findButton(dialog, "自适应思考").getAttribute("aria-pressed"), "true");
-
-  // always -> 始终开启 pressed, 自适应思考 disabled
-  enhance.openPanel({
-    providerId: "custom",
-    key: "custom/m-always",
-    model: { displayName: "Always", maxContextSize: 131072, capabilities: ["always_thinking"], adaptiveThinking: true },
-    managed: false,
-  });
-  dialog = enhance.state.panel!;
-  assert.equal(findButton(dialog, "不支持").getAttribute("aria-pressed"), "false");
-  assert.equal(findButton(dialog, "可开关").getAttribute("aria-pressed"), "false");
-  assert.equal(findButton(dialog, "始终开启").getAttribute("aria-pressed"), "true");
-  assert.equal(findButton(dialog, "自适应思考").disabled, true);
-  assert.equal(findButton(dialog, "自适应思考").getAttribute("aria-pressed"), "false");
+  drawer = enhance.state.panel!;
+  assert.equal(findButton(drawer, "no").getAttribute("aria-pressed"), "false");
+  assert.equal(findButton(drawer, "medium").getAttribute("aria-pressed"), "true");
+  assert.equal(findButton(drawer, "xhigh").getAttribute("aria-pressed"), "true");
+  assert.equal(findButton(drawer, "max").getAttribute("aria-pressed"), "true");
+  assert.equal(findButton(drawer, "1M").getAttribute("aria-pressed"), "true");
 });
 
-test("dialog interactions update thinking mode and submit mapped capabilities and adaptive_thinking", async () => {
+test("inline panel clicks submit direct thinking efforts, preserve adaptive_thinking, and clear thinking on no", async () => {
   const requests: Array<{ action: string; payload?: Record<string, unknown> }> = [];
-  const { enhance } = loadProviderEnhance(async (action, payload) => {
+  const { doc, enhance } = loadProviderEnhance(async (action, payload) => {
     requests.push({ action, payload });
     return {};
   });
 
+  const row = doc.createElement("div");
+  row.className = "pmt-grid";
+  const idInput = doc.createElement("input");
+  idInput.value = "m1";
+  const ctxInput = doc.createElement("input");
+  ctxInput.value = "128000";
+  row.append(idInput, ctxInput);
+  doc.body.append(row);
+
   enhance.openPanel({
     providerId: "custom",
     key: "custom/m1",
-    model: { displayName: "M1", maxContextSize: 65536, capabilities: ["image_in"] },
+    model: { displayName: "M1", maxContextSize: 128000, capabilities: ["image_in"] },
     managed: false,
+    row,
   });
-  const dialog = enhance.state.panel!;
+  const drawer = enhance.state.panel!;
+  assert.equal(drawer.parentElement, row, "drawer renders inline inside the model row");
 
-  findButton(dialog, "可开关").click();
-  const adaptive = findButton(dialog, "自适应思考");
-  assert.equal(adaptive.disabled, false);
-  adaptive.click();
-  assert.equal(adaptive.getAttribute("aria-pressed"), "true");
+  findButton(drawer, "medium").click();
+  findButton(drawer, "xhigh").click();
+  findButton(drawer, "500K").click();
 
-  findButton(dialog, "保存").click();
+  const inputs = drawer.querySelectorAll("input.ekd-px-input");
+  assert.equal(inputs.length, 2);
+  assert.equal(inputs[0]?.value, "500K");
+  inputs[1]!.value = "32K";
+
+  findButton(drawer, "保存").click();
   await new Promise(resolve => setTimeout(resolve, 0));
 
   assert.equal(requests.length, 1);
@@ -304,9 +432,140 @@ test("dialog interactions update thinking mode and submit mapped capabilities an
   assert.deepEqual(plain(requests[0]?.payload?.edit), {
     capabilities: ["image_in", "thinking"],
     thinking: "toggle",
+    max_context_size: 512000,
+    max_output_size: 32768,
+    support_efforts: ["medium", "xhigh"],
+  });
+  assert.equal(ctxInput.value, "512000", "saving inline panel syncs official row context input");
+
+  // Clicking `no` clears all efforts and disables thinking without writing literal "no"
+  findButton(drawer, "no").click();
+  findButton(drawer, "保存").click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(plain(requests[1]?.payload?.edit), {
+    capabilities: ["image_in"],
+    thinking: "none",
+    max_context_size: 512000,
+    max_output_size: 32768,
+    support_efforts: [],
+  });
+
+  // Stored adaptive_thinking: true (e.g. Claude) survives edits until `no` is explicitly selected
+  enhance.openPanel({
+    providerId: "anthropic",
+    key: "anthropic/claude-opus-4-6",
+    model: {
+      displayName: "Claude Opus 4.6",
+      maxContextSize: 200000,
+      capabilities: ["tool_use", "thinking"],
+      adaptiveThinking: true,
+      supportEfforts: ["low", "medium", "high"],
+    },
+    managed: false,
+    row,
+  });
+  const claudeDrawer = enhance.state.panel!;
+  findButton(claudeDrawer, "max").click();
+  findButton(claudeDrawer, "保存").click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(plain(requests[2]?.payload?.edit), {
+    capabilities: ["tool_use", "thinking"],
+    thinking: "toggle",
     adaptive_thinking: true,
-    max_context_size: 65536,
+    max_context_size: 200000,
+    max_output_size: null,
+    support_efforts: ["low", "medium", "high", "max"],
+  });
+
+  findButton(claudeDrawer, "no").click();
+  findButton(claudeDrawer, "保存").click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(plain(requests[3]?.payload?.edit), {
+    capabilities: ["tool_use"],
+    thinking: "none",
+    max_context_size: 200000,
     max_output_size: null,
     support_efforts: [],
   });
+});
+
+test("row enhance button toggles inline collapsible drawer inside the model row", async () => {
+  const { doc, enhance } = loadProviderEnhance(async (action) => {
+    if (action === "config.get") {
+      return {
+        providers: {
+          "custom-a": { type: "openai_legacy", baseUrl: "https://api.example.com/v1" },
+        },
+        models: {
+          "custom-a/demo-model": { displayName: "Demo Model", maxContextSize: 262144, capabilities: ["tool_use"] },
+        },
+      };
+    }
+    return {};
+  });
+
+  const dialog = doc.createElement("div");
+  dialog.className = "settings-dialog";
+  const form = doc.createElement("div");
+  form.className = "pf";
+  const back = doc.createElement("button");
+  back.className = "pf-back";
+
+  const fieldType = doc.createElement("div");
+  fieldType.className = "pf-field";
+  const typeText = doc.createElement("span");
+  typeText.className = "ui-select__value-text";
+  typeText.textContent = "openai_legacy";
+  fieldType.append(typeText);
+
+  const fieldName = doc.createElement("div");
+  fieldName.className = "pf-field";
+  const nameInput = doc.createElement("input");
+  nameInput.className = "ui-input";
+  nameInput.value = "custom-a";
+  fieldName.append(nameInput);
+
+  const fieldUrl = doc.createElement("div");
+  fieldUrl.className = "pf-field";
+  const urlInput = doc.createElement("input");
+  urlInput.className = "ui-input";
+  urlInput.value = "https://api.example.com/v1";
+  fieldUrl.append(urlInput);
+
+  const table = doc.createElement("div");
+  table.className = "pmt";
+  const row = doc.createElement("div");
+  row.className = "pmt-grid";
+  const modelInput = doc.createElement("input");
+  modelInput.value = "demo-model";
+  const removeBtn = doc.createElement("button");
+  removeBtn.setAttribute("aria-label", "移除模型");
+  row.append(modelInput, removeBtn);
+  table.append(row);
+
+  form.append(back, fieldType, fieldName, fieldUrl, table);
+  dialog.append(form);
+  doc.body.append(dialog);
+
+  enhance.scan();
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  const btn = row.querySelector("[data-ekd-px-button]");
+  assert.ok(btn, "expected injected enhance button");
+  assert.equal(btn.getAttribute("aria-label"), "能力与限制");
+  assert.equal(btn.getAttribute("aria-expanded"), "false");
+  assert.equal(btn.getAttribute("title"), "展开设置模型能力、思考强度与上下文限制");
+  assert.equal(btn.getAttribute("data-ekd-enhance"), "1");
+  assert.ok(allText(btn).includes("能力与限制"), "button should contain readable label text");
+
+  btn.click();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(enhance.state.panel?.shown, "clicking the labeled button should expand the inline panel");
+  assert.equal(enhance.state.panel?.parentElement, row);
+  assert.equal(btn.getAttribute("aria-expanded"), "true");
+
+  btn.click();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(enhance.state.panel, null, "clicking again collapses the inline panel");
+  assert.equal(btn.getAttribute("aria-expanded"), "false");
 });

@@ -412,14 +412,20 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.handoff(ctx, input)
 	case "config.get":
 		raw, err := s.kap.Request(ctx, http.MethodGet, "/config", nil)
-		return rawAsAny(raw), err
+		return rawJSON(raw), err
 	case "config.save":
-		patch, ok := input["patch"].(map[string]any)
-		if !ok || len(patch) == 0 {
+		var wrapper struct {
+			Patch json.RawMessage `json:"patch"`
+		}
+		if err := json.Unmarshal(payload, &wrapper); err != nil {
 			return nil, errors.New("需要非空配置补丁")
 		}
-		raw, err := s.kap.Request(ctx, http.MethodPost, "/config", patch)
-		return rawAsAny(raw), err
+		var patch map[string]any
+		if err := json.Unmarshal(wrapper.Patch, &patch); err != nil || len(patch) == 0 {
+			return nil, errors.New("需要非空配置补丁")
+		}
+		raw, err := s.kap.Request(ctx, http.MethodPost, "/config", wrapper.Patch)
+		return rawJSON(raw), err
 	case "providers.updateModel":
 		return s.updateProviderModel(ctx, input)
 	case "managed.usage":
@@ -480,6 +486,14 @@ func rawAsAny(raw json.RawMessage) any {
 		return nil
 	}
 	return value
+}
+
+func rawJSON(raw json.RawMessage) any {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || !json.Valid(trimmed) {
+		return nil
+	}
+	return json.RawMessage(trimmed)
 }
 
 func stringInput(input map[string]any, key string) string {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { followNativeSession, type NativeHost } from "../native";
+import { followNativeSession, type NativeHost, type RecoveryState } from "../native";
 import { ErrorNotice, Spinner } from "./ui";
-import { RecoveryPanel, SessionInputProvider, SessionPane } from "./workbench/SessionPanes";
+import { SessionInputProvider, SessionPane } from "./workbench/SessionPanes";
 import { useNativeBootstrap } from "./Surfaces";
 
 type SessionGridProps = { host: NativeHost; initialExtraIds: string[]; onNativeRestore: () => void };
@@ -32,6 +32,7 @@ function SessionGridBody({ host, initialExtraIds, onNativeRestore }: SessionGrid
     setIds(current => followNativeSession(current, id));
     void reload();
   }), [host, reload]);
+  useEffect(() => host.subscribe<RecoveryState>("recovery", setRecovery), [host]);
   useEffect(() => { setWeights(current => ids.map((_, index) => current[index] ?? 1)); }, [ids.length]);
 
   const add = useCallback(async () => {
@@ -88,17 +89,19 @@ function SessionGridBody({ host, initialExtraIds, onNativeRestore }: SessionGrid
   return <div className="session-grid wb">
     {actionError ? <p className="wb-error session-grid-error" role="alert">{actionError}</p> : null}
     <div className="session-grid-scroll"><div className="session-grid-panes" ref={gridRef} style={{ gridTemplateColumns: columns.map(weight => `minmax(300px, ${weight}fr)`).join(" ") }}>
-      {ids.map((id, index) => <div className="session-grid-cell" key={index}>{index > 0 ? <div className="session-resizer" role="separator" aria-label={`调整会话 ${index} 与 ${index + 1} 的宽度`} aria-orientation="vertical" tabIndex={0} onPointerDown={event => beginResize(event, index - 1)} onKeyDown={event => {
-        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-        event.preventDefault();
-        const delta = event.key === "ArrowLeft" ? -0.1 : 0.1;
-        setWeights(current => {
-          const next = [...current]; const pair = (next[index - 1] ?? 1) + (next[index] ?? 1);
-          const first = Math.min(pair - 0.55, Math.max(0.55, (next[index - 1] ?? 1) + delta));
-          next[index - 1] = first; next[index] = pair - first; return next;
-        });
-      }} /> : null}<SessionPane host={host} index={index} sessions={sessions} models={boot.nativeModels} sessionId={id} onSessionId={next => changeSession(index, next)} onSessions={setSessions} onAdd={index === 0 ? () => void add() : undefined} canAdd={ids.length < 3 && !adding} onRestore={index === 0 ? onNativeRestore : undefined} onClose={index > 0 ? () => setIds(current => current.filter((_, itemIndex) => itemIndex !== index)) : undefined} /></div>)}
+      {ids.map((id, index) => {
+        const waitingEntry = recovery?.entries.find(item => item.id === `session:${id}` && item.status === "WAITING");
+        return <div className="session-grid-cell" key={index}>{index > 0 ? <div className="session-resizer" role="separator" aria-label={`调整会话 ${index} 与 ${index + 1} 的宽度`} aria-orientation="vertical" tabIndex={0} onPointerDown={event => beginResize(event, index - 1)} onKeyDown={event => {
+          if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+          event.preventDefault();
+          const delta = event.key === "ArrowLeft" ? -0.1 : 0.1;
+          setWeights(current => {
+            const next = [...current]; const pair = (next[index - 1] ?? 1) + (next[index] ?? 1);
+            const first = Math.min(pair - 0.55, Math.max(0.55, (next[index - 1] ?? 1) + delta));
+            next[index - 1] = first; next[index] = pair - first; return next;
+          });
+        }} /> : null}<SessionPane host={host} index={index} sessions={sessions} models={boot.nativeModels} sessionId={id} recovery={waitingEntry ? { enabled: Boolean(recovery?.enabled), nextAt: waitingEntry.nextAt, note: waitingEntry.note } : null} onSessionId={next => changeSession(index, next)} onSessions={setSessions} onAdd={index === 0 ? () => void add() : undefined} canAdd={ids.length < 3 && !adding} onRestore={index === 0 ? onNativeRestore : undefined} onClose={index > 0 ? () => setIds(current => current.filter((_, itemIndex) => itemIndex !== index)) : undefined} /></div>;
+      })}
     </div></div>
-    <RecoveryPanel host={host} state={recovery} onState={setRecovery} watchSession={ids[0] ?? ""} />
   </div>;
 }

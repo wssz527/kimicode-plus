@@ -267,9 +267,12 @@ export function dangerousGuardPatch(enabled: boolean): Record<string, unknown> {
 export function matchesModelPool(config: unknown, expected: { models: Record<string, string>; defaultModel: string }): boolean {
   const section = configSection(asConfigObject(config), ["secondary_model", "secondaryModel"]);
   const written = asConfigObject(configField(section, ["models"])) ?? {};
-  const wanted = expected.models;
-  if (Object.keys(written).length !== Object.keys(wanted).length) return false;
-  if (!Object.entries(wanted).every(([key, desc]) => written[key] === desc)) return false;
+  const writtenKeys = Object.keys(written);
+  const wantedKeys = Object.keys(expected.models);
+  if (writtenKeys.length !== wantedKeys.length) return false;
+  if (!wantedKeys.every((key, index) => writtenKeys[index] === key && written[key] === expected.models[key])) {
+    return false;
+  }
   return configField(section, ["defaultModel", "default_model", "model"]) === expected.defaultModel;
 }
 

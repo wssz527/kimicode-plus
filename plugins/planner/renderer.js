@@ -27,33 +27,118 @@ export const DEFAULT_SITES = [
   { id: "chatgpt", label: "ChatGPT", url: "https://chatgpt.com" },
 ];
 
+const CHROME_EXCLUDE = [
+  "nav",
+  "aside",
+  "header",
+  "footer",
+  "dialog",
+  "[role=\"navigation\"]",
+  "[role=\"complementary\"]",
+  "[role=\"banner\"]",
+  "[role=\"contentinfo\"]",
+  "[aria-hidden=\"true\"]",
+  "[contenteditable=\"true\"]",
+  "textarea",
+];
+
+const COMMON_STRIP = [
+  "button",
+  "[role=\"button\"]",
+  "[role=\"toolbar\"]",
+  "[role=\"menu\"]",
+  "svg",
+  "style",
+  "script",
+  "noscript",
+  "[aria-hidden=\"true\"]",
+  "details:not([open]) > :not(summary)",
+];
+
 const SITE_SPECS = {
   kimi: {
     selectors: ["[data-message-author-role]", "[data-role]", ".chat-content-item", ".segment-user", ".segment-assistant", ".chat-item"],
+    exclude: [".sidebar", ".sider", ".history-list", ".session-list", ".chat-input", ".editor-container", ".recommend-prompts", ".welcome-page"],
+    strip: [".segment-actions", ".message-actions", ".copy-btn", ".think-header", ".tool-bar"],
     inputs: ["#chat-input", "div[contenteditable=\"true\"]", "textarea"],
   },
   deepseek: {
     selectors: ["[data-message-author-role]", ".ds-message", ".ds-markdown", "[data-role]", ".chat-message"],
+    exclude: [".ds-sidebar", ".chat-sidebar", "#chat-input", ".ds-input", ".welcome-container"],
+    strip: [".ds-flex-actions", ".md-code-block-action", ".ds-think-header", ".ds-icon-button"],
     inputs: ["#chat-input", "div[contenteditable=\"true\"]", "textarea"],
   },
   gemini: {
     selectors: ["user-query", "model-response", "message-content", "[data-message-author-role]"],
+    exclude: ["bard-sidenav", "side-navigation", "input-area-v2", "rich-textarea", "hallucination-disclaimer"],
+    strip: ["message-actions", "tts-control", "thumb-up-button", "thumb-down-button", ".response-footer"],
     inputs: ["div[contenteditable=\"true\"]", "rich-textarea", "textarea"],
   },
   claude: {
-    selectors: ["[data-testid=\"user-message\"]", "[data-testid=\"assistant-message\"]", ".font-claude-message", "[data-message-author-role]", ".chat-message"],
+    selectors: ["[data-testid=\"user-message\"]", "[data-testid=\"assistant-message\"]", ".font-claude-message", ".font-claude-response", "[data-message-author-role]", ".chat-message"],
+    exclude: ["[data-testid=\"chat-menu\"]", "[data-testid=\"sidebar\"]", "fieldset", ".composer"],
+    strip: ["[data-testid=\"action-bar\"]", ".message-actions"],
     inputs: ["div[contenteditable=\"true\"]", "textarea"],
   },
   chatgpt: {
-    selectors: ["[data-message-author-role]", "[data-testid=\"conversation-turn\"]", "article"],
+    selectors: ["[data-message-author-role]", "[data-testid=\"conversation-turn\"]", "[data-testid^=\"conversation-turn-\"]", "article"],
+    exclude: ["#stage-slideover-sidebar", "[data-testid=\"composer-background\"]", "#prompt-textarea", "form"],
+    strip: [".sr-only", "[data-testid=\"copy-turn-action-button\"]"],
     inputs: ["#prompt-textarea", "div[contenteditable=\"true\"]", "textarea"],
   },
+  doubao: {
+    selectors: ["[data-testid=\"receive_message\"]", "[data-testid=\"send_message\"]", "[data-message-id]", "[class*=\"message-block\"]", "[class*=\"chat-message\"]"],
+    exclude: ["[data-testid=\"sider\"]", "[class*=\"sidebar\"]", "[class*=\"sider\"]", "[data-testid=\"chat_input\"]", "[class*=\"chat-input\"]"],
+    strip: ["[data-testid*=\"message_action\"]", "[class*=\"action-bar\"]", "[class*=\"suggest\"]"],
+    inputs: ["[data-testid=\"chat_input_input\"]", "textarea", "div[contenteditable=\"true\"]"],
+  },
+  qwen: {
+    selectors: ["[data-message-author-role]", "[class*=\"answerItem\"]", "[class*=\"questionItem\"]", "[class*=\"chatItem\"]", ".chat-message"],
+    exclude: ["[class*=\"sidebar\"]", "[class*=\"sessionList\"]", "[class*=\"inputWrap\"]", "[class*=\"chatInput\"]"],
+    strip: ["[class*=\"operateBar\"]", "[class*=\"actionBar\"]", "[class*=\"recommend\"]"],
+    inputs: ["textarea", "div[contenteditable=\"true\"]"],
+  },
+  yuanbao: {
+    selectors: ["[data-conv-speaker]", ".agent-chat__list__item", "[class*=\"hyc-content\"]", "[data-message-author-role]", ".chat-message"],
+    exclude: [".yb-nav", "[class*=\"sidebar\"]", ".agent-dialogue__tool", "[class*=\"input-box\"]"],
+    strip: ["[class*=\"toolbar\"]", "[class*=\"action\"]", "[class*=\"think-header\"]"],
+    inputs: [".ql-editor", "div[contenteditable=\"true\"]", "textarea"],
+  },
 };
+
+const NOISE_LINE_PATTERNS = [
+  /^(复制|复制代码|复制全文|Copy|Copy code|Copied|重试|重新生成|Regenerate|编辑|Edit|分享|Share|朗读|Read aloud|好|不好|点赞|点踩)$/i,
+  /^(已深度思考|思考完成|Thought for \d+|Thinking process)(?:[（(].*[)）])?$/i,
+  /^(AI\s*生成的内容可能不准确.*|内容由\s*AI\s*大模型生成.*|ChatGPT\s*也可能会犯错.*|ChatGPT can make mistakes.*|Claude can make mistakes.*|Gemini\s*可能会显示不准确的信息.*|Kimi\s*可能会犯错.*|请核实重要信息.*)$/i,
+];
+
+export function stripWebNoise(raw, _site = "") {
+  const source = String(raw ?? "").replace(/\r\n/g, "\n");
+  if (!source.trim()) return "";
+  const lines = source.split("\n");
+  const out = [];
+  let inFence = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^```/.test(trimmed)) {
+      inFence = !inFence;
+      out.push(line);
+      continue;
+    }
+    if (!inFence && trimmed) {
+      if (NOISE_LINE_PATTERNS.some(pattern => pattern.test(trimmed))) continue;
+    }
+    out.push(line);
+  }
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
 
 function adapterSource(site, spec) {
   const config = JSON.stringify({
     site,
     selectors: spec.selectors,
+    exclude: [...CHROME_EXCLUDE, ...(spec.exclude || [])].join(", "),
+    strip: [...COMMON_STRIP, ...(spec.strip || [])].join(", "),
     limit: 60,
     maxLen: MAX_MESSAGE_CHARS,
     totalMax: MAX_EXTRACT_TOTAL,
@@ -70,9 +155,57 @@ function adapterSource(site, spec) {
   const attr = (node, name) => {
     try { return node && node.getAttribute ? String(node.getAttribute(name) || '') : ''; } catch (error) { return ''; }
   };
+  const widgetRoles = new Set(['button', 'menuitem', 'tab', 'tabpanel', 'tooltip', 'dialog', 'toolbar', 'navigation', 'sidebar', 'banner', 'input', 'composer', 'listbox', 'option', 'switch', 'checkbox', 'link', 'icon', 'status']);
+  const isExcluded = (node) => {
+    if (!node) return true;
+    const dr = attr(node, 'data-role').trim().toLowerCase();
+    if (dr && widgetRoles.has(dr)) return true;
+    if (spec.exclude && typeof node.closest === 'function') {
+      try { if (node.closest(spec.exclude)) return true; } catch (error) {}
+    }
+    if (String(node.tagName || '').toUpperCase() === 'ARTICLE' && !attr(node, 'data-testid') && !attr(node, 'data-message-author-role')) {
+      if (typeof node.querySelector === 'function') {
+        try { if (node.querySelector('nav, header, footer')) return true; } catch (error) {}
+      }
+    }
+    return false;
+  };
+  const cleanLines = (raw) => {
+    const text = String(raw || '').replace(/\\r\\n/g, '\\n');
+    const noise = [
+      /^(复制|复制代码|复制全文|Copy|Copy code|Copied|重试|重新生成|Regenerate|编辑|Edit|分享|Share|朗读|Read aloud|好|不好|点赞|点踩)$/i,
+      /^(已深度思考|思考完成|Thought for \\d+|Thinking process)(?:[（(].*[)）])?$/i,
+      /^(AI\\s*生成的内容可能不准确.*|内容由\\s*AI\\s*大模型生成.*|ChatGPT\\s*也可能会犯错.*|ChatGPT can make mistakes.*|Claude can make mistakes.*|Gemini\\s*可能会显示不准确的信息.*|Kimi\\s*可能会犯错.*|请核实重要信息.*)$/i
+    ];
+    let inFence = false;
+    const keptLines = [];
+    for (const line of text.split('\\n')) {
+      const trimmed = line.trim();
+      if (/^\`\`\`/.test(trimmed)) { inFence = !inFence; keptLines.push(line); continue; }
+      if (!inFence && trimmed && noise.some(re => re.test(trimmed))) continue;
+      keptLines.push(line);
+    }
+    return keptLines.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+  };
   const bodyText = (node) => {
-    const raw = typeof node.innerText === 'string' && node.innerText ? node.innerText : (typeof node.textContent === 'string' ? node.textContent : '');
-    return raw.replace(/\\r\\n/g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+    let target = node;
+    if (node && typeof node.cloneNode === 'function') {
+      try {
+        const clone = node.cloneNode(true);
+        if (spec.strip && typeof clone.querySelectorAll === 'function') {
+          for (const junk of Array.from(clone.querySelectorAll(spec.strip))) {
+            if (junk && typeof junk.remove === 'function') junk.remove();
+          }
+        }
+        target = clone;
+      } catch (error) {
+        target = node;
+      }
+    }
+    const raw = typeof target.innerText === 'string' && target.innerText
+      ? target.innerText
+      : (typeof target.textContent === 'string' ? target.textContent : '');
+    return cleanLines(raw);
   };
   const nodes = [];
   const seen = new Set();
@@ -80,7 +213,7 @@ function adapterSource(site, spec) {
     let list = [];
     try { list = Array.from(document.querySelectorAll(selector)); } catch (error) { list = []; }
     for (const node of list) {
-      if (!node || seen.has(node)) continue;
+      if (!node || seen.has(node) || isExcluded(node)) continue;
       seen.add(node);
       nodes.push(node);
     }
@@ -93,12 +226,14 @@ function adapterSource(site, spec) {
     push(attr(node, 'data-message-author-role'));
     push(attr(node, 'data-role'));
     push(attr(node, 'data-author'));
-    for (const selector of ['user-query', 'model-response', '[data-message-author-role]', '[data-role]']) {
+    push(attr(node, 'data-testid'));
+    for (const selector of ['user-query', 'model-response', '[data-message-author-role]', '[data-role]', '[data-testid]']) {
       try {
         const found = node.closest ? node.closest(selector) : null;
         if (found) {
           push(attr(found, 'data-message-author-role'));
           push(attr(found, 'data-role'));
+          push(attr(found, 'data-testid'));
           if (found.tagName) push(String(found.tagName));
         }
       } catch (error) {}
@@ -136,6 +271,142 @@ function adapterSource(site, spec) {
 export const SITE_ADAPTERS = Object.fromEntries(
   Object.entries(SITE_SPECS).map(([site, spec]) => [site, adapterSource(site, spec)]),
 );
+
+// 通用网页去噪提取器：用于未命中五大预设域名的其他对话站点（如通义、豆包、Poe、Perplexity）
+// 或技术文档页面，主动剔除侧边栏、导航栏、输入区、弹窗和按钮栏等常驻界面噪音。
+export const GENERIC_PAGE_ADAPTER_SOURCE = `(args) => {
+  const clamp = (value, min, max, fallback) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.trunc(number))) : fallback;
+  };
+  const limit = clamp(args && args.limit, 1, 80, 60);
+  const maxLen = clamp(args && args.maxLen, 200, 20000, ${MAX_MESSAGE_CHARS});
+  const totalMax = clamp(args && args.totalMax, 1000, 120000, ${MAX_EXTRACT_TOTAL});
+  const chromeSelector = [
+    'nav', 'aside', 'header', 'footer', 'dialog', 'form', 'textarea',
+    '[contenteditable="true"]', '[role="navigation"]', '[role="complementary"]',
+    '[role="banner"]', '[role="contentinfo"]', '[aria-hidden="true"]',
+    '[class*="sidebar"]', '[class*="sider"]', '[class*="sidenav"]',
+    '[class*="navbar"]', '[class*="topbar"]', '[class*="cookie"]',
+    '[class*="composer"]', '[class*="input-box"]', '[class*="chat-input"]',
+    '[class*="history-list"]', '[class*="session-list"]'
+  ].join(', ');
+  const stripSelector = [
+    'button', '[role="button"]', '[role="toolbar"]', '[role="menu"]',
+    'svg', 'style', 'script', 'noscript', '[aria-hidden="true"]',
+    'details:not([open]) > :not(summary)'
+  ].join(', ');
+  const cleanText = (raw) => {
+    const text = String(raw || '').replace(/\\r\\n/g, '\\n');
+    const noise = [
+      /^(复制|复制代码|复制全文|Copy|Copy code|Copied|重试|重新生成|Regenerate|编辑|Edit|分享|Share|好|不好|点赞|点踩)$/i,
+      /^(已深度思考|思考完成|Thought for \\d+|Thinking process)(?:[（(].*[)）])?$/i,
+      /^(AI\\s*生成的内容可能不准确.*|内容由\\s*AI\\s*大模型生成.*|.*can make mistakes.*)$/i
+    ];
+    let inFence = false;
+    const kept = [];
+    for (const line of text.split('\\n')) {
+      const trimmed = line.trim();
+      if (/^\`\`\`/.test(trimmed)) { inFence = !inFence; kept.push(line); continue; }
+      if (!inFence && trimmed && noise.some(re => re.test(trimmed))) continue;
+      kept.push(line);
+    }
+    return kept.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+  };
+  try {
+    const selected = typeof window !== 'undefined' && window.getSelection ? String(window.getSelection() || '').trim() : '';
+    if (selected.length >= 12) {
+      const clipped = selected.length > totalMax ? selected.slice(0, totalMax) + '…' : selected;
+      return { kind: 'selection', messages: [{ id: 'sel-1', role: 'page', text: clipped }], truncated: selected.length > totalMax };
+    }
+  } catch (error) {}
+
+  const readNode = (node) => {
+    let target = node;
+    if (node && typeof node.cloneNode === 'function') {
+      try {
+        const clone = node.cloneNode(true);
+        if (typeof clone.querySelectorAll === 'function') {
+          for (const junk of Array.from(clone.querySelectorAll(chromeSelector + ', ' + stripSelector))) {
+            if (junk && typeof junk.remove === 'function') junk.remove();
+          }
+        }
+        target = clone;
+      } catch (error) { target = node; }
+    }
+    const raw = typeof target.innerText === 'string' && target.innerText
+      ? target.innerText
+      : (typeof target.textContent === 'string' ? target.textContent : '');
+    return cleanText(raw);
+  };
+
+  const turnSelectors = [
+    '[data-message-author-role]',
+    '[data-message-id]',
+    '[data-testid*="message"]',
+    '[class*="chat-message"]',
+    '[class*="message-item"]',
+    '[class*="conversation-turn"]'
+  ];
+  const candidates = [];
+  const seen = new Set();
+  for (const selector of turnSelectors) {
+    let list = [];
+    try { list = Array.from(document.querySelectorAll(selector)); } catch (error) { list = []; }
+    for (const node of list) {
+      if (!node || seen.has(node)) continue;
+      try { if (node.closest && node.closest(chromeSelector)) continue; } catch (error) {}
+      seen.add(node);
+      candidates.push(node);
+    }
+  }
+  const innerTurns = candidates.filter(node => !candidates.some(other => other !== node && node.contains && node.contains(other)));
+  if (innerTurns.length > 0) {
+    const messages = [];
+    let total = 0;
+    let truncated = false;
+    for (const node of innerTurns) {
+      if (messages.length >= limit) { truncated = true; break; }
+      let text = readNode(node);
+      if (!text) continue;
+      if (text.length > maxLen) { text = text.slice(0, maxLen) + '…'; truncated = true; }
+      if (total + text.length > totalMax) { truncated = true; break; }
+      total += text.length;
+      const hint = [
+        node.getAttribute ? (node.getAttribute('data-message-author-role') || '') : '',
+        node.getAttribute ? (node.getAttribute('data-role') || '') : '',
+        typeof node.className === 'string' ? node.className : ''
+      ].join(' ').toLowerCase();
+      const role = /(^|[^a-z])(user|human|query)([^a-z]|$)/.test(hint)
+        ? 'user'
+        : /(assistant|model|bot|ai|answer|response)([^a-z]|$)/.test(hint)
+          ? 'assistant'
+          : 'unknown';
+      messages.push({ id: 'gen-' + (messages.length + 1), role, text });
+    }
+    if (messages.length > 0) {
+      return { kind: 'chat', messages, truncated, total };
+    }
+  }
+
+  let root = null;
+  for (const sel of ['article', '[role="main"]', 'main', '.markdown-body', 'body']) {
+    try {
+      const found = document.querySelector(sel);
+      if (found) { root = found; break; }
+    } catch (error) {}
+  }
+  if (!root) return { kind: 'empty', messages: [], truncated: false };
+  const cleaned = readNode(root);
+  if (!cleaned) return { kind: 'empty', messages: [], truncated: false };
+  const clipped = cleaned.length > totalMax ? cleaned.slice(0, totalMax) + '…' : cleaned;
+  return {
+    kind: 'main',
+    messages: [{ id: 'main-1', role: 'page', text: clipped }],
+    truncated: cleaned.length > totalMax,
+    total: clipped.length,
+  };
+}`;
 
 // 只填入，不发送：read 读取输入框现有草稿，write 写入并读回。任何站点都没有
 // 提交动作，插件也不提供发送控件。
@@ -201,7 +472,16 @@ export const CURRENT_URL_SOURCE = `(args) => {
   try { return String(location.href); } catch (error) { return ''; }
 }`;
 
-const SITE_ALIASES = { kimi: ["kimi.com"], deepseek: ["deepseek.com"], gemini: ["gemini.google.com"], claude: ["claude.ai"], chatgpt: ["chatgpt.com"] };
+const SITE_ALIASES = {
+  kimi: ["kimi.com"],
+  deepseek: ["deepseek.com"],
+  gemini: ["gemini.google.com"],
+  claude: ["claude.ai"],
+  chatgpt: ["chatgpt.com"],
+  doubao: ["doubao.com"],
+  qwen: ["qianwen.com", "tongyi.aliyun.com", "chat.qwen.ai"],
+  yuanbao: ["yuanbao.tencent.com"],
+};
 
 export function normalizeUrl(raw) {
   if (typeof raw !== "string") return "";
@@ -323,7 +603,7 @@ export function normalizeMessages(raw, options = {}) {
  * notice is shown to the user verbatim, so an empty parse never looks like a
  * successful extraction.
  */
-export function chooseExtraction({ site = "", adapter = null, adapterError = "", pageText = "" } = {}) {
+export function chooseExtraction({ site = "", adapter = null, genericAdapter = null, adapterError = "", pageText = "" } = {}) {
   const parsed = adapter ? normalizeMessages(adapter) : { messages: [], truncated: false, total: 0 };
   if (parsed.messages.length) {
     return {
@@ -331,10 +611,28 @@ export function chooseExtraction({ site = "", adapter = null, adapterError = "",
       site,
       messages: parsed.messages,
       truncated: parsed.truncated || Boolean(adapter?.truncated),
-      notice: site ? `已按 ${site} 站点适配器解析 ${parsed.messages.length} 条消息；请核对后勾选。` : `已解析 ${parsed.messages.length} 条消息。`,
+      notice: site
+        ? `已按 ${site} 站点规则去噪解析 ${parsed.messages.length} 条对话（已剔除侧边栏与常驻控件）；默认已聚焦规划内容。`
+        : `已解析 ${parsed.messages.length} 条消息。`,
     };
   }
-  const text = String(pageText || "").replace(/\r\n/g, "\n").trim();
+  const genericParsed = genericAdapter ? normalizeMessages(genericAdapter) : { messages: [], truncated: false, total: 0 };
+  if (genericParsed.messages.length) {
+    const kind = genericAdapter?.kind || "main";
+    const notice = kind === "selection"
+      ? "已提取当前鼠标选中的文本。"
+      : kind === "chat"
+        ? `已按通用对话结构去噪解析 ${genericParsed.messages.length} 条消息（已剔除导航栏与侧边栏）。`
+        : "已提取页面主内容区并剔除导航栏、侧边栏与常驻控件；可自由编辑或使用模型归纳提炼规划。";
+    return {
+      mode: kind === "chat" ? "adapter" : "generic",
+      site,
+      messages: genericParsed.messages,
+      truncated: genericParsed.truncated || Boolean(genericAdapter?.truncated),
+      notice,
+    };
+  }
+  const text = stripWebNoise(pageText, site);
   if (text) {
     const clipped = text.length > MAX_EXTRACT_TOTAL ? text.slice(0, MAX_EXTRACT_TOTAL) + "…" : text;
     const reason = site ? `${site} 站点适配器没有解析到消息` : "当前站点没有消息适配器";
@@ -344,10 +642,199 @@ export function chooseExtraction({ site = "", adapter = null, adapterError = "",
       site,
       messages: [{ id: "page-1", role: "page", text: clipped, label: "网页正文" }],
       truncated: text.length > MAX_EXTRACT_TOTAL,
-      notice: `${reason}${detail}，已回退为选区/正文。`,
+      notice: `${reason}${detail}，已回退为去噪后的选区/正文。`,
     };
   }
   return { mode: "empty", site, messages: [], truncated: false, notice: "当前页面没有可提取的选区或正文。" };
+}
+
+/** Identifies whether a message carries structured or substantive planning content. */
+export function isPlanningMessage(message) {
+  if (!message || typeof message !== "object") return false;
+  const text = String(message.text || "").trim();
+  if (!text) return false;
+  if (/(^|\n)#{1,6}\s+\S/.test(text)) return true;
+  if (/(^|\n)\s*\d+[.)、]\s+\S/.test(text) && text.length >= 40) return true;
+  if (/(^|\n)\s*[-*•]\s+\S/.test(text) && text.length >= 60) return true;
+  if (/(目标|方案|步骤|阶段|架构|接口|实施|验证|约束|模块|重构|迁移|规划|plan|step|phase|architecture|implementation)/i.test(text) && text.length >= 50) {
+    return true;
+  }
+  return message.role === "assistant" && text.length >= 160;
+}
+
+/**
+ * Selects planning-focused messages by default instead of checking every chat
+ * greeting or user prompt. Falls back to assistant replies or all messages when
+ * no message exhibits explicit plan structure.
+ */
+export function selectPlanningIds(messages) {
+  const list = Array.isArray(messages) ? messages.filter(item => item && item.id) : [];
+  if (list.length <= 1) return new Set(list.map(item => item.id));
+  const assistants = list.filter(item => item.role === "assistant");
+  if (assistants.length > 0) {
+    const planningAssistants = assistants.filter(isPlanningMessage);
+    if (planningAssistants.length > 0) {
+      return new Set(planningAssistants.map(item => item.id));
+    }
+    return new Set(assistants.map(item => item.id));
+  }
+  const structured = list.filter(isPlanningMessage);
+  if (structured.length > 0) return new Set(structured.map(item => item.id));
+  return new Set(list.map(item => item.id));
+}
+
+function utf8Bytes(text) {
+  if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text).length;
+  return unescape(encodeURIComponent(text)).length;
+}
+
+function clipToUtf8Bytes(text, maxBytes) {
+  const raw = String(text || "");
+  if (utf8Bytes(raw) <= maxBytes) return { text: raw, truncated: false };
+  let low = 0;
+  let high = raw.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (utf8Bytes(raw.slice(0, mid)) <= maxBytes) low = mid;
+    else high = mid - 1;
+  }
+  return { text: raw.slice(0, Math.max(0, low)).trimEnd() + "\n…（内容较长，已按归纳输入上限截断）", truncated: true };
+}
+
+/**
+ * Builds a bounded prompt (under PlannerService's 32000-byte limit) asking the
+ * chosen model to distill web conversation content into an actionable plan.
+ */
+export function buildSummarizePrompt(rawText, meta = {}) {
+  const sourceLabel = meta.site ? `（来源站点：${meta.site}）` : "";
+  const header = [
+    `请将以下从网页端提取的内容${sourceLabel}归纳整理为一份可直接交接给代码会话执行的【结构化规划方案】。`,
+    "要求：",
+    "1. 剔除寒暄、重复讨论、跑题对话以及残留的网页常驻提示词，只保留与规划和实现直接相关的内容。",
+    "2. 保留所有明确的技术选型、文件路径、接口字段、代码片段、边界约束与验收标准，不要编造原文没有提到的需求。",
+    "3. 按「目标与范围」「关键方案与决策」「实施步骤」「约束与待确认项」清晰分段输出（某节无内容可省略）。",
+    "",
+    "--- 提取原文开始 ---",
+  ].join("\n");
+  const footer = "\n--- 提取原文结束 ---";
+  const budget = 29500 - utf8Bytes(header) - utf8Bytes(footer);
+  const body = clipToUtf8Bytes(String(rawText || "").trim(), Math.max(2000, budget));
+  return header + "\n" + body.text + footer;
+}
+
+/**
+ * Runs a temporary read-only `pure` planner thread to distill extracted web
+ * content into a clean plan, cleaning up the temporary thread afterwards.
+ */
+export async function runWebSummarization(apis, { model, text, site = "", onProgress } = {}) {
+  const plannerApi = apis?.planner;
+  const eventsApi = apis?.events;
+  if (!plannerApi || typeof plannerApi.create !== "function" || typeof plannerApi.send !== "function") {
+    throw new Error("当前环境未开放规划模型归纳接口，请使用直接提取。");
+  }
+  const chosenModel = String(model || "").trim();
+  if (!chosenModel) {
+    throw new Error("尚未选择可用的归纳模型，请先配置模型或使用「直接交接所选」。");
+  }
+  const cleanedInput = String(text || "").trim();
+  if (!cleanedInput) {
+    throw new Error("没有可供归纳的内容。");
+  }
+  const prompt = buildSummarizePrompt(cleanedInput, { site });
+  const thread = await plannerApi.create({
+    title: "网页规划归纳（临时）",
+    model: chosenModel,
+    options: planOptions("pure"),
+  });
+  let sub = null;
+  let stopped = false;
+  let resolveDone;
+  let rejectDone;
+  const donePromise = new Promise((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
+  });
+
+  const extractAssistantReply = snapshot => {
+    const msgs = Array.isArray(snapshot?.messages) ? snapshot.messages : [];
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i]?.role === "assistant" && String(msgs[i]?.text || "").trim()) {
+        return String(msgs[i].text).trim();
+      }
+    }
+    return "";
+  };
+
+  const inspectSnapshot = snapshot => {
+    if (!snapshot || snapshot.id !== thread.id) return false;
+    const partial = extractAssistantReply(snapshot);
+    if (partial && typeof onProgress === "function") onProgress(partial);
+    if (snapshot.status === "running") return false;
+    if (snapshot.status === "stopped" || stopped) {
+      rejectDone(new Error("已取消模型归纳"));
+      return true;
+    }
+    if (snapshot.status === "error" || snapshot.status === "quota") {
+      rejectDone(new Error(snapshot.error || (snapshot.status === "quota" ? "模型额度等待中，请改用直接提取或切换其他模型" : "模型归纳未完成")));
+      return true;
+    }
+    if (snapshot.status === "idle") {
+      const reply = extractAssistantReply(snapshot);
+      if (reply) {
+        resolveDone(reply);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  if (eventsApi && typeof eventsApi.on === "function") {
+    sub = eventsApi.on("planner:" + thread.id, payload => {
+      inspectSnapshot(payload);
+    });
+  }
+
+  let pollTimer = null;
+  const startPolling = () => {
+    if (typeof plannerApi.get !== "function") return;
+    const tick = async () => {
+      if (stopped) return;
+      try {
+        const latest = await plannerApi.get(thread.id);
+        if (inspectSnapshot(latest)) return;
+      } catch {
+        /* 事件通道仍在监听 */
+      }
+      if (!stopped) pollTimer = setTimeout(tick, 350);
+    };
+    pollTimer = setTimeout(tick, 350);
+  };
+
+  const cancel = async () => {
+    stopped = true;
+    if (pollTimer) clearTimeout(pollTimer);
+    if (typeof plannerApi.stop === "function") {
+      await plannerApi.stop(thread.id).catch(() => {});
+    }
+    rejectDone(new Error("已取消模型归纳"));
+  };
+
+  if (typeof apis?.onCancelReady === "function") apis.onCancelReady(cancel);
+
+  try {
+    const sent = await plannerApi.send(thread.id, prompt);
+    if (!inspectSnapshot(sent)) {
+      startPolling();
+    }
+    return await donePromise;
+  } finally {
+    stopped = true;
+    if (pollTimer) clearTimeout(pollTimer);
+    sub?.dispose?.();
+    if (typeof plannerApi.remove === "function") {
+      await plannerApi.remove(thread.id).catch(() => {});
+    }
+  }
 }
 
 export function buildHandoffText(messages, selectedIds, meta = {}) {
@@ -913,9 +1400,15 @@ const STYLE = `
 .ekd-foot select{min-height:26px;max-width:46%;border:1px solid var(--color-line,color-mix(in srgb,var(--color-text,#1f2328) 20%,transparent));border-radius:6px;padding:2px 6px;background:var(--color-bg,#fff);min-width:0}
 .ekd-foot .ekd-spacer{flex:1 1 auto}
 .ekd-chip{font-size:11px;padding:1px 7px;border-radius:999px;background:var(--color-hover,rgba(0,0,0,.05));color:var(--color-text-secondary,color-mix(in srgb,var(--color-text,#1f2328) 62%,var(--color-bg,#fff)));white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
-.ekd-primary{background:var(--blue,#1783ff)!important;color:#fff!important;padding:4px 12px!important}
+.ekd-outline{border:1px solid var(--color-line,color-mix(in srgb,var(--color-text,#1f2328) 20%,transparent))!important;padding:3px 9px!important}
+.ekd-primary{background:var(--blue,#1783ff)!important;color:#fff!important;padding:4px 10px!important}
 .ekd-primary:hover:not(:disabled){filter:brightness(1.06)}
 .ekd-danger{color:var(--red,var(--danger,#d2352c))!important}
+.ekd-subbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 10px;border-bottom:1px solid var(--color-line,color-mix(in srgb,var(--color-text,#1f2328) 14%,transparent));background:var(--panel,color-mix(in srgb,var(--color-text,#1f2328) 3%,var(--color-bg,#fff)));flex:0 0 auto;min-width:0}
+.ekd-subbar select{min-height:26px;max-width:170px;border:1px solid var(--color-line,color-mix(in srgb,var(--color-text,#1f2328) 20%,transparent));border-radius:6px;padding:2px 6px;background:var(--color-bg,#fff);font-size:12px;min-width:0}
+.ekd-filter-btn{min-height:22px!important;padding:1px 8px!important;font-size:12px!important;border:1px solid var(--color-line,color-mix(in srgb,var(--color-text,#1f2328) 18%,transparent))!important;border-radius:999px!important}
+.ekd-variant-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 8px;border-radius:8px;border:1px solid var(--color-line,color-mix(in srgb,var(--color-text,#1f2328) 16%,transparent));background:var(--panel,color-mix(in srgb,var(--color-text,#1f2328) 4%,var(--color-bg,#fff)));font-size:12px}
+.ekd-variant-bar select{min-height:24px;max-width:160px;border:1px solid var(--color-line,color-mix(in srgb,var(--color-text,#1f2328) 20%,transparent));border-radius:6px;padding:1px 6px;background:var(--color-bg,#fff);font-size:12px}
 .ekd-status{font-size:12px;color:var(--color-text-secondary,color-mix(in srgb,var(--color-text,#1f2328) 62%,var(--color-bg,#fff)));min-width:0;overflow-wrap:anywhere}
 .ekd-status.is-error{color:var(--red,var(--danger,#d2352c))}
 .ekd-banner{display:flex;gap:6px;align-items:flex-start;font-size:12px;padding:6px 10px;border-bottom:1px solid var(--color-line,color-mix(in srgb,var(--color-text,#1f2328) 16%,transparent));background:color-mix(in srgb,var(--warn,#e3b654) 16%,transparent)}
@@ -1065,6 +1558,12 @@ export async function activate(ctx) {
     pendingFill: null,
     fillGeneration: 0,
     fillInFlight: false,
+    summarize: {
+      busy: false,
+      model: "",
+      cancel: null,
+      seq: 0,
+    },
     local: {
       thread: null,
       threads: [],
@@ -1344,17 +1843,23 @@ export async function activate(ctx) {
     }
   }
 
-  async function extract() {
+  async function extract(options = {}) {
+    const wantSummarize = Boolean(options && options.summarize);
     if (!state.view) {
       setStatus("先打开网页再提取。", true);
       return;
     }
+    if (state.summarize.busy) {
+      setStatus("正在进行模型归纳，可先取消归纳或等待完成。", true);
+      return;
+    }
     state.busy = "extract";
     renderToolbar();
-    setStatus("正在读取当前页面…");
+    setStatus("正在按站点规则去噪读取当前页面…");
     await refreshCurrentUrl();
     const adapter = adapterFor(state.viewUrl);
     let answer = null;
+    let genericAdapter = null;
     let adapterError = "";
     if (adapter) {
       try {
@@ -1363,14 +1868,32 @@ export async function activate(ctx) {
         adapterError = errorText(error);
       }
     }
+    if (!answer || !Array.isArray(answer.messages) || answer.messages.length === 0) {
+      try {
+        genericAdapter = await state.view.adapter(GENERIC_PAGE_ADAPTER_SOURCE, { limit: 60 });
+      } catch (error) {
+        if (!adapterError) adapterError = errorText(error);
+      }
+    }
     let pageText = "";
     let pageError = "";
-    try {
-      pageText = await state.view.extract();
-    } catch (error) {
-      pageError = errorText(error);
+    const hasStructured =
+      (Array.isArray(answer?.messages) && answer.messages.length > 0) ||
+      (Array.isArray(genericAdapter?.messages) && genericAdapter.messages.length > 0);
+    if (!hasStructured) {
+      try {
+        pageText = await state.view.extract();
+      } catch (error) {
+        pageError = errorText(error);
+      }
     }
-    const result = chooseExtraction({ site: adapter?.site || "", adapter, adapterError, pageText });
+    const result = chooseExtraction({
+      site: adapter?.site || "",
+      adapter: answer,
+      genericAdapter,
+      adapterError,
+      pageText,
+    });
     state.busy = "";
     renderToolbar();
     if (!result.messages.length) {
@@ -1378,12 +1901,121 @@ export async function activate(ctx) {
       return;
     }
     state.extraction = result;
-    state.selected = new Set(result.messages.map(message => message.id));
-    state.pickOpen = true;
+    state.selected = selectPlanningIds(result.messages);
     setMenuOpen(false);
+    await loadModels().catch(() => []);
+    if (!state.summarize.model && state.local.model) {
+      state.summarize.model = state.local.model;
+    }
+    if (wantSummarize) {
+      const chosen = selectedMessages();
+      const rawText = buildHandoffText(chosen.length ? chosen : result.messages, new Set((chosen.length ? chosen : result.messages).map(item => item.id)), { site: result.site || "" });
+      if (!state.summarize.model) {
+        state.pickOpen = true;
+        renderPicker();
+        applyChrome();
+        setStatus("当前尚未配置可用归纳模型，已打开去噪提取结果；可直接勾选后点「直接交接所选」。", true);
+        return;
+      }
+      await summarizeToPreview(rawText, { site: result.site || "", fallbackToPicker: true });
+      return;
+    }
+    state.pickOpen = true;
     renderPicker();
     applyChrome();
     setStatus(result.notice, result.mode === "fallback");
+  }
+
+  async function cancelSummarize() {
+    if (!state.summarize.busy) return;
+    state.summarize.seq++;
+    const cancel = state.summarize.cancel;
+    state.summarize.cancel = null;
+    state.summarize.busy = false;
+    renderToolbar();
+    renderPicker();
+    renderPreview();
+    if (typeof cancel === "function") {
+      await cancel().catch(() => {});
+    }
+    setStatus("已取消模型归纳；仍可使用「直接提取 / 直接交接所选」。");
+  }
+
+  async function summarizeToPreview(rawText, meta = {}) {
+    const cleaned = String(rawText || "").trim();
+    if (!cleaned) {
+      setStatus("请先选择或填写要归纳的内容。", true);
+      return;
+    }
+    await loadModels().catch(() => []);
+    const model = state.summarize.model || state.local.model || state.local.models[0]?.id || "";
+    if (!model) {
+      setStatus("没有可用的归纳模型，请先在模型供应商里配置模型，或直接使用「直接交接所选」。", true);
+      if (meta.fallbackToPicker && state.extraction) {
+        state.pickOpen = true;
+        renderPicker();
+        applyChrome();
+      }
+      return;
+    }
+    state.summarize.model = model;
+    const seq = ++state.summarize.seq;
+    state.summarize.busy = true;
+    state.summarize.cancel = null;
+    renderToolbar();
+    renderPicker();
+    renderPreview();
+    setStatus("正在用模型归纳提炼规划内容（可随时点「取消归纳」）…");
+    try {
+      const distilled = await runWebSummarization(
+        {
+          planner,
+          events: ctx.events,
+          onCancelReady: fn => {
+            if (state.summarize.seq === seq) state.summarize.cancel = fn;
+          },
+        },
+        {
+          model,
+          text: cleaned,
+          site: meta.site || "",
+          onProgress: partial => {
+            if (state.summarize.seq !== seq) return;
+            setStatus("正在用模型归纳规划内容…（已生成 " + partial.length + " 字符）");
+          },
+        },
+      );
+      if (disposed || state.summarize.seq !== seq) return;
+      state.summarize.busy = false;
+      state.summarize.cancel = null;
+      const prefix = meta.site ? `来自 ${meta.site} 的网页规划（经模型归纳）\n\n` : "网页规划（经模型归纳）\n\n";
+      const summaryFull = prefix + distilled;
+      openPreview(summaryFull, "web", {
+        rawText: cleaned,
+        summarizedText: summaryFull,
+        variant: "summary",
+        site: meta.site || "",
+        preserveFields: Boolean(meta.preserveFields),
+      });
+      setStatus("已完成模型归纳，可在下方编辑或随时切回提取原文。");
+    } catch (error) {
+      if (disposed || state.summarize.seq !== seq) return;
+      state.summarize.busy = false;
+      state.summarize.cancel = null;
+      const msg = errorText(error);
+      if (meta.fallbackToPicker && state.extraction) {
+        state.pickOpen = true;
+        renderPicker();
+        applyChrome();
+      }
+      setStatus("模型归纳未完成：" + msg + "。你仍可直接交接提取原文。", true);
+    } finally {
+      if (!disposed) {
+        renderToolbar();
+        renderPicker();
+        renderPreview();
+      }
+    }
   }
 
   function selectedMessages() {
@@ -1810,27 +2442,34 @@ export async function activate(ctx) {
   }
 
   // --- handoff -------------------------------------------------------------
-  function openPreview(text, from) {
+  function openPreview(text, from, extra = {}) {
+    const preserved = extra.preserveFields && state.preview ? state.preview : null;
     state.pickOpen = false;
     state.committed = null;
     state.previewSeq = (Number(state.previewSeq) || 0) + 1;
     state.previewDraftSeq = (Number(state.previewDraftSeq) || 0) + 1;
     const draftId = state.previewDraftSeq;
+    const initialText = String(text || "");
     state.preview = {
       draftId,
       seq: state.previewSeq,
-      text: String(text || ""),
+      text: initialText,
+      rawText: typeof extra.rawText === "string" ? extra.rawText : (from === "web" ? initialText : ""),
+      summarizedText: typeof extra.summarizedText === "string" ? extra.summarizedText : "",
+      variant: extra.variant === "summary" ? "summary" : "raw",
+      site: String(extra.site || state.extraction?.site || ""),
       from,
-      target: "",
-      mode: "normal",
-      cwd: "",
-      model: pickHandoffModel(state.local.model, state.handoffModels),
-      title: "",
+      target: preserved ? preserved.target : "",
+      mode: preserved ? preserved.mode : "normal",
+      cwd: preserved ? preserved.cwd : "",
+      model: preserved ? preserved.model : pickHandoffModel(state.local.model, state.handoffModels),
+      title: preserved ? preserved.title : "",
       confirmed: null,
       confirmedPayload: null,
     };
     renderPreview();
     applyChrome();
+    void loadModels().then(() => renderPreview()).catch(() => {});
     void populatePreviewTargets(draftId);
     void populatePreviewModels(draftId);
   }
@@ -2025,8 +2664,16 @@ export async function activate(ctx) {
     if (el.backBtn) el.backBtn.disabled = !state.view;
     if (el.reloadBtn) el.reloadBtn.disabled = !state.view;
     if (el.extractBtn) {
-      el.extractBtn.disabled = !state.view || state.busy === "extract";
-      el.extractBtn.textContent = state.busy === "extract" ? "读取中…" : "提取";
+      el.extractBtn.disabled = !state.view || state.busy === "extract" || state.summarize.busy;
+      el.extractBtn.textContent = state.busy === "extract" ? "读取中…" : "直接提取";
+    }
+    if (el.summarizeExtractBtn) {
+      el.summarizeExtractBtn.hidden = state.summarize.busy;
+      el.summarizeExtractBtn.disabled = !state.view || state.busy === "extract" || state.summarize.busy;
+      el.summarizeExtractBtn.textContent = "模型归纳";
+    }
+    if (el.cancelSummarizeBtn) {
+      el.cancelSummarizeBtn.hidden = !state.summarize.busy;
     }
     if (el.webStatus) {
       el.webStatus.textContent = state.view ? "" : "网页视图尚未打开";
@@ -2282,12 +2929,40 @@ export async function activate(ctx) {
     renderHistory();
   }
 
+  function renderSummarizeSelect(selectNode) {
+    if (!selectNode) return;
+    selectNode.replaceChildren();
+    const list = state.local.models;
+    if (!list.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "无可用归纳模型";
+      selectNode.append(opt);
+      selectNode.disabled = true;
+      return;
+    }
+    for (const model of list) {
+      const opt = document.createElement("option");
+      opt.value = model.id;
+      opt.textContent = model.name;
+      selectNode.append(opt);
+    }
+    const wanted = state.summarize.model || state.local.model || list[0]?.id || "";
+    state.summarize.model = wanted;
+    selectNode.value = wanted;
+    selectNode.disabled = state.summarize.busy;
+  }
+
   function renderPicker() {
     const extraction = state.extraction;
     if (!el.pickList) return;
     el.pickList.replaceChildren();
     el.pickNotice.textContent = extraction?.notice || "";
-    if (!extraction) return;
+    renderSummarizeSelect(el.pickSummarizeModel);
+    if (!extraction) {
+      updatePickCount();
+      return;
+    }
     for (const message of extraction.messages) {
       const label = document.createElement("label");
       label.className = "ekd-check";
@@ -2300,7 +2975,10 @@ export async function activate(ctx) {
         updatePickCount();
       });
       const body = node("span", "");
-      body.append(node("strong", "", message.label || ""), document.createTextNode("\n"), node("span", "", message.text.slice(0, 300)));
+      const roleTag = isPlanningMessage(message) && message.role === "assistant"
+        ? (message.label || "助手") + " · 规划内容"
+        : (message.label || "");
+      body.append(node("strong", "", roleTag), document.createTextNode("\n"), node("span", "", message.text.slice(0, 300)));
       label.append(box, body);
       el.pickList.append(label);
     }
@@ -2311,8 +2989,16 @@ export async function activate(ctx) {
   function updatePickCount() {
     if (!el.pickCount) return;
     const total = state.extraction?.messages.length || 0;
+    const empty = state.selected.size === 0;
     el.pickCount.textContent = "已选 " + state.selected.size + " / " + total;
-    if (el.pickGo) el.pickGo.disabled = state.selected.size === 0;
+    if (el.pickGo) el.pickGo.disabled = empty || state.summarize.busy;
+    if (el.pickSummarizeBtn) {
+      el.pickSummarizeBtn.hidden = state.summarize.busy;
+      el.pickSummarizeBtn.disabled = empty || !state.local.models.length;
+    }
+    if (el.pickCancelSummarizeBtn) {
+      el.pickCancelSummarizeBtn.hidden = !state.summarize.busy;
+    }
   }
 
   function renderPreviewModels(selectedModel, list = state.handoffModels) {
@@ -2345,6 +3031,32 @@ export async function activate(ctx) {
     if (el.previewCwd) el.previewCwd.value = preview.cwd;
     if (el.previewTitle) el.previewTitle.value = preview.title;
     renderPreviewModels(preview.model, state.handoffModels);
+    if (el.previewVariantBar) {
+      const isWeb = preview.from === "web";
+      el.previewVariantBar.hidden = !isWeb;
+      if (isWeb) {
+        renderSummarizeSelect(el.previewSummarizeModel);
+        const hasBoth = Boolean(preview.summarizedText && preview.rawText);
+        if (el.previewVariantLabel) {
+          el.previewVariantLabel.textContent = hasBoth
+            ? (preview.variant === "summary" ? "当前：模型归纳版" : "当前：直接提取原文")
+            : "当前：直接提取 / 粘贴原文";
+        }
+        if (el.previewToggleVariantBtn) {
+          el.previewToggleVariantBtn.hidden = !hasBoth;
+          el.previewToggleVariantBtn.disabled = state.summarize.busy || Boolean(preview.committing);
+          el.previewToggleVariantBtn.textContent = preview.variant === "summary" ? "切回提取原文" : "切回模型归纳版";
+        }
+        if (el.previewRunSummarizeBtn) {
+          el.previewRunSummarizeBtn.hidden = state.summarize.busy;
+          el.previewRunSummarizeBtn.disabled = Boolean(preview.committing) || !state.local.models.length;
+          el.previewRunSummarizeBtn.textContent = hasBoth ? "重新归纳" : "用模型归纳规划";
+        }
+        if (el.previewCancelSummarizeBtn) {
+          el.previewCancelSummarizeBtn.hidden = !state.summarize.busy;
+        }
+      }
+    }
   }
 
   function renderPreview() {
@@ -2366,9 +3078,10 @@ export async function activate(ctx) {
     // render writes it.
     const existing = Boolean(preview.target);
     const locked = Boolean(preview.committing);
+    const summarizing = Boolean(state.summarize.busy);
     if (el.previewNewFields) el.previewNewFields.hidden = existing;
     if (el.previewExistingNote) el.previewExistingNote.hidden = !existing;
-    if (el.previewText) el.previewText.disabled = locked;
+    if (el.previewText) el.previewText.disabled = locked || summarizing;
     if (el.previewTarget) el.previewTarget.disabled = locked;
     if (el.previewMode) el.previewMode.disabled = locked;
     if (el.previewCwd) el.previewCwd.disabled = locked;
@@ -2380,12 +3093,12 @@ export async function activate(ctx) {
       : null;
     if (el.previewConfirm) {
       el.previewConfirm.hidden = Boolean(state.committed);
-      el.previewConfirm.disabled = Boolean(preview.busy || preview.committing || state.committed);
+      el.previewConfirm.disabled = Boolean(preview.busy || preview.committing || summarizing || state.committed);
       el.previewConfirm.textContent = preview.busy ? "预览中…" : "预览";
     }
     if (el.previewCommit) {
       el.previewCommit.hidden = !validConfirmed;
-      el.previewCommit.disabled = Boolean(preview.committing) || !validConfirmed;
+      el.previewCommit.disabled = Boolean(preview.committing || summarizing) || !validConfirmed;
       el.previewCommit.textContent = preview.committing ? "交接中…" : validConfirmed?.newSession ? "创建会话并交接" : "交接到已有会话";
     }
     if (el.previewSummary) {
@@ -2439,9 +3152,14 @@ export async function activate(ctx) {
     el.reloadBtn = iconButton("reload", "刷新");
     el.reloadBtn.addEventListener("click", () => void pageAction("reload", "刷新"));
     el.siteChips = siteChips();
-    el.extractBtn = button("提取");
-    el.extractBtn.addEventListener("click", () => void extract());
-    webTools.append(el.backBtn, el.reloadBtn, el.siteChips, el.extractBtn);
+    el.extractBtn = button("直接提取", "ekd-outline", "按站点去噪提取页面对话，勾选后直接交接（不经模型归纳）");
+    el.extractBtn.addEventListener("click", () => void extract({ summarize: false }));
+    el.summarizeExtractBtn = button("模型归纳", "ekd-primary", "提取页面对话并由模型归纳提炼规划方案（可选项）");
+    el.summarizeExtractBtn.addEventListener("click", () => void extract({ summarize: true }));
+    el.cancelSummarizeBtn = button("取消归纳", "ekd-danger", "取消正在进行的模型归纳");
+    el.cancelSummarizeBtn.hidden = true;
+    el.cancelSummarizeBtn.addEventListener("click", () => void cancelSummarize());
+    webTools.append(el.backBtn, el.reloadBtn, el.siteChips, el.extractBtn, el.summarizeExtractBtn, el.cancelSummarizeBtn);
     bar.append(webTools);
 
     const localTools = node("div", "ekd-tools");
@@ -2717,18 +3435,67 @@ export async function activate(ctx) {
       state.pickOpen = false;
       applyChrome();
     });
-    el.pickGo = button("交接所选", "ekd-primary");
+    head.append(el.pickCount, spacer, back);
+
+    const filterBar = node("div", "ekd-subbar");
+    const onlyPlan = button("仅选规划内容", "ekd-filter-btn", "只勾选助手回复中的规划正文，跳过提问与寒暄");
+    onlyPlan.addEventListener("click", () => {
+      if (!state.extraction) return;
+      state.selected = selectPlanningIds(state.extraction.messages);
+      renderPicker();
+    });
+    const onlyLatest = button("仅选最新回复", "ekd-filter-btn", "只勾选最后一条助手回复");
+    onlyLatest.addEventListener("click", () => {
+      const list = state.extraction?.messages || [];
+      const lastAssistant = [...list].reverse().find(item => item.role === "assistant") || list[list.length - 1];
+      state.selected = lastAssistant ? new Set([lastAssistant.id]) : new Set();
+      renderPicker();
+    });
+    const selectAll = button("全选", "ekd-filter-btn");
+    selectAll.addEventListener("click", () => {
+      state.selected = new Set((state.extraction?.messages || []).map(item => item.id));
+      renderPicker();
+    });
+    const clearAll = button("清空", "ekd-filter-btn");
+    clearAll.addEventListener("click", () => {
+      state.selected = new Set();
+      renderPicker();
+    });
+    filterBar.append(onlyPlan, onlyLatest, selectAll, clearAll);
+
+    const actionBar = node("div", "ekd-subbar");
+    el.pickSummarizeModel = document.createElement("select");
+    el.pickSummarizeModel.setAttribute("aria-label", "归纳模型");
+    el.pickSummarizeModel.title = "选择用于归纳提炼规划内容的模型（可选功能）";
+    el.pickSummarizeModel.addEventListener("change", () => {
+      state.summarize.model = el.pickSummarizeModel.value;
+    });
+    const actionSpacer = node("span", "ekd-spacer");
+    actionSpacer.style.flex = "1 1 auto";
+    el.pickGo = button("直接交接所选", "ekd-outline", "不经过模型归纳，直接将所选去噪内容带入交接预览");
     el.pickGo.addEventListener("click", () => {
       const messages = selectedMessages();
       if (!messages.length) return;
-      openPreview(buildHandoffText(messages, state.selected, { site: state.extraction?.site || "" }), "web");
+      const rawText = buildHandoffText(messages, state.selected, { site: state.extraction?.site || "" });
+      openPreview(rawText, "web", { rawText, variant: "raw", site: state.extraction?.site || "" });
     });
-    head.append(el.pickCount, spacer, back, el.pickGo);
+    el.pickSummarizeBtn = button("模型归纳后交接", "ekd-primary", "用所选模型把勾选内容提炼为结构化规划后再进入交接预览");
+    el.pickSummarizeBtn.addEventListener("click", () => {
+      const messages = selectedMessages();
+      if (!messages.length) return;
+      const rawText = buildHandoffText(messages, state.selected, { site: state.extraction?.site || "" });
+      void summarizeToPreview(rawText, { site: state.extraction?.site || "", fallbackToPicker: false });
+    });
+    el.pickCancelSummarizeBtn = button("取消归纳", "ekd-danger");
+    el.pickCancelSummarizeBtn.hidden = true;
+    el.pickCancelSummarizeBtn.addEventListener("click", () => void cancelSummarize());
+    actionBar.append(el.pickSummarizeModel, actionSpacer, el.pickGo, el.pickSummarizeBtn, el.pickCancelSummarizeBtn);
+
     const scroll = node("div", "ekd-scroll");
     el.pickNotice = node("p", "ekd-note");
     el.pickList = node("div", "ekd-list");
     scroll.append(el.pickNotice, el.pickList);
-    pane.append(head, scroll);
+    pane.append(head, filterBar, actionBar, scroll);
     return pane;
   }
 
@@ -2769,11 +3536,68 @@ export async function activate(ctx) {
       for (const name of events) control.addEventListener(name, handler);
     }
 
+    el.previewVariantBar = node("div", "ekd-variant-bar");
+    el.previewVariantBar.hidden = true;
+    el.previewVariantLabel = node("span", "ekd-status", "当前：直接提取 / 粘贴原文");
+    const variantSpacer = node("span", "ekd-spacer");
+    variantSpacer.style.flex = "1 1 auto";
+    el.previewToggleVariantBtn = button("切回提取原文", "ekd-filter-btn");
+    el.previewToggleVariantBtn.hidden = true;
+    el.previewToggleVariantBtn.addEventListener("click", () => {
+      if (!state.preview || state.preview.from !== "web") return;
+      if (!state.preview.rawText || !state.preview.summarizedText) return;
+      const nextVariant = state.preview.variant === "summary" ? "raw" : "summary";
+      state.preview.variant = nextVariant;
+      state.preview.text = nextVariant === "summary" ? state.preview.summarizedText : state.preview.rawText;
+      setDraft("web", state.preview.text);
+      queueDrafts();
+      invalidatePreviewConfirmation();
+      renderPreviewStructure(state.preview);
+      applyChrome();
+    });
+    el.previewSummarizeModel = document.createElement("select");
+    el.previewSummarizeModel.setAttribute("aria-label", "归纳模型");
+    el.previewSummarizeModel.title = "选择用于归纳提炼规划内容的模型";
+    el.previewSummarizeModel.addEventListener("change", () => {
+      state.summarize.model = el.previewSummarizeModel.value;
+    });
+    el.previewRunSummarizeBtn = button("用模型归纳规划", "ekd-outline");
+    el.previewRunSummarizeBtn.addEventListener("click", () => {
+      if (!state.preview || state.preview.from !== "web") return;
+      const sourceText = (state.preview.rawText || el.previewText?.value || state.preview.text || "").trim();
+      if (!sourceText) {
+        setStatus("请先输入或提取要归纳的内容。", true);
+        return;
+      }
+      state.preview.rawText = sourceText;
+      void summarizeToPreview(sourceText, {
+        site: state.preview.site || state.extraction?.site || "",
+        fallbackToPicker: false,
+        preserveFields: true,
+      });
+    });
+    el.previewCancelSummarizeBtn = button("取消归纳", "ekd-danger");
+    el.previewCancelSummarizeBtn.hidden = true;
+    el.previewCancelSummarizeBtn.addEventListener("click", () => void cancelSummarize());
+    el.previewVariantBar.append(
+      el.previewVariantLabel,
+      variantSpacer,
+      el.previewToggleVariantBtn,
+      el.previewSummarizeModel,
+      el.previewRunSummarizeBtn,
+      el.previewCancelSummarizeBtn,
+    );
+
     el.previewText = document.createElement("textarea");
     el.previewText.setAttribute("aria-label", "交接内容");
     bindPreviewField(el.previewText, ["input", "change"], () => {
       state.preview.text = el.previewText.value;
       if (state.preview.from === "web") {
+        if (state.preview.variant === "summary") {
+          state.preview.summarizedText = el.previewText.value;
+        } else {
+          state.preview.rawText = el.previewText.value;
+        }
         setDraft("web", el.previewText.value);
         queueDrafts();
       }
@@ -2846,7 +3670,7 @@ export async function activate(ctx) {
 
     const targetField = node("div", "ekd-grid");
     targetField.append(field("目标", el.previewTarget), field("模式", el.previewMode));
-    pane.append(head, el.previewText, targetField, el.previewNewFields, el.previewExistingNote, actions, el.previewSummary, el.previewError, el.previewResult);
+    pane.append(head, el.previewVariantBar, el.previewText, targetField, el.previewNewFields, el.previewExistingNote, actions, el.previewSummary, el.previewError, el.previewResult);
     return pane;
   }
 
@@ -3014,6 +3838,13 @@ export async function activate(ctx) {
 
   ctx.onDispose(() => {
     disposed = true;
+    state.summarize.seq++;
+    const pendingSummarizeCancel = state.summarize.cancel;
+    state.summarize.cancel = null;
+    state.summarize.busy = false;
+    if (typeof pendingSummarizeCancel === "function") {
+      void pendingSummarizeCancel().catch(() => {});
+    }
     flushDrafts();
     if (syncFrame !== null) window.cancelAnimationFrame(syncFrame);
     window.clearTimeout(previewDraftTimer);

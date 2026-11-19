@@ -955,6 +955,11 @@
   overflow-x: hidden;
 }
 
+.session-grid-scroll,
+.session-resizer {
+  -webkit-app-region: no-drag;
+}
+
 .wb-exec {
   display: flex;
   flex-direction: column;
@@ -962,6 +967,7 @@
   min-width: 0;
   background: var(--paper);
   overflow: hidden;
+  -webkit-app-region: no-drag;
 }
 
 .wb-exec-head {
@@ -972,6 +978,7 @@
   padding: 7px 10px;
   border-bottom: 1px solid var(--line);
   flex: none;
+  -webkit-app-region: no-drag;
 }
 
 .wb-exec-head .wb-select {
@@ -1178,6 +1185,31 @@
   flex-wrap: wrap;
 }
 
+.wb-exec-recovery {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-bottom: 1px solid var(--line);
+  flex: none;
+  min-width: 0;
+}
+
+.wb-exec-recovery > svg {
+  flex: none;
+}
+
+.wb-exec-recovery > span {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .wb-exec-composer {
   flex: none;
 }
@@ -1189,83 +1221,6 @@
 
 .wb-exec-composer .wb-textarea {
   min-height: 44px;
-}
-
-/* ---------- 额度恢复 ---------- */
-
-.wb-recovery {
-  margin: 10px 12px 0;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-  flex: none;
-  max-height: 42%;
-  overflow-y: auto;
-}
-
-.wb-recovery-head {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  width: 100%;
-  padding: 7px 10px;
-  border: 0;
-  background: transparent;
-  color: var(--ink);
-  font: inherit;
-  font-size: 12px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.wb-recovery-head > svg:first-child {
-  color: var(--ink-muted);
-  flex: none;
-}
-
-.wb-recovery-head > span:first-of-type {
-  flex: 1;
-  min-width: 0;
-}
-
-.wb-recovery-head > svg:last-child {
-  color: var(--ink-muted);
-  flex: none;
-}
-
-.wb-recovery-body {
-  display: grid;
-  gap: 8px;
-  padding: 6px 10px 10px;
-  border-top: 1px solid var(--line);
-}
-
-.wb-facts {
-  display: grid;
-  gap: 2px;
-  font-size: 11.5px;
-}
-
-.wb-facts > div {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 3px 0;
-  border-bottom: 1px dashed var(--line);
-}
-
-.wb-facts > div:last-child {
-  border-bottom: 0;
-}
-
-.wb-facts dt {
-  color: var(--ink-muted);
-}
-
-.wb-facts dd {
-  color: var(--ink);
-  text-align: right;
-  overflow-wrap: anywhere;
 }
 
 /* ---------- 原生设置 ---------- */
