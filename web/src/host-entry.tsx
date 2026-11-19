@@ -17,7 +17,28 @@ export { createCoreTransport, createEventChannel, createNativeHost };
 // renderer loads it instead of shipping a copy.
 export { createPluginRuntime } from "./plugin-runtime/runtime";
 export { createEntryMountManager, mountMainAreaSurface } from "./plugin-runtime/entries";
-export type { EntryMountManager, EntryPlan, MainAreaMountOptions, SidebarNavPlan } from "./plugin-runtime/entries";
+export type { EntryMountManager, EntryPlan, EntrySurfaceGates, MainAreaMountOptions, SidebarNavPlan } from "./plugin-runtime/entries";
+export {
+  createDOMContractState,
+  detectSidebarMode,
+  evaluateDOMContracts,
+  findAccountMenuAnchor,
+  findOfficialSettingsPanel,
+  findOfficialSettingsTab,
+  findSettingsDialogParts,
+  findSidebarFooter,
+  findSidebarNewChatButtons,
+  isOfficialSettingsTabSelected,
+  resolveOfficialTexts,
+} from "./plugin-runtime/contracts";
+export type {
+  ContractProbeStatus,
+  DOMContractEvaluation,
+  DOMContractProbe,
+  DOMContractState,
+  OfficialSettingsTabKey,
+  SettingsDialogParts,
+} from "./plugin-runtime/contracts";
 export { loadModule as loadPluginModule, entryPath as pluginEntryPath } from "./plugin-runtime/loader";
 export type { ActivePlugin, PluginRuntime } from "./plugin-runtime/runtime";
 import "./styles/workbench.css";

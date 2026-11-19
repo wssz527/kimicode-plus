@@ -65,6 +65,10 @@ async function installNativeRenderer(options) {
     pluginSettings: new Map(),
     watchedSession: '',
     browserNavListeners: new Map(),
+    contractState: module.createDOMContractState(),
+    contracts: null,
+    lastContractDigest: '',
+    contractReportTimer: null,
   };
   const activeSession = () => {
     if (options.sourceSessionId) return options.sourceSessionId;
@@ -212,18 +216,17 @@ async function installNativeRenderer(options) {
       if (!button) throw new Error('官方设置入口未就绪');
       button.click();
     }
-    const findOfficialTab = label => [...(state.settingsList?.querySelectorAll('button.tab[role="tab"]') || [])]
-      .find(item => item !== state.settingsButton && item.textContent.includes(label));
+    const findOfficialTab = key => module.findOfficialSettingsTab(document, key);
     const deadline = Date.now() + 10000;
-    while (!state.settingsBody || !state.settingsButton || (tab === 'providers' && !findOfficialTab('模型供应商'))) {
+    while (!state.settingsBody || !state.settingsButton || (tab === 'providers' && !findOfficialTab('providers'))) {
       syncSettingsTab();
-      if (state.settingsBody && state.settingsButton && (tab !== 'providers' || findOfficialTab('模型供应商'))) break;
+      if (state.settingsBody && state.settingsButton && (tab !== 'providers' || findOfficialTab('providers'))) break;
       if (Date.now() >= deadline) throw new Error('官方设置对话框契约未就绪');
       await new Promise(resolve => setTimeout(resolve, 50));
     }
     if (tab === 'providers') {
       if (state.settingsActive) deactivateSettings();
-      const providerTab = findOfficialTab('模型供应商');
+      const providerTab = findOfficialTab('providers');
       if (!providerTab) throw new Error('官方模型供应商标签未找到');
       providerTab.click();
       providerTab.classList.add('on');
@@ -233,17 +236,22 @@ async function installNativeRenderer(options) {
     await activateSettings();
   }
   function syncSettingsTab() {
-    const dialog = document.querySelector('.settings-dialog');
-    if (!dialog) {
+    const parts = module.findSettingsDialogParts(document);
+    if (!parts) {
       if (state.settingsDialog) {
         deactivateSettings();
         detachSettings();
       }
       return;
     }
-    const list = dialog.querySelector('.settings-tab-list');
-    const body = dialog.querySelector('section.settings-region .body');
-    if (!list || !body) return;
+    const { dialog, tabList: list, body } = parts;
+    if (!list || !body || parts.officialTabs.length === 0) {
+      if (state.settingsDialog) {
+        deactivateSettings();
+        detachSettings();
+      }
+      return;
+    }
     if (state.settingsDialog !== dialog) {
       deactivateSettings();
       detachSettings();
@@ -270,7 +278,7 @@ async function installNativeRenderer(options) {
       if (state.settingsActive) markSettingsActive();
       return;
     }
-    const nativeTab = list.querySelector('button.tab[role="tab"]');
+    const nativeTab = parts.officialTabs[0];
     if (!nativeTab) return;
     const button = nativeTab.cloneNode(true);
     button.classList.remove('on');
@@ -284,7 +292,7 @@ async function installNativeRenderer(options) {
       event.stopPropagation();
       void activateSettings();
     });
-    const archived = [...list.querySelectorAll('button.tab')].find(tab => tab.textContent.includes('已归档'));
+    const archived = module.findOfficialSettingsTab(document, 'archived');
     list.insertBefore(button, archived || null);
     replaceIcon(button);
     state.settingsButton = button;
@@ -479,10 +487,31 @@ async function installNativeRenderer(options) {
       });
     return true;
   }
-  function syncEntryMount() {
+  function scheduleContractReport(probes, immediate = false) {
+    if (options.surface !== 'host' || state.removed) return;
+    const digest = JSON.stringify(probes.map(p => [p.id, p.status, p.reason || '', p.detail || '']));
+    if (digest === state.lastContractDigest) return;
+    state.lastContractDigest = digest;
+    const send = () => {
+      state.contractReportTimer = null;
+      if (state.removed) return;
+      void transport.request('contracts.report', {
+        appVersion: options.appVersion || '',
+        electron: options.electron || '',
+        probes,
+      }).catch(() => {});
+    };
+    if (state.contractReportTimer) {
+      clearTimeout(state.contractReportTimer);
+      state.contractReportTimer = null;
+    }
+    if (immediate) send();
+    else state.contractReportTimer = setTimeout(send, 120);
+  }
+  function syncEntryMount(gates) {
     const entries = allEntryPlans();
-    state.entryMount?.sync(entries, sidebarNavPlans());
-    syncOverlayEntries(entries);
+    state.entryMount?.sync(entries, sidebarNavPlans(), gates);
+    syncOverlayEntries(gates?.rightPanel === false ? [] : entries);
   }
   function removeEntry(action) {
     state.entryMount?.remove(action);
@@ -508,26 +537,54 @@ async function installNativeRenderer(options) {
   // gets its plugin row back without a stale module-level reference deciding
   // whether it "already exists".
   function syncNativeEntries() {
-    syncEntryMount();
+    const firstEvaluation = state.contracts === null;
+    const evaluation = module.evaluateDOMContracts(document, state.contractState);
+    state.contractState = evaluation.state;
+    state.contracts = evaluation;
+    const gates = {
+      sessionInfo: evaluation.byId['dom.session_info_available']?.status !== 'disabled',
+      rightPanel: evaluation.byId['dom.right_panel']?.status !== 'disabled',
+      sidebarNav: evaluation.byId['dom.sidebar_nav']?.status !== 'disabled',
+    };
+    syncEntryMount(gates);
     // The sidebar cache widget used to be mounted here. It is now the preinstalled
     // Monitor plugin, which mounts through the plugin runtime's own sidebar slot,
     // so this file owns no cache surface and no private channel for one.
-    syncSettingsTab();
-    if (state.activePluginPanel && panelContract()?.activeTabId?.value) {
-      deactivatePluginPanel(state.activePluginPanel, false);
+    if (evaluation.byId['dom.sidebar_footer']?.status === 'disabled') {
+      for (const anchor of document.querySelectorAll('[data-ekdp-sidebar-anchor]')) anchor.remove();
     }
-    for (const [id, entry] of state.pluginPanels) {
-      syncPluginPanelTab(entry);
-      if (state.activePluginPanel === id) {
-        const body = panelBody();
-        if (body) {
-          body.dataset.ekdpPanel = id;
-          if (entry.host.parentElement !== body) body.append(entry.host);
+    if (evaluation.byId['dom.settings_dialog']?.status === 'disabled') {
+      deactivateSettings();
+      detachSettings();
+    } else {
+      syncSettingsTab();
+    }
+    if (evaluation.byId['dom.settings_providers']?.status === 'disabled') {
+      state.providerEnhance?.clearDecorations?.();
+    }
+    if (!gates.rightPanel) {
+      if (state.activePluginPanel) deactivatePluginPanel(state.activePluginPanel, false);
+      for (const entry of state.pluginPanels.values()) {
+        if (entry.wrapper.isConnected) entry.wrapper.remove();
+      }
+    } else {
+      if (state.activePluginPanel && panelContract()?.activeTabId?.value) {
+        deactivatePluginPanel(state.activePluginPanel, false);
+      }
+      for (const [id, entry] of state.pluginPanels) {
+        syncPluginPanelTab(entry);
+        if (state.activePluginPanel === id) {
+          const body = panelBody();
+          if (body) {
+            body.dataset.ekdpPanel = id;
+            if (entry.host.parentElement !== body) body.append(entry.host);
+          }
         }
       }
     }
     if (state.sessionContainer && !state.sessionContainer.isConnected) closeSessions();
     if (state.sessionContainer) state.sessionContainer.setAttribute('data-ekd-containment', 'sessions');
+    scheduleContractReport(evaluation.probes, firstEvaluation || Boolean(document.querySelector('.settings-dialog')));
   }
   function ensure() {
     if (state.removed) return;
@@ -567,6 +624,8 @@ async function installNativeRenderer(options) {
     document.removeEventListener('click', settingsTabClick, true);
     document.removeEventListener('scroll', settingsScroll, true);
     clearTimeout(state.settingsScrollTimer);
+    clearTimeout(state.contractReportTimer);
+    state.contractReportTimer = null;
     state.picker?.close();
     deactivateSettings();
     detachSettings();
@@ -601,10 +660,13 @@ async function installNativeRenderer(options) {
   };
   const settingsTabClick = event => {
     const tab = event.target.closest('.settings-tab-list button.tab[role="tab"]');
-    if (tab && tab !== state.settingsButton && state.settingsActive) {
-      deactivateSettings();
-      tab.classList.add('on');
-      tab.setAttribute('aria-selected', 'true');
+    if (tab && tab !== state.settingsButton) {
+      if (state.settingsActive) {
+        deactivateSettings();
+        tab.classList.add('on');
+        tab.setAttribute('aria-selected', 'true');
+      }
+      setTimeout(() => ensure(), 40);
     }
   };
   const settingsScroll = event => {
@@ -1052,6 +1114,7 @@ async function installNativeRenderer(options) {
       activateSession: id => activateSession(id),
       openSettings: tab => openSettings(tab),
       invokeEntry: action => invokeEntryPlan(action),
+      contracts: () => (state.contracts?.probes || []).map(item => ({ ...item })),
       get plugins() {
         const runtime = state.plugins;
         if (!runtime) return null;

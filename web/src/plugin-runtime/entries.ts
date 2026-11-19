@@ -15,6 +15,11 @@
  */
 
 import type { Cleanup, MainAreaDefinition, MainAreaHandle } from "./context.js";
+import {
+  findRightPanelContainers,
+  findSessionInfoAvailableContainers,
+  findSidebarNewChatButtons,
+} from "./contracts.js";
 
 export interface EntryPlan {
   /** Stable action id; `plugin:<pluginId>:<entryId>` for plugin entries. */
@@ -42,8 +47,14 @@ export interface EntryMountManagerOptions {
   onError?: (pluginId: string | null, error: unknown) => void;
 }
 
+export interface EntrySurfaceGates {
+  sessionInfo?: boolean;
+  rightPanel?: boolean;
+  sidebarNav?: boolean;
+}
+
 export interface EntryMountManager {
-  sync(entries: EntryPlan[], navs?: SidebarNavPlan[]): void;
+  sync(entries: EntryPlan[], navs?: SidebarNavPlan[], gates?: EntrySurfaceGates): void;
   remove(action: string): void;
   dispose(): void;
   stats(): { entries: number; navs: number; observers: number };
@@ -53,7 +64,7 @@ export interface EntryMountManager {
 // `pl` launcher is the empty right-panel page; `panel-add-menu` is the dropdown
 // the `+` button opens. Both are kept because the acceptance plan names the
 // launcher and the live client renders both at different moments.
-function entryContainers(document: Document): Element[] {
+function entryContainers(document: Document, gates?: EntrySurfaceGates): Element[] {
   const seen = new Set<Element>();
   const containers: Element[] = [];
   const add = (container: Element) => {
@@ -61,20 +72,12 @@ function entryContainers(document: Document): Element[] {
     seen.add(container);
     containers.push(container);
   };
-  // `SessionInfoTabs` renders two sections (opened / available); only the
-  // section that carries `.sit-available` buttons is a plugin target. The class
-  // lives on the buttons, not on the section, so the section is resolved by
-  // content instead of assuming a class name the official client does not use.
-  for (const section of Array.from(document.querySelectorAll("aside.session-info .sit-section"))) {
-    if (section.querySelector(".sit-available")) add(section);
+  if (gates?.sessionInfo !== false) {
+    for (const container of findSessionInfoAvailableContainers(document)) add(container);
   }
-  for (const sit of Array.from(document.querySelectorAll(".pt-body .sit"))) {
-    const sections = Array.from(sit.querySelectorAll(".sit-section")).filter(section => section.querySelector(".sit-available"));
-    if (sections.length > 0) sections.forEach(add);
-    else add(sit);
+  if (gates?.rightPanel !== false) {
+    for (const container of findRightPanelContainers(document)) add(container);
   }
-  for (const launcher of Array.from(document.querySelectorAll(".pt-body .pl"))) add(launcher);
-  for (const menu of Array.from(document.querySelectorAll(".panel-add-menu"))) add(menu);
   return containers;
 }
 
@@ -215,13 +218,13 @@ export function createEntryMountManager(options: EntryMountManagerOptions): Entr
     return button;
   }
 
-  function syncEntries(entries: EntryPlan[]): Set<Element> {
+  function syncEntries(entries: EntryPlan[], gates?: EntrySurfaceGates): Set<Element> {
     const live = new Set<Element>();
     const plans = entries.filter(plan => plan
       && typeof plan.action === "string" && plan.action !== ""
       && typeof plan.title === "string" && plan.title.trim() !== ""
       && typeof plan.open === "function");
-    for (const container of entryContainers(document)) {
+    for (const container of entryContainers(document, gates)) {
       const officials = officialEntries(container);
       if (officials.length === 0) continue;
       const template = officials[0]!;
@@ -251,13 +254,14 @@ export function createEntryMountManager(options: EntryMountManagerOptions): Entr
     return live;
   }
 
-  function syncNavs(navs: SidebarNavPlan[]): Set<Element> {
+  function syncNavs(navs: SidebarNavPlan[], gates?: EntrySurfaceGates): Set<Element> {
     const live = new Set<Element>();
+    if (gates?.sidebarNav === false) return live;
     const plans = navs.filter(plan => plan
       && typeof plan.action === "string" && plan.action !== ""
       && typeof plan.title === "string" && plan.title.trim() !== ""
       && typeof plan.open === "function");
-    for (const native of Array.from(document.querySelectorAll("button.btn-new-chat"))) {
+    for (const native of findSidebarNewChatButtons(document)) {
       const container = native.parentElement;
       if (!container) continue;
       if (native.hasAttribute(ENTRY_ATTRIBUTE) || native.hasAttribute(NAV_ATTRIBUTE)) continue;
@@ -295,11 +299,11 @@ export function createEntryMountManager(options: EntryMountManagerOptions): Entr
   }
 
   return {
-    sync(entries, navs = []) {
+    sync(entries, navs = [], gates) {
       if (disposed) return;
-      const liveEntries = syncEntries(entries);
+      const liveEntries = syncEntries(entries, gates);
       sweep(ENTRY_ATTRIBUTE, liveEntries);
-      const liveNavs = syncNavs(navs);
+      const liveNavs = syncNavs(navs, gates);
       sweep(NAV_ATTRIBUTE, liveNavs);
     },
     remove(action) {

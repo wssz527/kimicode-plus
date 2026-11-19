@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"enhancedkimi/internal/webassets"
+	"strings"
 )
 
 //go:embed assets/bootstrap.js
@@ -41,6 +42,10 @@ type AttachOptions struct {
 	// they actually use. Without it, an instance with no isolated profile is
 	// discovered but reported as需要授权 instead of being attached to.
 	AllowDailyInstance bool
+	// AppVersionOverride overrides the reported appVersion during isolated-host
+	// contract acceptance (e.g. simulating an unknown future version "1.9.9").
+	// It is ignored whenever Profile is empty.
+	AppVersionOverride string
 }
 
 type AttachResult struct {
@@ -51,6 +56,8 @@ type AttachResult struct {
 	Electron    string `json:"electron"`
 	HostPID     int    `json:"hostPid"`
 	DOMRevision int    `json:"domRevision"`
+	Verified    bool   `json:"verified"`
+	VersionNote string `json:"versionNote,omitempty"`
 	// Daily is true when the attached instance is the user's normal client rather
 	// than a disposable isolated host.
 	Daily bool `json:"daily"`
@@ -141,6 +148,10 @@ func AttachNative(ctx context.Context, options AttachOptions) (*AttachResult, er
 	if identity.PID != pid {
 		return nil, errors.New("宿主进程身份在附着时发生变化")
 	}
+	realAppVersion := strings.TrimSpace(identity.AppVersion)
+	if options.Profile != "" && strings.TrimSpace(options.AppVersionOverride) != "" {
+		identity.AppVersion = strings.TrimSpace(options.AppVersionOverride)
+	}
 	contract, err := identity.Contract()
 	if err != nil {
 		return nil, err
@@ -148,7 +159,7 @@ func AttachNative(ctx context.Context, options AttachOptions) (*AttachResult, er
 	var capabilities map[string]bool
 	domDeadline := time.Now().Add(15 * time.Second)
 	for {
-		domRaw, domErr := cdp.Evaluate(attachCtx, `(async()=>{const req=typeof require==='function'?require:process.mainModule.require.bind(process.mainModule);const{webContents}=req('electron');const wc=webContents.getAllWebContents().find(item=>item.getURL().startsWith('app://renderer/')&&!/screenshot|browser-overlay/.test(item.getURL()));if(!wc)throw new Error('隔离主窗口未找到');return wc.executeJavaScript("(()=>({ptShell:!!document.querySelector('.pt-shell'),ptBody:!!document.querySelector('.pt-body'),sideColumn:!!document.querySelector('.side .col'),sideFooter:!!document.querySelector('.side-footer'),chat:!!document.querySelector('.chat'),composer:!!document.querySelector('.composer'),sideChat:[...document.querySelectorAll('button.sit-link')].some(button=>button.textContent.trim()==='侧边聊天')}))()")})()`)
+		domRaw, domErr := cdp.Evaluate(attachCtx, `(async()=>{const req=typeof require==='function'?require:process.mainModule.require.bind(process.mainModule);const{webContents}=req('electron');const wc=webContents.getAllWebContents().find(item=>item.getURL().startsWith('app://renderer/')&&!/screenshot|browser-overlay/.test(item.getURL()));if(!wc)throw new Error('隔离主窗口未找到');return wc.executeJavaScript("(()=>({appMounted:!!(document.querySelector('#app')&&document.querySelector('#app').childElementCount>0),ptShell:!!document.querySelector('.pt-shell'),ptBody:!!document.querySelector('.pt-body'),sideColumn:!!document.querySelector('.side .col'),sideFooter:!!document.querySelector('.side-footer'),chat:!!document.querySelector('.chat'),composer:!!document.querySelector('.composer'),sideChat:[...document.querySelectorAll('button.sit-link')].some(button=>button.textContent.trim()==='侧边聊天')}))()")})()`)
 		missing := ""
 		if domErr == nil {
 			if json.Unmarshal(domRaw, &capabilities) == nil {
@@ -161,6 +172,9 @@ func AttachNative(ctx context.Context, options AttachOptions) (*AttachResult, er
 		if time.Now().After(domDeadline) {
 			if domErr != nil {
 				return nil, domErr
+			}
+			if capabilities["appMounted"] {
+				break
 			}
 			return nil, fmt.Errorf("宿主 DOM 契约缺少 %s，增强保持停用", missing)
 		}
@@ -181,7 +195,8 @@ func AttachNative(ctx context.Context, options AttachOptions) (*AttachResult, er
 	}
 	config := map[string]any{
 		"coreURL": options.CoreURL, "pairingToken": options.PairingToken,
-		"expectedApp": contract.AppVersion, "expectedElectron": contract.Electron,
+		"expectedApp": realAppVersion, "expectedElectron": contract.Electron,
+		"reportedApp": contract.AppVersion,
 		"moduleSource": string(moduleSource), "cssSource": string(cssSource), "rendererSource": rendererBundle,
 	}
 	encoded, err := json.Marshal(config)
@@ -199,6 +214,10 @@ func AttachNative(ctx context.Context, options AttachOptions) (*AttachResult, er
 	if result.Status != "installed" || result.Transport != "main-loopback-rpc" || result.Protocol != 1 {
 		return nil, errors.New("宿主没有确认正式 RPC 已挂载")
 	}
+	result.AppVersion = contract.AppVersion
+	result.Electron = contract.Electron
+	result.Verified = contract.Verified
+	result.VersionNote = HostVersionNote(contract.AppVersion, contract.Electron)
 	result.HostPID = pid
 	result.DOMRevision = contract.DOMRevision
 	result.Daily = options.Profile == ""

@@ -76,7 +76,7 @@ func TestNativeActionPermissionsFollowIntent(t *testing.T) {
 	for action, expected := range map[string]string{
 		"bootstrap": "core:read", "events.poll": "core:read", "session.view": "tasks:read",
 		"session.watch": "tasks:read", "session.unwatch": "tasks:read", "config.get": "core:read",
-		"diagnostics.get": "core:read",
+		"diagnostics.get": "core:read", "contracts.status": "core:read", "contracts.report": "adapter:write",
 		"config.save":     "settings:write", "managed.usage": "usage:read", "cache.summary": "usage:read",
 		"automation.get": "core:read", "automation.set": "settings:write",
 		"recovery.get": "core:read", "recovery.set": "settings:write", "recovery.watch": "tasks:write",

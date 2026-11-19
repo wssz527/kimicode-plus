@@ -125,8 +125,19 @@
   color: var(--success, #27865a);
 }
 
+.ekds-state.is-warn {
+  color: var(--warning, #b7791f);
+}
+
 .ekds-state.is-faulted {
   color: var(--danger, #c64b52);
+}
+
+.ekds-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 /* ---------- 内容页 ---------- */

@@ -26,18 +26,33 @@ func TestParseMainPIDRequiresIsolatedProfile(t *testing.T) {
 		t.Fatal("multiple main processes must be refused")
 	}
 }
-func TestHostContractIsExplicit(t *testing.T) {
-	identity := HostIdentity{Type: "browser", AppVersion: "1.3.5", Electron: "45.1.0"}
-	if _, err := identity.Contract(); err != nil {
-		t.Fatalf("verified host rejected: %v", err)
+func TestHostContractIsVersionAgnostic(t *testing.T) {
+	for _, version := range []string{"1.3.4", "1.3.5", "1.3.7"} {
+		identity := HostIdentity{Type: "browser", AppVersion: version, Electron: SupportedElectron}
+		contract, err := identity.Contract()
+		if err != nil {
+			t.Fatalf("verified host %s rejected: %v", version, err)
+		}
+		if !contract.Verified {
+			t.Fatalf("verified host %s not marked verified", version)
+		}
 	}
-	identity.AppVersion = "1.3.7"
-	if _, err := identity.Contract(); err != nil {
-		t.Fatalf("verified host rejected: %v", err)
+	unknown := HostIdentity{Type: "browser", AppVersion: "1.9.9", Electron: SupportedElectron}
+	contract, err := unknown.Contract()
+	if err != nil {
+		t.Fatalf("unknown version with valid process type was rejected: %v", err)
 	}
-	identity.AppVersion = "1.3.6"
-	if _, err := identity.Contract(); err == nil {
-		t.Fatal("unknown host must not be enabled")
+	if contract.Verified {
+		t.Fatal("unknown version must not be marked human-verified")
+	}
+	if got := HostVersionNote(contract.AppVersion, contract.Electron); got != UnverifiedVersionNote {
+		t.Fatalf("HostVersionNote = %q, want %q", got, UnverifiedVersionNote)
+	}
+	if _, err := (HostIdentity{Type: "renderer", AppVersion: "1.3.7", Electron: SupportedElectron}).Contract(); err == nil {
+		t.Fatal("non-browser process must be rejected")
+	}
+	if _, err := (HostIdentity{Type: "browser", AppVersion: "", Electron: SupportedElectron}).Contract(); err == nil {
+		t.Fatal("empty appVersion must be rejected")
 	}
 }
 

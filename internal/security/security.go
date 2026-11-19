@@ -105,8 +105,10 @@ func permission(r *http.Request) string {
 }
 func nativeActionPermission(action string) string {
 	switch action {
-	case "bootstrap", "events.poll", "config.get", "automation.get", "recovery.get", "diagnostics.get":
+	case "bootstrap", "events.poll", "config.get", "automation.get", "recovery.get", "diagnostics.get", "contracts.status":
 		return "core:read"
+	case "contracts.report":
+		return "adapter:write"
 	case "session.view", "session.watch", "session.unwatch":
 		return "tasks:read"
 	case "managed.usage", "cache.summary", "cache.sessions", "cache.history", "cache.turns", "cache.retention", "cache.receipts", "quota.balances":

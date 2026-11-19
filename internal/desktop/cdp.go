@@ -198,12 +198,17 @@ type HostContract struct {
 	Electron       string
 	RendererScheme string
 	DOMRevision    int
+	Verified       bool
 }
 
+// SupportedHosts lists host versions explicitly verified by human acceptance.
+// Admission is no longer gated by this list: any unrecognized version passes
+// when security gates and runtime contract probes pass, and diagnostics marks
+// it as unverified.
 var SupportedHosts = []HostContract{
-	{AppVersion: "1.3.4", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1},
-	{AppVersion: "1.3.5", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1},
-	{AppVersion: "1.3.7", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1},
+	{AppVersion: "1.3.4", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1, Verified: true},
+	{AppVersion: "1.3.5", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1, Verified: true},
+	{AppVersion: "1.3.7", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1, Verified: true},
 }
 
 type HostIdentity struct {
@@ -217,12 +222,18 @@ func (i HostIdentity) Contract() (HostContract, error) {
 	if i.Type != "browser" {
 		return HostContract{}, errors.New("目标进程不是 Kimi Code 主进程")
 	}
-	for _, contract := range SupportedHosts {
-		if contract.AppVersion == i.AppVersion && contract.Electron == i.Electron {
-			return contract, nil
-		}
+	appVersion := strings.TrimSpace(i.AppVersion)
+	electron := strings.TrimSpace(i.Electron)
+	if appVersion == "" || electron == "" {
+		return HostContract{}, errors.New("无法读取宿主应用或 Electron 版本信息")
 	}
-	return HostContract{}, fmt.Errorf("Kimi Code %s / Electron %s 尚未通过增强契约验证", i.AppVersion, i.Electron)
+	return HostContract{
+		AppVersion:     appVersion,
+		Electron:       electron,
+		RendererScheme: "app://renderer/",
+		DOMRevision:    1,
+		Verified:       IsVerifiedHost(appVersion, electron),
+	}, nil
 }
 
 type CDP struct {

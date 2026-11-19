@@ -232,6 +232,7 @@ async function installNativeBootstrap(options) {
     state.channels.set(target.id, { key, instanceId, expectedOrigin: target === wc ? 'app://renderer' : 'null' });
     const config = {
       endpoint: state.endpoint, bridgeKey: key, instanceId, moduleSource: options.moduleSource, cssSource: options.cssSource,
+      appVersion: options.reportedApp || app.getVersion(), electron: process.versions.electron,
       surface, ...extra,
     };
     return target.executeJavaScript('(' + options.rendererSource + ')(' + JSON.stringify(config) + ')');

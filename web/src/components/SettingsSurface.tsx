@@ -171,9 +171,40 @@ type AttachStatus = {
     electron?: string;
   };
   agent: { enabled: boolean; path?: string; error?: string };
-  last?: { status?: string; error?: string; consentRequired?: boolean; hostPid?: number; appVersion?: string; daily?: boolean };
+  last?: { status?: string; error?: string; consentRequired?: boolean; hostPid?: number; appVersion?: string; electron?: string; verified?: boolean; versionNote?: string; daily?: boolean };
   available: boolean;
   unavailableReason?: string;
+};
+
+type ContractProbe = {
+  id: string;
+  group: "dom" | "api" | string;
+  label: string;
+  status: "available" | "disabled" | "untested" | string;
+  reason?: string;
+  detail?: string;
+  checkedAt?: string;
+};
+
+type ContractReport = {
+  appVersion?: string;
+  electron?: string;
+  verified: boolean;
+  versionNote?: string;
+  updatedAt?: string;
+  probes: ContractProbe[];
+};
+
+const CONTRACT_STATUS_TEXT: Record<string, string> = {
+  available: "可用",
+  disabled: "已停用",
+  untested: "未检测",
+};
+
+const CONTRACT_STATUS_CLASS: Record<string, string> = {
+  available: "ready",
+  disabled: "faulted",
+  untested: "unknown",
 };
 
 type DiagnosticsFile = {
@@ -210,6 +241,7 @@ function DiagnosticsSection({ host }: { host: NativeHost }) {
   const { health } = useAuth();
   const [status, setStatus] = useState<AttachStatus | null>(null);
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
+  const [contracts, setContracts] = useState<ContractReport | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [consent, setConsent] = useState(false);
@@ -218,12 +250,14 @@ function DiagnosticsSection({ host }: { host: NativeHost }) {
 
   const reload = useCallback(async () => {
     try {
-      const [next, files] = await Promise.all([
+      const [next, files, contractReport] = await Promise.all([
         host.request<AttachStatus>("attach.status"),
         host.request<Diagnostics>("diagnostics.get"),
+        host.request<ContractReport>("contracts.status").catch(() => null),
       ]);
       setStatus(next);
       setDiagnostics(files);
+      setContracts(contractReport);
       setError("");
     } catch (cause) {
       setError(errorText(cause));
@@ -255,6 +289,10 @@ function DiagnosticsSection({ host }: { host: NativeHost }) {
   const modules = health?.modules ?? [];
   const log = diagnostics?.attachLog;
   const notices = diagnostics?.notices;
+  const detectedVersion = contracts?.appVersion || status.host.appVersion || status.last?.appVersion || "未知";
+  const versionNote = contracts?.versionNote || status.last?.versionNote || "";
+  const domProbes = (contracts?.probes ?? []).filter(probe => probe.group === "dom");
+  const apiProbes = (contracts?.probes ?? []).filter(probe => probe.group === "api");
   return <>
     <div className="ekds-group">
       <div className="ekds-row">
@@ -273,11 +311,18 @@ function DiagnosticsSection({ host }: { host: NativeHost }) {
       </div>
       {running ? <dl className="ekds-facts is-inset">
         <div><dt>进程号</dt><dd className="num">{status.host.pid ?? "—"}</dd></div>
-        <div><dt>客户端版本</dt><dd>{status.host.appVersion ?? status.last?.appVersion ?? "未知"}</dd></div>
+        <div><dt>客户端版本</dt><dd>{detectedVersion}{versionNote ? `（${versionNote}）` : ""}</dd></div>
         <div><dt>调试开关</dt><dd>{FUSE_TEXT[status.host.fuse ?? ""] ?? "未知"}</dd></div>
         <div><dt>临时调试端口</dt><dd>{status.host.inspectorBusy ? "已被占用，本次不会接入" : "空闲"}</dd></div>
         {status.host.debugInstance ? <div><dt>启动参数</dt><dd>带调试参数的实例，不会自动接入</dd></div> : null}
       </dl> : null}
+      {versionNote ? <div className="ekds-row" data-ekd-unverified-version="true">
+        <span className="ekds-row-label">
+          <strong>版本验证状态</strong>
+          <small>{versionNote}</small>
+        </span>
+        <span className="ekds-state is-warn">未经人工验证</span>
+      </div> : null}
       <div className="ekds-row">
         <span className="ekds-row-label">
           <strong>重启后自动恢复</strong>
@@ -314,6 +359,36 @@ function DiagnosticsSection({ host }: { host: NativeHost }) {
       </div> : null}
     </div>
     {error ? <p className="ekds-note is-error">{error}</p> : null}
+
+    {contracts ? <section className="ekds-section" data-ekd-contracts="true">
+      <div className="ekds-section-head">
+        <h3>契约检测</h3>
+        <button type="button" className="ekds-btn" onClick={() => void reload()}>重新检测</button>
+      </div>
+      <p className="ekds-note">按界面注入点与官方本地接口逐项检测，单项失效只停用对应功能，其余功能照常运行。</p>
+      {domProbes.length > 0 ? <div className="ekds-group">
+        {domProbes.map(probe => <div className="ekds-row" key={probe.id} data-ekd-probe={probe.id}>
+          <span className="ekds-row-label">
+            <strong>{probe.label}</strong>
+            <small>{probe.reason || probe.detail || (probe.status === "available" ? "检测通过" : "暂未检测")}</small>
+          </span>
+          <span className={`ekds-state is-${CONTRACT_STATUS_CLASS[probe.status] ?? "unknown"}`}>
+            {CONTRACT_STATUS_TEXT[probe.status] ?? probe.status}
+          </span>
+        </div>)}
+      </div> : null}
+      {apiProbes.length > 0 ? <div className="ekds-group">
+        {apiProbes.map(probe => <div className="ekds-row" key={probe.id} data-ekd-probe={probe.id}>
+          <span className="ekds-row-label">
+            <strong>{probe.label}</strong>
+            <small>{probe.reason || probe.detail || (probe.status === "available" ? "接口与字段检测通过" : "暂未检测")}</small>
+          </span>
+          <span className={`ekds-state is-${CONTRACT_STATUS_CLASS[probe.status] ?? "unknown"}`}>
+            {CONTRACT_STATUS_TEXT[probe.status] ?? probe.status}
+          </span>
+        </div>)}
+      </div> : null}
+    </section> : null}
 
     <section className="ekds-section">
       <h3>模块</h3>

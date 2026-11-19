@@ -95,6 +95,11 @@ type NativeService struct {
 	// quota is the balance layer. It owns no timer: a plugin asks for a refresh and
 	// that is the only thing that makes a request.
 	quota *quotaService
+
+	contractAppVersion string
+	contractElectron   string
+	contractUpdatedAt  string
+	domProbes          map[string]ContractProbe
 }
 
 const addonFeaturesKey = "features"
@@ -435,6 +440,10 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.attachStatus(ctx), nil
 	case "diagnostics.get":
 		return s.diagnosticsStatus(), nil
+	case "contracts.status":
+		return s.ContractStatus(ctx), nil
+	case "contracts.report":
+		return s.reportContracts(payload)
 	case "attach.enable":
 		return s.enableAttach(ctx, input)
 	case "attach.disable":

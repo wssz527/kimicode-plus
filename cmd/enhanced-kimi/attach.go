@@ -20,6 +20,7 @@ type attachOptions struct {
 	kimiHome           string
 	profile            string
 	allowDailyInstance bool
+	appVersionOverride string
 	coreURL            string
 	pairingToken       string
 	install            bool
@@ -37,6 +38,7 @@ func runAttach(args []string) error {
 	set.StringVar(&options.kimiHome, "kimi-home", "", "KIMI_CODE_HOME of the host")
 	set.StringVar(&options.profile, "host-profile", "", "isolated Kimi Code profile (empty: the running client)")
 	set.BoolVar(&options.allowDailyInstance, "allow-daily-instance", false, "attach to the client you actually use")
+	set.StringVar(&options.appVersionOverride, "app-version-override", "", "override reported host version on isolated profile for contract acceptance")
 	set.StringVar(&options.coreURL, "core-url", "", "core base URL to report to")
 	set.StringVar(&options.pairingToken, "pairing-token", "", "core pairing token")
 	set.BoolVar(&options.install, "install", false, "install and load the WatchPaths LaunchAgent")
@@ -90,6 +92,7 @@ func runAttach(args []string) error {
 	result, attachErr := desktop.AttachOnce(ctx, desktop.AttachOptions{
 		Profile: options.profile, CoreURL: options.coreURL, PairingToken: options.pairingToken,
 		AllowDailyInstance: options.allowDailyInstance,
+		AppVersionOverride: options.appVersionOverride,
 	})
 	recordErr := desktop.RecordAttach(options.dataDir, anyOrError(result, attachErr))
 	if attachErr != nil {

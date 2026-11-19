@@ -484,7 +484,8 @@ function createProviderEnhance(options) {
     for (const row of rows) {
       row.dataset.ekdPxRow = '1';
       if (row.querySelector('[data-ekd-px-button]')) continue;
-      const remove = row.querySelector('button[aria-label="移除模型"]');
+      const remove = row.querySelector('button[aria-label="移除模型"], button[aria-label="Remove model"]')
+        || [...row.querySelectorAll('button')].filter(b => !b.hasAttribute('data-ekd-px-button')).at(-1);
       if (!remove) continue;
       const button = el('button', {
         type: 'button',
@@ -1013,12 +1014,8 @@ function createProviderEnhance(options) {
     scan();
   }
 
-  function remove() {
-    if (state.removed) return;
-    state.removed = true;
+  function clearDecorations() {
     closePanel();
-    state.observer?.disconnect();
-    state.observer = null;
     for (const node of document.querySelectorAll('[data-ekd-px-button],[data-ekd-px-head-pad],[data-ekd-px-hint],[data-ekd-px-note],[data-ekd-provider-enhance]')) {
       node.remove();
     }
@@ -1028,6 +1025,14 @@ function createProviderEnhance(options) {
     for (const row of document.querySelectorAll('[data-ekd-px-row]')) {
       delete row.dataset.ekdPxRow;
     }
+  }
+
+  function remove() {
+    if (state.removed) return;
+    state.removed = true;
+    state.observer?.disconnect();
+    state.observer = null;
+    clearDecorations();
     state.style?.remove();
     state.style = null;
   }
@@ -1035,6 +1040,7 @@ function createProviderEnhance(options) {
   return {
     install,
     remove,
+    clearDecorations,
     scan,
     formatSize,
     parseSize,
