@@ -8,15 +8,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"enhancedkimi/internal/credentials"
 	"enhancedkimi/internal/httpx"
@@ -61,8 +63,7 @@ type Options struct {
 	// resolver; a test supplies one to exercise rebinding deterministically.
 	Resolver *net.Resolver
 	// Official is the build-time allowlist of bundled plugin content digests.
-	// Nil means no plugin is treated as official, so every privileged capability
-	// stays unusable without failing the ordinary v1 surface.
+	// A nil allowlist leaves bundled plugins without v2 privileges.
 	Official OfficialDigests
 	// StopPluginWork ends background work a plugin started outside this package.
 	StopPluginWork func(ctx context.Context, id string) error
@@ -130,20 +131,21 @@ type EventPage struct {
 // capabilities are reported as granted names so an ungranted permission is not
 // displayed as if it were in force.
 type Plugin struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	Version      string   `json:"version"`
-	Description  string   `json:"description,omitempty"`
-	Author       string   `json:"author,omitempty"`
-	License      string   `json:"license,omitempty"`
-	Source       string   `json:"source"`
-	State        string   `json:"state"`
-	Enabled      bool     `json:"enabled"`
-	Error        string   `json:"error,omitempty"`
-	Capabilities []string `json:"capabilities"`
-	Declared     []string `json:"declaredCapabilities"`
-	Slots        []string `json:"slots"`
-	HostVersions []string `json:"hostVersions"`
+	PlatformLimitations []PlatformLimitation `json:"platformLimitations,omitempty"`
+	ID                  string               `json:"id"`
+	Name                string               `json:"name"`
+	Version             string               `json:"version"`
+	Description         string               `json:"description,omitempty"`
+	Author              string               `json:"author,omitempty"`
+	License             string               `json:"license,omitempty"`
+	Source              string               `json:"source"`
+	State               string               `json:"state"`
+	Enabled             bool                 `json:"enabled"`
+	Error               string               `json:"error,omitempty"`
+	Capabilities        []string             `json:"capabilities"`
+	Declared            []string             `json:"declaredCapabilities"`
+	Slots               []string             `json:"slots"`
+	HostVersions        []string             `json:"hostVersions"`
 	// APIVersion is the version this plugin's own manifest declares. The list
 	// response advertises the newest API the host implements separately, so a v1
 	// plugin keeps reporting 1 no matter which host build reads it.
@@ -151,8 +153,11 @@ type Plugin struct {
 	Compatible  bool `json:"compatible"`
 	HasSettings bool `json:"hasSettings"`
 	// Entry is the manifest entry, which the renderer needs to load the module.
-	Entry       Entry  `json:"entry"`
-	Upstream    string `json:"upstream,omitempty"`
+	Entry                  Entry    `json:"entry"`
+	Upstream               string   `json:"upstream,omitempty"`
+	PrivilegedCapabilities []string `json:"privilegedCapabilities,omitempty"`
+	HasNotice              bool     `json:"hasNotice,omitempty"`
+	PluginUpstream
 	InstalledAt string `json:"installedAt,omitempty"`
 	UpdatedAt   string `json:"updatedAt,omitempty"`
 	// Desired is the user's enabled intent, which survives a restart. Enabled is
@@ -163,8 +168,7 @@ type Plugin struct {
 	// declared in hostVersions.
 	Forced bool `json:"forced,omitempty"`
 	// Official marks a bundled plugin whose installed content still matches the
-	// compiled allowlist. Only such a plugin can use the v2 privileged
-	// capabilities; the flag is informational, the action gate re-hashes.
+	// compiled allowlist.
 	Official bool `json:"official,omitempty"`
 	// Restorable marks a bundled plugin the user uninstalled. It is not
 	// installed, holds no files and is not running; it appears in the list only
@@ -176,38 +180,33 @@ type Plugin struct {
 	Token string `json:"token,omitempty"`
 }
 
-// entry is a live install: the parsed manifest, the granted capabilities and
-// where its files are. The manifest is re-read from disk on every start, so an
-// edited file is caught instead of being trusted from the database.
+// entry holds the installed manifest, grants, runtime state and integrity baseline.
 type entry struct {
-	manifest  Manifest
-	grants    Grants
-	declared  []string
-	source    string
-	dir       string
-	state     string
-	errText   string
-	enabled   bool
-	forced    bool
-	updated   time.Time
-	installed time.Time
-	// official records, at load or enable time, that this entry is a bundled
-	// plugin whose content matched the allowlist. It is a cache for display and
-	// for the cheap half of the privilege gate; verifyOfficialForAction re-hashes
-	// the directory before every privileged call.
-	official bool
+	manifest      Manifest
+	grants        Grants
+	declared      []string
+	source        string
+	dir           string
+	state         string
+	errText       string
+	enabled       bool
+	forced        bool
+	updated       time.Time
+	installed     time.Time
+	installDigest string
 }
 
 type Manager struct {
-	db      *sql.DB
-	safe    func() bool
-	dataDir string
-	host    string
-	core    Core
-	vault   *credentials.Vault
-	bundled func() (map[string]map[string][]byte, error)
-	now     func() time.Time
-	gate    EnableGate
+	db       *sql.DB
+	safe     func() bool
+	dataDir  string
+	host     string
+	platform string
+	core     Core
+	vault    *credentials.Vault
+	bundled  func() (map[string]map[string][]byte, error)
+	now      func() time.Time
+	gate     EnableGate
 
 	officialDigests OfficialDigests
 	views           map[string]map[string]*browserView
@@ -230,12 +229,13 @@ type Manager struct {
 	onUninstall    func(ctx context.Context, id string, deleteData bool) error
 	onChange       func()
 
-	mu      sync.Mutex
-	entries map[string]*entry
-	order   []string
-	tokens  map[string]string
-	lookup  *net.Resolver
-	closed  bool
+	installMu sync.Mutex
+	mu        sync.Mutex
+	entries   map[string]*entry
+	order     []string
+	tokens    map[string]string
+	lookup    *net.Resolver
+	closed    bool
 }
 
 // New builds the plugin host. A missing data directory is not fatal: the manager
@@ -259,6 +259,7 @@ func New(db *sql.DB, safe func() bool, options ...Option) (*Manager, error) {
 		return nil, err
 	}
 	manager := &Manager{
+		platform:        runtime.GOOS,
 		db:              db,
 		safe:            safe,
 		dataDir:         opts.DataDir,
@@ -417,9 +418,8 @@ func (m *Manager) load() error {
 		dir := filepath.Join(m.pluginsDir(), manifest.DataDirName())
 		m.entries[item.id] = &entry{
 			manifest: manifest, grants: grants, declared: manifest.CapabilityNames(),
-			source: item.source, dir: dir,
-			official: m.officialFor(manifest, dir, item.source),
-			state:    state, errText: item.err, enabled: item.desired,
+			source: item.source, dir: dir, installDigest: item.installDigest,
+			state: state, errText: item.err, enabled: item.desired,
 			// Force-enabling an incompatible plugin is not a separate column: it is
 			// exactly a desired plugin the host version does not cover, so the flag
 			// is re-derived instead of drifting from what was stored.
@@ -434,7 +434,8 @@ func (m *Manager) load() error {
 
 func (m *Manager) snapshot() []Plugin {
 	m.mu.Lock()
-	out := make([]Plugin, 0, len(m.order))
+	items := make([]entry, 0, len(m.order))
+	host := m.host
 	installed := make(map[string]bool, len(m.order))
 	for _, id := range m.order {
 		item := m.entries[id]
@@ -442,9 +443,13 @@ func (m *Manager) snapshot() []Plugin {
 			continue
 		}
 		installed[id] = true
-		out = append(out, m.presentLocked(item))
+		items = append(items, *item)
 	}
 	m.mu.Unlock()
+	out := make([]Plugin, 0, len(items))
+	for _, item := range items {
+		out = append(out, m.present(item, host))
+	}
 	// Restorable entries need the embedded set and the tombstone rows, and both
 	// involve work that takes the same lock (or does DB I/O). They are assembled
 	// after the entries snapshot so a list call cannot deadlock on itself.
@@ -491,35 +496,58 @@ func (m *Manager) restorable(installed map[string]bool) []Plugin {
 	return out
 }
 
-// presentLocked builds the API projection of one entry. The caller must hold
-// m.mu: every field it reads (state, enabled, forced, errText, updated) is
-// written by Enable/Disable/Fail under that same lock, so building the projection
-// after unlocking would race with a concurrent transition.
-func (m *Manager) presentLocked(item *entry) Plugin {
+func (m *Manager) effectiveGrants(item entry) Grants {
+	if !item.grants.hasPrivileged() || m.privilegeIntact(item) {
+		return item.grants
+	}
+	return item.grants.WithoutPrivileged()
+}
+
+func (m *Manager) present(item entry, host string) Plugin {
+	official := m.officialFor(item.manifest, item.dir, item.source)
+	grants := item.grants
+	if item.source == SourceBundled {
+		if !official {
+			grants = grants.WithoutPrivileged()
+		}
+	} else {
+		grants = m.effectiveGrants(item)
+	}
+	privileged := privilegedNames(item.declared)
+	for _, name := range privilegedNames(item.grants.Names()) {
+		if !contains(privileged, name) {
+			privileged = append(privileged, name)
+		}
+	}
+	sort.Strings(privileged)
 	plugin := Plugin{
-		ID:           item.manifest.ID,
-		Name:         item.manifest.Name,
-		Version:      item.manifest.Version,
-		Description:  item.manifest.Description,
-		Author:       item.manifest.Author,
-		License:      item.manifest.License,
-		Source:       item.source,
-		State:        item.state,
-		Enabled:      item.state == StateEnabled,
-		Desired:      item.enabled,
-		Forced:       item.forced,
-		Error:        item.errText,
-		Capabilities: effectiveGrants(item).Names(),
-		Declared:     append([]string(nil), item.declared...),
-		Official:     item.official,
-		Slots:        grantedSlots(effectiveGrants(item)),
-		HostVersions: append([]string(nil), item.manifest.HostVersions...),
-		APIVersion:   item.manifest.APIVersion,
-		Compatible:   m.compatible(item.manifest),
-		HasSettings:  item.manifest.Entry.Settings != "",
-		Entry:        item.manifest.Entry,
-		Upstream:     upstreamLabel(item.manifest),
-		UpdatedAt:    item.updated.String(),
+		ID:                     item.manifest.ID,
+		Name:                   item.manifest.Name,
+		Version:                item.manifest.Version,
+		Description:            item.manifest.Description,
+		Author:                 item.manifest.Author,
+		License:                item.manifest.License,
+		Source:                 item.source,
+		State:                  item.state,
+		Enabled:                item.state == StateEnabled,
+		Desired:                item.enabled,
+		Forced:                 item.forced,
+		Error:                  item.errText,
+		Capabilities:           grants.Names(),
+		Declared:               append([]string(nil), item.declared...),
+		Official:               official,
+		Slots:                  grantedSlots(grants),
+		HostVersions:           append([]string(nil), item.manifest.HostVersions...),
+		APIVersion:             item.manifest.APIVersion,
+		Compatible:             hostCompatible(item.manifest, host),
+		HasSettings:            item.manifest.Entry.Settings != "",
+		Entry:                  item.manifest.Entry,
+		Upstream:               upstreamLabel(item.manifest),
+		PluginUpstream:         item.manifest.upstreamMetadata(),
+		PrivilegedCapabilities: privileged,
+		PlatformLimitations:    pluginPlatformLimitations(m.platform, item.declared),
+		HasNotice:              hasNotice(item.dir),
+		UpdatedAt:              item.updated.String(),
 	}
 	if !item.installed.IsZero() {
 		plugin.InstalledAt = item.installed.String()
@@ -546,7 +574,7 @@ func upstreamLabel(manifest Manifest) string {
 
 func grantedSlots(grants Grants) []string {
 	slots := []string{}
-	for _, slot := range []string{"sidebar", "settings", "thinking", "message"} {
+	for _, slot := range []string{"sidebar", "settings", "thinking", "message", "entry", "sidebar-nav", "main-area", "right-panel", "layout"} {
 		if grants.AllowsSlot(slot) {
 			slots = append(slots, slot)
 		}
@@ -559,7 +587,11 @@ func grantedSlots(grants Grants) []string {
 // unverified hosts, and refusing everything would make the feature unusable in a
 // developer build. A known version that is not declared is a real mismatch.
 func (m *Manager) compatible(manifest Manifest) bool {
-	host := strings.TrimSpace(m.host)
+	return hostCompatible(manifest, m.host)
+}
+
+func hostCompatible(manifest Manifest, host string) bool {
+	host = strings.TrimSpace(host)
 	if host == "" {
 		return true
 	}
@@ -572,24 +604,27 @@ func (m *Manager) List() []Plugin { return m.snapshot() }
 // Get returns one install.
 func (m *Manager) Get(id string) (Plugin, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	item, ok := m.entries[id]
 	if !ok {
+		m.mu.Unlock()
 		return Plugin{}, false
 	}
-	return m.presentLocked(item), true
+	snapshot, host := *item, m.host
+	m.mu.Unlock()
+	return m.present(snapshot, host), true
 }
 
-// GrantsFor returns the granted capabilities of an enabled plugin. The zero
-// Grants denies everything, so a missing or disabled plugin cannot act.
+// GrantsFor returns the effective capabilities of an enabled plugin.
 func (m *Manager) GrantsFor(id string) (Grants, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	item, ok := m.entries[id]
 	if !ok || item.state != StateEnabled {
+		m.mu.Unlock()
 		return Grants{}, false
 	}
-	return item.grants, true
+	snapshot := *item
+	m.mu.Unlock()
+	return m.effectiveGrants(snapshot), true
 }
 
 // TokenOwner resolves the plugin a token belongs to. The dedicated action route
@@ -702,16 +737,12 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 		return Plugin{}, apiError(http.StatusConflict, "MANAGER_CLOSED", "插件管理器已关闭")
 	}
 	if item.state == StateEnabled {
-		// Build the projection while the lock is still held: presentLocked reads
-		// fields that a concurrent Disable writes under the same lock.
-		plugin := m.presentLocked(item)
+		snapshot, host := *item, m.host
 		m.mu.Unlock()
-		return plugin, nil
+		return m.present(snapshot, host), nil
 	}
 	safe := m.safe()
-	manifest := item.manifest
-	dir := item.dir
-	source := item.source
+	manifest, dir, host := item.manifest, item.dir, m.host
 	m.mu.Unlock()
 
 	now := m.now()
@@ -719,8 +750,8 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 		m.fail(ctx, id, StateBlocked, "安全模式已阻止插件启动。", ActivitySafeMode, now)
 		return m.Get2(id), apiError(http.StatusConflict, "SAFE_MODE", "安全模式已阻止插件启动")
 	}
-	if !m.compatible(manifest) && !force {
-		message := fmt.Sprintf("未在此宿主版本（%s）验证，已拒绝启用。确认风险后可强制启用。", m.host)
+	if !hostCompatible(manifest, host) && !force {
+		message := fmt.Sprintf("未在此宿主版本（%s）验证，已拒绝启用。确认风险后可强制启用。", host)
 		m.fail(ctx, id, StateIncompat, message, ActivityVersion, now)
 		return m.Get2(id), apiError(http.StatusConflict, "PLUGIN_INCOMPATIBLE", message)
 	}
@@ -730,7 +761,6 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 		return m.Get2(id), apiError(http.StatusConflict, "PLUGIN_FILES_INVALID", message)
 	}
 
-	official := m.officialFor(manifest, dir, source)
 	m.mu.Lock()
 	gate := m.gate
 	m.mu.Unlock()
@@ -742,22 +772,21 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 	}
 
 	m.mu.Lock()
-	item = m.entries[id]
-	if item == nil || m.closed {
+	if m.closed {
 		m.mu.Unlock()
-		return Plugin{}, apiError(http.StatusConflict, "MANAGER_CLOSED", "插件管理器已关闭")
+		return Plugin{}, m.closedError()
+	}
+	if m.entries[id] != item {
+		m.mu.Unlock()
+		return Plugin{}, apiError(http.StatusConflict, "PLUGIN_INSTALL_CHANGED", "插件安装已变更，请重试")
 	}
 	item.state = StateEnabled
 	item.errText = ""
 	item.enabled = true
-	// A user who repaired or replaced the files gets the privileged surface back
-	// without reinstalling; a tampered bundle loses it here and on every call.
-	// The hash is computed outside this lock, before the state transition.
-	item.official = official
 	item.forced = force && !m.compatible(manifest)
 	item.updated = now
 	token, tokenErr := m.issueTokenLocked(id)
-	plugin := m.presentLocked(item)
+	snapshot, host := *item, m.host
 	m.mu.Unlock()
 
 	if tokenErr != nil {
@@ -773,6 +802,7 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 		return m.Get2(id), apiError(http.StatusInternalServerError, "PLUGIN_STATE_UNAVAILABLE", "无法保存插件状态")
 	}
 	_ = recordActivity(ctx, m.db, id, ActivityEnable, "插件已启用", now)
+	plugin := m.present(snapshot, host)
 	plugin.Token = token
 	m.notifyChange()
 	return plugin, nil
@@ -1164,6 +1194,7 @@ func (m *Manager) Register(mux *http.ServeMux) {
 	// design, because the URL cannot name a plugin at all.
 	mux.HandleFunc("POST "+APIPrefix+"/plugin-runtime/{action}", m.handleRuntime)
 	mux.HandleFunc("GET "+APIPrefix+"/plugins/{id}", m.handleGet)
+	mux.HandleFunc("GET "+APIPrefix+"/plugins/{id}/legal", m.handleLegal)
 	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}/enable", m.handleEnable)
 	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}/disable", m.handleDisable)
 	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}/uninstall", m.handleUninstall)
@@ -1178,11 +1209,12 @@ func (m *Manager) Register(mux *http.ServeMux) {
 func (m *Manager) handleList(w http.ResponseWriter, _ *http.Request) {
 	plugins := m.snapshot()
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"items":       plugins,
-		"total":       len(plugins),
-		"safeMode":    m.safe(),
-		"hostVersion": m.host,
-		"apiVersion":  APIVersion,
+		"items":               plugins,
+		"total":               len(plugins),
+		"safeMode":            m.safe(),
+		"hostVersion":         m.host,
+		"apiVersion":          APIVersion,
+		"platformLimitations": PlatformLimitations(m.platform),
 	})
 }
 
@@ -1215,7 +1247,7 @@ func (m *Manager) handleRuntime(w http.ResponseWriter, r *http.Request) {
 	if len(params) == 0 {
 		params = json.RawMessage("{}")
 	}
-	value, err := m.runAction(r.Context(), id, action, params, nil)
+	value, err := m.runAction(r.Context(), id, body.Token, action, params, nil)
 	if err != nil {
 		fail(w, err)
 		return
@@ -1377,64 +1409,73 @@ func (m *Manager) handleToken(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"id": id, "token": token})
 }
 
-// handleAssets returns a plugin's own module source as JSON. The renderer runs
+// handleAssets returns a plugin's own modules and assets as JSON. The renderer runs
 // under the official `app://renderer` origin, so it cannot fetch a plugin file by
 // URL: the source travels through the same authenticated core channel as every
 // other plugin call and is imported from a blob URL there.
 func (m *Manager) handleAssets(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("id"))
-	file := strings.TrimSpace(r.PathValue("file"))
+	file := r.PathValue("file")
 	m.mu.Lock()
-	item, ok := m.entries[id]
-	enabled := ok && item.state == StateEnabled
-	var dir string
-	var manifest Manifest
+	live, ok := m.entries[id]
+	var item entry
 	if ok {
-		dir = item.dir
-		manifest = item.manifest
+		item = *live
 	}
 	m.mu.Unlock()
 	if !ok {
 		httpx.Fail(w, http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件未安装")
 		return
 	}
-	if !enabled {
+	if item.state != StateEnabled {
 		httpx.Fail(w, http.StatusConflict, "PLUGIN_DISABLED", "插件未启用")
 		return
 	}
-	if file == "" {
-		httpx.Fail(w, http.StatusNotFound, "PLUGIN_ASSET_MISSING", "没有指定文件")
-		return
-	}
-	cleaned := path.Clean(file)
-	// Only the files the manifest names can be served. An enabled plugin must not
-	// be able to read arbitrary files it happens to ship next to its entry point,
-	// and nothing outside the plugin directory is reachable at all.
-	allowed := manifest.Entry.Renderer == cleaned || (manifest.Entry.Settings != "" && manifest.Entry.Settings == cleaned)
-	if !allowed || strings.HasPrefix(cleaned, "..") || path.IsAbs(cleaned) {
+	entryFile := file != "" && (file == item.manifest.Entry.Renderer || file == item.manifest.Entry.Settings)
+	if !entryFile && !strings.HasPrefix(file, "assets/") {
 		httpx.Fail(w, http.StatusNotFound, "PLUGIN_ASSET_MISSING", "文件不存在")
 		return
 	}
-	target := filepath.Join(dir, filepath.FromSlash(cleaned))
-	if !strings.HasPrefix(target, dir+string(os.PathSeparator)) {
+	root, err := openPluginRoot(item.dir)
+	if err != nil {
 		httpx.Fail(w, http.StatusNotFound, "PLUGIN_ASSET_MISSING", "文件不存在")
 		return
 	}
-	info, err := os.Stat(target)
-	if err != nil || !info.Mode().IsRegular() {
+	defer root.Close()
+	asset, info, err := openPluginFile(root, file)
+	if err != nil {
 		httpx.Fail(w, http.StatusNotFound, "PLUGIN_ASSET_MISSING", "文件不存在")
 		return
 	}
+	defer asset.Close()
 	if info.Size() > assetLimit {
 		httpx.Fail(w, http.StatusRequestEntityTooLarge, "PLUGIN_ASSET_LIMIT", "插件文件过大")
 		return
 	}
-	data, err := os.ReadFile(target)
+	data, err := io.ReadAll(io.LimitReader(asset, assetLimit+1))
 	if err != nil {
 		httpx.Fail(w, http.StatusInternalServerError, "PLUGIN_ASSET_UNAVAILABLE", "无法读取插件文件")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"path": cleaned, "source": string(data)})
+	if len(data) > assetLimit {
+		httpx.Fail(w, http.StatusRequestEntityTooLarge, "PLUGIN_ASSET_LIMIT", "插件文件过大")
+		return
+	}
+	if entryFile && item.grants.hasPrivileged() {
+		expected := item.installDigest
+		if item.source == SourceBundled {
+			expected = m.officialDigest(item.manifest, item.source)
+		}
+		if !digestMatches(item.dir, expected, &servedModule{name: file, data: data}) {
+			fail(w, privilegeDenied())
+			return
+		}
+	}
+	if !entryFile && !utf8.Valid(data) {
+		httpx.JSON(w, http.StatusOK, map[string]any{"path": file, "source": base64.StdEncoding.EncodeToString(data), "encoding": "base64"})
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"path": file, "source": string(data)})
 }
 
 const assetLimit = 8 << 20

@@ -2,19 +2,27 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"enhancedkimi/internal/httpx"
+	"enhancedkimi/internal/plugins"
 	"enhancedkimi/internal/security"
 )
 
@@ -29,6 +37,7 @@ type windowsBridgeSession struct {
 type windowsBridge struct {
 	mu       sync.Mutex
 	sessions map[string]windowsBridgeSession
+	dialogMu sync.Mutex
 }
 
 func newWindowsBridge() *windowsBridge {
@@ -269,11 +278,16 @@ func (a *App) dispatchWindowsBridge(
 		}, "", nil
 
 	case "host.syncOverlayEntries":
-		return map[string]any{"count": 0}, "", nil
-	case "window.ensureWidth", "window.close":
+		return windowsFeatureUnavailable(plugins.FeatureNativeOverlay)
+	case "plugin.window.open", "window.close":
+		return windowsFeatureUnavailable(plugins.FeaturePopout)
+	case "browser.view.open", "browser.view.navigate", "browser.view.history", "browser.view.external",
+		"browser.view.bounds", "browser.view.extract", "browser.view.adapter", "browser.view.close":
+		return windowsFeatureUnavailable(plugins.FeatureBrowserView)
+	case "window.ensureWidth":
 		return map[string]any{}, "", nil
 	case "host.pickDirectory", "host.pickFiles":
-		return nil, "HOST_DIALOG_UNAVAILABLE", errors.New("当前 Windows 渲染层直连模式请直接使用客户端文件选择能力")
+		return a.winBridge.pickPaths(orig.Context(), action == "host.pickDirectory", payload)
 	default:
 		innerReq := httptest.NewRequest(http.MethodPost, "http://"+guard.Host()+"/enhance/v1/desktop/actions/"+action, bytes.NewReader(payload)).WithContext(orig.Context())
 		innerReq.Host = guard.Host()
@@ -307,4 +321,151 @@ func (a *App) dispatchWindowsBridge(
 		}
 		return body.Value, "", nil
 	}
+}
+
+func windowsFeatureUnavailable(feature string) (any, string, error) {
+	limitation := plugins.CheckPlatformFeature("windows", feature)
+	return nil, limitation.Code, errors.New(limitation.Message)
+}
+
+type windowsPickerOptions struct {
+	Directory   bool   `json:"directory"`
+	Single      bool   `json:"single"`
+	Title       string `json:"title"`
+	DefaultPath string `json:"defaultPath"`
+	Filter      string `json:"filter"`
+}
+
+var dialogExtension = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._+-]{0,15}$`)
+
+func parseWindowsPickerOptions(directory bool, payload json.RawMessage) (windowsPickerOptions, error) {
+	var input struct {
+		Title       string `json:"title"`
+		DefaultPath string `json:"defaultPath"`
+		Single      bool   `json:"single"`
+		Filters     []struct {
+			Name       string   `json:"name"`
+			Extensions []string `json:"extensions"`
+		} `json:"filters"`
+	}
+	if err := json.Unmarshal(payload, &input); err != nil || len(input.Title) > 512 || len(input.DefaultPath) > 32768 || len(input.Filters) > 16 {
+		return windowsPickerOptions{}, errors.New("文件选择参数无效")
+	}
+	options := windowsPickerOptions{Directory: directory, Single: input.Single, Title: strings.TrimSpace(input.Title), DefaultPath: strings.TrimSpace(input.DefaultPath)}
+	if options.Title == "" {
+		options.Title = "添加附件"
+		if directory {
+			options.Title = "选择项目文件夹"
+		}
+	}
+	var filters []string
+	for _, filter := range input.Filters {
+		if filter.Name == "" || len(filter.Name) > 128 || strings.ContainsAny(filter.Name, "|\x00") || len(filter.Extensions) == 0 || len(filter.Extensions) > 16 {
+			return windowsPickerOptions{}, errors.New("文件类型筛选无效")
+		}
+		var patterns []string
+		for _, extension := range filter.Extensions {
+			if extension != "*" && !dialogExtension.MatchString(extension) {
+				return windowsPickerOptions{}, errors.New("文件类型筛选无效")
+			}
+			patterns = append(patterns, "*."+extension)
+		}
+		filters = append(filters, filter.Name, strings.Join(patterns, ";"))
+	}
+	options.Filter = strings.Join(filters, "|")
+	return options, nil
+}
+
+func (b *windowsBridge) pickPaths(ctx context.Context, directory bool, payload json.RawMessage) (any, string, error) {
+	options, err := parseWindowsPickerOptions(directory, payload)
+	if err != nil {
+		return nil, "NATIVE_RPC", err
+	}
+	if runtime.GOOS != "windows" {
+		return nil, "HOST_DIALOG_UNAVAILABLE", errors.New("当前核心无法打开 Windows 文件选择器，请手动输入路径。")
+	}
+	if !b.dialogMu.TryLock() {
+		return nil, "HOST_DIALOG_BUSY", errors.New("已有一个文件选择器，请先完成或取消。")
+	}
+	defer b.dialogMu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	paths, code, err := showWindowsPicker(ctx, options)
+	if err != nil {
+		return nil, code, err
+	}
+	if directory {
+		path := ""
+		if len(paths) > 0 {
+			path = paths[0]
+		}
+		return map[string]string{"path": path}, "", nil
+	}
+	files := make([]map[string]string, 0, len(paths))
+	for _, path := range paths {
+		files = append(files, map[string]string{"path": path, "name": filepath.Base(path)})
+	}
+	return files, "", nil
+}
+
+const windowsPickerScript = `
+$ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+if (-not [Environment]::UserInteractive -or [Diagnostics.Process]::GetCurrentProcess().SessionId -eq 0) {
+  [Console]::WriteLine('{"interactive":false}')
+  exit 0
+}
+$options = [Console]::In.ReadToEnd() | ConvertFrom-Json
+Add-Type -AssemblyName System.Windows.Forms
+$paths = @()
+if ($options.directory) {
+  $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+  $dialog.Description = $options.title
+  $dialog.ShowNewFolderButton = $true
+  if ($options.defaultPath) { $dialog.SelectedPath = $options.defaultPath }
+} else {
+  $dialog = New-Object System.Windows.Forms.OpenFileDialog
+  $dialog.Title = $options.title
+  $dialog.Multiselect = -not $options.single
+  $dialog.CheckFileExists = $true
+  if ($options.filter) { $dialog.Filter = $options.filter }
+  if ($options.defaultPath) { $dialog.InitialDirectory = $options.defaultPath }
+}
+try {
+  if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    if ($options.directory) { $paths = @($dialog.SelectedPath) } else { $paths = @($dialog.FileNames) }
+  }
+} finally {
+  $dialog.Dispose()
+}
+[Console]::WriteLine((@{interactive = $true; paths = $paths} | ConvertTo-Json -Compress))
+`
+
+func showWindowsPicker(ctx context.Context, options windowsPickerOptions) ([]string, string, error) {
+	root := os.Getenv("SystemRoot")
+	if !filepath.IsAbs(root) {
+		return nil, "HOST_DIALOG_UNAVAILABLE", errors.New("无法启动 Windows 文件选择器，请手动输入路径。")
+	}
+	powershell := filepath.Join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+	script := utf16.Encode([]rune(windowsPickerScript))
+	encoded := make([]byte, 2*len(script))
+	for i, unit := range script {
+		binary.LittleEndian.PutUint16(encoded[2*i:], unit)
+	}
+	cmd := exec.CommandContext(ctx, powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand", base64.StdEncoding.EncodeToString(encoded))
+	input, _ := json.Marshal(options)
+	cmd.Stdin = bytes.NewReader(input)
+	output, err := cmd.Output()
+	var result struct {
+		Interactive bool     `json:"interactive"`
+		Paths       []string `json:"paths"`
+	}
+	if err != nil || json.Unmarshal(output, &result) != nil {
+		return nil, "HOST_DIALOG_UNAVAILABLE", errors.New("无法打开 Windows 文件选择器，请手动输入路径。")
+	}
+	if !result.Interactive {
+		return nil, "HOST_DIALOG_UNAVAILABLE", errors.New("增强核心未在 Windows 交互桌面运行。请从客户端选择，或手动输入完整路径。")
+	}
+	return result.Paths, "", nil
 }

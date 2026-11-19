@@ -1022,7 +1022,7 @@ test("ui.pickDirectory requires workspace capability and handles selection and c
         denied = await context.ui.pickDirectory!({ title: "选目录" }).catch(error => error);
       },
     },
-    { id: "test.unprivileged", version: "1.0.0", apiVersion: 2, granted: ["ui:sidebar"], token: "t-denied" },
+    { id: "test.unprivileged", version: "1.0.0", apiVersion: 2, granted: ["ui:thinking"], token: "t-denied" },
   );
   assert.match(String(denied), /打开目录选择器的能力/);
 

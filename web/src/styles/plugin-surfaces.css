@@ -105,7 +105,7 @@
   flex: none;
 }
 
-.capability-choice span {
+.capability-choice > span {
   display: flex;
   flex-direction: column;
   gap: 2px;

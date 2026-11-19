@@ -1534,11 +1534,13 @@ export async function activate(ctx) {
   if (typeof document === "undefined") return;
   const pluginId = ctx.plugin?.id || PLUGIN_ID;
   const { storage, planner, handoff, browser, commands, sessions, models: modelsApi } = ctx;
-  const windowHost = ctx.window;
+  const supported = feature => !ctx.plugin?.platformLimitations?.some(item => item.feature === feature);
+  const webAvailable = supported("browser.view");
+  const windowHost = supported("window.popout") ? ctx.window : undefined;
   const surface = ctx.plugin?.surface === "popout" ? "popout" : "host";
 
   const state = {
-    source: "web",
+    source: webAvailable ? "web" : "local",
     sites: DEFAULT_SITES.map(site => ({ ...site })),
     lastWebUrl: DEFAULT_SITES[0].url,
     drafts: { web: "", local: "" },
@@ -1681,7 +1683,7 @@ export async function activate(ctx) {
     const lastWeb = normalizeUrl(value(1));
     if (lastWeb) state.lastWebUrl = lastWeb;
     const source = value(2);
-    if (source === "web" || source === "local") state.source = source;
+    if ((webAvailable && source === "web") || source === "local") state.source = source;
     const drafts = value(3);
     if (drafts && typeof drafts === "object") {
       state.drafts = { web: String(drafts.web || ""), local: String(drafts.local || "") };
@@ -3137,6 +3139,7 @@ export async function activate(ctx) {
     sourceGroup.setAttribute("aria-label", "规划来源");
     el.sourceButtons = {};
     for (const [id, label] of [["web", "网页"], ["local", "本地"]]) {
+      if (id === "web" && !webAvailable) continue;
       const item = button(label);
       item.setAttribute("aria-pressed", String(state.source === id));
       item.addEventListener("click", () => setSource(id));
@@ -3194,10 +3197,12 @@ export async function activate(ctx) {
       if (open) {
         renderHistory();
         void loadThreads();
-        renderSiteEditors();
-        el.address.value = state.viewUrl || state.lastWebUrl || "";
-        el.address.focus();
-        void refreshCurrentUrl();
+        if (webAvailable) {
+          renderSiteEditors();
+          el.address.value = state.viewUrl || state.lastWebUrl || "";
+          el.address.focus();
+          void refreshCurrentUrl();
+        }
       }
       scheduleSync();
     });
@@ -3223,9 +3228,9 @@ export async function activate(ctx) {
     const addressRow = node("div", "ekd-row");
     addressRow.append(el.address, go);
     addressLabel.append(addressRow);
-    el.menu.append(addressLabel, node("div", "ekd-sep"), node("p", "ekd-note", "常用站点"));
+    if (webAvailable) el.menu.append(addressLabel, node("div", "ekd-sep"), node("p", "ekd-note", "常用站点"));
     el.siteEditorList = node("div", "ekd-list");
-    el.menu.append(el.siteEditorList);
+    if (webAvailable) el.menu.append(el.siteEditorList);
     const addRow = node("div", "ekd-row");
     el.newSiteLabel = document.createElement("input");
     el.newSiteLabel.placeholder = "名称";
@@ -3250,23 +3255,22 @@ export async function activate(ctx) {
       setStatus("站点已添加");
     });
     addRow.append(el.newSiteLabel, el.newSiteUrl, add);
-    el.menu.append(addRow);
-    el.menu.append(node("div", "ekd-sep"));
+    if (webAvailable) el.menu.append(addRow, node("div", "ekd-sep"));
     const paste = button("粘贴内容导入");
     paste.addEventListener("click", () => void pasteImport());
     const fillSummary = button("把会话摘要填入网页");
     fillSummary.addEventListener("click", () => void pickSessionForFill("summary"));
     const fillDiff = button("把会话 Diff 填入网页");
     fillDiff.addEventListener("click", () => void pickSessionForFill("diff"));
-    el.menu.append(paste, fillSummary, fillDiff);
-    el.menu.append(node("p", "ekd-note", "只填入输入框并读回校验，不发送、不读取网页回复。"));
-    el.menu.append(node("div", "ekd-sep"), node("p", "ekd-note", "窗口"));
+    el.menu.append(paste);
+    if (webAvailable) el.menu.append(fillSummary, fillDiff, node("p", "ekd-note", "只填入输入框并读回校验，不发送、不读取网页回复。"));
+    if (webAvailable || windowHost) el.menu.append(node("div", "ekd-sep"), node("p", "ekd-note", "窗口"));
     const external = button("在系统浏览器打开");
     external.addEventListener("click", () => {
       setMenuOpen(false);
       void openExternal();
     });
-    el.menu.append(external);
+    if (webAvailable) el.menu.append(external);
     if (surface === "popout") {
       const closeWindow = button("关闭窗口");
       closeWindow.addEventListener("click", () => void closePopout());
@@ -3693,7 +3697,7 @@ export async function activate(ctx) {
 
   // --- lifecycle -----------------------------------------------------------
   function setSource(source) {
-    if (source !== "web" && source !== "local") return;
+    if (source !== "local" && (source !== "web" || !webAvailable)) return;
     if (state.source === source) {
       applyChrome();
       return;

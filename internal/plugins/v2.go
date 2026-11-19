@@ -18,7 +18,7 @@ import (
 // This file implements the API v2 surface whose behaviour lives in the core: the
 // browser-view registry, the plugin command registry, attachment validation and
 // the handoff preview. Every entry point is reached only through runAction,
-// which applies the capability table and the official-bundle gate first.
+// which applies the capability and install integrity checks first.
 
 const (
 	commandPattern  = `^[a-zA-Z][a-zA-Z0-9._-]{0,63}$`
@@ -53,9 +53,9 @@ func owned(view browserView) map[string]any {
 		"pluginId":   view.PluginID,
 		"instanceId": view.InstanceID,
 		"viewId":     view.ID,
-		"url":       view.URL,
-		"visible":   view.Visible,
-		"createdAt": view.Created,
+		"url":        view.URL,
+		"visible":    view.Visible,
+		"createdAt":  view.Created,
 	}
 }
 
@@ -86,12 +86,12 @@ func (m *Manager) browserAction(ctx context.Context, id, action string, r *http.
 		ViewID     string  `json:"viewId"`
 		InstanceID string  `json:"instanceId"`
 		URL        string  `json:"url"`
-		Visible bool    `json:"visible"`
-		X       float64 `json:"x"`
-		Y       float64 `json:"y"`
-		Width   float64 `json:"width"`
-		Height  float64 `json:"height"`
-		Mode    string  `json:"mode"`
+		Visible    bool    `json:"visible"`
+		X          float64 `json:"x"`
+		Y          float64 `json:"y"`
+		Width      float64 `json:"width"`
+		Height     float64 `json:"height"`
+		Mode       string  `json:"mode"`
 		// Adapter is the site adapter a plugin asks the host to run against its
 		// own view. The plugin supplies the source and the arguments; the core
 		// only bounds and checks them, and the Electron side executes them in the

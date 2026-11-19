@@ -357,8 +357,11 @@ function runCleanup(cleanup: Cleanup | void): void {
   }
 }
 
+const mainAreaReleases = new WeakMap<HTMLElement, () => void>();
+
 export function mountMainAreaSurface(options: MainAreaMountOptions): MainAreaHandle {
   const { document, container, pluginId, definition } = options;
+  mainAreaReleases.get(container)?.();
   const hostWindow = options.window ?? null;
   const mode = definition?.mode === "page" ? "page" : "split";
 
@@ -381,7 +384,9 @@ export function mountMainAreaSurface(options: MainAreaMountOptions): MainAreaHan
   pane.className = "ekdp-main-pane";
   pane.dataset.ekdpPlugin = pluginId;
 
-  for (const child of Array.from(container.childNodes)) native.append(child);
+  const nativeChildren = Array.from(container.childNodes);
+  const { display, flexDirection } = container.style;
+  for (const child of nativeChildren) native.append(child);
   row.append(native, splitter, pane);
   container.append(row);
 
@@ -470,13 +475,21 @@ export function mountMainAreaSurface(options: MainAreaMountOptions): MainAreaHan
       splitter.removeEventListener("keydown", onKeyDown as EventListener);
     }
     runCleanup(renderCleanup);
-    for (const child of Array.from(native.childNodes)) container.append(child);
+    for (const child of nativeChildren) {
+      if (child.parentNode !== native) continue;
+      if (row.parentNode === container) container.insertBefore(child, row);
+      else container.append(child);
+    }
     row.remove();
     container.style.removeProperty("display");
     container.style.removeProperty("flex-direction");
+    if (display) container.style.display = display;
+    if (flexDirection) container.style.flexDirection = flexDirection;
     delete container.dataset.ekdpSplit;
     delete container.dataset.ekdpPage;
+    if (mainAreaReleases.get(container) === release) mainAreaReleases.delete(container);
   };
+  mainAreaReleases.set(container, release);
   try {
     renderCleanup = definition.render(pane);
   } catch (error) {
@@ -486,7 +499,7 @@ export function mountMainAreaSurface(options: MainAreaMountOptions): MainAreaHan
 
   return {
     setWidth(px: number) {
-      if (mode === "page") return;
+      if (released || mode === "page") return;
       width = Math.min(max, Math.max(min, Number(px) || width));
       apply();
     },

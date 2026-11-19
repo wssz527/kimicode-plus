@@ -41,6 +41,10 @@ export class FakeElement {
     }) as Record<string, string> & { removeProperty: (name: string) => void };
   }
 
+  get parentNode(): FakeElement | null {
+    return this.parentElement;
+  }
+
   get childNodes(): FakeElement[] {
     return this.children;
   }
@@ -141,6 +145,13 @@ export class FakeElement {
       this.children.push(node);
       node.setConnected(this.isConnected);
     }
+  }
+
+  insertBefore(node: FakeElement, reference: FakeElement): FakeElement {
+    this.append(node);
+    this.children.pop();
+    this.children.splice(this.children.indexOf(reference), 0, node);
+    return node;
   }
 
   replaceChildren(...nodes: FakeElement[]): void {

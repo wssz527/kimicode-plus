@@ -70,6 +70,7 @@ var migrations = []string{
 		installed_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	)`,
+	`ALTER TABLE plugin_installs ADD COLUMN install_digest TEXT NOT NULL DEFAULT ''`,
 }
 
 // record is the persisted half of an install. The manifest is stored verbatim so
@@ -78,18 +79,19 @@ var migrations = []string{
 // confirm fewer capabilities than the manifest asks for, and only the granted
 // list is ever consulted for authorization.
 type record struct {
-	id           string
-	name         string
-	version      string
-	manifest     []byte
-	capabilities []string
-	source       string
-	desired      bool
-	state        string
-	err          string
-	tombstone    bool
-	installedAt  time.Time
-	updatedAt    time.Time
+	id            string
+	name          string
+	version       string
+	manifest      []byte
+	capabilities  []string
+	source        string
+	installDigest string
+	desired       bool
+	state         string
+	err           string
+	tombstone     bool
+	installedAt   time.Time
+	updatedAt     time.Time
 }
 
 func migrate(db *sql.DB) error {
@@ -100,7 +102,7 @@ func migrate(db *sql.DB) error {
 }
 
 func loadRecords(ctx context.Context, db *sql.DB) ([]record, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id,name,version,manifest,capabilities,source,desired,state,error,tombstone,installed_at,updated_at FROM plugin_installs ORDER BY id`)
+	rows, err := db.QueryContext(ctx, `SELECT id,name,version,manifest,capabilities,source,install_digest,desired,state,error,tombstone,installed_at,updated_at FROM plugin_installs ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("load plugin installs: %w", err)
 	}
@@ -111,7 +113,7 @@ func loadRecords(ctx context.Context, db *sql.DB) ([]record, error) {
 		var capabilities string
 		var desired, tombstone int
 		var installed, updated string
-		if err := rows.Scan(&item.id, &item.name, &item.version, &item.manifest, &capabilities, &item.source, &desired, &item.state, &item.err, &tombstone, &installed, &updated); err != nil {
+		if err := rows.Scan(&item.id, &item.name, &item.version, &item.manifest, &capabilities, &item.source, &item.installDigest, &desired, &item.state, &item.err, &tombstone, &installed, &updated); err != nil {
 			return nil, fmt.Errorf("scan plugin install: %w", err)
 		}
 		item.desired = desired == 1
@@ -138,12 +140,12 @@ func saveRecord(ctx context.Context, db *sql.DB, item record) error {
 	if item.tombstone {
 		tombstone = 1
 	}
-	_, err = db.ExecContext(ctx, `INSERT INTO plugin_installs(id,name,version,manifest,capabilities,source,desired,state,error,tombstone,installed_at,updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err = db.ExecContext(ctx, `INSERT INTO plugin_installs(id,name,version,manifest,capabilities,source,install_digest,desired,state,error,tombstone,installed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name,version=excluded.version,manifest=excluded.manifest,capabilities=excluded.capabilities,
-			source=excluded.source,desired=excluded.desired,state=excluded.state,error=excluded.error,tombstone=excluded.tombstone,
+			source=excluded.source,install_digest=excluded.install_digest,desired=excluded.desired,state=excluded.state,error=excluded.error,tombstone=excluded.tombstone,
 			installed_at=excluded.installed_at,updated_at=excluded.updated_at`,
-		item.id, item.name, item.version, item.manifest, string(capabilities), item.source, desired, item.state, item.err, tombstone,
+		item.id, item.name, item.version, item.manifest, string(capabilities), item.source, item.installDigest, desired, item.state, item.err, tombstone,
 		storage.SortableTime(item.installedAt), storage.SortableTime(item.updatedAt))
 	if err != nil {
 		return fmt.Errorf("save plugin install: %w", err)

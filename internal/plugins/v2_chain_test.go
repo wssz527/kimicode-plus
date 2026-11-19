@@ -62,6 +62,7 @@ func officialManager(t *testing.T, core Core, capabilities []string) (*Manager, 
 		t.Fatal(err)
 	}
 	manager.UseCore(core)
+	manager.platform = "darwin"
 	files := map[string][]byte{
 		"plugin.json": []byte(manifestFor("test.official", 2, capabilities)),
 		"renderer.js": []byte("export function activate(){}\n"),
@@ -124,17 +125,14 @@ func TestPrivilegedActionsReachTheCoreWithTheRightShape(t *testing.T) {
 	}
 }
 
-// A plugin that holds the session capabilities but no official digest must be
-// refused by every one of them, and nothing may reach the core.
-func TestThirdPartyCannotReachPrivilegedActions(t *testing.T) {
+// A bundled plugin that holds session capabilities but fails its official
+// content check cannot reach the core.
+func TestBundledPluginWithSameIDAndWrongDigestCannotReachPrivilegedActions(t *testing.T) {
 	core := &pluginCoreDouble{}
 	manager, _ := testManager(t, func() bool { return false })
 	manager.UseCore(core)
 	// Same id as the official plugin, different content: this is the case the
 	// allowlist exists for.
-	// The install path refuses a privileged consent outright, so the "same id,
-	// different content" row is built the way a bundled release builds it: files
-	// first, then the stored grant. Only the digest check can separate them.
 	source := writePluginDir(t, t.TempDir(), manifestFor("test.official", 2, []string{CapSessionsHistory, CapHandoff}), nil)
 	files := map[string][]byte{}
 	err := filepath.Walk(source, func(path string, info os.FileInfo, walkErr error) error {

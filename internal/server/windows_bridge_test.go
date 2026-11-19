@@ -2,12 +2,17 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"enhancedkimi/internal/security"
 	"enhancedkimi/internal/storage"
@@ -136,5 +141,53 @@ func TestWindowsBridgeSessionAndRPCDispatch(t *testing.T) {
 	app.Handler.ServeHTTP(actRec, actReq)
 	if actRec.Code != http.StatusOK || !bytes.Contains(actRec.Body.Bytes(), []byte(`"available"`)) {
 		t.Fatalf("bridge attach.status failed: %d %s", actRec.Code, actRec.Body.String())
+	}
+}
+
+func TestWindowsBridgeUnsupportedPluginFeatures(t *testing.T) {
+	guard := security.New("127.0.0.1:18444")
+	app := &App{winBridge: newWindowsBridge()}
+	key, _ := app.winBridge.issue(guard)
+	handler := app.wrapWindowsBridge(guard, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("unsupported action was forwarded")
+	}))
+	for _, action := range []string{"host.syncOverlayEntries", "plugin.window.open", "window.close", "browser.view.open", "browser.view.close"} {
+		request := httptest.NewRequest(http.MethodPost, "http://"+guard.Host()+"/ekd/native/v1", strings.NewReader(`{"protocol":1,"id":"test","action":"`+action+`"}`))
+		request.Header.Set("Origin", "app://renderer")
+		request.Header.Set("X-EKD-Bridge", key)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		var result struct {
+			Error struct{ Code, Message string }
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || response.Code != http.StatusOK || result.Error.Code != "PLATFORM_UNSUPPORTED" || !strings.Contains(result.Error.Message, "Windows 暂不支持") {
+			t.Fatalf("%s => %d %s (%v)", action, response.Code, response.Body, err)
+		}
+	}
+}
+
+func TestWindowsBridgeFilePickerOptions(t *testing.T) {
+	picker, err := parseWindowsPickerOptions(false, json.RawMessage(`{"title":"选择 ZIP 插件包","defaultPath":"C:\\Users\\测试","single":true,"filters":[{"name":"ZIP 插件包","extensions":["zip"]}]}`))
+	if err != nil || picker.Title != "选择 ZIP 插件包" || picker.DefaultPath != `C:\Users\测试` || !picker.Single || picker.Directory || picker.Filter != "ZIP 插件包|*.zip" {
+		t.Fatalf("picker: %+v (%v)", picker, err)
+	}
+	folder, err := parseWindowsPickerOptions(true, json.RawMessage(`{}`))
+	if err != nil || !folder.Directory || folder.Title != "选择项目文件夹" {
+		t.Fatalf("picker: %+v (%v)", folder, err)
+	}
+	if _, err := parseWindowsPickerOptions(false, json.RawMessage(`{"filters":[{"name":"ZIP","extensions":["zip;*.exe"]}]}`)); err == nil {
+		t.Fatal("accepted an invalid extension")
+	}
+}
+
+func TestWindowsPickerRejectsNoninteractiveDesktop(t *testing.T) {
+	if runtime.GOOS != "windows" || os.Getenv("EKD_TEST_NONINTERACTIVE_DESKTOP") != "1" {
+		t.Skip("requires the Windows OpenSSH session")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, code, err := showWindowsPicker(ctx, windowsPickerOptions{})
+	if code != "HOST_DIALOG_UNAVAILABLE" || err == nil || !strings.Contains(err.Error(), "交互桌面") {
+		t.Fatalf("noninteractive picker: %s (%v)", code, err)
 	}
 }

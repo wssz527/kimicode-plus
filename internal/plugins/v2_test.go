@@ -11,9 +11,7 @@ import (
 )
 
 // officialFixture installs one bundled plugin and makes the manager treat its
-// installed copy as official. It is the only way to reach the privileged actions
-// in a test, which is exactly the property the tests then check from the other
-// direction.
+// installed copy as official.
 func officialFixture(t *testing.T, capabilities []string) (*Manager, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -21,6 +19,7 @@ func officialFixture(t *testing.T, capabilities []string) (*Manager, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	manager.platform = "darwin"
 	files := map[string][]byte{
 		"plugin.json": []byte(manifestFor("test.official", 2, capabilities)),
 		"renderer.js": []byte("export function activate(){}\n"),
@@ -78,16 +77,16 @@ func callPlugin(t *testing.T, manager *Manager, token, action string, params any
 	return code, value
 }
 
-func TestLocalPluginCannotBeGrantedPrivilegedCapability(t *testing.T) {
+func TestLocalPluginRequiresExplicitConfirmationForPrivilegedCapability(t *testing.T) {
 	manager, _ := testManager(t, func() bool { return false })
 	source := writePluginDir(t, t.TempDir(), manifestFor("test.local", 2, []string{"ui:right-panel"}), nil)
 	declared := []string{CapUIRightPanel}
-	_, err := manager.Install(context.Background(), InstallRequest{Root: source, Capabilities: &declared})
+	_, err := manager.Install(context.Background(), InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: &declared})
 	if err == nil {
-		t.Fatal("a local plugin was granted a privileged capability")
+		t.Fatal("a local plugin was granted a privileged capability without confirmation")
 	}
 	var pluginErr *Error
-	if !asError(err, &pluginErr) || pluginErr.Code != "PLUGIN_CAPABILITY_PRIVILEGED" {
+	if !asError(err, &pluginErr) || pluginErr.Code != "PLUGIN_PRIVILEGED_CONFIRM_REQUIRED" || pluginErr.Status != http.StatusBadRequest {
 		t.Fatalf("unexpected refusal: %v", err)
 	}
 }
@@ -167,15 +166,13 @@ func TestDisableReleasesViewsCommandsAndToken(t *testing.T) {
 func TestCommandsAreVisibleButNotHijackable(t *testing.T) {
 	manager, token := officialFixture(t, []string{CapCommands})
 	second := writePluginDir(t, t.TempDir(), manifestFor("test.other", 2, []string{CapCommands}), nil)
-	declared, err := ParseCapabilities([]string{CapCommands})
-	if err != nil {
+	consent := []string{CapCommands}
+	if _, err := manager.Install(context.Background(), InstallRequest{Root: second, PackageDigest: previewDigest(t, manager, second), Capabilities: &consent, ConfirmPrivileged: true}); err != nil {
 		t.Fatal(err)
 	}
-	_ = declared
-	// test.other is local: it cannot hold commands, so it is refused at install.
-	consent := []string{CapCommands}
-	if _, err = manager.Install(context.Background(), InstallRequest{Root: second, Capabilities: &consent}); err == nil {
-		t.Fatal("a local plugin was granted commands")
+	other, err := manager.Enable(context.Background(), "test.other")
+	if err != nil {
+		t.Fatal(err)
 	}
 	if code, _ := callPlugin(t, manager, token, "commands.register", map[string]any{"name": "multiSession.open"}); code != http.StatusOK {
 		t.Fatal("register failed")
@@ -183,6 +180,14 @@ func TestCommandsAreVisibleButNotHijackable(t *testing.T) {
 	code, value := callPlugin(t, manager, token, "commands.register", map[string]any{"name": "multiSession.open"})
 	if code != http.StatusOK {
 		t.Fatalf("re-registering one's own command failed: %d %#v", code, value)
+	}
+	code, value = callPlugin(t, manager, other.Token, "commands.invoke", map[string]any{"command": "multiSession.open"})
+	if code != http.StatusOK || value["value"].(map[string]any)["ownerId"] != "test.official" {
+		t.Fatalf("local plugin could not invoke the command: %d %#v", code, value)
+	}
+	code, value = callPlugin(t, manager, other.Token, "commands.register", map[string]any{"name": "multiSession.open"})
+	if code != http.StatusConflict {
+		t.Fatalf("local plugin overwrote the command: %d %#v", code, value)
 	}
 }
 
@@ -192,7 +197,7 @@ func TestV1PluginCannotCallV2Actions(t *testing.T) {
 	manager, _ := testManager(t, func() bool { return false })
 	source := writePluginDir(t, t.TempDir(), manifestFor("test.v1", 1, []string{"sessions:read"}), nil)
 	consent := []string{CapSessionsRead}
-	if _, err := manager.Install(context.Background(), InstallRequest{Root: source, Capabilities: &consent}); err != nil {
+	if _, err := manager.Install(context.Background(), InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: &consent}); err != nil {
 		t.Fatal(err)
 	}
 	enabled, err := manager.Enable(context.Background(), "test.v1")
@@ -256,8 +261,7 @@ func TestBrowserAnswersNameTheTokenOwner(t *testing.T) {
 // as a view that never existed, so the reply cannot be used to enumerate.
 func TestBrowserViewIDSpaceIsPerPlugin(t *testing.T) {
 	manager, token := officialFixture(t, []string{CapBrowserView})
-	// A second bundled plugin, also official, is the only way to hold
-	// browser:view twice in one manager.
+	// A second official plugin verifies isolation between bundled installs.
 	secondFiles := map[string][]byte{
 		"plugin.json": []byte(manifestFor("test.other", 2, []string{CapBrowserView})),
 		"renderer.js": []byte("export function activate(){}\n"),
@@ -382,7 +386,7 @@ func TestAPIVersionFollowsEachManifest(t *testing.T) {
 	v1manager, _ := testManager(t, func() bool { return false })
 	source := writePluginDir(t, t.TempDir(), manifestFor("test.v1", 1, []string{CapSessionsRead}), nil)
 	consent := []string{CapSessionsRead}
-	if _, err := v1manager.Install(context.Background(), InstallRequest{Root: source, Capabilities: &consent}); err != nil {
+	if _, err := v1manager.Install(context.Background(), InstallRequest{Root: source, PackageDigest: previewDigest(t, v1manager, source), Capabilities: &consent}); err != nil {
 		t.Fatal(err)
 	}
 	enabled, err := v1manager.Enable(context.Background(), "test.v1")

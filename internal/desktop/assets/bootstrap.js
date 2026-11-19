@@ -291,7 +291,14 @@ async function installNativeBootstrap(options) {
         return { count: state.overlayEntries.length };
       }
       case 'host.pickFiles': {
-        const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(target), { title: '添加附件', properties: ['openFile', 'multiSelections'] });
+        const dialogOptions = {
+          title: typeof payload?.title === 'string' && payload.title.trim() ? payload.title.trim() : '添加附件',
+          properties: payload?.single ? ['openFile'] : ['openFile', 'multiSelections'],
+        };
+        if (Array.isArray(payload?.filters) && payload.filters.length > 0) {
+          dialogOptions.filters = payload.filters;
+        }
+        const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(target), dialogOptions);
         return result.canceled ? [] : result.filePaths.map(path => ({ path, name: req('node:path').basename(path) }));
       }
       case 'host.pickDirectory': {

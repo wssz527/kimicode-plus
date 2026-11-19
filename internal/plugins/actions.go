@@ -65,26 +65,25 @@ func (m *Manager) Call(ctx context.Context, id, action, token string, r *http.Re
 	if !m.Verify(id, token) {
 		return nil, apiError(http.StatusUnauthorized, "PLUGIN_IDENTITY_REJECTED", "插件身份令牌无效")
 	}
-	return m.runAction(ctx, id, action, nil, r)
+	return m.runAction(ctx, id, token, action, nil, r)
 }
 
 // runAction is the single authorization gate. Both the id-addressed action route
 // and the token-addressed runtime route end here, so the capability table, the
 // credential injection and the activity rules cannot diverge between them.
-func (m *Manager) runAction(ctx context.Context, id, action string, params json.RawMessage, r *http.Request) (any, error) {
+func (m *Manager) runAction(ctx context.Context, id, token, action string, params json.RawMessage, r *http.Request) (any, error) {
 	// Everything the action needs is copied while the lock is held. Reading the
 	// entry afterwards would race with Enable/Disable/Uninstall, which rewrite the
 	// same fields under a different lock acquisition.
 	m.mu.Lock()
-	item, ok := m.entries[id]
+	installed, ok := m.entries[id]
+	validToken := token != "" && subtleEqual(m.tokens[id], token)
 	closed := m.closed
 	core := m.core
 	vault := m.vault
-	var state string
-	var grants Grants
+	var item entry
 	if ok {
-		state = item.state
-		grants = item.grants
+		item = *installed
 	}
 	m.mu.Unlock()
 	if closed {
@@ -93,19 +92,20 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 	if !ok {
 		return nil, apiError(http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件未安装")
 	}
-	if state != StateEnabled {
+	if !validToken {
+		return nil, apiError(http.StatusUnauthorized, "PLUGIN_IDENTITY_REJECTED", "插件身份令牌无效")
+	}
+	if item.state != StateEnabled {
 		return nil, apiError(http.StatusConflict, "PLUGIN_DISABLED", "插件未启用")
 	}
 	if r != nil && len(params) > 0 {
 		r = r.WithContext(context.WithValue(r.Context(), paramsKey{}, params))
 	}
 
+	grants := item.grants
 	switch {
 	case action == "runtime.info":
-		// The identity is built on every call and re-verifies the official digest,
-		// so a plugin whose files changed while it ran cannot keep advertising
-		// capabilities the action gate would already refuse.
-		return m.runtimeInfo(id), nil
+		return m.runtimeInfo(item), nil
 	case action == "log":
 		var input struct {
 			Level   string `json:"level"`
@@ -134,14 +134,14 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 		}
 		return m.credentialsAction(ctx, id, grants, action, r, params)
 	case action == "events.poll":
-		return m.pollEvents(ctx, grants, r, params)
+		return m.pollEvents(ctx, m.effectiveGrants(item), r, params)
 	case strings.HasPrefix(action, "commands."):
 		// Commands are process-local bookkeeping: the manager, not the native
 		// service, owns who registered what and which invocation is pending.
 		if err := grants.Authorize(action); err != nil {
 			return nil, err
 		}
-		if err := m.verifyPrivilege(id); err != nil {
+		if err := m.verifyPrivilege(item); err != nil {
 			return nil, err
 		}
 		return m.commandsAction(ctx, id, action, r, params)
@@ -149,7 +149,10 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 		if err := grants.Authorize(action); err != nil {
 			return nil, err
 		}
-		if err := m.verifyPrivilege(id); err != nil {
+		if err := m.verifyPrivilege(item); err != nil {
+			return nil, err
+		}
+		if err := CheckPlatformFeature(m.platform, FeatureBrowserView); err != nil {
 			return nil, err
 		}
 		return m.browserAction(ctx, id, action, r, params)
@@ -167,10 +170,9 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 		return nil, err
 	}
 	// The privilege gate is deliberately separate from the capability table: a
-	// stored grant or a manifest edit can widen the latter, but only an intact
-	// official bundle passes this re-hash of the installed directory.
+	// grant must be backed by the verified contents of this install.
 	if known && RequiresPrivilege(capability) {
-		if err := m.verifyPrivilege(id); err != nil {
+		if err := m.verifyPrivilege(item); err != nil {
 			return nil, err
 		}
 	}
@@ -192,6 +194,9 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 		}
 		return m.sessionWatch(ctx, id, stringValue(input["id"]), action == "sessions.watch")
 	case action == "ui.popout":
+		if err := CheckPlatformFeature(m.platform, FeaturePopout); err != nil {
+			return nil, err
+		}
 		return map[string]any{"pluginId": id}, nil
 	case action == "sessions.open":
 		input, err := decodeObject(payload)
@@ -298,49 +303,16 @@ func (m *Manager) runAction(ctx context.Context, id, action string, params json.
 	return value, nil
 }
 
-// effectiveGrants hides v2 capabilities from a plugin that is installed but no
-// longer an intact official bundle. The stored grant is not rewritten: restoring
-// the files (or a later release) makes the same grant effective again.
-func effectiveGrants(item *entry) Grants {
-	if item.official {
-		return item.grants
-	}
-	return item.grants.WithoutPrivileged()
-}
-
-// runtimeInfo builds the identity answer for one plugin. The installed directory
-// is hashed on every call rather than read from the cached flag, because this is
-// the answer the renderer uses to decide which surfaces to offer: a plugin whose
-// files changed while it ran must not keep advertising capabilities the action
-// gate would already refuse.
-func (m *Manager) runtimeInfo(id string) map[string]any {
+func (m *Manager) runtimeInfo(item entry) map[string]any {
 	m.mu.Lock()
-	item := m.entries[id]
-	var manifest Manifest
-	var dir, source string
-	var grants Grants
-	var name, version string
-	if item != nil {
-		manifest, dir, source = item.manifest, item.dir, item.source
-		grants, name, version = item.grants, item.manifest.Name, item.manifest.Version
-	}
 	host := m.host
 	m.mu.Unlock()
-	if item == nil {
-		return nil
-	}
-	effective := grants.WithoutPrivileged()
-	if m.officialFor(manifest, dir, source) {
-		effective = grants
-	}
+	grants := m.effectiveGrants(item)
 	return map[string]any{
-		"id":           id,
-		"name":         name,
-		"version":      version,
-		"apiVersion":   manifest.APIVersion,
-		"hostVersion":  host,
-		"capabilities": effective.Names(),
-		"slots":        grantedSlots(effective),
+		"id": item.manifest.ID, "name": item.manifest.Name, "version": item.manifest.Version,
+		"apiVersion": item.manifest.APIVersion, "hostVersion": host,
+		"capabilities": grants.Names(), "slots": grantedSlots(grants),
+		"platformLimitations": pluginPlatformLimitations(m.platform, item.declared),
 	}
 }
 

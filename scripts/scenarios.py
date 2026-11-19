@@ -133,7 +133,7 @@ def verify_plugins(core, results, folder):
     preview = core.request('/plugins/preview', {'root': root})
     assert preview['id'] == local and preview['capabilities'] == ['storage', 'ui:sidebar'], preview
     core.request('/plugins/install', {'root': root}, expected=400)
-    installed = core.request('/plugins/install', {'root': root, 'capabilities': preview['capabilities']}, expected=201)
+    installed = core.request('/plugins/install', {'root': root, 'packageDigest': preview['packageDigest'], 'capabilities': preview['capabilities']}, expected=201)
     assert installed['id'] == local and installed['source'] == 'LOCAL'
     assert installed['capabilities'] == ['storage', 'ui:sidebar'], installed
     core.request('/plugins/' + local + '/enable', {})
@@ -147,7 +147,7 @@ def verify_plugins(core, results, folder):
     narrow_root = make_local_plugin(folder, 'acceptance.narrow', capabilities=['ui:sidebar', 'storage'])
     narrow_preview = core.request('/plugins/preview', {'root': narrow_root})
     assert narrow_preview['capabilities'] == ['storage', 'ui:sidebar'], narrow_preview
-    narrow = core.request('/plugins/install', {'root': narrow_root, 'capabilities': ['ui:sidebar']}, expected=201)
+    narrow = core.request('/plugins/install', {'root': narrow_root, 'packageDigest': narrow_preview['packageDigest'], 'capabilities': ['ui:sidebar']}, expected=201)
     assert narrow['capabilities'] == ['ui:sidebar'], narrow
     # The capability the user did not confirm is not usable even though the
     # manifest declares it: enabling issues a token, but storage is still denied.

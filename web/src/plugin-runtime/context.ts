@@ -1,3 +1,4 @@
+import type { PluginPlatformLimitation } from "../api.js";
 /** The plugin-facing API. Every field here is a capability-gated channel; there
  * is deliberately no `fetch`, no DOM-wide observer and no raw credential access.
  */
@@ -210,6 +211,7 @@ export interface PluginIdentity {
   /** The plugin manifest API version, so a plugin can branch on the contract. */
   dataVersion: number;
   surface?: "host" | "popout";
+  platformLimitations?: readonly PluginPlatformLimitation[];
 }
 
 export interface PluginTheme {

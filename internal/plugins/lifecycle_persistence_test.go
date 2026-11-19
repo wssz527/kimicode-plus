@@ -50,7 +50,7 @@ func TestEnableDecisionSurvivesShutdown(t *testing.T) {
 	}
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.Enable(ctx, "test.sample"); err != nil {
@@ -90,7 +90,7 @@ func TestDisableDecisionSurvivesShutdown(t *testing.T) {
 	}
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.Enable(ctx, "test.sample"); err != nil {
@@ -130,7 +130,7 @@ func TestNarrowedGrantSurvivesReleaseBundled(t *testing.T) {
 	// The user reinstalls the same plugin and accepts only the sidebar, not storage.
 	narrowed := []string{CapUISidebar}
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: &narrowed}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: &narrowed}); err != nil {
 		t.Fatal(err)
 	}
 	installed, _ := manager.Get("test.sample")
@@ -183,7 +183,7 @@ func TestUpgradeKeepsNarrowedGrantAndEnableDecision(t *testing.T) {
 	}
 	narrowed := []string{CapUISidebar}
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: &narrowed}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: &narrowed}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.Enable(ctx, "test.sample"); err != nil {
@@ -288,7 +288,7 @@ func TestForceEnableIsRequiredOutsideHostVersions(t *testing.T) {
 	}
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.Enable(ctx, "test.sample"); err == nil {
@@ -318,7 +318,7 @@ func TestConcurrentEnableAndActionIsRaceFree(t *testing.T) {
 	}
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatal(err)
 	}
 	enabled, err := manager.Enable(ctx, "test.sample")
@@ -352,7 +352,7 @@ func TestEnableAlreadyEnabledReturnsCurrentState(t *testing.T) {
 	manager, _ := testManager(t, func() bool { return false })
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatal(err)
 	}
 	first, err := manager.Enable(ctx, "test.sample")
@@ -381,7 +381,7 @@ func TestReportErrorIsRecordedWithoutCore(t *testing.T) {
 	manager, _ := testManager(t, func() bool { return false })
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatal(err)
 	}
 	enabled, err := manager.Enable(ctx, "test.sample")
@@ -408,7 +408,7 @@ func TestCorruptPluginKeepsGrantAndIntent(t *testing.T) {
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
 	narrowed := []string{CapUISidebar}
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: &narrowed}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: &narrowed}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.Enable(ctx, "test.sample"); err != nil {
@@ -480,7 +480,7 @@ func TestUpgradeFromPreviousSchema(t *testing.T) {
 	}
 	// And the upgraded database is usable, not merely openable.
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(context.Background(), InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(context.Background(), InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatalf("install on an upgraded database: %v", err)
 	}
 }
@@ -584,7 +584,7 @@ func TestCloseConcurrentWithLifecycleIsRaceFree(t *testing.T) {
   "capabilities": ["ui:sidebar"]
 }`
 		source := writePluginDir(t, filepath.Join(t.TempDir(), "source-"+id), manifest, nil)
-		if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+		if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 			t.Fatalf("install %s: %v", id, err)
 		}
 		if _, err := manager.Enable(ctx, id); err != nil {
@@ -660,7 +660,7 @@ func TestFatalReportFaultsThePluginAndKeepsTheReason(t *testing.T) {
 	}
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatal(err)
 	}
 	enabled, err := manager.Enable(ctx, "test.sample")
@@ -728,7 +728,7 @@ func TestLateFatalReportKeepsTheFirstReason(t *testing.T) {
 	manager, _ := testManager(t, func() bool { return false })
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatal(err)
 	}
 	enabled, err := manager.Enable(ctx, "test.sample")

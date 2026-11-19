@@ -1,14 +1,15 @@
 # 插件开发说明（插件系统 v1 / v2）
 
-> 版本关系：`apiVersion: 1` 的清单与运行时接口保持原样，Monitor、KCT 和示例插件不需要改动。`apiVersion: 2` 增加一组高权限能力，**只授予内容摘要匹配的官方预装插件**；第三方插件即使声明也会在安装阶段被拒绝。下文能力清单按 v1 / v2 分节。
+> 版本关系：`apiVersion: 1` 的清单与运行时接口完全向后兼容，Monitor、KCT 和基础示例插件无需改动。`apiVersion: 2` 开放完整的界面挂载点（左侧栏一级导航、主聊天区整页/分栏、右侧面板标签与弹出窗、会话信息与 `+` 菜单入口、侧栏折叠协作、独立隔离网页视图）以及会话控制、模型目录、附件、规划、交接、命令和定时任务等全部核心能力。v1 与 v2 能力开放给第三方本地插件，由用户在安装时逐项勾选授权并对高权限能力作二次风险确认。Windows 宿主能力以运行时的 `platformLimitations` 为准。
 
-KimiCode+ 支持本地受信插件。插件是运行在宿主渲染进程里的 ES module，可以贴合官方界面，并通过核心提供的接口取用缓存指标、会话、配置和网络。核心在 Go 端按插件身份与能力强制授权，渲染层的校验只是第二道防线。
+KimiCode+ 支持本地受信增强插件。插件是运行在宿主渲染进程里的 ES module，可以贴合官方界面，并通过核心提供的接口取用缓存指标、会话、配置、模型、网页视图和网络代理。核心在 Go 端按插件身份与已授权能力强制鉴权，渲染层的校验作为第二道防线。
 
-本轮范围：
+能力与安全边界：
 
-- 只从**本地文件夹或 zip** 安装，没有插件市场、在线安装源或签名校验。
-- 不做不可信插件沙箱。插件运行在宿主渲染进程里，**可以读取当前界面内容**，界面会如实告知这一点。
-- Monitor 与 KCT 都只是这套接口下的适配插件，核心没有为它们留私有通道。核心关闭全部插件后仍完整可用。
+- 安装方式：支持从**本地文件夹或 `.zip` 包**安装（设置页可直接唤起系统目录/文件选择器，或粘贴路径）。不提供第三方在线插件市场。
+- 运行环境：不做不可信沙箱。插件运行在宿主渲染进程中，**可以读取当前界面内容**，安装界面与权限清单会如实提示，请只安装你信任的插件。
+- 完整性保护：预装插件持续对照二进制内嵌的构建期内容摘要；第三方本地插件在安装完成时固化目录内容摘要（`install_digest`），每次调用高权限能力前重新核对磁盘内容，防止安装确认后被静默篡改提权。开发者更新本地代码后，重新执行本地覆盖安装即可刷新摘要并重新确认授权。
+- 核心解耦：Monitor、KCT、规划、定时任务都运行在这套标准接口之上，关闭全部插件后核心功能仍完整可用。
 
 ## 包结构
 
@@ -78,9 +79,14 @@ KimiCode+ 支持本地受信插件。插件是运行在宿主渲染进程里的 
 
 未授权时返回 `403 PLUGIN_CAPABILITY_DENIED`。
 
-## 能力清单 v2（高权限，仅官方预装）
+## 能力清单 v2（扩展挂载点与高权限能力，向第三方插件全面开放）
 
-v2 能力由构建时机制授权：`plugins/registry.go` 对每个嵌入插件目录计算 SHA-256（排序后的相对路径 + 字节长度 + 字节内容），写入二进制内的允许列表。启用和**每一次**高权限调用都会重新哈希安装目录，摘要不一致立即返回 `403 PLUGIN_PRIVILEGE_DENIED`。这不是密钥签名，也不保护已被替换的二进制；它保证的是「本地安装的插件冒充同名官方插件」和「官方插件文件被改写」都会被挡住。
+第三方插件只需在 `plugin.json` 中将 `"apiVersion"` 设为 `2`，即可申请下表中的所有 UI 挂载点与核心能力。授权与完整性机制如下：
+
+- **安装期二次确认**：用户在「增强插件 → 安装本地增强插件」勾选任何 v2 高权限能力时，界面会给出明确风险提示，要求勾选风险确认框（请求体携带 `confirmPrivileged: true`），未确认会被核心拒绝（`400 PLUGIN_PRIVILEGED_CONFIRM_REQUIRED`）。
+- **内容摘要保护**：
+  - 预装插件：延续构建期 `plugins/registry.go` 计算的 SHA-256 摘要白名单，每次高权限调用都会重新核对磁盘内容。
+  - 第三方本地插件：安装落盘时计算并持久化目录内容摘要（`install_digest`），每次高权限调用前重新核对磁盘内容。若安装后文件在磁盘上被外部静默篡改，摘要失配会立即拒绝高权限调用（`403 PLUGIN_PRIVILEGE_DENIED`）；开发者修改插件源码后，重新执行本地安装即可更新摘要并重新确认授权。
 
 | 能力 | 提供内容 | 对应动作 |
 |---|---|---|
@@ -103,10 +109,12 @@ v2 能力由构建时机制授权：`plugins/registry.go` 对每个嵌入插件�
 
 约束：
 
-- 第三方（本地文件夹或 zip）安装时提交这些能力会返回 `403 PLUGIN_CAPABILITY_PRIVILEGED`，不会写入授权记录。
-- 摘要不匹配时，`runtime.info` 不再列出高权限能力，运行时因此不会渲染对应界面；即使插件绕过界面直接调用，Go 门禁也会拒绝。
+- 第三方（本地文件夹或 zip）安装时提交高权限能力且未传 `confirmPrivileged: true` 会返回 `400 PLUGIN_PRIVILEGED_CONFIRM_REQUIRED`；确认后与预装插件共享同一套能力鉴权与运行时挂载点。
+- 磁盘内容摘要不匹配时，`runtime.info` 不再列出高权限能力，运行时因此不会渲染对应界面；即使插件绕过界面直接调用，Go 门禁也会返回 `403 PLUGIN_PRIVILEGE_DENIED`。
 - 停用、卸载、故障、安全模式和核心关闭都会撤销身份令牌，并同时释放该插件的网页视图、命令注册与会话订阅；这些停止路径都会结束该插件创建且仍在运行的规划线程（历史保留）。
 - `commands` 只做身份与归属校验，命令本体在插件自己的渲染上下文里执行。调用不存在的命令返回 `404 PLUGIN_COMMAND_UNKNOWN`，所属插件未运行返回 `409 PLUGIN_COMMAND_UNAVAILABLE`，不会返回伪造的成功结果。
+- Windows 通过现有 loopback 桥使用核心命令授权，命令本体在当前渲染器中相应插件的作用域运行。ZIP 和文件夹选择优先使用官方客户端系统对话框，缺少客户端入口时由同一 Windows 交互桌面中的核心打开系统对话框。也可在安装页手动输入完整路径。
+- `GET /enhance/v1/plugins` 返回平台的 `platformLimitations`。安装预览和插件详情返回与该插件声明匹配的部分。每项含 `feature`、`capability` 和中文 `message`。Windows 当前限制为插件隔离网页视图（`browser.view`）、独立插件窗口（`window.popout`）和独立右侧 `+` 浮层同步（`entry.nativeOverlay`）。核心动作返回 `409 PLATFORM_UNSUPPORTED`，宿主桥也返回同一错误码。右侧面板标签、会话信息入口、右侧面板列表以及同一文档中的 `+` 菜单仍可挂载。
 
 ### v2 输入输出要点
 
@@ -204,7 +212,7 @@ export function renderSettings(ctx, element) {
 
 ```ts
 interface PluginContext {
-  plugin: { id: string; version: string; dataVersion: number };
+  plugin: { id: string; version: string; dataVersion: number; surface?: "host" | "popout"; platformLimitations?: readonly { feature: string; capability: string; message: string }[] };
   core: { request<T>(action: string, params?: unknown): Promise<T> };
   events: { on(name: string, listener: (payload: unknown) => void): Disposable };
   ui: {
@@ -298,6 +306,7 @@ await ctx.core.request("credentials.delete", { name: "translator" });
 - `ctx.storage` 单值上限 32 KiB，键名 1–200 字符。
 - `ctx.events.on` 的订阅按时长轮询实现，只投递已授权的 scope；未授权的 scope 被丢弃。`planner:<threadId>` scope 只对 `planner:run` 开放。
 - v2 的挂载点、网页视图、侧栏引用和命令注册都登记在插件作用域里：停用一个插件只释放它自己的资源，其他插件继续工作。
+- 主聊天区的分栏和整页挂载共用一个位置。同一时间只保留一个插件界面。打开新的挂载会先释放前一个界面，关闭已被替换的旧句柄不会影响当前挂载。当前挂载关闭后，官方聊天节点回到原位置。
 - 停用时按相反顺序释放：先跑 `activate` 返回的清理和各个 `Disposable`，再移除分栏容器、右面板标签与入口按钮，最后撤销身份令牌。已实测停用后页面与启用前逐项一致（分栏、面板、侧栏折叠、入口都不残留）。
 - `ctx.planner.threads()` / `ctx.planner.models()` 是只读发现，不受设置里旧的「规划」附加功能开关影响；该开关只管冻结的内置规划界面。其余 `planner.*` 动作同样走插件自己的授权，不读写那套界面状态。
 - 规划线程归属创建它的插件。`planner.configure/send/retry/stop/approve/delete` 只对**同一插件**创建的线程生效；拿其他插件的线程 ID 调用会返回「规划线程不属于该插件」，内置线程（`pluginOwner` 为空）同样如此。`planner.get`/`threads`/`models` 不受此限制，插件仍能看到列表里的每个线程。
@@ -354,17 +363,19 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/enhance/v1/plugin-runtime/{action}` | 插件动作。body `{token, params}`；**由令牌决定插件身份**，URL 不能命名插件。 |
-| GET | `/enhance/v1/plugins/{id}/assets/{file}` | 加载插件自己的 ES module。只服务已启用插件、只允许插件目录内文件。 |
+| GET | `/enhance/v1/plugins/{id}/assets/{file}` | 加载插件自己的 ES module（`entry.renderer`、`entry.settings`）及 `assets/` 目录下的静态文件。只服务已启用插件，拒绝路径穿越与符号链接。 |
 | POST | `/enhance/v1/plugins/{id}/token` | 取得该插件的身份令牌（同一令牌），供窗口打开前已启用的插件使用。 |
 
 管理界面使用：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/enhance/v1/plugins` | 列表，含 `safeMode`、`hostVersion`、`apiVersion`。 |
+| GET | `/enhance/v1/plugins` | 列表，含 `safeMode`、`hostVersion`、`apiVersion`、结构化上游信息与 `hasNotice`。 |
 | GET | `/enhance/v1/plugins/health` | 汇总。 |
-| GET | `/enhance/v1/plugins/{id}` | 单个插件。 |
-| POST | `/enhance/v1/plugins/install` | body `{root, capabilities?}`，安装本地文件夹或 zip。 |
+| GET | `/enhance/v1/plugins/{id}` | 单个插件详情。 |
+| GET | `/enhance/v1/plugins/{id}/legal` | 读取插件目录内的 `LICENSE` 与 `NOTICE`/`NOTICE.md` 及上游元数据；插件停用时也可读取。 |
+| POST | `/enhance/v1/plugins/preview` | body `{root}`，校验本地目录或 zip，返回清单、上游、高权限能力和暂存内容的 `packageDigest`，不安装插件。 |
+| POST | `/enhance/v1/plugins/install` | body `{root, packageDigest, capabilities, confirmPrivileged?}`，安装本地文件夹或 zip。`packageDigest` 必须来自该包的预览。包改变时返回 `409 PLUGIN_PACKAGE_CHANGED`，需重新预览并确认授权。授予高权限能力时需传 `confirmPrivileged: true`。 |
 | POST | `/enhance/v1/plugins/{id}/enable` | 启用，响应含 `token`。 |
 | POST | `/enhance/v1/plugins/{id}/disable` | 停用并撤销令牌。 |
 | POST | `/enhance/v1/plugins/{id}/uninstall` | 卸载并写墓碑。 |
@@ -413,13 +424,81 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 - 入口与页面：`ui:sidebar-nav` 在左侧栏“新建会话”下方注入“定时任务”，点击在主聊天区（`ui:main-area` `mode: "page"`）打开任务与运行记录页；`ui:entry` 在会话信息与右侧面板提供当前会话绑定的任务视图。
 - 调度与安全：支持单次、预设、每日多时刻和自定义间隔/周几，错过运行默认合并补跑一次（可改为跳过）；支持新开会话与绑定会话投递；无人值守出现审批请求时不自动批准，标记为“等待批准”并保留未读提醒；卸载时可选择保留或一并删除已创建的任务数据。
 
-## 示例
+## 示例与第三方快速起步
+
+### 基础示例（v1：`plugins/example-hello/`）
 
 `plugins/example-hello/` 不再预装在发布二进制中，只作为第三方开发模板保留在仓库里。它包含最简结构：侧栏一行文字 + 一个设置子页 + 使用私有存储记录启用次数，可直接复制改名开发自己的插件。
 
-如需在 KimiCode+ 中加载它，打开设置里的「插件 → 安装本地插件」，选择 `plugins/example-hello/` 目录（或先打成 `.zip`），在权限确认弹层中核对 `ui:sidebar`、`ui:settings`、`storage` 后完成安装，再手动启用。已安装过旧版示例插件的用户在升级后不会被自动卸载；卸载后「恢复预装插件」不会再恢复它。
+如需在 KimiCode+ 中加载它，打开设置里的「KimiCode+ → 增强插件 → 安装本地增强插件」，点击「选择文件夹」选中 `plugins/example-hello/`（或打成 `.zip` 后选包），在权限确认弹层中核对 `ui:sidebar`、`ui:settings`、`storage` 后完成安装，再手动启用。
 
-`plugins/kct/` 是完整示例（移植自 MIT 许可的 `kimi-cot-translate`）：装饰思考块、分段与码块保护、三种翻译服务、`credentials:` 注入与私有存储缓存。它同时演示了「插件被宿主门禁拦住」的场景：独立版 KCT 的后台加载器仍在时，它的启用会被核心以 `PLUGIN_MIGRATION_REQUIRED` 拒绝。
+### 扩展挂载示例（v2：左侧栏导航 + 主区页面 + 右侧面板）
+
+第三方插件声明 `"apiVersion": 2` 后，可以直接使用全部开放挂载点：
+
+```json
+{
+  "id": "yourname.my-workbench",
+  "name": "我的工作台",
+  "version": "1.0.0",
+  "apiVersion": 2,
+  "description": "在左侧栏增加一级入口，并在主区和右侧面板打开自定义工具。",
+  "author": "yourname",
+  "license": "MIT",
+  "hostVersions": ["1.*"],
+  "entry": { "renderer": "renderer.js" },
+  "capabilities": ["ui:sidebar-nav", "ui:main-area", "ui:right-panel", "ui:entry", "storage"]
+}
+```
+
+```js
+export async function activate(ctx) {
+  let pageHandle = null;
+
+  // 1. 在左侧栏「新建会话」下方挂一级导航，点击打开主区整页
+  const nav = ctx.sidebarNav?.add({
+    id: "workbench",
+    title: "我的工作台",
+    open() {
+      pageHandle?.dispose();
+      pageHandle = ctx.mainArea?.mount({
+        mode: "page",
+        render(el) {
+          el.innerHTML = `<div style="padding:24px"><h2>我的工作台</h2><p>第三方 v2 插件主区页面已挂载。</p></div>`;
+          return () => { el.textContent = ""; };
+        },
+      }) ?? null;
+    },
+  });
+
+  // 2. 在右侧面板挂独立标签页，并在会话信息 / 右侧 + 菜单添加入口
+  const panel = ctx.rightPanel?.mount({
+    title: "快捷工具",
+    render(el) {
+      el.innerHTML = `<div style="padding:16px">右侧面板内容</div>`;
+      return () => { el.textContent = ""; };
+    },
+  });
+  const entry = ctx.entry?.add({
+    id: "quick-tool",
+    title: "快捷工具",
+    open: () => panel?.open(),
+  });
+
+  ctx.onDispose(() => {
+    entry?.dispose();
+    panel?.dispose();
+    pageHandle?.dispose();
+    nav?.dispose();
+  });
+}
+```
+
+安装时在权限确认界面勾选对应能力并确认高权限风险提示，启用即可生效。
+
+### 预装适配示例（`plugins/kct/`）
+
+`plugins/kct/` 是完整 v1 适配示例（移植自 MIT 许可的 `https://github.com/wssz527/kimi-cot-translate`）：装饰思考块、分段与码块保护、三种翻译服务、`credentials:` 注入与私有存储缓存。它同时演示了「插件被宿主门禁拦住」的场景：独立版 KCT 的后台加载器仍在时，它的启用会被核心以 `PLUGIN_MIGRATION_REQUIRED` 拒绝。
 
 构建与验证：
 

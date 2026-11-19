@@ -30,7 +30,7 @@ const (
 )
 
 // stageRoot is <dataDir>/staged/<id>, deliberately outside the plugin's install
-// directory: the official allowlist hashes that directory's contents, so a
+// directory: the integrity check hashes that directory's contents, so a
 // temporary file inside it would invalidate every privileged call, and the asset
 // route would serve it. A manager with no data directory cannot stage at all,
 // because a shared temporary directory would expose one plugin's dropped bytes

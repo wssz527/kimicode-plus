@@ -106,9 +106,16 @@ func TestModulesShareOneMuxAndStorage(t *testing.T) {
 	if err = os.WriteFile(filepath.Join(root, "LICENSE"), []byte("MIT\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	pluginPreview := httptest.NewRecorder()
+	previewBody, _ := json.Marshal(map[string]string{"root": root})
+	mux.ServeHTTP(pluginPreview, httptest.NewRequest(http.MethodPost, "/enhance/v1/plugins/preview", strings.NewReader(string(previewBody))))
+	var pkg plugins.PackagePreview
+	if pluginPreview.Code != http.StatusOK || json.Unmarshal(pluginPreview.Body.Bytes(), &pkg) != nil || pkg.PackageDigest == "" {
+		t.Fatalf("plugin preview => %d %s", pluginPreview.Code, pluginPreview.Body.String())
+	}
 	install := httptest.NewRecorder()
-	// The user confirmed the manifest's own capability list after the preview.
-	mux.ServeHTTP(install, httptest.NewRequest(http.MethodPost, "/enhance/v1/plugins/install", strings.NewReader(`{"root":"`+root+`","capabilities":["ui:sidebar"]}`)))
+	installBody, _ := json.Marshal(plugins.InstallRequest{Root: root, PackageDigest: pkg.PackageDigest, Capabilities: &pkg.Capabilities})
+	mux.ServeHTTP(install, httptest.NewRequest(http.MethodPost, "/enhance/v1/plugins/install", strings.NewReader(string(installBody))))
 	if install.Code != http.StatusCreated {
 		t.Fatalf("install => %d %s", install.Code, install.Body.String())
 	}

@@ -6,11 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 )
 
@@ -24,10 +24,11 @@ const APIVersion = 2
 const ManifestLimit = 64 << 10
 
 var (
-	idPattern      = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}\.[a-z0-9][a-z0-9-]{0,31}$`)
-	versionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
-	hostPattern    = regexp.MustCompile(`^[0-9]+(\.[0-9]+){0,2}$|^[0-9]+(\.[0-9]+){0,1}\.\*$`)
-	entryPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`)
+	idPattern           = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}\.[a-z0-9][a-z0-9-]{0,31}$`)
+	versionPattern      = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+	hostPattern         = regexp.MustCompile(`^[0-9]+(\.[0-9]+){0,2}$|^[0-9]+(\.[0-9]+){0,1}\.\*$`)
+	upstreamRepoPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`)
+	entryPattern        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`)
 )
 
 // Entry names the ES modules the host loads. Both are relative to the plugin
@@ -43,6 +44,39 @@ type Upstream struct {
 	Repo    string `json:"repo,omitempty"`
 	Commit  string `json:"commit,omitempty"`
 	License string `json:"license,omitempty"`
+}
+
+type PluginUpstream struct {
+	UpstreamRepo    string `json:"upstreamRepo,omitempty"`
+	UpstreamURL     string `json:"upstreamUrl,omitempty"`
+	UpstreamCommit  string `json:"upstreamCommit,omitempty"`
+	UpstreamLicense string `json:"upstreamLicense,omitempty"`
+}
+
+func (m Manifest) upstreamMetadata() PluginUpstream {
+	if m.Upstream == nil {
+		return PluginUpstream{}
+	}
+	return PluginUpstream{
+		UpstreamRepo: m.Upstream.Repo, UpstreamURL: normalizeUpstreamURL(m.Upstream.Repo),
+		UpstreamCommit: m.Upstream.Commit, UpstreamLicense: m.Upstream.License,
+	}
+}
+
+func normalizeUpstreamURL(repo string) string {
+	if upstreamRepoPattern.MatchString(repo) {
+		owner, name, _ := strings.Cut(repo, "/")
+		if owner != "." && owner != ".." && name != "." && name != ".." {
+			return "https://github.com/" + repo
+		}
+		return ""
+	}
+	u, err := url.Parse(repo)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.Hostname() == "" {
+		return ""
+	}
+	u.Host = strings.ToLower(u.Host)
+	return u.String()
 }
 
 // Manifest is plugin.json. Unknown fields are refused by the parser: a typo in
@@ -224,9 +258,8 @@ func (m Manifest) CapabilityGrants() (Grants, error) {
 // CapabilityNames returns the manifest capabilities in a stable order so the
 // consent prompt and the stored grant do not churn between reads.
 func (m Manifest) CapabilityNames() []string {
-	names := append([]string(nil), m.Capabilities...)
-	sort.Strings(names)
-	return names
+	grants, _ := m.CapabilityGrants()
+	return grants.Names()
 }
 
 // DataDirName is the on-disk directory name under <dataDir>/plugins. The id is

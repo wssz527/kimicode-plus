@@ -3,6 +3,8 @@ package plugins
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,98 +38,132 @@ const (
 // nothing", which would otherwise be indistinguishable from an omitted field and
 // would silently grant everything the manifest asks for.
 type InstallRequest struct {
-	Root         string    `json:"root"`
-	Capabilities *[]string `json:"capabilities"`
+	Root              string    `json:"root"`
+	PackageDigest     string    `json:"packageDigest"`
+	Capabilities      *[]string `json:"capabilities"`
+	ConfirmPrivileged bool      `json:"confirmPrivileged,omitempty"`
 }
 
 // PackagePreview is what the plugin page shows before asking for consent. It
 // validates the package and reports the declared capabilities without installing
 // anything, so a user decides from what the plugin actually asked for.
 type PackagePreview struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	Version      string   `json:"version"`
-	Description  string   `json:"description,omitempty"`
-	Author       string   `json:"author,omitempty"`
-	License      string   `json:"license,omitempty"`
-	HostVersions []string `json:"hostVersions"`
-	Capabilities []string `json:"capabilities"`
-	Compatible   bool     `json:"compatible"`
-	Installed    bool     `json:"installed"`
-	Source       string   `json:"source"`
-	Upstream     string   `json:"upstream,omitempty"`
+	PlatformLimitations    []PlatformLimitation `json:"platformLimitations,omitempty"`
+	PackageDigest          string               `json:"packageDigest"`
+	ID                     string               `json:"id"`
+	Name                   string               `json:"name"`
+	Version                string               `json:"version"`
+	Description            string               `json:"description,omitempty"`
+	Author                 string               `json:"author,omitempty"`
+	License                string               `json:"license,omitempty"`
+	HostVersions           []string             `json:"hostVersions"`
+	Capabilities           []string             `json:"capabilities"`
+	Compatible             bool                 `json:"compatible"`
+	Installed              bool                 `json:"installed"`
+	Source                 string               `json:"source"`
+	Upstream               string               `json:"upstream,omitempty"`
+	APIVersion             int                  `json:"apiVersion"`
+	PrivilegedCapabilities []string             `json:"privilegedCapabilities,omitempty"`
+	HasNotice              bool                 `json:"hasNotice,omitempty"`
+	PluginUpstream
 }
 
 // Preview validates a package exactly as Install would, but writes nothing.
 func (m *Manager) Preview(ctx context.Context, root string) (PackagePreview, error) {
-	manifest, data, err := m.inspectPackage(root)
+	staging, err := m.preparePackage(root)
 	if err != nil {
 		return PackagePreview{}, err
 	}
-	_ = data
-	_, installed := m.Get(manifest.ID)
+	defer os.RemoveAll(staging.dir)
+	if err := staging.validate(); err != nil {
+		return PackagePreview{}, err
+	}
+	staging.digest, err = DirDigest(staging.pluginDir())
+	if err != nil {
+		return PackagePreview{}, apiError(http.StatusBadRequest, "PLUGIN_PACKAGE_INVALID", redact.Text(err.Error()))
+	}
+	manifest := staging.manifest
+	m.mu.Lock()
+	_, installed := m.entries[manifest.ID]
+	compatible := m.compatible(manifest)
+	m.mu.Unlock()
+	capabilities := manifest.CapabilityNames()
 	return PackagePreview{
-		ID:           manifest.ID,
-		Name:         manifest.Name,
-		Version:      manifest.Version,
-		Description:  manifest.Description,
-		Author:       manifest.Author,
-		License:      manifest.License,
-		HostVersions: manifest.HostVersions,
-		Capabilities: manifest.CapabilityNames(),
-		Compatible:   m.compatible(manifest),
-		Installed:    installed,
-		Source:       SourceLocal,
-		Upstream:     upstreamLabel(manifest),
+		PackageDigest: staging.digest, ID: manifest.ID, Name: manifest.Name, Version: manifest.Version,
+		Description: manifest.Description, Author: manifest.Author, License: manifest.License,
+		HostVersions: manifest.HostVersions, APIVersion: manifest.APIVersion,
+		Capabilities: capabilities, PrivilegedCapabilities: privilegedNames(capabilities),
+		PlatformLimitations: pluginPlatformLimitations(m.platform, capabilities),
+		Compatible:          compatible, Installed: installed, Source: SourceLocal,
+		Upstream: upstreamLabel(manifest), PluginUpstream: manifest.upstreamMetadata(),
+		HasNotice: hasNotice(staging.pluginDir()),
 	}, nil
 }
 
-// inspectPackage copies a package into a staging directory and validates it,
-// returning the parsed manifest and the raw manifest bytes. The staging directory
-// is removed before returning, so a preview leaves no trace.
-func (m *Manager) inspectPackage(root string) (Manifest, []byte, error) {
+type stagedPackage struct {
+	dir      string
+	manifest Manifest
+	data     []byte
+	digest   string
+}
+
+func (p stagedPackage) pluginDir() string { return filepath.Join(p.dir, "plugin") }
+
+func (m *Manager) preparePackage(root string) (_ stagedPackage, resultErr error) {
 	root = strings.TrimSpace(root)
 	if root == "" {
-		return Manifest{}, nil, apiError(http.StatusBadRequest, "PLUGIN_SOURCE_REQUIRED", "请选择插件文件夹或 zip")
+		return stagedPackage{}, apiError(http.StatusBadRequest, "PLUGIN_SOURCE_REQUIRED", "请选择插件文件夹或 zip")
 	}
 	info, err := os.Stat(root)
 	if err != nil {
-		return Manifest{}, nil, apiError(http.StatusBadRequest, "PLUGIN_SOURCE_MISSING", "插件来源不存在或无法读取")
+		return stagedPackage{}, apiError(http.StatusBadRequest, "PLUGIN_SOURCE_MISSING", "插件来源不存在或无法读取")
 	}
 	parent := m.dataDir
 	if parent == "" {
 		parent = os.TempDir()
 	}
-	staging, err := os.MkdirTemp(parent, ".plugin-inspect-*")
+	staging, err := os.MkdirTemp(parent, ".plugin-package-*")
 	if err != nil {
-		return Manifest{}, nil, apiError(http.StatusInternalServerError, "PLUGIN_STORAGE_UNAVAILABLE", "无法准备检查目录")
+		return stagedPackage{}, apiError(http.StatusInternalServerError, "PLUGIN_STORAGE_UNAVAILABLE", "无法准备插件暂存目录")
 	}
-	defer os.RemoveAll(staging)
-	extracted := filepath.Join(staging, "plugin")
+	defer func() {
+		if resultErr != nil {
+			_ = os.RemoveAll(staging)
+		}
+	}()
+	pkg := stagedPackage{dir: staging}
 	if info.IsDir() {
-		err = copyTree(root, extracted)
+		err = copyTree(root, pkg.pluginDir())
 	} else {
-		err = extractZip(root, extracted)
+		err = extractZip(root, pkg.pluginDir())
 	}
 	if err != nil {
 		var pluginErr *Error
 		if errors.As(err, &pluginErr) {
-			return Manifest{}, nil, pluginErr
+			return stagedPackage{}, pluginErr
 		}
-		return Manifest{}, nil, apiError(http.StatusBadRequest, "PLUGIN_PACKAGE_INVALID", redact.Text(err.Error()))
+		return stagedPackage{}, apiError(http.StatusBadRequest, "PLUGIN_PACKAGE_INVALID", redact.Text(err.Error()))
 	}
-	data, err := os.ReadFile(filepath.Join(extracted, "plugin.json"))
+	return pkg, nil
+}
+
+func (pkg *stagedPackage) validate() (err error) {
+	pkg.data, err = os.ReadFile(filepath.Join(pkg.pluginDir(), "plugin.json"))
 	if err != nil {
-		return Manifest{}, nil, apiError(http.StatusBadRequest, "PLUGIN_MANIFEST_MISSING", "插件包缺少 plugin.json")
+		return apiError(http.StatusBadRequest, "PLUGIN_MANIFEST_MISSING", "插件包缺少 plugin.json")
 	}
-	manifest, err := ParseManifest(data)
+	pkg.manifest, err = ParseManifest(pkg.data)
 	if err != nil {
-		return Manifest{}, nil, apiError(http.StatusBadRequest, "PLUGIN_MANIFEST_INVALID", redact.Text(err.Error()))
+		return apiError(http.StatusBadRequest, "PLUGIN_MANIFEST_INVALID", redact.Text(err.Error()))
 	}
-	if err = manifest.ValidateFiles(extracted); err != nil {
-		return Manifest{}, nil, apiError(http.StatusBadRequest, "PLUGIN_FILES_INVALID", redact.Text(err.Error()))
+	if err = pkg.manifest.ValidateFiles(pkg.pluginDir()); err != nil {
+		return apiError(http.StatusBadRequest, "PLUGIN_FILES_INVALID", redact.Text(err.Error()))
 	}
-	return manifest, data, nil
+	return nil
+}
+
+func packageChanged() error {
+	return apiError(http.StatusConflict, "PLUGIN_PACKAGE_CHANGED", "插件包在预览后发生了变化，请重新预览")
 }
 
 // Install copies a plugin folder or zip into <dataDir>/plugins/<id>, validates
@@ -142,105 +178,131 @@ func (m *Manager) Install(ctx context.Context, request InstallRequest) (Plugin, 
 	if request.Capabilities == nil {
 		return Plugin{}, apiError(http.StatusBadRequest, "PLUGIN_CONSENT_REQUIRED", "安装前需要先查看并确认插件申请的能力")
 	}
+	digest, err := hex.DecodeString(request.PackageDigest)
+	if err != nil || len(digest) != sha256.Size {
+		return Plugin{}, apiError(http.StatusBadRequest, "PLUGIN_PACKAGE_DIGEST_REQUIRED", "安装前需要先预览插件包")
+	}
 	if m.pluginsDir() == "" {
 		return Plugin{}, apiError(http.StatusConflict, "PLUGIN_STORAGE_UNAVAILABLE", "没有可用的数据目录，无法安装插件")
 	}
-	manifest, data, err := m.inspectPackage(request.Root)
-	if err != nil {
-		return Plugin{}, err
-	}
-	// A local install is never official. Refusing the privileged names at consent
-	// time is clearer than storing a grant the action gate would refuse anyway,
-	// and it keeps a mistaken "granted" row out of the plugin page.
-	for _, name := range *request.Capabilities {
-		if RequiresPrivilege(strings.TrimSpace(name)) {
-			return Plugin{}, apiError(http.StatusForbidden, "PLUGIN_CAPABILITY_PRIVILEGED", "高权限能力只授予官方预装插件，不能授予本地插件")
-		}
-	}
-	grants, err := m.resolveGrants(manifest, *request.Capabilities)
-	if err != nil {
-		return Plugin{}, err
-	}
-	// The validated copy is re-created here because inspectPackage removed its
-	// staging directory; installing from the same source keeps one validation
-	// rule instead of two slightly different copies of it.
-	source, err := os.Stat(strings.TrimSpace(request.Root))
-	if err != nil {
-		return Plugin{}, apiError(http.StatusBadRequest, "PLUGIN_SOURCE_MISSING", "插件来源不存在或无法读取")
-	}
-	staging, err := os.MkdirTemp(m.dataDir, ".plugin-install-*")
-	if err != nil {
-		return Plugin{}, apiError(http.StatusInternalServerError, "PLUGIN_STORAGE_UNAVAILABLE", "无法准备安装目录")
-	}
-	defer os.RemoveAll(staging)
-	extracted := filepath.Join(staging, "plugin")
-	if source.IsDir() {
-		err = copyTree(strings.TrimSpace(request.Root), extracted)
-	} else {
-		err = extractZip(strings.TrimSpace(request.Root), extracted)
-	}
+	pkg, err := m.preparePackage(request.Root)
 	if err != nil {
 		var pluginErr *Error
-		if errors.As(err, &pluginErr) {
-			return Plugin{}, pluginErr
+		if errors.As(err, &pluginErr) && pluginErr.Status == http.StatusBadRequest && pluginErr.Code != "PLUGIN_SOURCE_REQUIRED" {
+			return Plugin{}, packageChanged()
 		}
-		return Plugin{}, apiError(http.StatusBadRequest, "PLUGIN_PACKAGE_INVALID", redact.Text(err.Error()))
+		return Plugin{}, err
 	}
-	if err = manifest.ValidateFiles(extracted); err != nil {
-		return Plugin{}, apiError(http.StatusBadRequest, "PLUGIN_FILES_INVALID", redact.Text(err.Error()))
+	defer os.RemoveAll(pkg.dir)
+	pkg.digest, err = DirDigest(pkg.pluginDir())
+	if err != nil || pkg.digest != strings.ToLower(request.PackageDigest) {
+		return Plugin{}, packageChanged()
 	}
+	if err := pkg.validate(); err != nil {
+		return Plugin{}, err
+	}
+	if !request.ConfirmPrivileged {
+		for _, name := range *request.Capabilities {
+			if RequiresPrivilege(strings.TrimSpace(name)) {
+				return Plugin{}, apiError(http.StatusBadRequest, "PLUGIN_PRIVILEGED_CONFIRM_REQUIRED", "授予高权限能力前需要明确确认风险")
+			}
+		}
+	}
+	grants, err := m.resolveGrants(pkg.manifest, *request.Capabilities)
+	if err != nil {
+		return Plugin{}, err
+	}
+	item, host, err := m.commitLocalInstall(ctx, pkg, grants)
+	if err != nil {
+		return Plugin{}, err
+	}
+	_ = recordActivity(ctx, m.db, item.manifest.ID, ActivityInstall, "已从本地安装 "+item.manifest.Name+" "+item.manifest.Version, item.installed)
+	m.notifyChange()
+	return m.present(item, host), nil
+}
 
+func (m *Manager) commitLocalInstall(ctx context.Context, pkg stagedPackage, grants Grants) (entry, string, error) {
+	m.installMu.Lock()
+	defer m.installMu.Unlock()
+	manifest := pkg.manifest
 	target := filepath.Join(m.pluginsDir(), manifest.DataDirName())
-	if err = os.MkdirAll(m.pluginsDir(), 0o700); err != nil {
-		return Plugin{}, apiError(http.StatusInternalServerError, "PLUGIN_STORAGE_UNAVAILABLE", "无法创建插件目录")
+	if err := os.MkdirAll(m.pluginsDir(), 0o700); err != nil {
+		return entry{}, "", apiError(http.StatusInternalServerError, "PLUGIN_STORAGE_UNAVAILABLE", "无法创建插件目录")
 	}
-	// Replacing a running plugin must stop it first: the old files are about to
-	// disappear from under its renderer.
 	if m.enabled(manifest.ID) {
-		_ = m.Disable(ctx, manifest.ID)
+		if err := m.Disable(ctx, manifest.ID); err != nil {
+			return entry{}, "", err
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return entry{}, "", m.closedError()
+	}
+	if item := m.entries[manifest.ID]; item != nil && item.state == StateEnabled {
+		return entry{}, "", apiError(http.StatusConflict, "PLUGIN_INSTALL_FAILED", "插件正在运行，请先停用后重试安装")
 	}
 	backup := ""
-	if _, err = os.Stat(target); err == nil {
+	if _, err := os.Lstat(target); err == nil {
 		backup = target + ".previous"
-		_ = os.RemoveAll(backup)
-		if err = os.Rename(target, backup); err != nil {
-			return Plugin{}, apiError(http.StatusInternalServerError, "PLUGIN_INSTALL_FAILED", "无法替换现有插件文件")
+		if err := os.RemoveAll(backup); err != nil {
+			return entry{}, "", apiError(http.StatusInternalServerError, "PLUGIN_INSTALL_FAILED", "无法清理上次安装的备份")
 		}
+		if err := os.Rename(target, backup); err != nil {
+			return entry{}, "", apiError(http.StatusInternalServerError, "PLUGIN_INSTALL_FAILED", "无法替换现有插件文件")
+		}
+	} else if !os.IsNotExist(err) {
+		return entry{}, "", apiError(http.StatusInternalServerError, "PLUGIN_INSTALL_FAILED", "无法检查现有插件文件")
 	}
-	if err = os.Rename(extracted, target); err != nil {
+	if err := os.Rename(pkg.pluginDir(), target); err != nil {
 		if backup != "" {
 			_ = os.Rename(backup, target)
 		}
-		return Plugin{}, apiError(http.StatusInternalServerError, "PLUGIN_INSTALL_FAILED", "无法写入插件文件，原插件已保留")
+		return entry{}, "", apiError(http.StatusInternalServerError, "PLUGIN_INSTALL_FAILED", "无法写入插件文件")
 	}
-	if backup != "" {
-		_ = os.RemoveAll(backup)
+	digest, err := DirDigest(target)
+	if err != nil {
+		restoreLocalInstall(target, backup)
+		return entry{}, "", apiError(http.StatusInternalServerError, "PLUGIN_INSTALL_FAILED", "无法校验安装后的插件文件")
+	}
+
+	if digest != pkg.digest {
+		restoreLocalInstall(target, backup)
+		return entry{}, "", packageChanged()
 	}
 
 	now := m.now()
-	item := &entry{
+	item := entry{
 		manifest: manifest, grants: grants, declared: manifest.CapabilityNames(),
-		source: SourceLocal, dir: target, state: StateDisabled, updated: now, installed: now,
+		source: SourceLocal, dir: target, installDigest: digest, state: StateDisabled, updated: now, installed: now,
 	}
 	stored := record{
 		id: manifest.ID, name: manifest.Name, version: manifest.Version,
-		manifest: data, capabilities: grants.Names(), source: SourceLocal,
+		manifest: pkg.data, capabilities: grants.Names(), source: SourceLocal, installDigest: digest,
 		state: StateDisabled, installedAt: now, updatedAt: now,
 	}
-	if err = saveRecord(ctx, m.db, stored); err != nil {
-		return Plugin{}, apiError(http.StatusInternalServerError, "PLUGIN_STATE_UNAVAILABLE", "插件已复制，但状态未能保存")
+	if err := saveRecord(ctx, m.db, stored); err != nil {
+		restoreLocalInstall(target, backup)
+		return entry{}, "", apiError(http.StatusInternalServerError, "PLUGIN_STATE_UNAVAILABLE", "无法保存插件安装状态")
 	}
-	m.mu.Lock()
-	m.entries[manifest.ID] = item
+	if backup != "" {
+		if err := os.RemoveAll(backup); err != nil {
+			_ = recordActivity(ctx, m.db, manifest.ID, ActivityError, "旧插件备份未能清理："+redact.Text(err.Error()), now)
+		}
+	}
+	m.entries[manifest.ID] = &item
 	if !contains(m.order, manifest.ID) {
 		m.order = append(m.order, manifest.ID)
 		sortStrings(m.order)
 	}
-	plugin := m.presentLocked(item)
-	m.mu.Unlock()
-	_ = recordActivity(ctx, m.db, manifest.ID, ActivityInstall, "已从本地安装 "+manifest.Name+" "+manifest.Version, now)
-	m.notifyChange()
-	return plugin, nil
+	return item, m.host, nil
+}
+
+func restoreLocalInstall(target, backup string) {
+	_ = os.RemoveAll(target)
+	if backup != "" {
+		_ = os.Rename(backup, target)
+	}
 }
 
 func sortStrings(list []string) {
@@ -422,6 +484,9 @@ func (m *Manager) ReleaseBundled(ctx context.Context, bundled map[string]map[str
 		if tombstones[id] {
 			continue
 		}
+		m.mu.Lock()
+		local := m.entries[id] != nil && m.entries[id].source == SourceLocal
+		m.mu.Unlock()
 		manifest, err := bundledManifest(id, files)
 		if err != nil {
 			return err
@@ -436,6 +501,9 @@ func (m *Manager) ReleaseBundled(ctx context.Context, bundled map[string]map[str
 		if targetExists {
 			existing, versionErr := readInstalledVersion(target)
 			if versionErr != nil {
+				if local {
+					continue
+				}
 				// A directory the core cannot read is the user's to inspect, not
 				// ours to overwrite: it is marked corrupt and left in place.
 				if err = m.adopt(ctx, id, target, SourceBundled); err != nil {
@@ -444,6 +512,9 @@ func (m *Manager) ReleaseBundled(ctx context.Context, bundled map[string]map[str
 				continue
 			}
 			if !newerVersion(manifest.Version, existing) {
+				if local {
+					continue
+				}
 				if err = m.adopt(ctx, id, target, SourceBundled); err != nil {
 					return err
 				}
@@ -649,7 +720,11 @@ func (m *Manager) adopt(ctx context.Context, id, dir, source string) error {
 		return m.markCorrupt(ctx, id, dir, source, err.Error())
 	}
 	desired := false
+	var installDigest string
 	if persisted != nil {
+		if source == SourceLocal && persisted.source == source {
+			installDigest = persisted.installDigest
+		}
 		if stored, storedErr := ParseCapabilities(persisted.capabilities); storedErr == nil {
 			grants = stored
 		}
@@ -664,12 +739,9 @@ func (m *Manager) adopt(ctx context.Context, id, dir, source string) error {
 		return nil
 	}
 	now := m.now()
-	// The digest is computed before taking the lock: it reads the directory, and
-	// holding m.mu across file I/O would stall every other plugin operation.
-	official := m.officialFor(manifest, dir, source)
 	item := &entry{
 		manifest: manifest, grants: grants, declared: manifest.CapabilityNames(),
-		source: source, dir: dir, official: official, state: StateDisabled, enabled: desired,
+		source: source, dir: dir, installDigest: installDigest, state: StateDisabled, enabled: desired,
 		forced:  desired && !m.compatible(manifest),
 		updated: now, installed: now,
 	}
@@ -695,7 +767,7 @@ func (m *Manager) adopt(ctx context.Context, id, dir, source string) error {
 
 	stored := record{
 		id: manifest.ID, name: manifest.Name, version: manifest.Version,
-		manifest: data, capabilities: grants.Names(), source: source,
+		manifest: data, capabilities: grants.Names(), source: source, installDigest: installDigest,
 		desired: item.state == StateEnabled, state: item.state, err: item.errText,
 		installedAt: item.installed, updatedAt: now,
 	}
@@ -727,7 +799,9 @@ func (m *Manager) markCorrupt(ctx context.Context, id, dir, source, reason strin
 	desired := false
 	capabilities := []string{}
 	var grants Grants
-	if persistedErr == nil && persisted != nil {
+	var installDigest string
+	if persistedErr == nil && persisted != nil && persisted.source == source {
+		installDigest = persisted.installDigest
 		desired = persisted.desired
 		capabilities = persisted.capabilities
 		if parsed, parseErr := ParseCapabilities(persisted.capabilities); parseErr == nil {
@@ -749,6 +823,7 @@ func (m *Manager) markCorrupt(ctx context.Context, id, dir, source, reason strin
 		}
 	}
 	item.grants = grants
+	item.installDigest = installDigest
 	item.state = StateCorrupt
 	item.enabled = desired
 	item.errText = message
@@ -758,7 +833,7 @@ func (m *Manager) markCorrupt(ctx context.Context, id, dir, source, reason strin
 	m.mu.Unlock()
 	_ = saveRecord(ctx, m.db, record{
 		id: id, name: id, version: "0.0.0", manifest: mustJSON(map[string]any{"id": id}), capabilities: capabilities,
-		source: source, desired: desired, state: StateCorrupt, err: message, installedAt: now, updatedAt: now,
+		source: source, installDigest: installDigest, desired: desired, state: StateCorrupt, err: message, installedAt: now, updatedAt: now,
 	})
 	_ = recordActivity(ctx, m.db, id, ActivityCorrupt, "插件异常已停用："+message, now)
 	return nil

@@ -25,10 +25,8 @@ const (
 	capNetPrefix     = "net:"
 	capCredentialPre = "credentials:"
 
-	// API v2 capabilities. Every one of them is privileged: it is granted only to
-	// an official bundled plugin whose installed content still matches the digest
-	// compiled into this binary. They are listed separately so the v1 consent
-	// path and the v2 privilege gate cannot drift apart.
+	// API v2 capabilities require verified installed content. Local installs
+	// additionally require explicit consent to the privilege.
 	CapUIEntry         = "ui:entry"
 	CapUISidebarNav    = "ui:sidebar-nav"
 	CapUIMainArea      = "ui:main-area"
@@ -56,14 +54,27 @@ var privilegedCapabilities = []string{
 	CapScheduleManage,
 }
 
-// RequiresPrivilege reports whether a capability belongs to the v2 set that is
-// reserved for official bundled plugins.
+// RequiresPrivilege reports whether a capability requires v2 integrity checks.
 func RequiresPrivilege(name string) bool { return contains(privilegedCapabilities, name) }
 
-// uiCapabilities are the mount points a plugin may ask for. Each one is checked
-// twice: the renderer will not mount an ungranted slot, and this list is what
-// the consent prompt shows.
-var uiCapabilities = []string{CapUISidebar, CapUISettings, CapUIThinking, CapUIMessage}
+func privilegedNames(names []string) []string {
+	var privileged []string
+	for _, name := range names {
+		if RequiresPrivilege(name) {
+			privileged = append(privileged, name)
+		}
+	}
+	return privileged
+}
+
+func (g Grants) hasPrivileged() bool {
+	for _, name := range privilegedCapabilities {
+		if g.Has(name) {
+			return true
+		}
+	}
+	return false
+}
 
 // fixedCapabilities is every capability with no parameter. Anything else must
 // carry a parameter behind a documented prefix.
@@ -416,8 +427,7 @@ func capabilityDenied(action, capability string) error {
 }
 
 // WithoutPrivileged drops every v2 capability. The stored grant is the user's
-// decision, but a plugin that is not an intact official bundle must never see
-// those names in its runtime identity.
+// decision. Runtime identity advertises these names only after integrity checks.
 func (g Grants) WithoutPrivileged() Grants {
 	out := Grants{fixed: make(map[string]bool), hosts: append([]string(nil), g.hosts...), credentials: append([]string(nil), g.credentials...)}
 	for name := range g.fixed {

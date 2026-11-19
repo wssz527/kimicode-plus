@@ -225,7 +225,21 @@ export interface Gateway {
   readOnly: boolean;
 }
 
-export interface PluginRecord {
+export interface PluginUpstream {
+  upstreamRepo?: string;
+  upstreamUrl?: string;
+  upstreamCommit?: string;
+  upstreamLicense?: string;
+}
+
+export interface PluginPlatformLimitation {
+  feature: "browser.view" | "window.popout" | "entry.nativeOverlay";
+  capability: string;
+  message: string;
+}
+
+export interface PluginRecord extends PluginUpstream {
+  platformLimitations?: PluginPlatformLimitation[];
   id: string;
   name: string;
   version?: string;
@@ -237,11 +251,15 @@ export interface PluginRecord {
   enabled?: boolean;
   error?: string;
   capabilities?: string[];
+  privilegedCapabilities?: string[];
   declaredCapabilities?: string[];
   slots?: string[];
   hostVersions?: string[];
   compatible?: boolean;
   hasSettings?: boolean;
+  apiVersion?: number;
+  official?: boolean;
+  hasNotice?: boolean;
   upstream?: string;
   installedAt?: string;
   updatedAt?: string;
@@ -256,7 +274,9 @@ export interface PluginRecord {
 }
 
 /** A validated package, before the user grants anything. Mirrors plugins.PackagePreview. */
-export interface PluginPreview {
+export interface PluginPreview extends PluginUpstream {
+  platformLimitations?: PluginPlatformLimitation[];
+  packageDigest: string;
   id: string;
   name: string;
   version: string;
@@ -265,10 +285,23 @@ export interface PluginPreview {
   license?: string;
   hostVersions: string[];
   capabilities: string[];
+  privilegedCapabilities?: string[];
+  apiVersion: number;
+  hasNotice?: boolean;
   compatible: boolean;
   installed: boolean;
   source: string;
   upstream?: string;
+}
+
+export interface PluginLegal extends Required<PluginUpstream> {
+  id: string;
+  license: string;
+  licenseText: string;
+  licenseTruncated: boolean;
+  noticeFile: string;
+  noticeText: string;
+  noticeTruncated: boolean;
 }
 
 export interface PluginActivity {
@@ -281,6 +314,7 @@ export interface PluginActivity {
 
 export interface PluginList {
   items: PluginRecord[];
+  platformLimitations?: PluginPlatformLimitation[] | null;
   total: number;
   safeMode: boolean;
   hostVersion?: string;
@@ -577,8 +611,14 @@ function pageQuery(offset = 0, limit = DEFAULT_LIMIT): Record<string, number> {
 }
 
 
+function installPlugin(root: string, packageDigest: string, capabilities: string[], confirmPrivileged?: boolean) {
+  return request<PluginRecord>("/plugins/install", { method: "POST", body: { root, packageDigest, capabilities, confirmPrivileged } });
+}
+
 export const api = {
   pair,
+  installPlugin,
+  pluginLegal: (id: string) => request<PluginLegal>(`/plugins/${encodeURIComponent(id)}/legal`),
   auth: {
     snapshot: authSnapshotValue,
     subscribe: subscribeAuth,
@@ -666,8 +706,7 @@ export const api = {
         body: options?.deleteData ? { deleteData: true } : {},
       }),
     preview: (root: string) => request<PluginPreview>("/plugins/preview", { method: "POST", body: { root } }),
-    install: (root: string, capabilities: string[]) =>
-      request<PluginRecord>("/plugins/install", { method: "POST", body: { root, capabilities } }),
+    install: installPlugin,
     restore: (id: string) => request<PluginRecord>(`/plugins/${encodeURIComponent(id)}/restore`, { method: "POST", body: {} }),
     forceEnable: (id: string) =>
       request<PluginRecord>(`/plugins/${encodeURIComponent(id)}/force-enable`, { method: "POST", body: {} }),

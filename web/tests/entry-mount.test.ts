@@ -360,3 +360,37 @@ test("mountMainAreaSurface supports split default and page full-area mode with c
   assert.equal(chatMain.dataset.ekdpPage, "");
   assert.equal(chatMain.style.display, undefined);
 });
+for (const closeOrder of [["a", "b"], ["b", "a"]] as const) {
+  test(`opening two plugin splits preserves chat when closed in order ${closeOrder.join(", ")}`, () => {
+    const document = new FakeDocument();
+    const chatMain = document.createElement("div");
+    const chat = document.createElement("div");
+    const composer = document.createElement("div");
+    const unrelated = document.createElement("div");
+    chatMain.append(chat, composer);
+    document.body.append(chatMain, unrelated);
+    chatMain.style.display = "grid";
+    const released: string[] = [];
+    const mount = (id: string) => mountMainAreaSurface({
+      document: document as unknown as Document,
+      container: chatMain as unknown as HTMLElement,
+      pluginId: id,
+      definition: { render: () => () => { released.push(id); } },
+    });
+    const a = mount("a");
+    const b = mount("b");
+    assert.deepEqual(released, ["a"]);
+    assert.equal(chatMain.querySelectorAll(".ekdp-main-split").length, 1);
+    assert.equal(chatMain.dataset.ekdpSplit, "b");
+    assert.deepEqual(chatMain.querySelector(".ekdp-main-native")!.children, [chat, composer]);
+    a.setWidth(500);
+    assert.equal(chatMain.dataset.ekdpSplit, "b");
+    closeOrder.forEach(id => ({ a, b })[id].dispose());
+    assert.deepEqual(released, ["a", "b"]);
+    assert.deepEqual(chatMain.children, [chat, composer]);
+    assert.deepEqual(document.body.children, [chatMain, unrelated]);
+    assert.equal(chatMain.querySelectorAll(".ekdp-main-split").length, 0);
+    assert.equal(chatMain.dataset.ekdpSplit, "");
+    assert.equal(chatMain.style.display, "grid");
+  });
+}

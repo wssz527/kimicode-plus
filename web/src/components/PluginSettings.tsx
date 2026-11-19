@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { api, type KctMigrationResult, type PluginActivity, type PluginPreview, type PluginRecord } from "../api";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { api, ApiError, type KctMigrationResult, type PluginActivity, type PluginPlatformLimitation, type PluginPreview, type PluginRecord, type PluginUpstream } from "../api";
 import { pluginHostBridge, syncPluginHost } from "../plugin-runtime/host";
 import type { NativeHost } from "../native";
 import { Icon } from "./Icon";
@@ -23,8 +23,17 @@ const CAPABILITY_LABELS: Record<string, { title: string; detail: string }> = {
   "ui:message": { title: "装饰消息块", detail: "可以读取并改写消息块的显示。" },
   "ui:entry": { title: "在会话信息中显示入口", detail: "在会话信息的「可打开」和右侧面板列表添加快捷入口。" },
   "ui:sidebar-nav": { title: "在左侧栏显示入口", detail: "在左侧栏「新建会话」下方添加导航入口。" },
-  "ui:main-area": { title: "在主聊天区旁打开面板", detail: "在主聊天区旁打开增强插件专属分栏界面。" },
+  "ui:main-area": { title: "在主聊天区打开界面", detail: "在主聊天区打开增强插件专属分栏或整页界面。" },
   "ui:right-panel": { title: "在右侧面板打开标签页", detail: "在右侧面板打开增强插件标签页。" },
+  "ui:layout": { title: "调整宿主布局", detail: "可为插件界面调整侧栏和面板布局。" },
+  "sessions:approve": { title: "处理会话审批", detail: "可向等待审批的会话提交批准或拒绝决定。" },
+  "sessions:abort": { title: "停止会话运行", detail: "可中断指定会话的当前运行。" },
+  "sessions:history": { title: "读取会话历史与审批记录", detail: "可翻页读取消息和审批记录。" },
+  attachments: { title: "选择和发送附件", detail: "可选择本地文件、暂存附件并将它们发送至会话。" },
+  "browser:view": { title: "控制内置浏览器视图", detail: "可在自己的浏览器视图中打开网页、导航并读取页面内容。" },
+  "planner:run": { title: "运行规划器", detail: "可创建和管理规划线程、发送提示词并处理其审批。" },
+  handoff: { title: "向会话交接内容", detail: "可把内容提交给已有会话或创建新的会话。" },
+  commands: { title: "注册和调用增强插件命令", detail: "可注册自己的命令并调用其他增强插件公开的命令。" },
   "models:read": { title: "读取可用模型列表", detail: "读取官方已配置的模型与推理强度选项。" },
   "schedule:manage": { title: "管理定时任务", detail: "创建、启停、立即运行和删除定时任务，查看运行记录与未读状态。" },
   storage: { title: "使用增强插件私有存储", detail: "只有该增强插件可读写的本地键值存储。" },
@@ -43,6 +52,86 @@ function capabilityLabel(name: string): { title: string; detail: string } {
     return { title: `使用凭据 ${ref}`, detail: "在出站请求中由核心注入凭据明文，增强插件本身拿不到明文。" };
   }
   return CAPABILITY_LABELS[name] ?? { title: name, detail: "未识别的能力，请核对增强插件清单。" };
+}
+
+function CapabilityTitle({ name, privileged }: { name: string; privileged: readonly string[] }) {
+  return (
+    <span className="plugin-capability-title">
+      <strong>{capabilityLabel(name).title}</strong>
+      {privileged.includes(name) ? <Badge tone="warn">高权限</Badge> : null}
+    </span>
+  );
+}
+
+function CapabilityPlatformNotes({ name, limitations }: { name: string; limitations?: PluginPlatformLimitation[] }) {
+  return limitations?.filter(item => item.capability === name).map(item => (
+    <span className="capability-detail" key={item.feature}>
+      <Badge tone="warn">Windows 暂不可用</Badge> {item.message}
+    </span>
+  ));
+}
+
+function PluginUpstreamInfo({ upstream }: { upstream: PluginUpstream & { upstream?: string } }) {
+  const { upstreamRepo, upstreamUrl, upstreamCommit, upstreamLicense } = upstream;
+  if (!upstreamRepo && !upstreamUrl && !upstreamCommit && !upstreamLicense) {
+    return upstream.upstream ? <p className="panel-note">上游仓库及许可信息 · {upstream.upstream}</p> : null;
+  }
+  return (
+    <div className="plugin-upstream">
+      {upstreamRepo || upstreamUrl ? <p className="panel-note">基于上游开源仓库改编适配</p> : null}
+      <dl className="rail-facts">
+        {upstreamRepo || upstreamUrl ? (
+          <div>
+            <dt>上游仓库</dt>
+            <dd>
+              {upstreamUrl ? <a href={upstreamUrl} target="_blank" rel="noopener noreferrer">{upstreamRepo || upstreamUrl}</a> : upstreamRepo}
+            </dd>
+          </div>
+        ) : null}
+        {upstreamCommit ? <div><dt>基线 commit</dt><dd><code title={upstreamCommit}>{upstreamCommit.slice(0, 8)}</code></dd></div> : null}
+        {upstreamLicense ? <div><dt>上游许可证</dt><dd>{upstreamLicense}</dd></div> : null}
+      </dl>
+    </div>
+  );
+}
+
+function PluginLegalFiles({ plugin }: { plugin: PluginRecord }) {
+  const [open, setOpen] = useState<"license" | "notice" | null>(null);
+  const regionId = useId();
+  const legal = useResource(`plugins/legal/${plugin.id}/${plugin.installedAt ?? ""}`, () => api.pluginLegal(plugin.id), { enabled: open !== null });
+  const notice = open === "notice";
+  const text = notice ? legal.data?.noticeText : legal.data?.licenseText;
+  const truncated = notice ? legal.data?.noticeTruncated : legal.data?.licenseTruncated;
+  const filename = notice ? legal.data?.noticeFile || "NOTICE" : "LICENSE";
+  return (
+    <div className="plugin-legal">
+      <div className="inline-actions">
+        <ActionButton aria-expanded={open === "license"} aria-controls={regionId} onClick={() => setOpen(open === "license" ? null : "license")}>
+          查看 LICENSE
+        </ActionButton>
+        {plugin.hasNotice ? (
+          <ActionButton aria-expanded={notice} aria-controls={regionId} onClick={() => setOpen(notice ? null : "notice")}>
+            查看 NOTICE
+          </ActionButton>
+        ) : null}
+      </div>
+      <div id={regionId} hidden={!open}>
+        {open ? (
+          legal.loading ? <SkeletonRows rows={2} cols={1} /> : legal.error ? (
+            <>
+              <ErrorNotice message={errorMessage(legal.error)} />
+              <ActionButton icon="refresh" onClick={legal.reload}>重新读取</ActionButton>
+            </>
+          ) : text ? (
+            <>
+              {truncated ? <p className="panel-note">{filename} 超过 128 KiB，此处显示文件开头。</p> : null}
+              <pre className="plugin-legal-text" tabIndex={0} aria-label={filename}>{text}</pre>
+            </>
+          ) : <p className="panel-note">{filename} 没有可显示的内容。</p>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 /** The bundled KCT adapter, whose enable is gated by the standalone handover. */
@@ -304,7 +393,7 @@ interface SchedulerAttachPromptState {
 export interface PluginSettingsProps {
   /** Rendered inside the settings dialog, where the page header is the dialog's. */
   embedded?: boolean;
-  /** Native host bridge, used to inspect and enable auto-attach when scheduler is enabled. */
+  /** Native host bridge for local package picking and scheduler auto-attach. */
   host?: NativeHost | null;
   /** Notifies the host settings surface when entering or leaving a single-plugin detail subpage. */
   onDetailChange?: (active: boolean) => void;
@@ -322,7 +411,10 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
   const [installError, setInstallError] = useState<string | null>(null);
   const [preview, setPreview] = useState<PluginPreview | null>(null);
   const [granted, setGranted] = useState<string[]>([]);
+  const [reconfirmGrants, setReconfirmGrants] = useState(false);
   const [previewBusy, setPreviewBusy] = useState(false);
+  const [pickerBusy, setPickerBusy] = useState<"directory" | "zip" | null>(null);
+  const [confirmPrivileged, setConfirmPrivileged] = useState(false);
   const [confirmForce, setConfirmForce] = useState(false);
   const [confirmUninstall, setConfirmUninstall] = useState(false);
   const [autoAttachPrompt, setAutoAttachPrompt] = useState<SchedulerAttachPromptState | null>(null);
@@ -342,6 +434,8 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
   const items = plugins.data?.items ?? [];
   const current = useMemo(() => items.find(item => item.id === selected) ?? null, [items, selected]);
   const detailActive = Boolean(current);
+  const previewPrivileged = preview?.privilegedCapabilities ?? [];
+  const needsPrivilegeConfirmation = granted.some(name => previewPrivileged.includes(name));
 
   useEffect(() => {
     onDetailChange?.(detailActive);
@@ -491,15 +585,43 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
     setInstallPath("");
     setPreview(null);
     setGranted([]);
+    setReconfirmGrants(false);
+    setConfirmPrivileged(false);
     setInstallError(null);
+    action.clearError();
+  }
+
+  async function pickInstallPath(kind: "directory" | "zip") {
+    if (!host || pickerBusy || previewBusy) return;
+    setPickerBusy(kind);
+    setInstallError(null);
+    try {
+      let path: string | undefined;
+      if (kind === "directory") {
+        const picked = await host.request<{ path?: string }>("host.pickDirectory", { title: "选择增强插件文件夹" });
+        path = picked?.path;
+      } else {
+        const files = await host.request<Array<{ path: string; name: string }>>("host.pickFiles", { title: "选择增强插件 .zip 包", filters: [{ name: "ZIP 插件包", extensions: ["zip"] }], single: true });
+        path = (files?.find(file => /\.zip$/i.test(file.name || file.path)) ?? files?.[0])?.path;
+      }
+      if (path) setInstallPath(path);
+    } catch (error) {
+      setInstallError(errorMessage(error) || "无法打开文件选择器，请手动输入路径。");
+    } finally {
+      setPickerBusy(null);
+    }
   }
 
   // Validation is a separate, side-effect-free step: the user sees the manifest
   // and the capability list before anything is written to disk, and the install
   // carries exactly the list they confirmed.
   async function inspect() {
+    if (previewBusy || pickerBusy) return;
+    action.clearError();
+    setConfirmPrivileged(false);
     setInstallError(null);
     setPreview(null);
+    setGranted([]);
     if (!installPath.trim()) {
       setInstallError("请填写增强插件文件夹或 zip 的完整路径。");
       return;
@@ -508,7 +630,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
     try {
       const result = await api.plugins.preview(installPath.trim());
       setPreview(result);
-      setGranted(result.capabilities);
+      setGranted(reconfirmGrants ? [] : result.capabilities);
     } catch (error) {
       setInstallError(errorMessage(error) || "无法读取这个增强插件包。");
     } finally {
@@ -517,16 +639,27 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
   }
 
   async function install() {
-    if (!preview) return;
+    if (!preview || action.busy || (needsPrivilegeConfirmation && !confirmPrivileged)) return;
     setInstallError(null);
-    const installed = (await action.run(() => api.plugins.install(installPath.trim(), granted))) as PluginRecord | null;
-    if (installed) {
+    const installed = await action.run(async () => {
+      try {
+        return await api.installPlugin(installPath.trim(), preview.packageDigest, granted, needsPrivilegeConfirmation ? true : undefined);
+      } catch (error) {
+        if (error instanceof ApiError && error.code === "PLUGIN_PACKAGE_CHANGED") {
+          setPreview(null);
+          setGranted([]);
+          setConfirmPrivileged(false);
+          setReconfirmGrants(true);
+        }
+        throw error;
+      }
+    });
+    if (installed && "state" in installed) {
+      await syncHost();
       closeInstall();
       openDetail(installed.id);
-      setFlash(`已安装「${installed.name}」。它保持停用，确认能力后再启用。`);
+      setFlash(`已安装「${installed.name}」。增强插件保持停用，可以从详情页启用。`);
       plugins.reload();
-    } else {
-      setInstallError(errorMessage(action.error) || "安装未完成。");
     }
   }
 
@@ -656,6 +789,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
 
   if (current) {
     const capabilities = current.capabilities ?? [];
+    const privileged = current.privilegedCapabilities ?? [];
     const ungranted = (current.declaredCapabilities ?? []).filter(name => !capabilities.includes(name));
     return (
       <div className={embedded ? "ekds-plugins ekds-subpage" : "page"} data-ekd-plugin-detail={current.id}>
@@ -696,8 +830,9 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                     <li key={name}>
                       <Icon name="check" size={14} />
                       <div>
-                        <strong>{label.title}</strong>
+                        <CapabilityTitle name={name} privileged={privileged} />
                         <p>{label.detail}</p>
+                        <CapabilityPlatformNotes name={name} limitations={current.platformLimitations} />
                       </div>
                     </li>
                   );
@@ -707,17 +842,24 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
             {ungranted.length > 0 ? (
               <InfoNote tone="warn">
                 <p>
-                  清单还申请了 {ungranted.map(name => capabilityLabel(name).title).join("、")}，但你没有授予。增强插件无法使用这些能力。
+                  当前不可用的能力
+                  {ungranted.map((name, index) => (
+                    <span key={name}>{index === 0 ? " · " : "、"}{capabilityLabel(name).title}{privileged.includes(name) ? "（高权限）" : ""}</span>
+                  ))}。
                 </p>
+                {ungranted.map(name => <CapabilityPlatformNotes key={name} name={name} limitations={current.platformLimitations} />)}
               </InfoNote>
             ) : null}
           </Panel>
 
           <Panel title="信息">
+            {current.description ? <p className="panel-note">{current.description}</p> : null}
             <dl className="rail-facts">
+              <div><dt>作者</dt><dd>{current.author || "未声明"}</dd></div>
+              {current.apiVersion ? <div><dt>插件 API</dt><dd className="num">v{current.apiVersion}</dd></div> : null}
               <div>
                 <dt>来源</dt>
-                <dd>{current.source === "BUNDLED" ? "预装" : "本地安装"}</dd>
+                <dd>{current.source === "BUNDLED" ? (current.official ? "内置预装，完整性已校验" : "预装") : "本地安装"}</dd>
               </div>
               <div>
                 <dt>许可证</dt>
@@ -738,7 +880,8 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                 </div>
               ) : null}
             </dl>
-            {current.upstream ? <p className="panel-note">上游：{current.upstream}</p> : null}
+            <PluginUpstreamInfo upstream={current} />
+            <PluginLegalFiles key={`${current.id}/${current.installedAt ?? ""}`} plugin={current} />
           </Panel>
 
           <Panel title="操作">
@@ -867,7 +1010,8 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
           <ActionButton icon="refresh" onClick={plugins.reload} busy={plugins.loading}>
             刷新
           </ActionButton>
-          <ActionButton variant="primary" icon="plus" onClick={() => setInstallOpen(open => !open)} disabled={safeMode}>
+          <ActionButton variant="primary" icon="plus" aria-expanded={installOpen} onClick={() => installOpen ? closeInstall() : setInstallOpen(true)}
+            disabled={safeMode || previewBusy || pickerBusy !== null || action.busy || syncing}>
             安装本地增强插件
           </ActionButton>
         </div>
@@ -892,6 +1036,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
         <Panel title={preview ? "确认能力并安装" : "从本地安装"}>
           {preview ? (
             <>
+              {preview.description ? <p className="panel-note">{preview.description}</p> : null}
               <dl className="rail-facts">
                 <div>
                   <dt>增强插件</dt>
@@ -901,6 +1046,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                   <dt>版本</dt>
                   <dd className="num">{preview.version}</dd>
                 </div>
+                <div><dt>插件 API</dt><dd className="num">v{preview.apiVersion}</dd></div>
                 <div>
                   <dt>作者</dt>
                   <dd>{preview.author || "未声明"}</dd>
@@ -914,6 +1060,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                   <dd className="num">{preview.hostVersions.join(", ") || "未声明"}</dd>
                 </div>
               </dl>
+              <PluginUpstreamInfo upstream={preview} />
               {preview.installed ? (
                 <InfoNote tone="warn">
                   <p>这个增强插件已经安装过。继续安装会替换它的文件，并按你下面勾选的能力重新授权；增强插件会保持停用，需要再手动启用。</p>
@@ -938,21 +1085,34 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                             <input
                               type="checkbox"
                               checked={granted.includes(name)}
-                              onChange={event =>
-                                setGranted(current =>
-                                  event.target.checked ? [...current, name] : current.filter(item => item !== name),
-                                )
-                              }
+                              disabled={action.busy || syncing}
+                              onChange={event => {
+                                const checked = event.target.checked;
+                                setGranted(current => checked ? [...current, name] : current.filter(item => item !== name));
+                                if (previewPrivileged.includes(name)) setConfirmPrivileged(false);
+                              }}
                             />
                             <span>
-                              <strong>{label.title}</strong>
+                              <CapabilityTitle name={name} privileged={previewPrivileged} />
                               <span className="capability-detail">{label.detail}</span>
+                              <CapabilityPlatformNotes name={name} limitations={preview.platformLimitations} />
                             </span>
                           </label>
                         </li>
                       );
                     })}
                   </ul>
+                  {needsPrivilegeConfirmation ? (
+                    <InfoNote tone="warn">
+                      <p><strong>授予高权限前请确认来源</strong></p>
+                      <p>高权限允许增强插件直接操作你勾选的宿主功能。请确认你信任插件来源和代码。</p>
+                      <label className="capability-choice">
+                        <input type="checkbox" checked={confirmPrivileged} disabled={action.busy || syncing}
+                          onChange={event => setConfirmPrivileged(event.target.checked)} />
+                        <span>我信任该插件来源，确认授予上述高权限能力</span>
+                      </label>
+                    </InfoNote>
+                  ) : null}
                   {granted.length < preview.capabilities.length ? (
                     <InfoNote tone="warn">
                       <p>你只授予了 {granted.length} / {preview.capabilities.length} 项能力。</p>
@@ -962,36 +1122,50 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
               )}
             </>
           ) : (
-            <Field label="增强插件文件夹或 zip 路径" htmlFor="plugin-install-path" hint="只从你选择的本地位置安装。安装后增强插件保持停用，确认能力后再启用。">
-              <input
-                id="plugin-install-path"
-                className="input"
-                value={installPath}
-                onChange={event => setInstallPath(event.target.value)}
-                onKeyDown={event => {
-                  if (event.key === "Enter") void inspect();
-                }}
-                placeholder="/Users/你/增强插件目录 或 增强插件.zip"
-              />
-            </Field>
+            <>
+              <Field label="增强插件文件夹或 zip 路径" htmlFor="plugin-install-path" hint="只从你选择的本地位置安装。安装后增强插件保持停用，确认能力后再启用。">
+                <input
+                  id="plugin-install-path"
+                  className="input"
+                  value={installPath}
+                  disabled={previewBusy || pickerBusy !== null}
+                  onChange={event => setInstallPath(event.target.value)}
+                  onKeyDown={event => {
+                    if (event.key === "Enter") void inspect();
+                  }}
+                  placeholder="/Users/你/增强插件目录 或 增强插件.zip"
+                />
+              </Field>
+              {host ? (
+                <div className="inline-actions">
+                  <ActionButton onClick={() => void pickInstallPath("directory")} busy={pickerBusy === "directory"}
+                    disabled={previewBusy || pickerBusy === "zip"}>选择插件文件夹</ActionButton>
+                  <ActionButton onClick={() => void pickInstallPath("zip")} busy={pickerBusy === "zip"}
+                    disabled={previewBusy || pickerBusy === "directory"}>选择 .zip 包</ActionButton>
+                </div>
+              ) : null}
+            </>
           )}
           {installError ? <ErrorNotice message={installError} onDismiss={() => setInstallError(null)} /> : null}
+          {action.error ? <ErrorNotice message={errorMessage(action.error)} onDismiss={action.clearError} /> : null}
           <div className="inline-actions">
             {preview ? (
               <>
-                <ActionButton variant="primary" icon="check" onClick={() => void install()} busy={action.busy || syncing}>
+                <ActionButton variant="primary" icon="check" onClick={() => void install()} busy={action.busy || syncing}
+                  disabled={needsPrivilegeConfirmation && !confirmPrivileged}>
                   授予 {granted.length} 项能力并安装
                 </ActionButton>
-                <ActionButton variant="quiet" onClick={() => setPreview(null)}>
+                <ActionButton variant="quiet" onClick={() => { setPreview(null); setGranted([]); setConfirmPrivileged(false); action.clearError(); }}
+                  disabled={action.busy || syncing}>
                   重新选择
                 </ActionButton>
               </>
             ) : (
-              <ActionButton variant="primary" icon="check" onClick={() => void inspect()} busy={previewBusy}>
+              <ActionButton variant="primary" icon="check" onClick={() => void inspect()} busy={previewBusy} disabled={pickerBusy !== null}>
                 检查增强插件包
               </ActionButton>
             )}
-            <ActionButton variant="quiet" onClick={closeInstall}>
+            <ActionButton variant="quiet" onClick={closeInstall} disabled={previewBusy || pickerBusy !== null || action.busy || syncing}>
               取消
             </ActionButton>
           </div>

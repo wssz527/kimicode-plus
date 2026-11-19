@@ -33,6 +33,15 @@ func confirmAll(t *testing.T, source string) *[]string {
 	return &names
 }
 
+func previewDigest(t *testing.T, manager *Manager, source string) string {
+	t.Helper()
+	preview, err := manager.Preview(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return preview.PackageDigest
+}
+
 func testManager(t *testing.T, safe func() bool) (*Manager, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -220,7 +229,7 @@ func TestInstallEnableDisableUninstall(t *testing.T) {
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
 
-	plugin, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)})
+	plugin, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)})
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}
@@ -320,10 +329,7 @@ func TestZipSlipIsRejected(t *testing.T) {
 	archive.Close()
 	file.Close()
 
-	// The consent list is irrelevant here: the package is refused before the
-	// grant is ever consulted, which is what makes zip slip uninstallable.
-	consent := []string{}
-	_, err = manager.Install(context.Background(), InstallRequest{Root: path, Capabilities: &consent})
+	_, err = manager.Preview(context.Background(), path)
 	if err == nil {
 		t.Fatal("zip slip was accepted")
 	}
@@ -336,7 +342,7 @@ func TestInstallRejectsUndeclaredGrant(t *testing.T) {
 	manager, _ := testManager(t, func() bool { return false })
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
 	undeclared := []string{"config:write"}
-	_, err := manager.Install(context.Background(), InstallRequest{Root: source, Capabilities: &undeclared})
+	_, err := manager.Install(context.Background(), InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: &undeclared})
 	if err == nil {
 		t.Fatal("undeclared capability was granted")
 	}
@@ -352,11 +358,11 @@ func TestSafeModeBlocksEnable(t *testing.T) {
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
 	// Safe mode must also refuse installation, not only activation.
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err == nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err == nil {
 		t.Fatal("safe mode allowed an install")
 	}
 	safe = false
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatalf("install after leaving safe mode: %v", err)
 	}
 	if _, err := manager.Enable(ctx, "test.sample"); err != nil {
@@ -377,7 +383,7 @@ func TestCloseRevokesTokensAndRefusesNewWork(t *testing.T) {
 	manager, _ := testManager(t, func() bool { return false })
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatal(err)
 	}
 	enabled, err := manager.Enable(ctx, "test.sample")
@@ -404,7 +410,7 @@ func TestTwoManagersDoNotShareIdentity(t *testing.T) {
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
 	for _, manager := range []*Manager{first, second} {
-		if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+		if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := manager.Enable(ctx, "test.sample"); err != nil {
@@ -464,7 +470,7 @@ func TestActivityTracksLifecycle(t *testing.T) {
 	manager, _ := testManager(t, func() bool { return false })
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.Enable(ctx, "test.sample"); err != nil {
@@ -492,7 +498,7 @@ func TestActionRequiresIdentityAndCapability(t *testing.T) {
 	manager, _ := testManager(t, func() bool { return false })
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatal(err)
 	}
 	enabled, err := manager.Enable(ctx, "test.sample")
@@ -519,7 +525,7 @@ func TestNetworkProxyRejectsUndeclaredHostAndScheme(t *testing.T) {
 	manager, _ := testManager(t, func() bool { return false })
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatal(err)
 	}
 	enabled, err := manager.Enable(ctx, "test.sample")
@@ -554,7 +560,7 @@ func TestLockedVaultReportsItsOwnError(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := writePluginDir(t, filepath.Join(t.TempDir(), "creds"), mustJSONText(manifest), nil)
-	if _, err := manager.Install(context.Background(), InstallRequest{Root: dir, Capabilities: confirmAll(t, dir)}); err != nil {
+	if _, err := manager.Install(context.Background(), InstallRequest{Root: dir, PackageDigest: previewDigest(t, manager, dir), Capabilities: confirmAll(t, dir)}); err != nil {
 		t.Fatal(err)
 	}
 	// A nil vault is the "core has no credential store" case, which must report
@@ -597,7 +603,7 @@ func TestRuntimeRouteIdentifiesPluginByToken(t *testing.T) {
 	manager, _ := testManager(t, func() bool { return false })
 	ctx := context.Background()
 	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: confirmAll(t, source)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
 		t.Fatal(err)
 	}
 	enabled, err := manager.Enable(ctx, "test.sample")
@@ -643,7 +649,7 @@ func TestCredentialPlaintextNeverReachesActivity(t *testing.T) {
 		"hostVersions": ["1.*"], "entry": {"renderer": "renderer.js"},
 		"capabilities": ["net:api.test", "credentials:demo"]
 	}`, nil)
-	if _, err := manager.Install(ctx, InstallRequest{Root: dir, Capabilities: confirmAll(t, dir)}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: dir, PackageDigest: previewDigest(t, manager, dir), Capabilities: confirmAll(t, dir)}); err != nil {
 		t.Fatal(err)
 	}
 	enabled, err := manager.Enable(ctx, "test.creds")
@@ -688,7 +694,7 @@ func TestStorageRequiresTheStorageGrant(t *testing.T) {
   "capabilities": ["ui:sidebar", "storage"]
 }`, nil)
 	narrowed := []string{CapUISidebar}
-	if _, err := manager.Install(ctx, InstallRequest{Root: source, Capabilities: &narrowed}); err != nil {
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: &narrowed}); err != nil {
 		t.Fatal(err)
 	}
 	enabled, err := manager.Enable(ctx, "test.nostorage")
@@ -702,5 +708,94 @@ func TestStorageRequiresTheStorageGrant(t *testing.T) {
 	}
 	if _, err := manager.Call(ctx, "test.nostorage", "storage.get", enabled.Token, nil); err == nil {
 		t.Fatal("storage.get without the storage grant was allowed")
+	}
+}
+
+func TestInstallRequiresCurrentPackagePreview(t *testing.T) {
+	for _, changed := range []string{"renderer.js", "plugin.json", "removed"} {
+		t.Run(changed, func(t *testing.T) {
+			manager, _ := testManager(t, func() bool { return false })
+			root := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
+			ctx := context.Background()
+			preview, err := manager.Preview(ctx, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertFailure := func(request InstallRequest, status int, code string) {
+				t.Helper()
+				_, err := manager.Install(ctx, request)
+				var failure *Error
+				if !errors.As(err, &failure) || failure.Status != status || failure.Code != code {
+					t.Fatalf("expected %d %s, got %v", status, code, err)
+				}
+			}
+			request := InstallRequest{Root: root, Capabilities: &preview.Capabilities}
+			assertFailure(request, http.StatusBadRequest, "PLUGIN_PACKAGE_DIGEST_REQUIRED")
+			request.PackageDigest = preview.PackageDigest
+			switch changed {
+			case "renderer.js":
+				err = os.WriteFile(filepath.Join(root, changed), []byte("// new source"), 0o600)
+			case "plugin.json":
+				err = os.WriteFile(filepath.Join(root, changed), []byte(strings.Replace(testManifest, "test.sample", "test.replaced", 1)), 0o600)
+			case "removed":
+				err = os.RemoveAll(root)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertFailure(request, http.StatusConflict, "PLUGIN_PACKAGE_CHANGED")
+			for _, id := range []string{"test.sample", "test.replaced"} {
+				if _, installed := manager.Get(id); installed {
+					t.Fatalf("installed changed package %s", id)
+				}
+			}
+			if changed != "removed" {
+				request.PackageDigest = previewDigest(t, manager, root)
+				if _, err := manager.Install(ctx, request); err != nil {
+					t.Fatalf("install with fresh preview: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestInstallPreviewBindsZipContents(t *testing.T) {
+	manager, _ := testManager(t, func() bool { return false })
+	ctx := context.Background()
+	file := filepath.Join(t.TempDir(), "plugin.zip")
+	writeZip := func(source string) {
+		t.Helper()
+		var data strings.Builder
+		archive := zip.NewWriter(&data)
+		for _, entry := range []struct{ name, text string }{{"plugin.json", testManifest}, {"renderer.js", source}, {"LICENSE", "MIT\n"}} {
+			writer, err := archive.Create(entry.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = writer.Write([]byte(entry.text)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := archive.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, []byte(data.String()), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeZip("export function activate() {}\n")
+	preview, err := manager.Preview(ctx, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := InstallRequest{Root: file, PackageDigest: preview.PackageDigest, Capabilities: &preview.Capabilities}
+	writeZip("export function activate() { return () => {} }\n")
+	var failure *Error
+	if _, err := manager.Install(ctx, request); !errors.As(err, &failure) || failure.Status != http.StatusConflict || failure.Code != "PLUGIN_PACKAGE_CHANGED" {
+		t.Fatalf("install changed zip: %v", err)
+	}
+	request.PackageDigest = previewDigest(t, manager, file)
+	if installed, err := manager.Install(ctx, request); err != nil || installed.ID != preview.ID {
+		t.Fatalf("install new preview: %+v (%v)", installed, err)
 	}
 }

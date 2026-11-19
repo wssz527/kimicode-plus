@@ -1,8 +1,9 @@
 async function installNativeRenderer(options) {
   if (window.__ekdNativeUI) await window.__ekdNativeUI.remove();
+  const windowsLoopback = options.transport === 'windows-cdp-loopback';
   const transport = {
     async request(action, payload = {}) {
-      if (options.transport === 'windows-cdp-loopback') {
+      if (windowsLoopback) {
         if (action === 'window.openSettings') {
           window.__ekdNativeUI?.openSettings?.(typeof payload?.tab === 'string' ? payload.tab : '');
           return {};
@@ -27,10 +28,14 @@ async function installNativeRenderer(options) {
           return { path: res?.canceled ? '' : (res?.filePaths?.[0] || '') };
         }
         if (action === 'host.pickFiles' && typeof window.kimiDesktop?.showOpenDialog === 'function') {
-          const res = await window.kimiDesktop.showOpenDialog({
-            title: '添加附件',
-            properties: ['openFile', 'multiSelections'],
-          });
+          const dialogOptions = {
+            title: typeof payload?.title === 'string' && payload.title.trim() ? payload.title.trim() : '添加附件',
+            properties: payload?.single ? ['openFile'] : ['openFile', 'multiSelections'],
+          };
+          if (Array.isArray(payload?.filters) && payload.filters.length > 0) {
+            dialogOptions.filters = payload.filters;
+          }
+          const res = await window.kimiDesktop.showOpenDialog(dialogOptions);
           return res?.canceled ? [] : (res?.filePaths || []).map(p => ({ path: p, name: String(p).split(/[\\/]/).pop() || p }));
         }
       }
@@ -1056,7 +1061,7 @@ async function installNativeRenderer(options) {
     return [...builtinEntryPlans(), ...pluginEntryPlans()];
   }
   function syncOverlayEntries(entries) {
-    if (options.popout) return;
+    if (options.popout || windowsLoopback) return;
     const next = entries.map(entry => ({ action: entry.action, title: entry.title, icon: entry.icon || '' }));
     const encoded = JSON.stringify(next);
     if (encoded === lastOverlayPayload) return;
@@ -1250,7 +1255,7 @@ async function installNativeRenderer(options) {
     state.entryMount = null;
     state.pluginSidebarNav.clear();
     lastOverlayPayload = '';
-    if (!options.popout) void transport.request('host.syncOverlayEntries', { entries: [] }).catch(() => {});
+    syncOverlayEntries([]);
     state.providerEnhance?.remove();
     state.providerEnhance = null;
     nativeStyle.remove();
@@ -1559,41 +1564,22 @@ async function installNativeRenderer(options) {
   // A main-area mount wraps the native chat column so the plugin's pane sits
   // beside it and the split width shrinks the native column. Unwrapping puts the
   // exact DOM the official shell produced back where it was.
-  function mountMainArea(pluginId, definition) {
-    const container = document.querySelector(".composer")?.closest(".chat-main") || document.querySelector(".chat")?.closest(".chat-main");
-    if (!container) throw new Error("主聊天区契约未就绪");
-    const handle = module.mountMainAreaSurface({
-      document,
-      container,
-      pluginId,
-      definition,
-      window,
-    });
-    const release = handle.dispose;
-    return {
-      mode: definition?.mode === "page" ? "page" : "split",
-      setWidth: handle.setWidth,
-      width: handle.width,
-      dispose: release,
-    };
-  }
-
   const pluginMainAreaHost = {
     mount(pluginId, definition) {
-      // A plugin has one main area, and page mode owns the full chat column, so
-      // replace any matching or page-mode mount rather than stacking wrappers.
-      for (const [otherId, otherHandle] of [...state.pluginMainAreas]) {
-        if (otherId === pluginId || otherHandle.mode === "page" || definition?.mode === "page") {
-          otherHandle.dispose();
-        }
-      }
-      const handle = mountMainArea(pluginId, definition);
-      state.pluginMainAreas.set(pluginId, handle);
-      const release = handle.dispose.bind(handle);
-      handle.dispose = () => {
-        release();
+      for (const handle of [...state.pluginMainAreas.values()]) handle.dispose();
+      const container = document.querySelector(".composer")?.closest(".chat-main") || document.querySelector(".chat")?.closest(".chat-main");
+      if (!container) throw new Error("主聊天区契约未就绪");
+      const mount = module.mountMainAreaSurface({ document, container, pluginId, definition, window });
+      const release = () => {
         if (state.pluginMainAreas.get(pluginId) === handle) state.pluginMainAreas.delete(pluginId);
+        mount.dispose();
       };
+      const handle = {
+        setWidth: mount.setWidth,
+        width: mount.width,
+        dispose: release,
+      };
+      state.pluginMainAreas.set(pluginId, handle);
       return handle;
     },
   };
@@ -2019,7 +2005,8 @@ async function installNativeRenderer(options) {
         layoutHost: options.surface === 'plugin' ? { acquireSidebarCollapse: () => ({ dispose: () => {} }) } : pluginLayoutHost,
         browserHost: pluginBrowserHost,
         windowHost: pluginWindowHost,
-        commandHost: pluginCommandHost,
+        commandHost: windowsLoopback ? undefined : pluginCommandHost,
+        platformLimitations: list?.platformLimitations || [],
         pickFiles: async () => (await transport.request('host.pickFiles', {})) || [],
         pickDirectory: async opts => ((await transport.request('host.pickDirectory', opts || {}))?.path) || null,
         openSettings: async tab => { await openSettings(tab || ''); },

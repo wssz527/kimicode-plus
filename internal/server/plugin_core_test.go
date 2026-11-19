@@ -145,7 +145,11 @@ func newPluginCoreFixture(t *testing.T, capabilities []string) (*plugins.Manager
 	// The fixture plays the user who reviewed the preview and accepted the
 	// manifest's declared capabilities.
 	consent := append([]string(nil), capabilities...)
-	if _, err := manager.Install(context.Background(), plugins.InstallRequest{Root: dir, Capabilities: &consent}); err != nil {
+	preview, err := manager.Preview(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Install(context.Background(), plugins.InstallRequest{Root: dir, PackageDigest: preview.PackageDigest, Capabilities: &consent}); err != nil {
 		t.Fatal(err)
 	}
 	enabled, err := manager.Enable(context.Background(), "test.sessions")

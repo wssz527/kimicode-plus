@@ -45,6 +45,7 @@ export interface RuntimeOptions {
   theme?: () => PluginTheme;
   surface?: "host" | "popout";
   instanceId?: string;
+  platformLimitations?: PluginIdentity["platformLimitations"];
   /** Called for every failure the runtime isolates from the rest of the page. */
   onError?: (id: string, error: unknown) => void;
   /**
@@ -93,6 +94,14 @@ const SLOT_CAPABILITY: Record<SlotName, string> = {
   thinking: "ui:thinking",
   message: "ui:message",
 };
+
+const DIRECTORY_PICKER_CAPABILITIES = [
+  "schedule:manage", "sessions:send", "handoff", "attachments", "planner:run",
+  "ui:main-area", "ui:right-panel", "ui:sidebar", "ui:settings",
+];
+const OPEN_SETTINGS_CAPABILITIES = [
+  "ui:main-area", "ui:sidebar-nav", "ui:right-panel", "ui:sidebar", "ui:settings", "ui:entry", "schedule:manage",
+];
 
 /** Poll cadence for a plugin with no subscribers, so a loop ends instead of idling. */
 const EVENT_IDLE_MS = 5000;
@@ -155,7 +164,10 @@ export function createPluginRuntime(options: RuntimeOptions) {
     const bridge = createBridge({ token, granted, request: options.request });
     // The plugin sees the API version its own manifest declares, not the newest
     // one this host supports: a v1 plugin must not be told it is v2.
-    const identity: PluginIdentity = { id, version, dataVersion: apiVersion, surface: options.surface ?? "host" };
+    const identity: PluginIdentity = {
+      id, version, dataVersion: apiVersion, surface: options.surface ?? "host",
+      platformLimitations: options.platformLimitations?.filter(item => granted.includes(item.capability)).map(item => ({ ...item })),
+    };
     const slots = grantedSlots(granted);
 
     const sessionsV2 = granted.includes("sessions:approve") || granted.includes("sessions:abort") || granted.includes("sessions:history") || granted.includes("sessions:read")
@@ -432,19 +444,23 @@ export function createPluginRuntime(options: RuntimeOptions) {
     function createCommandsApi(pluginId: string, call: typeof bridge) {
       return {
         async register(name: string, input?: { title?: string; run?: (args: unknown) => unknown }): Promise<CommandInfo> {
-          if (typeof input?.run === "function" && !handlers.has(`${pluginId}:${name}`)) {
-            // The body lives in the plugin's own renderer scope and dies with it:
-            // the registry below only ever maps a name to code this plugin wrote.
-            handlers.set(`${pluginId}:${name}`, input.run);
-          }
           const registered = await call.call<CommandInfo>("commands.register", { name, title: input?.title });
-          await options.commandHost?.register(pluginId, name);
+          await options.commandHost?.register(pluginId, registered.name);
+          const key = `${pluginId}:${registered.name}`;
+          const handler = input?.run;
+          if (typeof handler === "function" && !handlers.has(key)) {
+            handlers.set(key, handler);
+            scope.add(() => {
+              if (handlers.get(key) === handler) handlers.delete(key);
+            });
+          }
           return registered;
         },
         async unregister(name: string): Promise<boolean> {
           const result = await call.call<{ removed: boolean }>("commands.unregister", { name });
-          handlers.delete(`${pluginId}:${name}`);
-          await options.commandHost?.unregister(pluginId, name);
+          const canonicalName = name.trim();
+          handlers.delete(`${pluginId}:${canonicalName}`);
+          await options.commandHost?.unregister(pluginId, canonicalName);
           return Boolean(result?.removed);
         },
         async list(): Promise<CommandInfo[]> {
@@ -538,7 +554,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
         },
         theme,
         async pickDirectory(pickerOptions?: { title?: string; defaultPath?: string }): Promise<string | null> {
-          if (!granted.some(cap => cap === "schedule:manage" || cap === "sessions:create" || cap === "handoff" || cap === "attachments" || cap === "planner:run")) {
+          if (!DIRECTORY_PICKER_CAPABILITIES.some(capability => granted.includes(capability))) {
             throw new PluginError(403, "PLUGIN_CAPABILITY_DENIED", "插件没有打开目录选择器的能力");
           }
           if (!options.pickDirectory) {
@@ -548,7 +564,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
           return typeof chosen === "string" && chosen.trim() ? chosen.trim() : null;
         },
         openSettings: async (tab?: string) => {
-          if (!granted.includes("ui:main-area") && !granted.includes("ui:sidebar-nav") && !granted.includes("schedule:manage")) {
+          if (!OPEN_SETTINGS_CAPABILITIES.some(capability => granted.includes(capability))) {
             throw new PluginError(403, "PLUGIN_CAPABILITY_DENIED", "插件没有打开设置的能力");
           }
           if (!options.openSettings) {
@@ -730,11 +746,6 @@ export function createPluginRuntime(options: RuntimeOptions) {
   function deactivate(id: string): void {
     active.get(id)?.dispose();
     active.delete(id);
-    // Command bodies belong to the plugin that wrote them: dropping the owner's
-    // scope without dropping these would leave a callable stub behind.
-    for (const key of [...handlers.keys()]) {
-      if (key.startsWith(id + ":")) handlers.delete(key);
-    }
     // Dropping this plugin's subscriptions leaves the shared loop running for
     // every other plugin.
     pump.release(id);

@@ -7,10 +7,7 @@ import (
 	bundledpkg "enhancedkimi/plugins"
 )
 
-// ui:sidebar-nav is a v2 privileged capability: a locally installed plugin must
-// never be able to put a row under the official "new chat" button, because that
-// row sits in the official navigation and carries the client's own authority.
-func TestSidebarNavIsPrivilegedAndRefusedToLocalPlugins(t *testing.T) {
+func TestSidebarNavRequiresPrivilegedConsentForLocalPlugins(t *testing.T) {
 	if !contains(privilegedCapabilities, CapUISidebarNav) {
 		t.Fatal("ui:sidebar-nav is not in the privileged set")
 	}
@@ -25,18 +22,22 @@ func TestSidebarNavIsPrivilegedAndRefusedToLocalPlugins(t *testing.T) {
 		t.Fatal("parsed grants do not keep ui:sidebar-nav")
 	}
 	if dropped := grants.WithoutPrivileged(); dropped.Has(CapUISidebarNav) {
-		t.Fatal("a non-official plugin kept ui:sidebar-nav through WithoutPrivileged")
+		t.Fatal("a stripped grant kept ui:sidebar-nav")
 	}
 	manager, _ := testManager(t, func() bool { return false })
 	source := writePluginDir(t, t.TempDir(), manifestFor("test.local", 2, []string{CapUISidebarNav}), nil)
 	declared := []string{CapUISidebarNav}
-	if _, err := manager.Install(context.Background(), InstallRequest{Root: source, Capabilities: &declared}); err == nil {
-		t.Fatal("a local plugin was granted ui:sidebar-nav")
+	if _, err := manager.Install(context.Background(), InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: &declared}); err == nil {
+		t.Fatal("a local plugin was granted ui:sidebar-nav without confirmation")
 	} else {
 		var pluginErr *Error
-		if !asError(err, &pluginErr) || pluginErr.Code != "PLUGIN_CAPABILITY_PRIVILEGED" {
+		if !asError(err, &pluginErr) || pluginErr.Code != "PLUGIN_PRIVILEGED_CONFIRM_REQUIRED" {
 			t.Fatalf("unexpected refusal: %v", err)
 		}
+	}
+	plugin, err := manager.Install(context.Background(), InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: &declared, ConfirmPrivileged: true})
+	if err != nil || !contains(plugin.Slots, "sidebar-nav") || plugin.Official {
+		t.Fatalf("confirmed local sidebar grant: %#v, %v", plugin, err)
 	}
 }
 
@@ -71,7 +72,7 @@ func TestManagerOnChangeFiresOnEnableAndDisable(t *testing.T) {
 	manager.UseOnChange(func() { changes++ })
 	source := writePluginDir(t, t.TempDir(), manifestFor("test.notify", 1, []string{"storage"}), nil)
 	declared := []string{"storage"}
-	if _, err := manager.Install(context.Background(), InstallRequest{Root: source, Capabilities: &declared}); err != nil {
+	if _, err := manager.Install(context.Background(), InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: &declared}); err != nil {
 		t.Fatalf("install failed: %v", err)
 	}
 	if changes != 1 {

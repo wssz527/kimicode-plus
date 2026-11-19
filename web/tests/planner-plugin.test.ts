@@ -1216,7 +1216,7 @@ test("the panel hands the real context surfaces to each orchestrated call", () =
   // handle would leave a button that silently does nothing.
   const source = rendererSource;
   assert.ok(source.includes("const { storage, planner, handoff, browser, commands, sessions, models: modelsApi } = ctx;"));
-  assert.ok(source.includes("const windowHost = ctx.window;"));
+  assert.ok(source.includes('const windowHost = supported("window.popout") ? ctx.window : undefined;'));
   assert.ok(source.includes("const surface = ctx.plugin?.surface === \"popout\" ? \"popout\" : \"host\";"));
   assert.ok(source.includes("await openSessionTarget({ commands, sessions }, target);"));
   assert.ok(source.includes("openButtonState(target, { commands, sessions })"));
