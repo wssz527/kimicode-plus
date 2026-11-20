@@ -50,10 +50,7 @@ func unescapeXML(value string) string {
 	return replacer.Replace(value)
 }
 
-// TestLaunchAgentPlistCarriesTheAttachCredentials is the regression guard for the
-// agent that reported itself enabled while every wake-up failed: a launchd run
-// has no other channel for the core address or the pairing token.
-func TestLaunchAgentPlistCarriesTheAttachCredentials(t *testing.T) {
+func TestLaunchAgentPlistWatchesLiveCoreRuntime(t *testing.T) {
 	config := testAgentConfig()
 	plist, err := LaunchAgentPlist(config)
 	if err != nil {
@@ -69,10 +66,8 @@ func TestLaunchAgentPlistCarriesTheAttachCredentials(t *testing.T) {
 	if program[1] != "attach" {
 		t.Fatalf("program does not run the attach subcommand: %v", program)
 	}
-	// Credentials must be the last pair, so a token containing "=" or "-" cannot
-	// be read as another flag.
-	if got := program[len(program)-4:]; strings.Join(got, " ") != "--core-url "+config.CoreURL+" --pairing-token "+config.PairingToken {
-		t.Fatalf("credentials are not rendered last: %v", got)
+	if !strings.Contains(plist, xmlEscape(filepath.Join(config.DataDir, "runtime.json"))) || strings.Contains(plist, "--pairing-token") {
+		t.Fatal("expected runtime file with no fixed credential flags")
 	}
 }
 
@@ -111,8 +106,7 @@ func TestLaunchAgentPlistIsAValidPlist(t *testing.T) {
 		t.Skip("plutil is macOS only")
 	}
 	config := testAgentConfig()
-	config.CoreURL = "http://127.0.0.1:8321/?a=1&b=<2>"
-	config.PairingToken = strings.Repeat("t", 20) + `"&<>` + strings.Repeat("t", 24)
+	config.Executable = `/tmp/a&b<c>"d"`
 	plist, err := LaunchAgentPlist(config)
 	if err != nil {
 		t.Fatal(err)
@@ -140,37 +134,23 @@ func TestLaunchAgentPlistIsAValidPlist(t *testing.T) {
 	}
 }
 
-func TestLaunchAgentPlistEscapesCredentials(t *testing.T) {
+func TestLaunchAgentPlistEscapesExecutable(t *testing.T) {
 	config := testAgentConfig()
-	config.CoreURL = "http://127.0.0.1:8321/?a=1&b=<2>"
-	config.PairingToken = strings.Repeat("t", 20) + `"&<>` + strings.Repeat("t", 24)
+	config.Executable = `/tmp/a&b<c>"d"`
 	plist, err := LaunchAgentPlist(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(plist, "<2>") || strings.Contains(plist, `"&<>`) {
-		t.Fatal("credentials were not XML-escaped")
+	if strings.Contains(plist, config.Executable) {
+		t.Fatal("executable path was not XML-escaped")
 	}
 	program := plistProgramArguments(t, plist)
-	if program[len(program)-3] != config.CoreURL {
-		t.Fatalf("escaped core URL did not survive a round trip: %q", program[len(program)-3])
-	}
-	if program[len(program)-1] != config.PairingToken {
-		t.Fatalf("escaped token did not survive a round trip: %q", program[len(program)-1])
+	if program[0] != config.Executable {
+		t.Fatalf("escaped executable path did not survive a round trip: %q", program[0])
 	}
 }
 
 func TestLaunchAgentPlistRefusesAnAgentThatCannotAttach(t *testing.T) {
-	missingURL := testAgentConfig()
-	missingURL.CoreURL = ""
-	if _, err := LaunchAgentPlist(missingURL); err == nil {
-		t.Fatal("agent rendered without a core URL")
-	}
-	shortToken := testAgentConfig()
-	shortToken.PairingToken = "too-short"
-	if _, err := LaunchAgentPlist(shortToken); err == nil {
-		t.Fatal("agent rendered with a placeholder token")
-	}
 	noData := testAgentConfig()
 	noData.DataDir = ""
 	if _, err := LaunchAgentPlist(noData); err == nil {
@@ -194,24 +174,16 @@ func TestInstallLaunchAgentWritesThePlistOwnedByTheUser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The plist carries the pairing token, so it must stay readable by the user
-	// only.
 	if mode := info.Mode().Perm(); runtime.GOOS != "windows" && mode != 0o600 {
 		t.Fatalf("plist permissions are %o, want 600", mode)
 	}
-	data, err := os.ReadFile(path)
+	corePath, err := LaunchAgentPath(managedCoreLabel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	program := plistProgramArguments(t, string(data))
-	found := false
-	for _, value := range program {
-		if value == config.PairingToken {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("installed plist does not carry the pairing token")
+	data, err := os.ReadFile(corePath)
+	if err != nil || !strings.Contains(string(data), "<key>KeepAlive</key><true/>") || !strings.Contains(string(data), "<string>--resident</string>") {
+		t.Fatalf("managed core was not registered for login: %v", err)
 	}
 }
 

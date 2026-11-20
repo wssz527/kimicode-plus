@@ -37,7 +37,6 @@ func enableAutoAttachPlatform(config AttachConfig, allowDaily bool) (LaunchAgent
 	return InstallLaunchAgent(LaunchAgentConfig{
 		DataDir: config.DataDir, KimiHome: config.KimiHome, Profile: config.Profile,
 		AllowDailyInstance: allowDaily, Executable: config.Executable,
-		CoreURL: config.CoreURL, PairingToken: config.PairingToken,
 	})
 }
 

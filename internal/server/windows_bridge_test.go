@@ -160,7 +160,7 @@ func TestWindowsBridgeUnsupportedPluginFeatures(t *testing.T) {
 		var result struct {
 			Error struct{ Code, Message string }
 		}
-		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || response.Code != http.StatusOK || result.Error.Code != "PLATFORM_UNSUPPORTED" || !strings.Contains(result.Error.Message, "Windows 暂不支持") {
+		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || response.Code != http.StatusOK || result.Error.Code != "PLATFORM_UNSUPPORTED" || !strings.Contains(result.Error.Message, "从 KimiCode+ 入口重新打开 Kimi Code") {
 			t.Fatalf("%s => %d %s (%v)", action, response.Code, response.Body, err)
 		}
 	}

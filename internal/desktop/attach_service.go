@@ -5,8 +5,7 @@ import (
 	"errors"
 )
 
-// AttachConfig is the LaunchAgent configuration the core keeps so the settings
-// surface can turn the optional auto-attach on and off.
+// AttachConfig carries the core and host identities for native integration.
 type AttachConfig struct {
 	DataDir      string
 	KimiHome     string
@@ -68,8 +67,7 @@ func (s *NativeService) attachStatus(ctx context.Context) map[string]any {
 	return payload
 }
 
-// enableAttach installs auto-attach (LaunchAgent on macOS, fixed launcher +
-// backed-up Start Menu/Desktop shortcuts on Windows) only after explicit consent.
+// enableAttach installs the platform login tasks after explicit consent.
 func (s *NativeService) enableAttach(ctx context.Context, input map[string]any) (map[string]any, error) {
 	if !hostPlatformSupported {
 		return nil, ErrUnsupportedPlatform
@@ -104,8 +102,7 @@ func HostPlatformName() string {
 	return hostPlatformName
 }
 
-// AutoAttachStatus reports the current platform auto-attach state (LaunchAgent
-// on macOS, fixed launcher + backed-up shortcuts on Windows).
+// AutoAttachStatus reports the current platform login and attach state.
 func AutoAttachStatus(dataDir string) LaunchAgentState {
 	return autoAttachStatusPlatform(dataDir)
 }
@@ -113,17 +110,14 @@ func AutoAttachStatus(dataDir string) LaunchAgentState {
 // EnableAutoAttach installs the platform auto-attach mechanism.
 func EnableAutoAttach(config LaunchAgentConfig) (LaunchAgentState, error) {
 	return enableAutoAttachPlatform(AttachConfig{
-		DataDir:      config.DataDir,
-		KimiHome:     config.KimiHome,
-		Profile:      config.Profile,
-		CoreURL:      config.CoreURL,
-		PairingToken: config.PairingToken,
-		Executable:   config.Executable,
+		DataDir:    config.DataDir,
+		KimiHome:   config.KimiHome,
+		Profile:    config.Profile,
+		Executable: config.Executable,
 	}, config.AllowDailyInstance)
 }
 
-// DisableAutoAttach removes auto-attach (unloads LaunchAgent on macOS, restores
-// backed-up Start Menu & Desktop shortcuts on Windows).
+// DisableAutoAttach removes the platform login tasks and restores older launcher shortcuts when present.
 func DisableAutoAttach(dataDir string) (LaunchAgentState, error) {
 	return disableAutoAttachPlatform(dataDir)
 }

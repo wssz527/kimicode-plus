@@ -95,6 +95,7 @@ type NativeService struct {
 	scheduler    SchedulerActions
 	updater      *updater.Manager
 	attach       AttachConfig
+	attachOpMu   sync.Mutex
 	// quota is the balance layer. It owns no timer: a plugin asks for a refresh and
 	// that is the only thing that makes a request.
 	quota *quotaService
@@ -200,6 +201,13 @@ func NewNativeService(db *sql.DB, kap *KAPClient, cwd string, safe func() bool) 
 		defer service.wg.Done()
 		service.runAutomation()
 	}()
+	if runHostAttachWatcher != nil {
+		service.wg.Add(1)
+		go func() {
+			defer service.wg.Done()
+			runHostAttachWatcher(service)
+		}()
+	}
 	return service, nil
 }
 
@@ -495,6 +503,8 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.enableAttach(ctx, input)
 	case "attach.disable":
 		return s.disableAttach()
+	case "attach.reopen":
+		return reopenHost(ctx, s)
 	case "cache.summary":
 		return s.cacheSummary(ctx, time.Now().UTC())
 	case "cache.sessions":

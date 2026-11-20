@@ -75,7 +75,7 @@ func FindMainPID(ctx context.Context, profile string) (int, error) {
 	if profile != "" && !filepath.IsAbs(profile) {
 		return 0, errors.New("隔离宿主的 profile 必须是绝对路径")
 	}
-	output, err := exec.CommandContext(ctx, "/bin/ps", "-axo", "pid=,command=").Output()
+	output, err := darwinPS(ctx, "-axo", "pid=,command=")
 	if err != nil {
 		return 0, err
 	}
@@ -116,7 +116,7 @@ func parseMainPID(output []byte, executable, profile string) (int, error) {
 // ProcessIdentity reads uid, start time and executable path for a PID. It is the
 // half of the identity check that survives a PID reuse.
 func ProcessIdentity(ctx context.Context, pid int) (ProcessInfo, error) {
-	output, err := exec.CommandContext(ctx, "/bin/ps", "-p", strconv.Itoa(pid), "-o", "pid=,uid=,lstart=,comm=").Output()
+	output, err := darwinPS(ctx, "-p", strconv.Itoa(pid), "-o", "pid=,uid=,lstart=,comm=")
 	if err != nil {
 		return ProcessInfo{}, err
 	}
@@ -157,10 +157,16 @@ func parseProcessIdentity(output []byte) (ProcessInfo, error) {
 	return info, nil
 }
 
+func darwinPS(ctx context.Context, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "/bin/ps", append([]string{"-ww"}, args...)...)
+	cmd.Env = append(os.Environ(), "LC_ALL=en_US.UTF-8")
+	return cmd.Output()
+}
+
 // CommandLine returns the full command line of a PID, used to recognise debug
 // instances before any signal is sent.
 func CommandLine(ctx context.Context, pid int) (string, error) {
-	output, err := exec.CommandContext(ctx, "/bin/ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	output, err := darwinPS(ctx, "-p", strconv.Itoa(pid), "-o", "command=")
 	if err != nil {
 		return "", err
 	}

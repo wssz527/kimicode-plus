@@ -69,6 +69,7 @@ func runCore(updateAPIBaseURL string, updateHTTPClient *http.Client) error {
 	allowDaily := flag.Bool("allow-daily-instance", false, "attach to the client you actually use (requires explicit consent)")
 	workspace := flag.String("workspace", "", "default planning workspace (defaults to the official session or process directory)")
 	version := flag.Bool("version", false, "print version")
+	resident := flag.Bool("resident", false, "wait for any existing core and run for the signed-in user")
 	flag.Parse()
 	if *version {
 		fmt.Println(server.Version)
@@ -95,9 +96,14 @@ func runCore(updateAPIBaseURL string, updateHTTPClient *http.Client) error {
 		}
 		*dir = defaultDir
 	}
-	instance, supervised, err := updater.AcquireCore(*dir)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	instance, supervised, err := acquireCore(ctx, *dir, *resident)
 	if err != nil {
 		return err
+	}
+	if instance == nil {
+		return nil
 	}
 	defer instance.Close()
 	runtimePath := filepath.Join(instance.Dir, "runtime.json")
@@ -148,8 +154,6 @@ func runCore(updateAPIBaseURL string, updateHTTPClient *http.Client) error {
 	if err != nil {
 		return err
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	attachParent, stopAttach := context.WithCancel(ctx)
 	defer stopAttach()
 	restartRequested := make(chan struct{}, 1)
@@ -200,7 +204,7 @@ func runCore(updateAPIBaseURL string, updateHTTPClient *http.Client) error {
 	}()
 	var hostResult *desktop.AttachResult
 	hostError := ""
-	if *hostProfile != "" || *allowDaily || resume.Reattach {
+	if resume.Reattach || (!*resident && (*hostProfile != "" || *allowDaily)) {
 		attachCtx, attachCancel := context.WithTimeout(attachParent, 90*time.Second)
 		options := desktop.AttachOptions{DataDir: instance.Dir, Profile: *hostProfile, CoreURL: base, PairingToken: guard.PairingToken(), AllowDailyInstance: *allowDaily || resume.ReattachDaily}
 		if resume.Reattach {
@@ -223,7 +227,9 @@ func runCore(updateAPIBaseURL string, updateHTTPClient *http.Client) error {
 	if hostError != "" {
 		startup["hostError"] = hostError
 	}
-	json.NewEncoder(os.Stdout).Encode(startup)
+	if !*resident {
+		json.NewEncoder(os.Stdout).Encode(startup)
+	}
 	restarting := false
 	select {
 	case err = <-done:

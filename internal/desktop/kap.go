@@ -157,16 +157,26 @@ func (k *KAPClient) resolve() error {
 	if k.base != "" && k.token != "" {
 		return nil
 	}
-	if k.home == "" || !filepath.IsAbs(k.home) {
-		return errors.New("必须指定独立的 KIMI_CODE_HOME 绝对路径")
-	}
-	entries, err := os.ReadDir(filepath.Join(k.home, "server", "instances"))
+	base, token, err := readKAPEndpoint(k.home, 0)
 	if err != nil {
-		return errors.New("未找到官方服务实例，请确认隔离客户端已启动")
+		return err
+	}
+	k.base, k.token, k.resolved = base, token, true
+	return nil
+}
+
+func readKAPEndpoint(home string, expectedPID int) (string, string, error) {
+	if home == "" || !filepath.IsAbs(home) {
+		return "", "", errors.New("必须指定独立的 KIMI_CODE_HOME 绝对路径")
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "server", "instances"))
+	if err != nil {
+		return "", "", errors.New("未找到官方服务实例，请确认隔离客户端已启动")
 	}
 	type instance struct {
 		Port        int    `json:"port"`
 		Host        string `json:"host"`
+		PID         int    `json:"pid"`
 		HeartbeatAt int64  `json:"heartbeat_at"`
 	}
 	instances := []instance{}
@@ -174,17 +184,17 @@ func (k *KAPClient) resolve() error {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(k.home, "server", "instances", entry.Name()))
+		data, err := os.ReadFile(filepath.Join(home, "server", "instances", entry.Name()))
 		if err != nil || len(data) > 65536 {
 			continue
 		}
 		var item instance
-		if json.Unmarshal(data, &item) == nil && item.Port > 0 && item.Port <= 65535 {
+		if json.Unmarshal(data, &item) == nil && item.Port > 0 && item.Port <= 65535 && (expectedPID == 0 || item.PID == expectedPID) {
 			instances = append(instances, item)
 		}
 	}
 	if len(instances) == 0 {
-		return errors.New("官方服务实例记录为空")
+		return "", "", errors.New("未找到对应的官方服务实例记录")
 	}
 	sort.Slice(instances, func(i, j int) bool { return instances[i].HeartbeatAt > instances[j].HeartbeatAt })
 	host := instances[0].Host
@@ -193,20 +203,17 @@ func (k *KAPClient) resolve() error {
 	}
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
-		return errors.New("官方服务地址不是本机回环")
+		return "", "", errors.New("官方服务地址不是本机回环")
 	}
-	secret, err := os.ReadFile(filepath.Join(k.home, "server.token"))
+	secret, err := os.ReadFile(filepath.Join(home, "server.token"))
 	if err != nil {
-		return errors.New("官方服务访问凭据不可用，请重新打开隔离客户端")
+		return "", "", errors.New("官方服务访问凭据不可用，请重新打开隔离客户端")
 	}
 	token := strings.TrimSpace(string(secret))
 	if token == "" || len(token) > 4096 {
-		return errors.New("官方服务访问凭据格式无效")
+		return "", "", errors.New("官方服务访问凭据格式无效")
 	}
-	k.base = "http://" + net.JoinHostPort(host, strconv.Itoa(instances[0].Port))
-	k.token = token
-	k.resolved = true
-	return nil
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(instances[0].Port)), token, nil
 }
 
 func (k *KAPClient) endpoint() (string, string, error) {
@@ -500,14 +507,14 @@ func (k *KAPClient) Sessions(ctx context.Context) ([]NativeSession, error) {
 // the pickers display (provider, capabilities, reasoning efforts), so a caller
 // never has to re-read /config to describe a model the user is choosing.
 type NativeModel struct {
-	ID              string   `json:"id"`
-	Provider        string   `json:"provider"`
-	Model           string   `json:"model"`
-	Name            string   `json:"name"`
-	MaxContextSize  int64    `json:"max_context_size,omitempty"`
-	Capabilities    []string `json:"capabilities,omitempty"`
-	SupportEfforts  []string `json:"support_efforts,omitempty"`
-	AdaptiveThinking bool    `json:"adaptive_thinking,omitempty"`
+	ID               string   `json:"id"`
+	Provider         string   `json:"provider"`
+	Model            string   `json:"model"`
+	Name             string   `json:"name"`
+	MaxContextSize   int64    `json:"max_context_size,omitempty"`
+	Capabilities     []string `json:"capabilities,omitempty"`
+	SupportEfforts   []string `json:"support_efforts,omitempty"`
+	AdaptiveThinking bool     `json:"adaptive_thinking,omitempty"`
 }
 
 // Models reads the official catalog. The config map is keyed by the

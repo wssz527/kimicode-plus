@@ -152,7 +152,7 @@ func nativeActionPermission(action string) string {
 		return "tasks:read"
 	case "managed.usage", "cache.summary", "cache.sessions", "cache.history", "cache.turns", "cache.retention", "cache.receipts", "quota.balances":
 		return "usage:read"
-	case "config.save", "automation.set", "recovery.set":
+	case "config.save", "automation.set", "recovery.set", "attach.reopen":
 		return "settings:write"
 	case "planner.get", "planner.threads":
 		return "chat:read"

@@ -148,7 +148,7 @@ type AttachStatus = {
     debugPort?: number;
     debugPortWarning?: string;
   };
-  agent: { enabled: boolean; path?: string; error?: string; shortcutCount?: number; backupDir?: string };
+  agent: { enabled: boolean; path?: string; error?: string; needsMigration?: boolean; corePath?: string; legacyCorePresent?: boolean };
   last?: {
     status?: string;
     error?: string;
@@ -559,14 +559,12 @@ function DiagnosticsSection({
       </div> : null}
       <div className="ekds-row">
         <span className="ekds-row-label">
-          <strong>{isWindowsLauncher ? "随 Kimi Code 启动自动接入" : "重启后自动恢复"}</strong>
+          <strong>随 Kimi Code 启动自动接入</strong>
           <small>
             {status.available
-              ? (isWindowsLauncher
-                ? (status.agent.enabled
-                  ? `已通过固定路径启动器接管开始菜单与桌面快捷方式（已备份 ${status.agent.shortcutCount ?? 0} 个原快捷方式，关闭即可一键恢复）。`
-                  : "开启后会先备份开始菜单和桌面上的 Kimi Code 快捷方式，再改为指向固定路径启动器；关闭可一键恢复原快捷方式。")
-                : "由系统在客户端文件变化时触发，安装后默认只在当前用户生效。")
+              ? (status.agent.needsMigration
+                ? "当前使用旧版自动接入。请关闭后重新开启，启用登录常驻。"
+                : "开启后，登录系统时会启动增强核心。像平常一样打开 Kimi Code 即可自动接入。")
               : status.unavailableReason}
           </small>
         </span>
@@ -578,9 +576,10 @@ function DiagnosticsSection({
           disabled={busy || !status.available}
           onClick={() => void toggle(!status.agent.enabled)}
         >
-          {busy ? "处理中…" : status.agent.enabled ? (isWindowsLauncher ? "关闭并恢复" : "已开启") : "已关闭"}
+          {busy ? "处理中…" : status.agent.enabled ? "已开启" : "已关闭"}
         </button>
       </div>
+      {status.agent.legacyCorePresent ? <p className="ekds-note">检测到手工配置的旧核心登录项。如需迁移，请先开启产品的自动接入，再停用旧手工项。产品常驻核心会在已有核心退出后接管。</p> : null}
       {daily && !status.agent.enabled ? <div className="ekds-row">
         <span className="ekds-row-label">
           <strong>接入日常客户端</strong>

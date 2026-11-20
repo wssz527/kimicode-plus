@@ -2,15 +2,16 @@ package desktop
 
 import (
 	"context"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"strings"
 	"time"
 
 	"enhancedkimi/internal/webassets"
-	"strings"
 )
 
 //go:embed assets/bootstrap.js
@@ -53,6 +54,7 @@ type AttachOptions struct {
 	// contract acceptance (e.g. simulating an unknown future version "1.9.9").
 	// It is ignored whenever Profile is empty.
 	AppVersionOverride string
+	SkipCurrent        bool
 }
 
 type AttachResult struct {
@@ -72,6 +74,7 @@ type AttachResult struct {
 	DebugPort         int    `json:"debugPort,omitempty"`
 	DebugPortWarning  string `json:"debugPortWarning,omitempty"`
 	MainBridgeWarning string `json:"mainBridgeWarning,omitempty"`
+	attachKey         string
 }
 
 // ErrConsentRequired is returned when the only running client is the user's daily
@@ -100,41 +103,29 @@ func domReadyForNativeAttach(capabilities map[string]bool, mountedElapsed time.D
 	return capabilities["appMounted"] && mountedElapsed >= darwinMountedGrace
 }
 
-// resolveHost finds the instance to attach to and completes every identity check
-// that can run before a signal is sent. The command line is returned separately:
-// it is discovery input, not part of the identity that must stay identical.
-func resolveHost(ctx context.Context, options AttachOptions) (ProcessInfo, string, error) {
+func resolveHost(ctx context.Context, options AttachOptions) (ProcessInfo, error) {
 	pid, err := FindMainPID(ctx, options.Profile)
 	if err != nil {
-		return ProcessInfo{}, "", err
+		return ProcessInfo{}, err
 	}
 	info, err := ProcessIdentity(ctx, pid)
 	if err != nil {
-		return ProcessInfo{}, "", err
+		return ProcessInfo{}, err
 	}
 	if info.Executable != KimiExecutable {
-		return ProcessInfo{}, "", errors.New("目标进程不是 Kimi Code 主进程")
+		return ProcessInfo{}, errors.New("目标进程不是 Kimi Code 主进程")
 	}
 	command, err := CommandLine(ctx, pid)
 	if err != nil {
-		return ProcessInfo{}, "", err
+		return ProcessInfo{}, err
 	}
-	// A debug or test instance is never taken over automatically: its inspector
-	// may be opened by whoever launched it, and the port check cannot tell them
-	// apart.
 	if IsDebugInstance(command) && options.Profile == "" {
-		return ProcessInfo{}, "", errors.New("检测到调试或测试实例，增强不会自动接入")
+		return ProcessInfo{}, errors.New("检测到调试或测试实例，增强不会自动接入")
 	}
 	if options.Profile == "" && !options.AllowDailyInstance {
-		return ProcessInfo{}, "", ErrConsentRequired
+		return ProcessInfo{}, ErrConsentRequired
 	}
-	if err = CheckInspectorFuse(KimiFramework); err != nil {
-		return ProcessInfo{}, "", err
-	}
-	if err = VerifyLiveProcess(ctx, info); err != nil {
-		return ProcessInfo{}, "", err
-	}
-	return info, command, nil
+	return info, nil
 }
 
 func AttachNative(ctx context.Context, options AttachOptions) (*AttachResult, error) {
@@ -145,8 +136,20 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (*AttachResu
 	if options.CoreURL == "" || len(options.PairingToken) < AttachTokenMinLength {
 		return nil, errors.New("缺少增强核心地址或配对凭据")
 	}
-	info, _, err := resolveHost(ctx, options)
+	info, err := resolveHost(ctx, options)
 	if err != nil {
+		return nil, err
+	}
+	key := darwinAttachKey(info, options)
+	if options.SkipCurrent {
+		if state := ReadAttachState(options.DataDir); state["status"] == "installed" && state["attachKey"] == key {
+			return nil, nil
+		}
+	}
+	if err := CheckInspectorFuse(KimiFramework); err != nil {
+		return nil, err
+	}
+	if err := VerifyLiveProcess(ctx, info); err != nil {
 		return nil, err
 	}
 	pid := info.PID
@@ -258,8 +261,14 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (*AttachResu
 	result.DOMRevision = contract.DOMRevision
 	result.Daily = options.Profile == ""
 	result.Platform = "darwin"
+	result.attachKey = key
 	succeeded = true
 	return &result, nil
+}
+
+func darwinAttachKey(info ProcessInfo, options AttachOptions) string {
+	identity := fmt.Sprintf("%d\x00%d\x00%s\x00%s\x00%s\x00%s", info.PID, info.UID, info.Started, info.Executable, options.CoreURL, options.PairingToken)
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(identity)))
 }
 
 // DiscoverHost reports the running instance without attaching to it, so the

@@ -66,6 +66,7 @@ func runWindowsPowerShell(ctx context.Context, script string, extraEnv ...string
 }
 
 type windowsDiscoverPayload struct {
+	SessionID int                  `json:"sessionId"`
 	SID       string               `json:"sid"`
 	Processes []WindowsProcessInfo `json:"processes"`
 }
@@ -80,6 +81,7 @@ $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'Kimi Code.exe'" | ForE
   if ($owner.ReturnValue -eq 0 -and $owner.Sid -eq $sid) {
     [pscustomobject]@{
       pid = [int]$_.ProcessId
+      sessionId = [int]$_.SessionId
       ownerSid = $owner.Sid
       executable = [string]$_.ExecutablePath
       commandLine = [string]$_.CommandLine
@@ -87,7 +89,7 @@ $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'Kimi Code.exe'" | ForE
     }
   }
 })
-@{ sid = $sid; processes = $procs } | ConvertTo-Json -Depth 5 -Compress
+@{ sid = $sid; sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId; processes = $procs } | ConvertTo-Json -Depth 5 -Compress
 `
 	raw, err := runWindowsPowerShell(ctx, script)
 	if err != nil {
@@ -108,12 +110,22 @@ func windowsCurrentSID(ctx context.Context) (string, error) {
 	return payload.SID, nil
 }
 
+func (p windowsDiscoverPayload) desktopProcesses() []WindowsProcessInfo {
+	var processes []WindowsProcessInfo
+	for _, proc := range p.Processes {
+		if p.SessionID != 0 && proc.SessionID == p.SessionID {
+			processes = append(processes, proc)
+		}
+	}
+	return processes
+}
+
 func windowsListProcesses(ctx context.Context) ([]WindowsProcessInfo, error) {
 	payload, err := windowsDiscoverRaw(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return payload.Processes, nil
+	return payload.desktopProcesses(), nil
 }
 
 func windowsListListeners(ctx context.Context, port int) ([]WindowsPortListener, error) {
@@ -181,8 +193,11 @@ ConvertTo-Json -InputObject $items -Compress
 	return list, nil
 }
 
-func windowsSpawnInspectable(executable string, args []string) (*os.Process, error) {
+func windowsSpawnInspectable(executable string, args []string, kimiHome string) (*os.Process, error) {
 	cmd := exec.Command(executable, args...)
+	if kimiHome != "" {
+		cmd.Env = append(os.Environ(), "KIMI_CODE_HOME="+kimiHome)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: winCreateNewProcessGroup | winDetachedProcess,
 		HideWindow:    true,
@@ -193,8 +208,8 @@ func windowsSpawnInspectable(executable string, args []string) (*os.Process, err
 	return cmd.Process, nil
 }
 
-func windowsSpawnDetached(executable string, args []string) (int, error) {
-	process, err := windowsSpawnInspectable(executable, args)
+func windowsSpawnDetached(executable string, args []string, kimiHome string) (int, error) {
+	process, err := windowsSpawnInspectable(executable, args, kimiHome)
 	if err != nil {
 		return 0, err
 	}
@@ -298,7 +313,7 @@ func discoverHostPlatform(ctx context.Context, profile, dataDir string) (map[str
 		return map[string]any{"running": false, "reason": err.Error()}, nil
 	}
 	kimiExe, _ := resolveWindowsKimiExecutable(dataDir, "")
-	matches, err := SelectWindowsMainProcesses(payload.SID, payload.Processes, kimiExe, profile)
+	matches, err := SelectWindowsMainProcesses(payload.SID, payload.desktopProcesses(), kimiExe, profile)
 	if err != nil {
 		return map[string]any{"running": false, "reason": err.Error()}, nil
 	}
@@ -354,7 +369,7 @@ func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachRe
 		return nil, err
 	}
 	kimiExe, _ := resolveWindowsKimiExecutable(options.DataDir, options.KimiExecutable)
-	matches, err := SelectWindowsMainProcesses(payload.SID, payload.Processes, kimiExe, options.Profile)
+	matches, err := SelectWindowsMainProcesses(payload.SID, payload.desktopProcesses(), kimiExe, options.Profile)
 	if err != nil {
 		return nil, err
 	}
@@ -369,7 +384,8 @@ func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachRe
 	if options.Profile == "" && !options.AllowDailyInstance {
 		return nil, ErrConsentRequired
 	}
-	if _, err := VerifyWindowsBinaryFile(proc.Executable); err != nil {
+	binary, err := VerifyWindowsBinaryFile(proc.Executable)
+	if err != nil && !errors.Is(err, ErrInspectorDisabled) {
 		return nil, err
 	}
 	debugPort := options.DebugPort
@@ -378,8 +394,16 @@ func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachRe
 			debugPort = port
 		}
 	}
-	if debugPort <= 0 {
-		return nil, errors.New("当前 Kimi Code 未使用调试端口启动，请通过 KimiCode+ Windows 启动器打开客户端")
+	if debugPort <= 0 || (lease != nil && !IsWindowsDebugInstance(proc, lease)) {
+		if binary.InspectorFuseOn && binary.RunAsNodeFuseOn && binary.FuseCount == 9 {
+			result, attachErr := attachRunningWindowsMain(ctx, options, proc)
+			if attachErr == nil || debugPort <= 0 {
+				return result, attachErr
+			}
+		}
+		if debugPort <= 0 {
+			return nil, errors.New("当前客户端无法运行中接入，请通过 KimiCode+ 入口重新打开 Kimi Code")
+		}
 	}
 	listeners, err := windowsListListeners(ctx, debugPort)
 	if err != nil {
@@ -393,7 +417,7 @@ func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachRe
 	if err != nil {
 		return nil, err
 	}
-	recheckMatches, err := SelectWindowsMainProcesses(recheck.SID, recheck.Processes, kimiExe, options.Profile)
+	recheckMatches, err := SelectWindowsMainProcesses(recheck.SID, recheck.desktopProcesses(), kimiExe, options.Profile)
 	if err != nil || len(recheckMatches) != 1 {
 		return nil, errors.New("Windows 宿主进程在接入过程中退出")
 	}
@@ -419,27 +443,43 @@ func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachRe
 }
 
 func autoAttachStatusPlatform(dataDir string) LaunchAgentState {
-	return WindowsLauncherStatus(dataDir)
+	if windowsAutoAttachEnabled(dataDir) {
+		return LaunchAgentState{Enabled: true, Path: windowsAutoAttachMarker(dataDir)}
+	}
+	state := WindowsLauncherStatus(dataDir)
+	if state.Enabled {
+		state.NeedsMigration = true
+	}
+	return state
 }
 
 func enableAutoAttachPlatform(config AttachConfig, allowDaily bool) (LaunchAgentState, error) {
-	kimiExe, err := resolveWindowsKimiExecutable(config.DataDir, "")
-	if err != nil {
-		return LaunchAgentState{}, err
+	if config.Profile == "" && !allowDaily {
+		return LaunchAgentState{}, ErrConsentRequired
 	}
-	state, _, err := InstallWindowsLauncherAndShortcuts(WindowsLauncherConfig{
-		DataDir:            config.DataDir,
-		Executable:         config.Executable,
-		KimiExecutable:     kimiExe,
-		KimiHome:           config.KimiHome,
-		AllowDailyInstance: allowDaily,
-	}, windowsShortcutPSBackend{})
-	return state, err
+	state, err := installWindowsResident(config)
+	if err != nil {
+		return state, err
+	}
+	if WindowsLauncherStatus(config.DataDir).Enabled {
+		if _, _, err := RestoreWindowsShortcuts(config.DataDir); err != nil {
+			return state, fmt.Errorf("已开启后台接入，但旧快捷方式恢复失败：%w", err)
+		}
+	}
+	return state, nil
 }
 
 func disableAutoAttachPlatform(dataDir string) (LaunchAgentState, error) {
-	state, _, err := RestoreWindowsShortcuts(dataDir)
-	return state, err
+	if windowsAutoAttachEnabled(dataDir) {
+		if err := removeWindowsResident(dataDir); err != nil {
+			return LaunchAgentState{}, err
+		}
+	}
+	if WindowsLauncherStatus(dataDir).Enabled {
+		state, _, err := RestoreWindowsShortcuts(dataDir)
+		return state, err
+	}
+	return LaunchAgentState{}, nil
 }
 
 // RunWindowsLauncherPlatform executes the Windows launcher with real OS deps.
@@ -450,17 +490,22 @@ func RunWindowsLauncherPlatform(ctx context.Context, opts WindowsLaunchOptions) 
 	}
 	opts.KimiExecutable = kimiExe
 	return RunWindowsLauncher(ctx, opts, WindowsLauncherDeps{
-		CurrentSID:       windowsCurrentSID,
-		ListProcesses:    windowsListProcesses,
-		ListListeners:    windowsListListeners,
-		ListConnections:  windowsListConnections,
-		VerifyBinary:     VerifyWindowsBinaryFile,
-		SpawnDetached:    windowsSpawnDetached,
-		SpawnInspectable: windowsSpawnInspectable,
-		PickPort:         PickFreeLoopbackPort,
-		AttachCDP:        AttachWindowsCDP,
-		CheckCoreHealth:  defaultCheckCoreHealth,
-		SelfPID:          os.Getpid,
+		CurrentSID:      windowsCurrentSID,
+		ListProcesses:   windowsListProcesses,
+		ListListeners:   windowsListListeners,
+		ListConnections: windowsListConnections,
+		VerifyBinary:    VerifyWindowsBinaryFile,
+		SpawnDetached: func(executable string, args []string) (int, error) {
+			return windowsSpawnDetached(executable, args, opts.KimiHome)
+		},
+		SpawnInspectable: func(executable string, args []string) (*os.Process, error) {
+			return windowsSpawnInspectable(executable, args, opts.KimiHome)
+		},
+		PickPort:        PickFreeLoopbackPort,
+		AttachCDP:       AttachWindowsCDP,
+		AttachRunning:   attachRunningWindowsMain,
+		CheckCoreHealth: defaultCheckCoreHealth,
+		SelfPID:         os.Getpid,
 	})
 }
 

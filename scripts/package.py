@@ -49,8 +49,7 @@ def run_instructions(version, target, name):
         ])
     elif target.startswith('windows'):
         lines.extend([
-            'Close the official Kimi Code desktop client before the first launch.',
-            'Run this command in PowerShell to start the core and open the official client:',
+            'Run this command in PowerShell to start the core and open or attach to the official client:',
             f'  .\\{name} launch --allow-daily-instance',
         ])
     else:
@@ -59,6 +58,7 @@ def run_instructions(version, target, name):
         '',
         'When running the core directly, use the pairing URL printed at startup to open its browser interface.',
         'Add --data-dir <path> to use a separate data directory. Keep runtime.json private.',
+        'On macOS and Windows, enable automatic attachment under Status and Diagnostics to start the core at sign-in.',
         'For the latest version, open KimiCode+ settings and check for updates under Status and Diagnostics.',
     ])
     return ('\n'.join(lines) + '\n').encode('utf-8')

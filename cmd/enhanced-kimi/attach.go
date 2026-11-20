@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"enhancedkimi/internal/desktop"
+	"enhancedkimi/internal/platform"
 )
 
 // attachOptions is the argument set launchd runs. It mirrors the flags the
@@ -32,6 +33,7 @@ type attachOptions struct {
 	install            bool
 	uninstall          bool
 	status             bool
+	background         bool
 }
 
 // runAttach implements `enhanced-kimi attach`. Without --install/--uninstall it
@@ -45,15 +47,23 @@ func runAttach(args []string) error {
 	set.StringVar(&options.kimiExe, "kimi-exe", "", "explicit path to Kimi Code.exe on Windows")
 	set.StringVar(&options.profile, "host-profile", "", "isolated Kimi Code profile (empty: the running client)")
 	set.IntVar(&options.debugPort, "debug-port", 0, "optional loopback debugging port on Windows")
+	set.BoolVar(&options.background, "background", false, "skip an existing attachment to the same running core")
 	set.BoolVar(&options.allowDailyInstance, "allow-daily-instance", false, "attach to the client you actually use")
 	set.StringVar(&options.appVersionOverride, "app-version-override", "", "override reported host version on isolated profile for contract acceptance")
 	set.StringVar(&options.coreURL, "core-url", "", "core base URL to report to")
 	set.StringVar(&options.pairingToken, "pairing-token", "", "core pairing token")
-	set.BoolVar(&options.install, "install", false, "install auto-attach (LaunchAgent on macOS, launcher & shortcuts on Windows)")
-	set.BoolVar(&options.uninstall, "uninstall", false, "remove auto-attach and restore backed-up Windows shortcuts")
+	set.BoolVar(&options.install, "install", false, "install login and auto-attach tasks")
+	set.BoolVar(&options.uninstall, "uninstall", false, "remove login and auto-attach tasks")
 	set.BoolVar(&options.status, "status", false, "print the current attach state")
 	if err := set.Parse(args); err != nil {
 		return err
+	}
+	if options.dataDir == "" && (options.status || options.uninstall) {
+		dir, err := platform.DefaultDataDir()
+		if err != nil {
+			return err
+		}
+		options.dataDir = dir
 	}
 	if options.status {
 		state := desktop.AutoAttachStatus(options.dataDir)
@@ -67,9 +77,6 @@ func runAttach(args []string) error {
 	config := desktop.LaunchAgentConfig{
 		DataDir: options.dataDir, KimiHome: options.kimiHome, Profile: options.profile,
 		AllowDailyInstance: options.allowDailyInstance, Executable: executable,
-		// The installed agent runs this same subcommand with no other input, so it
-		// needs the same credentials a manual run gets.
-		CoreURL: options.coreURL, PairingToken: options.pairingToken,
 	}
 	switch {
 	case options.uninstall:
@@ -83,9 +90,17 @@ func runAttach(args []string) error {
 		// worse than no agent, because the settings surface reports it as enabled
 		// while every wake-up fails. The same argument builder renders the plist,
 		// so a passing check here is the contract the installed agent will run.
-		if desktop.HostPlatformName() != "windows" {
-			if err = validateAgentArguments(desktop.AttachArguments(config)); err != nil {
-				return fmt.Errorf("后台接入参数校验失败，未写入接入定义：%w", err)
+		if err = validateAgentArguments(desktop.AttachArguments(config)); err != nil {
+			return fmt.Errorf("后台接入参数校验失败，未写入接入定义：%w", err)
+		}
+		if config.KimiHome == "" {
+			config.KimiHome = os.Getenv("KIMI_CODE_HOME")
+			if config.KimiHome == "" {
+				home, err := os.UserHomeDir()
+				if err != nil {
+					return err
+				}
+				config.KimiHome = filepath.Join(home, ".kimi-code")
 			}
 		}
 		installed, err := installLaunchAgent(config)
@@ -99,13 +114,36 @@ func runAttach(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	if err := validateAttachCredentials(options.coreURL, options.pairingToken); err != nil {
+		return err
+	}
 	coreURL, pairingToken := resolveAttachCredentials(ctx, options.dataDir, options.coreURL, options.pairingToken)
+	if coreURL == "" {
+		wait, stop := context.WithTimeout(ctx, 6*time.Second)
+		defer stop()
+		ticker := time.NewTicker(300 * time.Millisecond)
+		defer ticker.Stop()
+		for coreURL == "" && wait.Err() == nil {
+			select {
+			case <-wait.Done():
+			case <-ticker.C:
+				coreURL, pairingToken = resolveAttachCredentials(wait, options.dataDir, "", "")
+			}
+		}
+		if coreURL == "" {
+			return errors.New("增强核心尚未就绪，待核心启动后重试接入")
+		}
+	}
 	result, attachErr := desktop.AttachOnce(ctx, desktop.AttachOptions{
 		DataDir: options.dataDir, KimiExecutable: options.kimiExe, DebugPort: options.debugPort,
 		Profile: options.profile, CoreURL: coreURL, PairingToken: pairingToken,
 		AllowDailyInstance: options.allowDailyInstance,
 		AppVersionOverride: options.appVersionOverride,
+		SkipCurrent:        options.background,
 	})
+	if result == nil && attachErr == nil {
+		return nil
+	}
 	recordErr := desktop.RecordAttach(options.dataDir, anyOrError(result, attachErr))
 	if attachErr != nil {
 		return attachErr
@@ -146,7 +184,12 @@ func resolveAttachCredentials(ctx context.Context, dataDir, fallbackURL, fallbac
 		return fallbackURL, fallbackToken
 	}
 	req.Header.Set("Authorization", "Bearer "+liveToken)
-	client := &http.Client{Transport: &http.Transport{Proxy: nil}}
+	client := &http.Client{
+		Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fallbackURL, fallbackToken
@@ -160,7 +203,8 @@ func resolveAttachCredentials(ctx context.Context, dataDir, fallbackURL, fallbac
 
 func isLoopbackHTTPURL(raw string) bool {
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme != "http" || parsed.User != nil {
+	if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.Port() == "" ||
+		parsed.Path != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
 		return false
 	}
 	host := parsed.Hostname()
@@ -186,6 +230,7 @@ func validateAgentArguments(args []string) error {
 	set.StringVar(&options.dataDir, "data-dir", "", "")
 	set.StringVar(&options.kimiHome, "kimi-home", "", "")
 	set.StringVar(&options.profile, "host-profile", "", "")
+	set.BoolVar(&options.background, "background", false, "skip an existing attachment to the same running core")
 	set.BoolVar(&options.allowDailyInstance, "allow-daily-instance", false, "")
 	set.StringVar(&options.coreURL, "core-url", "", "")
 	set.StringVar(&options.pairingToken, "pairing-token", "", "")
@@ -195,11 +240,18 @@ func validateAgentArguments(args []string) error {
 	if options.dataDir == "" {
 		return errors.New("后台接入缺少 --data-dir")
 	}
-	if options.coreURL == "" {
-		return errors.New("后台接入缺少 --core-url，重启后无法向核心回报")
+	return validateAttachCredentials(options.coreURL, options.pairingToken)
+}
+
+func validateAttachCredentials(coreURL, token string) error {
+	if coreURL == "" && token == "" {
+		return nil
 	}
-	if len(options.pairingToken) < desktop.AttachTokenMinLength {
-		return errors.New("后台接入缺少 --pairing-token，重启后无法通过核心鉴权")
+	if !isLoopbackHTTPURL(strings.TrimRight(coreURL, "/")) {
+		return errors.New("请提供本机回环的 --core-url，或让接入器从数据目录读取当前核心地址")
+	}
+	if len(token) < desktop.AttachTokenMinLength {
+		return errors.New("提供核心地址时需要有效的 --pairing-token")
 	}
 	return nil
 }

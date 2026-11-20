@@ -176,7 +176,10 @@ func fetchWindowsCDPJSON(ctx context.Context, debugPort int, path string, out an
 	if err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	client := &http.Client{
+		Timeout: 3 * time.Second, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err

@@ -15,12 +15,10 @@ import (
 
 func agentConfig() desktop.LaunchAgentConfig {
 	return desktop.LaunchAgentConfig{
-		DataDir:      "/tmp/ekd",
-		KimiHome:     "/tmp/kimi-home",
-		Profile:      "/tmp/isolated",
-		CoreURL:      "http://127.0.0.1:8321",
-		PairingToken: strings.Repeat("t", 48),
-		Executable:   "/tmp/ekd/enhanced-kimi",
+		DataDir:    "/tmp/ekd",
+		KimiHome:   "/tmp/kimi-home",
+		Profile:    "/tmp/isolated",
+		Executable: "/tmp/ekd/enhanced-kimi",
 	}
 }
 
@@ -50,8 +48,8 @@ func TestValidateAgentArgumentsAcceptsTheRenderedAgent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: plist failed: %v", name, err)
 		}
-		if !strings.Contains(plist, "<string>"+config.PairingToken+"</string>") {
-			t.Fatalf("%s: plist does not carry the token the agent needs", name)
+		if !strings.Contains(plist, filepath.Join(config.DataDir, "runtime.json")) || strings.Contains(plist, "--pairing-token") {
+			t.Fatalf("%s: plist does not use the live runtime file", name)
 		}
 	}
 }
@@ -83,38 +81,15 @@ func TestAttachInstallValidatesBeforeWriting(t *testing.T) {
 		return desktop.LaunchAgentState{Enabled: true}, nil
 	}
 	t.Cleanup(func() { installLaunchAgent = previous })
-	err := runAttach([]string{"--install", "--data-dir", t.TempDir()})
-	if desktop.HostPlatformName() == "windows" {
-		if err != nil || installs != 1 {
-			t.Fatalf("Windows launcher install needs only its data directory: installs=%d, error=%v", installs, err)
-		}
-		return
-	}
-	if err == nil {
-		t.Fatal("install ran without a core URL")
-	}
-	if !strings.Contains(err.Error(), "--core-url") {
+	err := runAttach([]string{"--install"})
+	if err == nil || !strings.Contains(err.Error(), "--data-dir") {
 		t.Fatalf("failure does not name the missing input: %v", err)
 	}
 	if installs != 0 {
 		t.Fatalf("install wrote an agent before validating its arguments: %d installs", installs)
 	}
-	// A complete definition does reach the installer, with its credentials intact.
-	var received desktop.LaunchAgentConfig
-	installLaunchAgent = func(config desktop.LaunchAgentConfig) (desktop.LaunchAgentState, error) {
-		received = config
-		return desktop.LaunchAgentState{Enabled: true, Path: "/tmp/plist"}, nil
-	}
-	token := strings.Repeat("t", 48)
-	if err = runAttach([]string{"--install", "--data-dir", t.TempDir(),
-		"--core-url", "http://127.0.0.1:8321", "--pairing-token", token}); err != nil {
-		t.Fatalf("complete install failed: %v", err)
-	}
-	if received.CoreURL != "http://127.0.0.1:8321" || received.PairingToken != token {
-		t.Fatalf("credentials did not reach the installer: %+v", received)
-	}
-	if err = validateAgentArguments(desktop.AttachArguments(received)); err != nil {
-		t.Fatalf("the installed definition does not parse: %v", err)
+	if err = runAttach([]string{"--install", "--data-dir", t.TempDir(), "--host-profile", t.TempDir(), "--kimi-home", t.TempDir()}); err != nil || installs != 1 {
+		t.Fatalf("install without fixed credentials failed: installs=%d, error=%v", installs, err)
 	}
 }
 

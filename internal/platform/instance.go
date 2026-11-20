@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 
 	"github.com/gofrs/flock"
 )
+
+var ErrInstanceOwned = errors.New("enhancement instance already owns this data directory")
 
 type Instance struct {
 	lock *flock.Flock
@@ -47,7 +50,7 @@ func Acquire(dir string) (*Instance, error) {
 		return nil, err
 	}
 	if !ok {
-		return nil, fmt.Errorf("enhancement instance already owns this data directory")
+		return nil, ErrInstanceOwned
 	}
 	return &Instance{lock, abs}, nil
 }

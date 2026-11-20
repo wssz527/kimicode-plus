@@ -42,6 +42,7 @@ var (
 // WindowsProcessInfo captures the identity of a running Kimi Code process on Windows.
 type WindowsProcessInfo struct {
 	PID         int    `json:"pid"`
+	SessionID   int    `json:"sessionId"`
 	OwnerSID    string `json:"ownerSid"`
 	Executable  string `json:"executable"`
 	CommandLine string `json:"commandLine"`
@@ -95,6 +96,7 @@ type WindowsBinaryInfo struct {
 	FuseVersion     byte   `json:"fuseVersion"`
 	FuseCount       int    `json:"fuseCount"`
 	InspectorFuseOn bool   `json:"inspectorFuseOn"`
+	RunAsNodeFuseOn bool   `json:"runAsNodeFuseOn"`
 }
 
 // WindowsLauncherPaths returns the fixed launcher locations under dataDir.
@@ -241,6 +243,7 @@ func IsWindowsDebugInstance(info WindowsProcessInfo, launcher *WindowsLauncherSt
 		launcher.LaunchedByUs &&
 		launcher.DebugPort > 0 &&
 		launcher.PID == info.PID &&
+		launcher.OwnerSID != "" && launcher.OwnerSID == info.OwnerSID &&
 		launcher.Started != "" &&
 		launcher.Started == info.Started &&
 		WindowsPathEqual(launcher.Executable, info.Executable)
@@ -376,6 +379,9 @@ func VerifyWindowsProcessIdentity(expected, current WindowsProcessInfo) error {
 	if expected.OwnerSID == "" || current.OwnerSID != expected.OwnerSID {
 		return errors.New("Windows 宿主进程属主 SID 不匹配，拒绝接入")
 	}
+	if current.SessionID != expected.SessionID {
+		return errors.New("Windows 宿主桌面会话已变化，拒绝接入")
+	}
 	if expected.Started == "" || current.Started != expected.Started {
 		return errors.New("Windows 宿主进程启动时间已变化（可能发生 PID 复用），已停止接入")
 	}
@@ -419,6 +425,7 @@ func VerifyWindowsPEAndFuses(data []byte) (WindowsBinaryInfo, error) {
 	info.FuseVersion = version
 	info.FuseCount = count
 	info.InspectorFuseOn = fuses[3] == '1'
+	info.RunAsNodeFuseOn = fuses[0] == '1'
 	if !info.InspectorFuseOn {
 		return info, ErrInspectorDisabled
 	}
@@ -511,6 +518,7 @@ func VerifyWindowsBinaryFile(executable string) (WindowsBinaryInfo, error) {
 								info.FuseVersion = version
 								info.FuseCount = count
 								info.InspectorFuseOn = fuses[3] == '1'
+								info.RunAsNodeFuseOn = fuses[0] == '1'
 								if !info.InspectorFuseOn {
 									fuseErr = ErrInspectorDisabled
 								}

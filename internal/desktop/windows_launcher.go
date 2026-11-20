@@ -55,6 +55,7 @@ type WindowsLauncherDeps struct {
 	SpawnDetached       func(executable string, args []string) (int, error)
 	PickPort            func() (int, error)
 	AttachCDP           func(ctx context.Context, opts WindowsCDPAttachOptions) (*AttachResult, error)
+	AttachRunning       func(context.Context, AttachOptions, WindowsProcessInfo) (*AttachResult, error)
 	SpawnInspectable    func(executable string, args []string) (*os.Process, error)
 	CheckCoreHealth     func(ctx context.Context, coreURL string) bool
 	SelfPID             func() int
@@ -144,7 +145,7 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 
 	// Step 1: Verify Kimi Code.exe PE header + Electron + fuse before spawning anything.
 	binary, err := deps.VerifyBinary(opts.KimiExecutable)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrInspectorDisabled) {
 		return nil, err
 	}
 
@@ -231,7 +232,19 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 		}
 		port, hasPort := extractDebugPortArg(SplitWindowsCommandLine(candidate.CommandLine))
 		if !hasPort {
-			return nil, errors.New("Kimi Code 已在运行，但不是通过带调试端口的启动器打开的；请先退出后从已配置的快捷方式重新打开")
+			if deps.AttachRunning == nil {
+				return nil, errors.New("当前客户端无法在运行中接入，请从 KimiCode+ 入口重新打开 Kimi Code")
+			}
+			result, err := deps.AttachRunning(ctx, AttachOptions{
+				DataDir: opts.DataDir, Profile: opts.Profile, CoreURL: coreRec.URL, PairingToken: coreRec.PairingToken,
+				AllowDailyInstance: opts.AllowDailyInstance, AppVersionOverride: opts.AppVersionOverride,
+			}, candidate)
+			if err != nil {
+				_ = RecordAttach(opts.DataDir, err)
+				return nil, err
+			}
+			_ = RecordAttach(opts.DataDir, result)
+			return &WindowsLaunchResult{CoreReused: coreReused, CoreURL: coreRec.URL, KimiReused: true, KimiPID: candidate.PID, Attach: result}, nil
 		}
 		targetProc = candidate
 		debugPort = port

@@ -26,6 +26,7 @@ func (f *fakeLaunch) bootstrap(plist string) error {
 		return f.bootstrapErr
 	}
 	f.installedPaths[plist] = true
+	f.loadedLabels[strings.TrimSuffix(filepath.Base(plist), ".plist")] = true
 	return nil
 }
 func (f *fakeLaunch) bootout(label string) error {
@@ -45,16 +46,12 @@ func withFakeLaunch(t *testing.T) *fakeLaunch {
 	return fake
 }
 
-// testAgentConfig is a complete agent definition: it carries the credentials a
-// real settings-page install always has.
 func testAgentConfig() LaunchAgentConfig {
 	return LaunchAgentConfig{
-		DataDir:      "/tmp/ekd",
-		KimiHome:     "/tmp/kimi-home",
-		Profile:      "/tmp/isolated",
-		CoreURL:      "http://127.0.0.1:8321",
-		PairingToken: strings.Repeat("t", 48),
-		Executable:   "/tmp/ekd/enhanced-kimi",
+		DataDir:    "/tmp/ekd",
+		KimiHome:   "/tmp/kimi-home",
+		Profile:    "/tmp/isolated",
+		Executable: "/tmp/ekd/enhanced-kimi",
 	}
 }
 
@@ -146,8 +143,13 @@ func TestLaunchAgentStatusRequiresInstalledAndLoaded(t *testing.T) {
 		t.Fatal("an installed-but-unloaded agent reported enabled")
 	}
 	fake.loadedLabels[LaunchAgentLabel] = true
-	if state := LaunchAgentStatus(); !state.Enabled {
-		t.Fatal("installed and loaded agent reported disabled")
+	if state := LaunchAgentStatus(); !state.Enabled || !state.NeedsMigration {
+		t.Fatalf("legacy attach-only install was not recognized: %+v", state)
+	}
+	corePath, _ := LaunchAgentPath(managedCoreLabel)
+	fake.installedPaths[corePath], fake.loadedLabels[managedCoreLabel] = true, true
+	if state := LaunchAgentStatus(); !state.Enabled || state.NeedsMigration {
+		t.Fatalf("paired agents did not report ready: %+v", state)
 	}
 }
 
@@ -176,15 +178,11 @@ func TestInstallLaunchAgentIsAtomicAndReloads(t *testing.T) {
 	if len(fake.bootedOut) != 1 || fake.bootedOut[0] != LaunchAgentLabel {
 		t.Fatalf("previous job was not unloaded before bootstrap: %v", fake.bootedOut)
 	}
-	if len(fake.bootstrapped) != 1 {
-		t.Fatalf("bootstrap attempts: %v", fake.bootstrapped)
+	if len(fake.bootstrapped) != 2 {
+		t.Fatalf("expected new load and rollback load attempts: %v", fake.bootstrapped)
 	}
-	// No temporary file may be left behind.
-	if _, err = os.Stat(path + ".next"); err == nil {
-		t.Fatal("temporary plist survived a failed install")
-	}
-	if data, readErr := os.ReadFile(path); readErr != nil || !strings.Contains(string(data), "WatchPaths") {
-		t.Fatal("the new plist was not written atomically over the old one")
+	if data, readErr := os.ReadFile(path); readErr != nil || string(data) != "old" {
+		t.Fatalf("failed load did not restore the old plist: %q, %v", data, readErr)
 	}
 	t.Cleanup(func() { _ = os.Remove(path) })
 }
@@ -199,6 +197,16 @@ func TestUninstallLaunchAgentIsIdempotent(t *testing.T) {
 	if err = os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
 		_ = os.WriteFile(path, []byte("plist"), 0o600)
 	}
+	legacyPath, _ := LaunchAgentPath(legacyCoreLabel)
+	if err := os.WriteFile(legacyPath, []byte("manual"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake.loadedLabels[legacyCoreLabel] = true
+	corePath, _ := LaunchAgentPath(managedCoreLabel)
+	if err := os.WriteFile(corePath, []byte("managed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake.loadedLabels[managedCoreLabel] = true
 	state, err := UninstallLaunchAgent()
 	if err != nil || state.Enabled {
 		t.Fatalf("uninstall failed: %+v %v", state, err)
@@ -206,7 +214,12 @@ func TestUninstallLaunchAgentIsIdempotent(t *testing.T) {
 	if _, err = os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("plist was not removed")
 	}
-	// A second call is harmless.
+	if _, err := os.Stat(corePath); !errors.Is(err, os.ErrNotExist) || fake.loadedLabels[managedCoreLabel] {
+		t.Fatal("managed core login item was not removed")
+	}
+	if data, err := os.ReadFile(legacyPath); err != nil || string(data) != "manual" || !fake.loadedLabels[legacyCoreLabel] {
+		t.Fatal("manual core login item was changed")
+	}
 	if _, err = UninstallLaunchAgent(); err != nil {
 		t.Fatalf("second uninstall failed: %v", err)
 	}

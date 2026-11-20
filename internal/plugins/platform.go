@@ -38,9 +38,9 @@ func PlatformLimitations(platform string) []PlatformLimitation {
 		return nil
 	}
 	return []PlatformLimitation{
-		{FeatureBrowserView, CapBrowserView, "Windows 暂不支持插件独立网页视图。"},
-		{FeaturePopout, CapUIRightPanel, "Windows 暂不支持弹出独立插件窗口。右侧面板标签仍可用。"},
-		{FeatureNativeOverlay, CapUIEntry, "Windows 暂不支持同步独立的右侧「+」浮层。会话信息和右侧面板列表入口仍可用。"},
+		{FeatureBrowserView, CapBrowserView, "插件独立网页需要从 KimiCode+ 入口重新打开 Kimi Code。"},
+		{FeaturePopout, CapUIRightPanel, "独立插件窗口需要从 KimiCode+ 入口重新打开 Kimi Code。右侧面板标签仍可用。"},
+		{FeatureNativeOverlay, CapUIEntry, "独立的右侧「+」浮层需要从 KimiCode+ 入口重新打开 Kimi Code。会话信息和右侧面板列表入口仍可用。"},
 	}
 }
 

@@ -10,12 +10,16 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"enhancedkimi/internal/platform"
 )
 
-// LaunchAgentLabel is the agent that re-attaches the enhancement after the
-// official client restarts. It is user-scoped and disabled by default: attaching
-// changes the client's interface, so the user has to turn it on explicitly.
-const LaunchAgentLabel = "com.user.enhanced-kimi.attach"
+const (
+	LaunchAgentLabel = "com.user.enhanced-kimi.attach"
+	managedCoreLabel = "com.user.enhanced-kimi.core-managed"
+	legacyCoreLabel  = "com.user.enhanced-kimi.core"
+	managedCoreEnv   = "KIMICODE_PLUS_MANAGED_CORE"
+)
 
 // WatchPaths are the directories launchd watches. The official client writes
 // into its profile continuously while running and stops on exit, so a change
@@ -38,9 +42,6 @@ type LaunchAgentConfig struct {
 	DataDir string
 	// KimiHome is the KIMI_CODE_HOME the core reads instance records from.
 	KimiHome string
-	// CoreURL and PairingToken let the agent report to an already-running core.
-	CoreURL      string
-	PairingToken string
 	// Profile narrows discovery to one isolated instance; empty means the running
 	// client, which requires AllowDailyInstance.
 	Profile            string
@@ -70,52 +71,45 @@ func xmlEscape(value string) string {
 	return replacer.Replace(value)
 }
 
-// LaunchAgentPlist renders the agent definition. WatchPaths makes it event
-// driven, RunAtLoad covers the case where the client is already running when the
-// user enables it, and ThrottleInterval keeps a burst of profile writes from
-// spawning a storm of runs.
-//
-// The rendered command line must be exactly what `enhanced-kimi attach` accepts
-// for a run. A launchd run has no other way to learn the core address or the
-// pairing token, so leaving either out makes the agent fail on every wake while
-// the settings surface still reports it as enabled. AttachArguments is the single
-// source of truth for that contract and is exercised by tests against the real
-// flag set.
 func LaunchAgentPlist(config LaunchAgentConfig) (string, error) {
-	if config.Executable == "" {
-		return "", errors.New("缺少增强核心路径，无法安装后台接入")
+	if config.Executable == "" || config.DataDir == "" {
+		return "", errors.New("缺少增强核心路径或数据目录，无法安装后台接入")
 	}
-	if config.DataDir == "" {
-		return "", errors.New("缺少增强数据目录，无法安装后台接入")
-	}
-	// The agent is useless without somewhere to report, so refuse to render an
-	// agent that would only fail at wake-up time.
-	if config.CoreURL == "" || len(config.PairingToken) < AttachTokenMinLength {
-		return "", errors.New("后台接入需要核心地址和配对凭据，无法生成接入定义")
-	}
-	program := append([]string{config.Executable}, AttachArguments(config)...)
-	arguments := strings.Builder{}
-	for _, value := range program {
-		arguments.WriteString("<string>" + xmlEscape(value) + "</string>")
-	}
-	watch := strings.Builder{}
-	for _, path := range WatchPaths(config.KimiHome) {
+	var watch strings.Builder
+	paths := append(WatchPaths(config.KimiHome), filepath.Join(config.DataDir, "runtime.json"))
+	for _, path := range paths {
 		watch.WriteString("<string>" + xmlEscape(path) + "</string>")
 	}
-	logPath := filepath.Join(config.DataDir, "attach.log")
+	settings := "<key>WatchPaths</key><array>" + watch.String() + "</array>"
+	return renderLaunchAgent(config, LaunchAgentLabel, AttachArguments(config), "attach.log", settings), nil
+}
+
+func managedCorePlist(config LaunchAgentConfig) string {
+	args := append([]string{"--resident"}, launchHostArguments(config)...)
+	settings := "<key>KeepAlive</key><true/>\n<key>EnvironmentVariables</key><dict><key>" + managedCoreEnv + "</key><string>1</string></dict>"
+	return renderLaunchAgent(config, managedCoreLabel, args, "resident-core.log", settings)
+}
+
+func renderLaunchAgent(config LaunchAgentConfig, label string, args []string, logName, settings string) string {
+	var arguments strings.Builder
+	for _, value := range append([]string{config.Executable}, args...) {
+		arguments.WriteString("<string>" + xmlEscape(value) + "</string>")
+	}
+	logPath := xmlEscape(filepath.Join(config.DataDir, logName))
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>%s</string>
 <key>ProgramArguments</key><array>%s</array>
-<key>WatchPaths</key><array>%s</array>
+%s
 <key>RunAtLoad</key><true/>
 <key>ThrottleInterval</key><integer>5</integer>
 <key>ProcessType</key><string>Background</string>
+<key>WorkingDirectory</key><string>%s</string>
 <key>StandardOutPath</key><string>%s</string>
 <key>StandardErrorPath</key><string>%s</string>
 </dict></plist>
-`, xmlEscape(LaunchAgentLabel), arguments.String(), watch.String(), xmlEscape(logPath), xmlEscape(logPath)), nil
+`, xmlEscape(label), arguments.String(), settings, xmlEscape(config.DataDir), logPath, logPath)
 }
 
 // AttachTokenMinLength is the shortest pairing token the attach command accepts.
@@ -126,29 +120,33 @@ const AttachTokenMinLength = 32
 // plist and any programmatic installer share this function so the rendered
 // command can never drift from the CLI contract.
 func AttachArguments(config LaunchAgentConfig) []string {
-	args := []string{"attach", "--data-dir", config.DataDir}
+	args := append([]string{"attach", "--background"}, launchHostArguments(config)...)
+	if config.AllowDailyInstance {
+		args = append(args, "--allow-daily-instance")
+	}
+	return args
+}
+
+func launchHostArguments(config LaunchAgentConfig) []string {
+	args := []string{"--data-dir", config.DataDir}
 	if config.KimiHome != "" {
 		args = append(args, "--kimi-home", config.KimiHome)
 	}
 	if config.Profile != "" {
 		args = append(args, "--host-profile", config.Profile)
 	}
-	if config.AllowDailyInstance {
-		args = append(args, "--allow-daily-instance")
-	}
-	// Rendered last so a token containing "=" or "-" cannot be misread as a flag.
-	args = append(args, "--core-url", config.CoreURL, "--pairing-token", config.PairingToken)
 	return args
 }
 
-// LaunchAgentState is what the settings surface reports (for macOS LaunchAgent
-// and Windows fixed-path launcher + shortcut management).
 type LaunchAgentState struct {
-	Enabled       bool   `json:"enabled"`
-	Path          string `json:"path,omitempty"`
-	Error         string `json:"error,omitempty"`
-	ShortcutCount int    `json:"shortcutCount,omitempty"`
-	BackupDir     string `json:"backupDir,omitempty"`
+	Enabled           bool   `json:"enabled"`
+	Path              string `json:"path,omitempty"`
+	CorePath          string `json:"corePath,omitempty"`
+	Error             string `json:"error,omitempty"`
+	ShortcutCount     int    `json:"shortcutCount,omitempty"`
+	BackupDir         string `json:"backupDir,omitempty"`
+	NeedsMigration    bool   `json:"needsMigration,omitempty"`
+	LegacyCorePresent bool   `json:"legacyCorePresent,omitempty"`
 }
 
 type launchController interface {
@@ -183,68 +181,127 @@ func (systemLaunch) bootout(label string) error {
 
 var launches launchController = systemLaunch{}
 
-// LaunchAgentStatus reports whether the agent is installed and loaded. Both must
-// hold for the client to recover on its own after a restart.
 func LaunchAgentStatus() LaunchAgentState {
 	path, err := LaunchAgentPath(LaunchAgentLabel)
 	if err != nil {
 		return LaunchAgentState{Error: err.Error()}
 	}
-	installed := launches.installed(path)
-	return LaunchAgentState{Enabled: installed && launches.loaded(LaunchAgentLabel), Path: path}
+	corePath, _ := LaunchAgentPath(managedCoreLabel)
+	legacyPath, _ := LaunchAgentPath(legacyCoreLabel)
+	attached := launches.installed(path) && launches.loaded(LaunchAgentLabel)
+	core := launches.installed(corePath) && launches.loaded(managedCoreLabel)
+	return LaunchAgentState{
+		Enabled: attached || core, Path: path, CorePath: corePath,
+		NeedsMigration:    attached != core,
+		LegacyCorePresent: launches.installed(legacyPath) || launches.loaded(legacyCoreLabel),
+	}
 }
 
-// InstallLaunchAgent writes the plist and loads it. The write is atomic so a
-// crash mid-install cannot leave a half-written agent that launchd refuses.
 func InstallLaunchAgent(config LaunchAgentConfig) (LaunchAgentState, error) {
-	path, err := LaunchAgentPath(LaunchAgentLabel)
-	if err != nil {
-		return LaunchAgentState{}, err
-	}
 	plist, err := LaunchAgentPlist(config)
 	if err != nil {
 		return LaunchAgentState{}, err
 	}
-	if err = os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return LaunchAgentState{}, errors.New("无法创建 LaunchAgents 目录")
-	}
-	tmp := path + ".next"
-	if err = os.WriteFile(tmp, []byte(plist), 0o600); err != nil {
-		return LaunchAgentState{}, fmt.Errorf("无法写入后台接入定义：%w", err)
-	}
-	if err = os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return LaunchAgentState{}, fmt.Errorf("无法安装后台接入：%w", err)
-	}
-	// A previous load must be removed first, otherwise bootstrap reports EEXIST.
-	if launches.loaded(LaunchAgentLabel) {
-		_ = launches.bootout(LaunchAgentLabel)
-	}
-	if err = launches.bootstrap(path); err != nil {
-		return LaunchAgentState{Path: path}, fmt.Errorf("后台接入已写入，但 launchd 未能加载：%w", err)
-	}
-	return LaunchAgentState{Enabled: true, Path: path}, nil
-}
-
-// UninstallLaunchAgent removes the agent and its plist. Removal is idempotent so
-// a repeated request from the settings surface is harmless.
-func UninstallLaunchAgent() (LaunchAgentState, error) {
-	path, err := LaunchAgentPath(LaunchAgentLabel)
-	if err != nil {
+	if err := os.MkdirAll(config.DataDir, 0o700); err != nil {
 		return LaunchAgentState{}, err
 	}
-	if launches.loaded(LaunchAgentLabel) {
-		_ = launches.bootout(LaunchAgentLabel)
+	undoAttach, err := replaceLaunchAgent(LaunchAgentLabel, plist)
+	if err != nil {
+		return LaunchAgentStatus(), err
 	}
-	if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return LaunchAgentState{Path: path}, errors.New("无法移除后台接入定义")
+	if _, err := replaceLaunchAgent(managedCoreLabel, managedCorePlist(config)); err != nil {
+		err = errors.Join(err, undoAttach())
+		return LaunchAgentStatus(), err
 	}
-	return LaunchAgentState{Enabled: false, Path: path}, nil
+	return LaunchAgentStatus(), nil
 }
 
-// AttachOnce is the work the agent performs per launchd event. It is idempotent:
-// the bootstrap already replaces a previous hook, and a second run on an
-// already-attached client is a no-op re-install rather than a second injection.
+func replaceLaunchAgent(label, plist string) (func() error, error) {
+	path, err := LaunchAgentPath(label)
+	if err != nil {
+		return nil, err
+	}
+	previous, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	existed := err == nil
+	loaded := launches.loaded(label)
+	if loaded && string(previous) == plist {
+		return func() error { return nil }, nil
+	}
+	if loaded && label == managedCoreLabel && os.Getenv(managedCoreEnv) == "1" {
+		return nil, errors.New("请先关闭旧的后台接入，再从更新后的核心重新开启")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	if err := platform.AtomicPrivateFile(path, []byte(plist)); err != nil {
+		return nil, fmt.Errorf("无法写入后台接入定义：%w", err)
+	}
+	restore := func() error {
+		if existed {
+			return platform.AtomicPrivateFile(path, previous)
+		}
+		return os.Remove(path)
+	}
+	reload := func() error {
+		if err := restore(); err != nil || !loaded || !existed {
+			return err
+		}
+		return launches.bootstrap(path)
+	}
+	if loaded {
+		if err := launches.bootout(label); err != nil {
+			return nil, errors.Join(fmt.Errorf("无法卸载旧后台接入任务：%w", err), restore())
+		}
+	}
+	if err := launches.bootstrap(path); err != nil {
+		return nil, errors.Join(fmt.Errorf("无法加载后台接入任务：%w", err), reload())
+	}
+	return func() error {
+		if err := launches.bootout(label); err != nil {
+			return err
+		}
+		return reload()
+	}, nil
+}
+
+func UninstallLaunchAgent() (LaunchAgentState, error) {
+	if err := removeLaunchAgent(LaunchAgentLabel); err != nil {
+		return LaunchAgentStatus(), err
+	}
+	if err := removeLaunchAgent(managedCoreLabel); err != nil {
+		return LaunchAgentStatus(), err
+	}
+	return LaunchAgentStatus(), nil
+}
+
+func removeLaunchAgent(label string) error {
+	path, err := LaunchAgentPath(label)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("无法移除后台接入定义：%w", err)
+	}
+	if !launches.loaded(label) {
+		return nil
+	}
+	if label == managedCoreLabel && os.Getenv(managedCoreEnv) == "1" {
+		// bootout stops the server itself. Let it finish serving this request.
+		controller := launches
+		time.AfterFunc(time.Second, func() {
+			if err := controller.bootout(label); err != nil {
+				fmt.Fprintln(os.Stderr, "无法卸载核心登录项：", err)
+			}
+		})
+		return nil
+	}
+	return launches.bootout(label)
+}
+
+// AttachOnce bounds an attachment initiated by a background job or restart.
 func AttachOnce(ctx context.Context, options AttachOptions) (*AttachResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
@@ -264,6 +321,9 @@ func RecordAttach(dataDir string, value any) error {
 		payload["appVersion"] = result.AppVersion
 		payload["electron"] = result.Electron
 		payload["verified"] = result.Verified
+		if result.attachKey != "" {
+			payload["attachKey"] = result.attachKey
+		}
 		if result.VersionNote != "" {
 			payload["versionNote"] = result.VersionNote
 		}
@@ -289,7 +349,7 @@ func RecordAttach(dataDir string, value any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dataDir, "attach-state.json"), data, 0o600)
+	return platform.AtomicPrivateFile(filepath.Join(dataDir, "attach-state.json"), data)
 }
 
 // ReadAttachState returns the last recorded attach outcome, or nil when the

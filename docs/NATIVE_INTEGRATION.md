@@ -45,21 +45,19 @@ EKD 由 `internal/desktop/inject.go`、`cdp.go`、`contracts.go`、`inspector_fu
 - 日常实例必须由用户在设置里显式同意（`--allow-daily-instance` / 设置页的同意勾选）。没有这份同意时返回"需要授权"，绝不静默附着。
 - 带 `--user-data-dir`、`--remote-debugging`、`--inspect` 的实例一律视为调试实例，不自动接入。
 
-### Windows 启动器与插件主进程桥
+### Windows 运行中接入与兼容重开
 
-Windows 启动器启动已校验的官方客户端时，在 Electron 开关允许的情况下使用临时环回 Node inspector。核对进程、监听属主、目标类型后，安装与 macOS 共用的主进程桥，并关闭 inspector。后续由主进程创建插件窗口、网页视图和独立菜单条目。兼容路径继续通过已验证的 Chromium 渲染端口接入。它保留右侧面板等渲染能力，并在安装预览和运行时报告三项独立能力的限制。现有 Windows 实例若只有渲染进程接入，正常退出客户端后通过启动器重新打开即可尝试主进程接入。
+开启「随 Kimi Code 启动自动接入」后，Windows 登录任务以当前用户的交互会话和普通权限启动增强核心。核心观察正常启动的官方客户端，同一桌面会话内可使用 Electron 自带的 Node 调试接口开启临时 inspector。接入前检查客户端路径、进程属主、启动时间、桌面会话及 Electron fuse，随后校验环回监听属主和 inspector 目标。安装与 macOS 共用的主进程桥后关闭临时端口。开始菜单、桌面和任务栏继续使用官方入口。旧版已改写的快捷方式在迁移时从备份恢复。
 
-### 可选的 LaunchAgent 事件驱动接入
+通过 `enhanced-kimi launch` 打开客户端时，增强仍可使用经校验的 Chromium 端口接入渲染进程。该兼容模式保留右侧面板等能力。独立网页、插件窗口和右侧「+」浮层需要主进程桥，增强插件页会提示从 KimiCode+ 入口重新打开并提供「立即重新打开」。重开动作通过客户端实例记录与监听属主核对会话服务，发现活动回合、待处理交互或无法确认状态时保留当前客户端。空闲时请求 Electron 正常退出，确认旧进程结束后再启动。客户端未退出时可在「状态与诊断」查看原因。
 
-`launch_agent.go` 提供默认关闭、用户显式开启的常驻接入：
+### macOS 登录常驻与事件驱动接入
 
-- plist 使用 `WatchPaths` 指向 `KIMI_CODE_HOME/server/instances` 与 `server.token`。这两个文件在官方客户端每次启动时被重写，因此重启或刷新会触发一次接入；**不使用 `StartInterval`，不轮询进程**。
-- 同时设置 `RunAtLoad`（开启时客户端已在运行也能立刻接入）与 `ThrottleInterval 5`（避免一次启动写出多份 profile 文件时反复拉起）。
-- 安装采用"写 `.next` 再 rename"的原子替换；旧的已加载 job 先 `bootout` 再 `bootstrap`，避免 EEXIST。卸载幂等。
-- 状态判定要求"plist 存在**且** job 已加载"，只有两者都成立才在界面上显示为已开启。
-- **plist 的 `ProgramArguments` 携带接入所需的全部参数，包括 `--core-url` 与 `--pairing-token`。** launchd 唤醒 agent 时没有任何其他输入渠道，缺任一项都会让每次唤醒失败，而界面仍显示"已开启"。因此这两项与 plist、程序化安装共用同一个参数构造函数（`AttachArguments`），plist 渲染结果与 CLI 参数集合由回归测试逐项比对，防止再次漂移。凭据排在参数末尾，避免含 `=`/`-` 的 token 被当作 flag。
-- **plist 含配对凭据，权限固定 `0600`（仅属主可读写）**；仅在用户显式开启后台接入时写入 `~/Library/LaunchAgents/`，卸载时一并删除。凭据不写入日志；`attach.log` 与 `attach-state.json` 只记录结果与错误原因。
-- 安装前先用真实 flag 集合解析一遍渲染出的参数；解析或必填项校验失败时**不写入** plist，避免留下一个必然失败的 agent。
+同一开关安装 `com.user.enhanced-kimi.core-managed` 和 `com.user.enhanced-kimi.attach`。核心项在登录时启动，并由 launchd 保持运行。若同一数据目录已有核心，常驻进程等待现有实例释放锁后再接管。接入项在加载时运行，并监听 `KIMI_CODE_HOME/server/instances`、`server.token` 和增强数据目录的 `runtime.json`，覆盖客户端重启和核心更换端口或凭据。同一个宿主和核心之间，实例心跳唤醒会复用已有接入。
+
+两个 plist 都使用 `0600` 和原子文件替换。接入项从对应数据目录读取并验证当前的环回地址和配对凭据。`attach.log`、`resident-core.log` 和 `attach-state.json` 用于查看启动和接入结果。
+
+迁移时先在「状态与诊断」开启产品的自动接入。若界面显示旧版接入已开启，先关闭再开启。手工创建的 `com.user.enhanced-kimi.core` 由原配置维护，产品仅检测其存在。需要交接时，请在开启产品常驻后停用旧手工任务，再确认产品核心已启动并接入。关闭产品开关会移除产品安装的两个任务。
 
 ### Electron fuse 位次与版本绑定
 
@@ -71,9 +69,9 @@ Windows 启动器启动已校验的官方客户端时，在 Electron 开关允�
 命令行入口：
 
 ```
-enhanced-kimi attach --kimi-home <home> --core-url <url> --pairing-token <token> [--host-profile <path>] [--allow-daily-instance]
-enhanced-kimi attach --kimi-home <home> --core-url <url> --pairing-token <token> --install
-enhanced-kimi attach --uninstall
+enhanced-kimi attach --data-dir <dir> --kimi-home <home> [--host-profile <path>] [--allow-daily-instance]
+enhanced-kimi attach --data-dir <dir> --kimi-home <home> --install [--host-profile <path>] [--allow-daily-instance]
+enhanced-kimi attach --data-dir <dir> --uninstall
 enhanced-kimi attach --status --data-dir <dir>
 ```
 

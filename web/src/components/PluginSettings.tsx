@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { api, ApiError, type KctMigrationResult, type PluginActivity, type PluginPlatformLimitation, type PluginPreview, type PluginRecord, type PluginUpstream } from "../api";
+import { api, ApiError, coreRequest, type KctMigrationResult, type PluginActivity, type PluginPlatformLimitation, type PluginPreview, type PluginRecord, type PluginUpstream } from "../api";
 import { pluginHostBridge, syncPluginHost } from "../plugin-runtime/host";
 import type { NativeHost } from "../native";
 import { Icon } from "./Icon";
@@ -66,9 +66,33 @@ function CapabilityTitle({ name, privileged }: { name: string; privileged: reado
 function CapabilityPlatformNotes({ name, limitations }: { name: string; limitations?: PluginPlatformLimitation[] }) {
   return limitations?.filter(item => item.capability === name).map(item => (
     <span className="capability-detail" key={item.feature}>
-      <Badge tone="warn">Windows 暂不可用</Badge> {item.message}
+      <Badge tone="warn">需重新打开 Kimi Code</Badge> {item.message}
     </span>
   ));
+}
+
+function WindowsPluginReopen({ host }: { host: NativeHost | null }) {
+  const action = useAction<{ reopening: boolean }>();
+  const [reopening, setReopening] = useState(false);
+  useEffect(() => {
+    if (!reopening) return;
+    const timeout = window.setTimeout(() => setReopening(false), 25_000);
+    return () => window.clearTimeout(timeout);
+  }, [reopening]);
+  async function reopen() {
+    const result = await action.run(async () => {
+      if (host) return host.request<{ reopening: boolean }>("attach.reopen");
+      return (await coreRequest<{ value: { reopening: boolean } }>("/desktop/actions/attach.reopen", { method: "POST", body: {} })).value;
+    });
+    if (result?.reopening) setReopening(true);
+  }
+  return <InfoNote tone="warn">
+    <p>需要从 KimiCode+ 入口重新打开 Kimi Code。会话运行中请先等它结束。</p>
+    <ActionButton onClick={() => void reopen()} busy={action.busy} disabled={reopening}>
+      {reopening ? "正在重新打开…" : "立即重新打开"}
+    </ActionButton>
+    {action.error ? <p role="alert">{errorMessage(action.error)}</p> : null}
+  </InfoNote>;
 }
 
 function PluginUpstreamInfo({ upstream }: { upstream: PluginUpstream & { upstream?: string } }) {
@@ -713,8 +737,8 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
       <p>
         已启用「{autoAttachPrompt.pluginName}」，但当前未开启
         {autoAttachPrompt.autoAttachKind === "windows_launcher" || autoAttachPrompt.platform === "windows"
-          ? " Windows 固定路径启动器自动接入"
-          : " LaunchAgent 后台自动接入"}
+          ? " Windows 登录后自动接入"
+          : " macOS 登录后自动接入"}
         。如果不开启，Kimi Code 重启后，定时任务要等您手动重新接入才会运行。
       </p>
       {autoAttachPrompt.dailyInstance ? (
@@ -820,6 +844,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
 
         <div className="plugins-detail-grid">
           <Panel title="能力">
+            {current.platformLimitations?.length ? <WindowsPluginReopen host={host} /> : null}
             {capabilities.length === 0 ? (
               <p className="panel-note">这个增强插件没有获得任何能力，只能显示自己的界面。</p>
             ) : (
@@ -1061,6 +1086,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                 </div>
               </dl>
               <PluginUpstreamInfo upstream={preview} />
+              {preview.platformLimitations?.length ? <WindowsPluginReopen host={host} /> : null}
               {preview.installed ? (
                 <InfoNote tone="warn">
                   <p>这个增强插件已经安装过。继续安装会替换它的文件，并按你下面勾选的能力重新授权；增强插件会保持停用，需要再手动启用。</p>
