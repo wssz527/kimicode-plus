@@ -336,7 +336,11 @@ func TestAttachWindowsCDPAndRunWindowsLauncherEndToEnd(t *testing.T) {
 				{ID: "main-1", Type: "page", URL: "app://renderer/sessions/s1", WebSocketDebuggerURL: wsURL},
 			})
 		case "/devtools/page/main-1":
-			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+			if r.Header.Get("Origin") != "" {
+				http.Error(w, "browser origin rejected", http.StatusForbidden)
+				return
+			}
+			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				return
 			}
@@ -547,7 +551,11 @@ func TestParseUserAgentVersionsAndWindowsVersionForwarding(t *testing.T) {
 				{ID: "main-1", Type: "page", URL: "app://renderer/sessions/s1", WebSocketDebuggerURL: wsURL},
 			})
 		case "/devtools/page/main-1":
-			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+			if r.Header.Get("Origin") != "" {
+				http.Error(w, "browser origin rejected", http.StatusForbidden)
+				return
+			}
+			conn, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				return
 			}

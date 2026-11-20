@@ -305,7 +305,7 @@ func AttachWindowsCDP(ctx context.Context, opts WindowsCDPAttachOptions) (*Attac
 	var detectedUA string
 	injectedCount := 0
 	for _, target := range targets {
-		pageRes, evalErr := injectWindowsPageTarget(ctx, target.WebSocketDebuggerURL, opts.DebugPort, script)
+		pageRes, evalErr := injectWindowsPageTarget(ctx, target.WebSocketDebuggerURL, script)
 		if evalErr != nil {
 			return nil, fmt.Errorf("Windows 渲染页面注入失败（%s）：%w", target.URL, evalErr)
 		}
@@ -369,10 +369,14 @@ type windowsPageInjectResult struct {
 	UserAgent string `json:"userAgent"`
 }
 
-func injectWindowsPageTarget(ctx context.Context, wsURL string, debugPort int, script string) (windowsPageInjectResult, error) {
-	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
-		HTTPHeader: http.Header{"Origin": []string{"http://127.0.0.1:" + strconv.Itoa(debugPort)}},
-	})
+func injectWindowsPageTarget(ctx context.Context, wsURL, script string) (windowsPageInjectResult, error) {
+	client := &http.Client{
+		Transport: &http.Transport{},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPClient: client})
 	if err != nil {
 		return windowsPageInjectResult{}, err
 	}
