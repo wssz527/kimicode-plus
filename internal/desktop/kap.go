@@ -346,24 +346,24 @@ func decodeNative[T any](raw json.RawMessage, label string) (T, error) {
 
 func mapNativeSession(raw json.RawMessage) (NativeSession, error) {
 	var value struct {
-		ID                 string       `json:"id"`
-		Title              string       `json:"title"`
-		Model              string       `json:"model"`
-		Status             string       `json:"status"`
-		Archived           bool         `json:"archived"`
-		ArchivedAt         string       `json:"archived_at"`
-		UpdatedAt          string       `json:"updated_at"`
-		LastTurnReason     string       `json:"last_turn_reason"`
-		Busy               bool         `json:"busy"`
-		MainTurnActive     bool         `json:"main_turn_active"`
-		PendingInteraction string       `json:"pending_interaction"`
-		Usage              *NativeUsage `json:"usage"`
+		ID                 string          `json:"id"`
+		Title              string          `json:"title"`
+		CWD                string          `json:"cwd"`
+		Model              string          `json:"model"`
+		Status             string          `json:"status"`
+		Archived           bool            `json:"archived"`
+		ArchivedAt         string          `json:"archived_at"`
+		UpdatedAt          string          `json:"updated_at"`
+		LastTurnReason     string          `json:"last_turn_reason"`
+		LastTurnOutcome    string          `json:"last_turn_outcome"`
+		Busy               bool            `json:"busy"`
+		MainTurnActive     bool            `json:"main_turn_active"`
+		PendingInteraction string          `json:"pending_interaction"`
+		Usage              *NativeUsage    `json:"usage"`
+		Activity           json.RawMessage `json:"activity"`
 		AgentConfig        struct {
 			Model string `json:"model"`
 		} `json:"agent_config"`
-		Activity struct {
-			Status string `json:"status"`
-		} `json:"activity"`
 		Meta struct {
 			Archived   bool   `json:"archived"`
 			ArchivedAt string `json:"archived_at"`
@@ -372,7 +372,10 @@ func mapNativeSession(raw json.RawMessage) (NativeSession, error) {
 			CWD string `json:"cwd"`
 		} `json:"metadata"`
 	}
-	if err := json.Unmarshal(raw, &value); err != nil || value.ID == "" {
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return NativeSession{}, errors.New("会话的响应格式与当前适配器不兼容")
+	}
+	if value.ID == "" {
 		return NativeSession{}, errors.New("会话响应缺少有效 ID")
 	}
 	pending := value.PendingInteraction
@@ -383,9 +386,29 @@ func mapNativeSession(raw json.RawMessage) (NativeSession, error) {
 	if model == "" {
 		model = strings.TrimSpace(value.Model)
 	}
-	status := strings.TrimSpace(value.Status)
-	if status == "" {
-		status = strings.TrimSpace(value.Activity.Status)
+	var activity string
+	if len(value.Activity) != 0 && json.Unmarshal(value.Activity, &activity) != nil {
+		var legacy struct {
+			Status string `json:"status"`
+		}
+		if err := json.Unmarshal(value.Activity, &legacy); err != nil {
+			return NativeSession{}, errors.New("会话活动状态的格式与当前适配器不兼容")
+		}
+		if value.Status == "" {
+			value.Status = legacy.Status
+		}
+	}
+	if value.Status == "" {
+		value.Status = activity
+	}
+	if value.CWD == "" {
+		value.CWD = value.Metadata.CWD
+	}
+	if value.LastTurnReason == "" {
+		value.LastTurnReason = value.LastTurnOutcome
+		if value.LastTurnOutcome == "interrupted" {
+			value.LastTurnReason = "cancelled"
+		}
 	}
 	archived := value.Archived || value.Meta.Archived
 	archivedAt := strings.TrimSpace(value.ArchivedAt)
@@ -395,15 +418,15 @@ func mapNativeSession(raw json.RawMessage) (NativeSession, error) {
 	return NativeSession{
 		ID:                 value.ID,
 		Title:              value.Title,
-		CWD:                value.Metadata.CWD,
+		CWD:                value.CWD,
 		Model:              model,
-		Status:             status,
+		Status:             strings.TrimSpace(value.Status),
 		Archived:           archived,
 		ArchivedAt:         archivedAt,
 		UpdatedAt:          value.UpdatedAt,
 		LastTurnReason:     value.LastTurnReason,
-		Busy:               value.Busy,
-		MainTurnActive:     value.MainTurnActive,
+		Busy:               value.Busy || (activity != "" && activity != "idle"),
+		MainTurnActive:     value.MainTurnActive || activity == "turn",
 		PendingInteraction: pending,
 		Usage:              value.Usage,
 	}, nil
@@ -483,24 +506,42 @@ func (k *KAPClient) AbortSession(ctx context.Context, sessionID string) error {
 }
 
 func (k *KAPClient) Sessions(ctx context.Context) ([]NativeSession, error) {
-	raw, err := k.Request(ctx, http.MethodGet, "/sessions?page_size=100", nil)
-	if err != nil {
-		return nil, err
-	}
-	page, err := decodeNative[struct {
-		Items []json.RawMessage `json:"items"`
-	}](raw, "会话列表")
-	if err != nil {
-		return nil, err
-	}
 	items := []NativeSession{}
-	for _, raw := range page.Items {
-		item, err := mapNativeSession(raw)
-		if err == nil {
-			items = append(items, item)
+	seenIDs := map[string]bool{}
+	seenTokens := map[string]bool{}
+	query := url.Values{"page_size": {"100"}}
+	for {
+		raw, err := k.Request(ctx, http.MethodGet, "/sessions?"+query.Encode(), nil)
+		if err != nil {
+			return nil, err
 		}
+		page, err := decodeNative[struct {
+			Items         []json.RawMessage `json:"items"`
+			HasMore       bool              `json:"has_more"`
+			NextPageToken string            `json:"next_page_token"`
+		}](raw, "会话列表")
+		if err != nil {
+			return nil, err
+		}
+		for _, raw := range page.Items {
+			item, err := mapNativeSession(raw)
+			if err != nil {
+				return nil, err
+			}
+			if !seenIDs[item.ID] {
+				items = append(items, item)
+				seenIDs[item.ID] = true
+			}
+		}
+		if !page.HasMore {
+			return items, nil
+		}
+		if page.NextPageToken == "" || seenTokens[page.NextPageToken] {
+			return nil, errors.New("官方会话列表返回无效的分页标记")
+		}
+		seenTokens[page.NextPageToken] = true
+		query.Set("page_token", page.NextPageToken)
 	}
-	return items, nil
 }
 
 // NativeModel is one entry of the official model catalog. It carries the fields

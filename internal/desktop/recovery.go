@@ -264,7 +264,7 @@ func (s *NativeService) recoveryCheck(ctx context.Context) (RecoverySettings, er
 	if err != nil {
 		return settings.Recovery, err
 	}
-	if s.safe != nil && s.safe() {
+	if s.isSafe() {
 		return settings.Recovery, errors.New("安全模式下不执行额度恢复")
 	}
 	err = s.recoveryTick(ctx, settings, time.Now().UTC())

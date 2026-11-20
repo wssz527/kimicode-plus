@@ -30,6 +30,10 @@ func (s *NativeService) UseAttach(config AttachConfig) {
 	s.mu.Unlock()
 }
 
+func (s *NativeService) isSafe() bool {
+	return s.safe != nil && s.safe()
+}
+
 func (s *NativeService) attachConfig() AttachConfig {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -52,7 +56,7 @@ func (s *NativeService) attachStatus(ctx context.Context) map[string]any {
 			host = map[string]any{"running": false, "reason": err.Error()}
 		}
 	}
-	if s.safe() {
+	if s.isSafe() {
 		host["canReopen"] = false
 	}
 	agent := autoAttachStatusPlatform(config.DataDir)

@@ -25,7 +25,8 @@ export function SessionPane({
   sessionId,
   recovery,
   onSessionId,
-  onSessions,
+  onSessionCreated,
+  onOpenSessions,
   onAdd,
   canAdd = true,
   onRestore,
@@ -38,7 +39,8 @@ export function SessionPane({
   sessionId: string;
   recovery?: SessionRecoveryHint | null;
   onSessionId: (id: string) => void;
-  onSessions: (next: NativeSession[]) => void;
+  onSessionCreated: (session: NativeSession) => void;
+  onOpenSessions: () => void;
   onAdd?: () => void;
   canAdd?: boolean;
   onRestore?: () => void;
@@ -68,13 +70,21 @@ export function SessionPane({
     setError(null);
     if (!sid) return;
     let alive = true;
-    host.request<SessionView>("session.view", { id: sid }).then(next => {
-      if (alive && next.session.id === sid) setView(next);
-    }).catch(cause => { if (alive) setError(errorText(cause)); });
+    let receivedEvent = false;
     const unsubscribe = host.subscribe<SessionView>(`session:${sid}`, next => {
-      if (alive && next.session.id === sid) setView(next);
+      if (!alive || next.session.id !== sid) return;
+      receivedEvent = true;
+      setView(next);
     });
-    return () => { alive = false; unsubscribe(); };
+    const watching = host.request<{ view: SessionView }>("session.watch", { id: sid });
+    watching.then(({ view: initial }) => {
+      if (alive && !receivedEvent && initial.session.id === sid) setView(initial);
+    }).catch(cause => { if (alive) setError(errorText(cause)); });
+    return () => {
+      alive = false;
+      unsubscribe();
+      void watching.then(() => host.request("session.unwatch", { id: sid })).catch(() => {});
+    };
   }, [host, sid]);
 
   useEffect(() => {
@@ -87,8 +97,7 @@ export function SessionPane({
     setError(null);
     try {
       const created = await host.request<NativeSession>("session.create", {});
-      const next = [created, ...sessions];
-      onSessions(next);
+      onSessionCreated(created);
       onSessionId(created.id);
     } catch (cause) {
       setError(errorText(cause));
@@ -162,7 +171,7 @@ export function SessionPane({
   return (
     <section className="wb-exec" data-pane={index} data-session-id={sid} aria-label={`执行会话 ${index + 1}`}>
       <div className="wb-exec-head">
-        <div className="wb-session-title"><ControlMenu label="选择执行会话" icon="chat" trigger={<><Icon name="chat" size={15} /><span>{session?.title || "选择会话"}</span><Icon name="chevronDown" size={12} /></>}>
+        <div className="wb-session-title"><ControlMenu label="选择执行会话" icon="chat" onOpenChange={open => { if (open) onOpenSessions(); }} trigger={<><Icon name="chat" size={15} /><span>{session?.title || "选择会话"}</span><Icon name="chevronDown" size={12} /></>}>
           <div className="wb-menu-options">{sessions.map(item => <button type="button" key={item.id} aria-pressed={item.id === sid} onClick={event => { onSessionId(item.id); event.currentTarget.closest<HTMLElement>("[popover]")?.hidePopover(); }}><span>{item.title || item.id.slice(0, 8)}</span>{item.id === sid ? <Icon name="check" size={14} /> : null}</button>)}</div>
         </ControlMenu></div>
         {running ? <span className={`wb-state is-${statusTone(waiting ? "waiting" : "running")}`}>{waiting ? "等待确认" : "执行中"}</span> : null}

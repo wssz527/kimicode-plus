@@ -112,8 +112,8 @@ func TestAcquireCoreReservesStartupForSupervisedProcess(t *testing.T) {
 }
 
 func TestApplyClearsRestartingWhenSupervisorFailsToAcknowledge(t *testing.T) {
-	r := unixRelease(t, "\x7fELF staged update")
-	o := testOptions(t, serveRelease(t, r).URL, "linux")
+	r := darwinRelease(t, "\xcf\xfa\xed\xfe staged update")
+	o := testOptions(t, serveRelease(t, r).URL, "darwin")
 	o.RequestRestart = func() { t.Error("old core was asked to stop without a supervisor") }
 	handoffErr := errors.New("supervisor stopped before acknowledging")
 	o.launchSupervisor = func(_, path string) error {

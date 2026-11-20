@@ -410,17 +410,14 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return map[string]any{"sessionId": stringInput(input, "id")}, err
 	case "session.watch":
 		id := stringInput(input, "id")
-		_, err := s.sessionView(ctx, id)
+		view, err := s.sessionView(ctx, id)
 		if err != nil {
 			return nil, err
 		}
-		// The v1 action keeps its shape but now takes a reference, so a reader
-		// that paired it with the v1 unwatch cannot drop a subscription another
-		// consumer still holds.
 		if err = s.WatchSession(id); err != nil {
 			return nil, err
 		}
-		return map[string]any{"watching": true}, nil
+		return map[string]any{"watching": true, "view": view}, nil
 	case "session.unwatch":
 		id := stringInput(input, "id")
 		s.UnwatchSession(id)

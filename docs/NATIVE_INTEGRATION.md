@@ -75,7 +75,9 @@ enhanced-kimi attach --data-dir <dir> --uninstall
 enhanced-kimi attach --status --data-dir <dir>
 ```
 
-早期 1.3.3 独立 BrowserWindow 与 1.3.4 设置内嵌样例是历史验证。当前 1.3.5 已使用正式本地 RPC，不再经 console-message 演示桥。真实 KAP 由 Go 客户端读取指定隔离 KIMI_CODE_HOME 下的实例记录和 `server.token`，访问 `/api/v1`；不会扫描或接管其他 profile。实例记录和凭据在连接失败或 401 时重新解析一次再重试，非幂等请求不会被盲目重发。
+早期 1.3.3 独立 BrowserWindow 与 1.3.4 设置内嵌样例是历史验证。自 1.3.5 起使用正式本地 RPC。真实 KAP 由 Go 客户端读取指定 KIMI_CODE_HOME 下的 `server/instances/` 实例记录和 `server.token`，访问 `/api/v1`。实例记录和凭据在连接失败或 401 时重新解析一次再重试，非幂等请求不会被盲目重发。
+
+同屏会话展开选择器时读取官方会话列表，按 `page_token` 分页。可选列表短暂为空时，选择器会重新读取。同屏新建的会话会先加入列表，等官方列表收录后再以官方数据为准。会话映射支持顶层 `cwd`、字符串 `activity`，也兼容旧版的 `metadata.cwd` 和 `activity.status`。每个窗格打开时读取历史并订阅会话事件，关闭或切换时释放该窗格持有的订阅。
 
 ## 网页、自动化与 Monitor
 
@@ -121,7 +123,7 @@ Monitor 位于会话侧栏，默认约 233px 的紧凑布局，详情折叠。�
 | 多会话/Tower | 最多三个 KAP 会话，逐次追加、主窗格跟随与交换去重；独立草稿/模型/模式/权限/附件/停止/审批；本地 Worktree 和布局偏好 | Reviewer 仍只是本地偏好 |
 | KCT/Monitor | Go 指令整理、兼容事件导入；紧凑侧栏、官方额度状态、MIT 界面归属与许可，回执与命中率分开 | 完整真实速度/缓存观测、真实账号额度验证、外部插件市场 |
 | 设置 | 单层 5 项列表加一条独立管理窗口跳转行，内嵌官方设置对话框；标签顺序/恢复、原生配置保存后经 GET 读回、缓存保存读回、附加功能开关即时保存、只读诊断（接入日志尾部与开源许可）| 更多真实账号和平台组合；管理窗口的实机深浅色截图 |
-| 发布 | 四平台纯 Go 交叉构建（macOS ARM64/Intel、Windows x64、Linux x64）、macOS ARM64 与 Windows x64 运行 | macOS Intel / Linux 原生运行、签名公证、Windows ACL |
+| 发布 | 三平台纯 Go 交叉构建（macOS ARM64、macOS Intel、Windows x64）、macOS ARM64 与 Windows x64 运行 | macOS Intel 原生运行、签名公证、Windows ACL |
 
 单实例锁只保护增强软件自己的数据目录，不能代表官方会话所有权。官方升级或适配器失配只停用相应能力，核心、本地配置和历史仍能启动。
 

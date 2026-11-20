@@ -863,9 +863,11 @@ async function installNativeRenderer(options) {
   }
   async function pickSession(exclude = []) {
     if (state.picker) { state.picker.close(); state.picker.remove(); }
-    const boot = await transport.request('bootstrap', { sourceSessionId: activeSession() });
     return new Promise((resolve, reject) => {
       let settled = false;
+      let items = null;
+      let loadError = '';
+      let retryTimer;
       const dialog = document.createElement('dialog');
       dialog.className = 'ekd-session-picker';
       dialog.innerHTML = '<div class="ekd-picker-head"><div><strong>添加同屏会话</strong><p>选择一个已有会话，与当前会话并排在主聊天区。</p></div><button type="button" class="ekd-picker-close" aria-label="关闭"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div><label class="ekd-picker-search"><span>搜索</span><input type="search" placeholder="搜索会话标题" /></label><div class="ekd-picker-list"></div><p class="ekd-picker-foot">最多 3 个同屏。关闭窗格不会结束会话。</p>';
@@ -874,18 +876,52 @@ async function installNativeRenderer(options) {
       function finish(id) {
         if (settled) return;
         settled = true;
+        clearTimeout(retryTimer);
         if (state.picker === dialog) state.picker = null;
         if (id) resolve(id);
         else reject(new Error('已取消选择'));
         dialog.close();
         dialog.remove();
       }
+      async function loadSessions(retries = 3) {
+        try {
+          const result = await transport.request('sessions.list');
+          if (settled) return;
+          const available = result.items.filter(session => !exclude.includes(session.id));
+          if (!available.length && retries > 0) {
+            retryTimer = setTimeout(() => void loadSessions(retries - 1), 500);
+            return;
+          }
+          items = available;
+        } catch (error) {
+          if (settled) return;
+          loadError = error?.message || '无法读取会话。';
+        }
+        render();
+      }
       function render() {
         const query = input.value.trim().toLowerCase();
-        const sessions = boot.sessions.filter(session => !exclude.includes(session.id) && (!query || (session.title || session.id).toLowerCase().includes(query)));
+        const sessions = items?.filter(session => !query || (session.title || session.id).toLowerCase().includes(query)) || [];
         list.replaceChildren();
         if (!sessions.length) {
-          const empty = document.createElement('p'); empty.className = 'ekd-picker-empty'; empty.textContent = '没有可添加的已有会话。'; list.append(empty); return;
+          const empty = document.createElement('p');
+          empty.className = 'ekd-picker-empty';
+          empty.setAttribute('role', 'status');
+          empty.textContent = loadError || (items === null ? '正在读取会话…' : '没有可添加的已有会话。');
+          list.append(empty);
+          if (loadError || items?.length === 0) {
+            const retry = document.createElement('button');
+            retry.type = 'button';
+            retry.textContent = '刷新会话';
+            retry.addEventListener('click', () => {
+              items = null;
+              loadError = '';
+              render();
+              void loadSessions();
+            });
+            list.append(retry);
+          }
+          return;
         }
         for (const session of sessions) {
           const button = document.createElement('button');
@@ -906,6 +942,7 @@ async function installNativeRenderer(options) {
       render();
       dialog.showModal();
       input.focus();
+      void loadSessions();
     });
   }
   function openOfficial(id) {

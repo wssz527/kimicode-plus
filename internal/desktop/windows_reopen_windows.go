@@ -35,7 +35,7 @@ func findWindowsAttachHost(ctx context.Context, dataDir, executable, profile str
 }
 
 func reopenWindowsHost(ctx context.Context, s *NativeService) (map[string]any, error) {
-	if s.safe() {
+	if s.isSafe() {
 		return nil, ErrSafeMode
 	}
 	if !s.attachOpMu.TryLock() {

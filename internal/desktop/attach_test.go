@@ -7,6 +7,23 @@ import (
 	"testing"
 )
 
+func TestAttachStatusAcceptsUnsetSafeMode(t *testing.T) {
+	service := &NativeService{}
+	service.UseAttach(AttachConfig{DataDir: t.TempDir()})
+	if service.isSafe() {
+		t.Fatal("an unset safe mode callback reported safe mode enabled")
+	}
+	status := service.attachStatus(t.Context())
+	if status["available"] != false {
+		t.Fatalf("attach should be unavailable without configuration: %+v", status)
+	}
+	service.safe = func() bool { return true }
+	host := service.attachStatus(t.Context())["host"].(map[string]any)
+	if host["canReopen"] != false {
+		t.Fatalf("safe mode allowed reopening the host: %+v", host)
+	}
+}
+
 func fuseBinary(version byte, fuses string) []byte {
 	var buffer bytes.Buffer
 	buffer.WriteString("prefix-bytes-before-the-sentinel")

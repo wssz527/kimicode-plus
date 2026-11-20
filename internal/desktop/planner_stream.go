@@ -30,7 +30,7 @@ func (s *NativeService) StreamKAPModel(
 	if s == nil || s.kap == nil {
 		return false, nil
 	}
-	if s.safe != nil && s.safe() {
+	if s.isSafe() {
 		return true, config.ErrSafeMode
 	}
 	snapshot, err := s.readConfig(ctx)

@@ -13,7 +13,7 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ('darwin-arm64', 'darwin-amd64', 'windows-amd64', 'linux-amd64')
+TARGETS = ('darwin-arm64', 'darwin-amd64', 'windows-amd64')
 VERSION_PATTERN = re.compile(
     r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
     r'(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?'
@@ -50,13 +50,11 @@ def run_instructions(version, target, name):
             f'  chmod +x ./{name}',
             f'  ./{name} --allow-daily-instance',
         ])
-    elif target.startswith('windows'):
+    else:
         lines.extend([
             'Run this command in PowerShell to start the core and open or attach to the official client:',
             f'  .\\{name} launch --allow-daily-instance',
         ])
-    else:
-        lines.extend(['Start the local enhancement core:', f'  ./{name}'])
     lines.extend([
         '',
         'When running the core directly, use the pairing URL printed at startup to open its browser interface.',

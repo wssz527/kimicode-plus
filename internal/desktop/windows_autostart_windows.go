@@ -154,7 +154,7 @@ func watchWindowsAttach(s *NativeService) {
 		case <-ticker.C:
 		}
 		cfg := s.attachConfig()
-		if !windowsAutoAttachEnabled(cfg.DataDir) || s.safe() {
+		if !windowsAutoAttachEnabled(cfg.DataDir) || s.isSafe() {
 			observed, tried = nil, windows.Filetime{}
 			continue
 		}
@@ -176,7 +176,7 @@ func watchWindowsAttach(s *NativeService) {
 }
 
 func tryWindowsBackgroundAttach(s *NativeService, cfg AttachConfig, candidates map[uint32]windows.Filetime, tried windows.Filetime) windows.Filetime {
-	if !windowsAutoAttachEnabled(cfg.DataDir) || s.safe() {
+	if !windowsAutoAttachEnabled(cfg.DataDir) || s.isSafe() {
 		return tried
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, 24*time.Second)

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { followNativeSession, type NativeHost, type RecoveryState } from "../native";
+import { followNativeSession, type NativeHost, type NativeSession, type RecoveryState } from "../native";
 import { ErrorNotice, Spinner } from "./ui";
 import { SessionInputProvider, SessionPane } from "./workbench/SessionPanes";
 import { useNativeBootstrap } from "./Surfaces";
@@ -20,6 +20,8 @@ function SessionGridBody({ host, initialExtraIds, onNativeRestore }: SessionGrid
   const idsRef = useRef(ids);
   idsRef.current = ids;
   const gridRef = useRef<HTMLDivElement>(null);
+  const listRequest = useRef(0);
+  const pendingSessions = useRef(new Map<string, NativeSession>());
 
   useEffect(() => {
     if (!boot) return;
@@ -27,11 +29,22 @@ function SessionGridBody({ host, initialExtraIds, onNativeRestore }: SessionGrid
     setRecovery(boot.recovery);
     setIds(current => current.length ? current : boot.sessions[0] ? [boot.sessions[0].id] : []);
   }, [boot]);
+  const refreshSessions = useCallback(async () => {
+    const request = ++listRequest.current;
+    try {
+      const { items } = await host.request<{ items: NativeSession[] }>("sessions.list");
+      if (request !== listRequest.current) return;
+      for (const item of items) pendingSessions.current.delete(item.id);
+      setSessions([...pendingSessions.current.values()].reverse().concat(items));
+    } catch (cause) {
+      if (request === listRequest.current) setActionError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, [host]);
   useEffect(() => host.onActiveSession?.(id => {
     if (!id) return;
     setIds(current => followNativeSession(current, id));
-    void reload();
-  }), [host, reload]);
+    void refreshSessions();
+  }), [host, refreshSessions]);
   useEffect(() => host.subscribe<RecoveryState>("recovery", setRecovery), [host]);
   useEffect(() => { setWeights(current => ids.map((_, index) => current[index] ?? 1)); }, [ids.length]);
 
@@ -42,11 +55,14 @@ function SessionGridBody({ host, initialExtraIds, onNativeRestore }: SessionGrid
     setActionError("");
     try {
       const id = await host.pickSession(idsRef.current);
-      if (id) setIds(current => current.includes(id) || current.length >= 3 ? current : [...current, id]);
+      if (id) {
+        setIds(current => current.includes(id) || current.length >= 3 ? current : [...current, id]);
+        void refreshSessions();
+      }
     } catch (cause) {
       if (!(cause instanceof Error && cause.message === "已取消选择")) setActionError(cause instanceof Error ? cause.message : String(cause));
     } finally { addingRef.current = false; setAdding(false); }
-  }, [host]);
+  }, [host, refreshSessions]);
   useEffect(() => host.onAddSession?.(() => { void add(); }), [host, add]);
 
   function beginResize(event: React.PointerEvent<HTMLDivElement>, index: number) {
@@ -100,7 +116,10 @@ function SessionGridBody({ host, initialExtraIds, onNativeRestore }: SessionGrid
             const first = Math.min(pair - 0.55, Math.max(0.55, (next[index - 1] ?? 1) + delta));
             next[index - 1] = first; next[index] = pair - first; return next;
           });
-        }} /> : null}<SessionPane host={host} index={index} sessions={sessions} models={boot.nativeModels} sessionId={id} recovery={waitingEntry ? { enabled: Boolean(recovery?.enabled), nextAt: waitingEntry.nextAt, note: waitingEntry.note } : null} onSessionId={next => changeSession(index, next)} onSessions={setSessions} onAdd={index === 0 ? () => void add() : undefined} canAdd={ids.length < 3 && !adding} onRestore={index === 0 ? onNativeRestore : undefined} onClose={index > 0 ? () => setIds(current => current.filter((_, itemIndex) => itemIndex !== index)) : undefined} /></div>;
+        }} /> : null}<SessionPane host={host} index={index} sessions={sessions} models={boot.nativeModels} sessionId={id} recovery={waitingEntry ? { enabled: Boolean(recovery?.enabled), nextAt: waitingEntry.nextAt, note: waitingEntry.note } : null} onSessionId={next => changeSession(index, next)} onSessionCreated={created => {
+          pendingSessions.current.set(created.id, created);
+          setSessions(current => [created, ...current.filter(item => item.id !== created.id)]);
+        }} onOpenSessions={() => void refreshSessions()} onAdd={index === 0 ? () => void add() : undefined} canAdd={ids.length < 3 && !adding} onRestore={index === 0 ? onNativeRestore : undefined} onClose={index > 0 ? () => setIds(current => current.filter((_, itemIndex) => itemIndex !== index)) : undefined} /></div>;
       })}
     </div></div>
   </div>;

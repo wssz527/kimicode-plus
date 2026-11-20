@@ -57,7 +57,7 @@ Windows 支持本地 ZIP 和文件夹安装、插件命令、右侧标签和会�
 
 ```bash
 sh scripts/build.sh        # 构建前端并生成本机 dist/enhanced-kimi
-sh scripts/crossbuild.sh   # 交叉编译 macOS / Windows / Linux 产物
+sh scripts/crossbuild.sh   # 交叉编译 macOS Apple Silicon / Intel 和 Windows x64 发布产物
 ```
 
 ### macOS 接入官方客户端

@@ -356,7 +356,7 @@ func (s *NativeService) automationTick(ctx context.Context, now time.Time) error
 	if err != nil {
 		return err
 	}
-	if s.safe != nil && s.safe() {
+	if s.isSafe() {
 		return nil
 	}
 	if s.isAutomationPausedForSwitch() {

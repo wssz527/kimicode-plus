@@ -20,7 +20,7 @@ Kimi Code Desktop 用户，关心缓存命中与额度成本，希望在官方�
 
 ## Operating Context
 
-macOS Apple Silicon/Intel、Windows x64、Linux x64。原生桌面验收已覆盖 macOS ARM64（1.3.7）与 Windows 11 x64（1.3.2 / 1.3.7 / 模拟 1.9.9 跨版本兼容）。附加功能中的网页规划使用增强程序自建 WebContentsView/窗口；网站内容提取、网站内发送与回复读取属于不同能力，必须分别验收。
+发布平台为 macOS Apple Silicon、macOS Intel 和 Windows x64。原生桌面验收已覆盖 macOS ARM64（1.3.7）与 Windows 11 x64（1.3.2 / 1.3.7 / 模拟 1.9.9 跨版本兼容）。附加功能中的网页规划使用增强程序自建 WebContentsView/窗口；网站内容提取、网站内发送与回复读取属于不同能力，必须分别验收。
 
 ## Capabilities and Constraints
 

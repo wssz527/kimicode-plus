@@ -163,10 +163,10 @@ func testOptions(t *testing.T, endpoint, target string) Options {
 	return Options{CurrentVersion: "0.2.0", Executable: exe, DataDir: t.TempDir(), APIBaseURL: endpoint + "/mirror", GOOS: target, GOARCH: "amd64", AllowInsecureHTTP: true, RestartState: func() RestartState { return RestartState{Port: 48352} }, RequestRestart: func() {}, Now: func() time.Time { return fixedTime }}
 }
 
-func unixRelease(t *testing.T, binary string) *fakeRelease {
+func darwinRelease(t *testing.T, binary string) *fakeRelease {
 	t.Helper()
-	name := "enhanced-kimi-0.3.0-linux-amd64.tar.gz"
-	archive := makeArchive(t, "linux", packageFile{"enhanced-kimi-linux-amd64", binary, 0}, packageFile{noticesName, "new notices", 0}, packageFile{"RUN.txt", "instructions", 0})
+	name := "enhanced-kimi-0.3.0-darwin-amd64.tar.gz"
+	archive := makeArchive(t, "darwin", packageFile{"enhanced-kimi-darwin-amd64", binary, 0}, packageFile{noticesName, "new notices", 0}, packageFile{"RUN.txt", "instructions", 0})
 	return &fakeRelease{tag: "v0.3.0", name: name, archive: archive, sums: fmt.Sprintf("%x  %s\n", sha256.Sum256(archive), name)}
 }
 
@@ -185,10 +185,10 @@ func TestCheckRelease(t *testing.T) {
 		{"invalid version", "version three", Failed, "", 0, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := unixRelease(t, "\x7fELF payload")
+			r := darwinRelease(t, "\xcf\xfa\xed\xfe payload")
 			r.tag, r.status = tc.tag, tc.code
 			server := serveRelease(t, r)
-			m := New(testOptions(t, server.URL, "linux"))
+			m := New(testOptions(t, server.URL, "darwin"))
 			if got := m.Status(); got.State != Idle || r.get.Load() != 0 || got.CurrentVersion != "0.2.0" {
 				t.Fatalf("constructor contacted GitHub or returned invalid state: %+v", got)
 			}
@@ -205,9 +205,9 @@ func TestCheckRelease(t *testing.T) {
 
 func TestSelectAssetsRequiresExactVersionAndPlatform(t *testing.T) {
 	for _, platform := range []struct{ os, arch, ext string }{
-		{"darwin", "arm64", ".tar.gz"}, {"windows", "amd64", ".zip"},
+		{"darwin", "arm64", ".tar.gz"}, {"darwin", "amd64", ".tar.gz"}, {"windows", "amd64", ".zip"},
 	} {
-		t.Run(platform.os, func(t *testing.T) {
+		t.Run(platform.os+"-"+platform.arch, func(t *testing.T) {
 			m := New(Options{CurrentVersion: "0.2.0", GOOS: platform.os, GOARCH: platform.arch})
 			defer m.Close()
 			suffix := platform.os + "-" + platform.arch + platform.ext
@@ -216,7 +216,7 @@ func TestSelectAssetsRequiresExactVersionAndPlatform(t *testing.T) {
 				{Name: suffix, URL: "https://example.com/no-version"},
 				{Name: "enhanced-kimi-0.2.0-" + suffix, URL: "https://example.com/old"},
 				{Name: "different-v0.3.0-" + suffix, URL: "https://example.com/different"},
-				{Name: "enhanced-kimi-0.3.0-linux-amd64.tar.gz", URL: "https://example.com/other-platform"},
+				{Name: "enhanced-kimi-0.3.0-windows-arm64.zip", URL: "https://example.com/other-platform"},
 			}
 			if archive, sums := m.selectAssets(otherAssets, "v0.3.0"); archive.Name != "" || sums.Name != "SHA256SUMS" {
 				t.Fatalf("unexpected fallback: archive=%+v sums=%+v", archive, sums)
@@ -238,7 +238,7 @@ func TestCheckRateLimitError(t *testing.T) {
 		_, _ = w.Write([]byte(`{"message":"API rate limit exceeded"}`))
 	}))
 	t.Cleanup(server.Close)
-	m := New(testOptions(t, server.URL, "linux"))
+	m := New(testOptions(t, server.URL, "darwin"))
 	s, err := m.Check(t.Context())
 	if err == nil || s.State != Failed || !strings.Contains(s.Error, "每小时上限") {
 		t.Fatalf("expected rate-limit hint, got status=%+v err=%v", s, err)
@@ -246,15 +246,16 @@ func TestCheckRateLimitError(t *testing.T) {
 }
 
 func TestCheckConfigurationAndBlockers(t *testing.T) {
-	r := unixRelease(t, "\x7fELF payload")
+	r := darwinRelease(t, "\xcf\xfa\xed\xfe payload")
 	server := serveRelease(t, r)
-	options := testOptions(t, server.URL, "linux")
+	options := testOptions(t, server.URL, "darwin")
 	for _, tc := range []struct {
 		name, reason string
 		configure    func(*Options, *fakeRelease)
 	}{
 		{"missing checksum", "缺少 SHA256SUMS", func(_ *Options, r *fakeRelease) { r.sums = "" }},
-		{"wrong platform", "该版本缺少本平台安装包", func(o *Options, _ *fakeRelease) { o.GOARCH = "arm64" }},
+		{"wrong architecture", "该版本缺少本平台安装包", func(o *Options, _ *fakeRelease) { o.GOARCH = "arm64" }},
+		{"Linux has no release artifact", "该版本缺少本平台安装包", func(o *Options, _ *fakeRelease) { o.GOOS = "linux" }},
 		{"temporary executable", "go run", func(o *Options, _ *fakeRelease) {
 			dir := filepath.Join(t.TempDir(), "go-build12345")
 			if err := os.Mkdir(dir, 0o755); err != nil {
@@ -265,7 +266,7 @@ func TestCheckConfigurationAndBlockers(t *testing.T) {
 		{"safe mode", "安全模式", func(o *Options, _ *fakeRelease) { o.Safe = func() bool { return true } }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := unixRelease(t, "\x7fELF payload")
+			r := darwinRelease(t, "\xcf\xfa\xed\xfe payload")
 			o := options
 			tc.configure(&o, r)
 			o.APIBaseURL = serveRelease(t, r).URL + "/mirror"
@@ -303,9 +304,9 @@ func TestCheckConfigurationAndBlockers(t *testing.T) {
 }
 
 func TestApplyStagesBeforeRequestingRestart(t *testing.T) {
-	for _, target := range []string{"linux", "windows"} {
+	for _, target := range []string{"darwin", "windows"} {
 		t.Run(target, func(t *testing.T) {
-			ext, binary := "", "\x7fELF updated executable"
+			ext, binary := "", "\xcf\xfa\xed\xfe updated executable"
 			archiveSuffix := ".tar.gz"
 			if target == "windows" {
 				ext, binary = ".exe", "MZ windows executable"
@@ -363,7 +364,7 @@ func TestApplyStagesBeforeRequestingRestart(t *testing.T) {
 func TestApplyRejectsTamperingAndMalformedChecksums(t *testing.T) {
 	for _, name := range []string{"tampered archive", "uppercase hash", "different archive", "duplicate checksum", "large checksum", "bad magic"} {
 		t.Run(name, func(t *testing.T) {
-			r := unixRelease(t, "\x7fELF updated executable")
+			r := darwinRelease(t, "\xcf\xfa\xed\xfe updated executable")
 			want, download := "校验值", false
 			switch name {
 			case "tampered archive":
@@ -379,10 +380,10 @@ func TestApplyRejectsTamperingAndMalformedChecksums(t *testing.T) {
 				r.sums += strings.Repeat("#", maxSumsBytes)
 				want = "大小限制"
 			case "bad magic":
-				r = unixRelease(t, "not an executable")
+				r = darwinRelease(t, "not an executable")
 				want, download = "程序格式", true
 			}
-			o := testOptions(t, serveRelease(t, r).URL, "linux")
+			o := testOptions(t, serveRelease(t, r).URL, "darwin")
 			o.RequestRestart = func() { t.Error("unexpected restart") }
 			s, err := New(o).Apply(t.Context())
 			if err == nil || s.State != Failed || !strings.Contains(s.Error, want) || (r.packageGet.Load() > 0) != download {
@@ -437,7 +438,7 @@ func TestSafeModeAndConcurrentApply(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses Unix test archive")
 	}
-	r := unixRelease(t, "\x7fELF payload")
+	r := darwinRelease(t, "\xcf\xfa\xed\xfe payload")
 	started, proceed := make(chan struct{}), make(chan struct{})
 	r.servePackage = func(w http.ResponseWriter, req *http.Request) {
 		_, _ = w.Write(r.archive[:5])
@@ -451,7 +452,7 @@ func TestSafeModeAndConcurrentApply(t *testing.T) {
 	}
 	var safe atomic.Bool
 	safe.Store(true)
-	o := testOptions(t, serveRelease(t, r).URL, "linux")
+	o := testOptions(t, serveRelease(t, r).URL, "darwin")
 	o.Safe = safe.Load
 	m := New(o)
 	defer m.Close()

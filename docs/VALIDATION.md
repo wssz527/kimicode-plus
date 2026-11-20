@@ -2,6 +2,15 @@
 
 验收使用本项目 `work/` 下的隔离数据目录和独立宿主 profile（Windows 端使用独立临时隔离目录）。当前范围为核心 M0–M6、插件接口 v2（A1）、规划插件（A3）、修正轮（R0–R4）及下一轮（N0–N6）。多屏会话插件 A2 延期。
 
+## v0.2.0 同屏会话与发布回归
+
+| 场景 | 结果 |
+|---|---|
+| macOS ARM64，官方 1.4.2 | 隔离宿主通过 `main-loopback-rpc` 接入。修复前，官方 `/api/v1/sessions` 返回旧会话和字符串 `activity`，增强列表返回 0 条，新建与详情误报缺少 ID。修复后可打开旧会话及历史，在主窗格与分栏分别新建会话，分栏实时显示发送和本机合成回复。由官方界面新建并发出首条消息后，同屏选择器可立即找到会话，并加载其对话。 |
+| Windows x64，官方 1.4.2 | 隔离宿主通过 `windows-cdp-loopback` 接入。对照官方 KAP 和核心列表，两者返回相同的会话 ID。模拟第一次列表响应暂时为空后，保持同一选择器即可加载旧会话。分栏新建后可发送消息并实时看到本机合成回复。 |
+| Linux 拒绝边界 | Linux amd64 `go vet ./...` 和桌面测试二进制交叉编译通过。Linux ARM64 隔离虚拟机运行四项回归通过，覆盖未设置安全模式回调、拒绝不受支持的宿主接入、状态边界及会话读取和新建。 |
+| 构建与发布归档 | Web 类型检查与 297 项测试、`make build`、二进制验收 27 项通过。`dist/release/` 下三个平台包逐包校验二进制、`LICENSE`、`THIRD_PARTY_NOTICES.txt`、`RUN.txt` 和 SHA-256。 |
+
 ## v0.2.0 登录任务与常驻路径补验
 
 | 场景 | 结果 |
@@ -10,11 +19,11 @@
 | Windows 空闲后台 CPU | 两版在同一台 16 逻辑处理器机器上各采样约 64 秒，隔离 Kimi Code 未启动。旧版观察到 11 个 PowerShell 子进程，累计至少 3531 毫秒 CPU 时间，占整机 CPU 容量至少 0.344%。新版观察到 0 个此类子进程，核心 CPU 时间增量低于本次采样分辨率。该方法不计入共享 WMI 服务开销。 |
 | Windows 接入失败与重开 | 占用临时 inspector 端口，官方 1.3.2 的无调试参数隔离实例报告接入失败。释放端口后，重开动作在会话空闲时正常退出旧进程，新进程完成主进程接入。内置浏览器用已记录的状态验证独立设置页提示、会话运行时拒绝文案和刷新后的接入状态。Go 回归覆盖四位 fuse v1、末尾追加位和缺失或关闭所需位。 |
 | macOS 常驻路径与隔离属性 | 本机测试二进制可由 launchd 从「下载」直接运行。安装隔离常驻副本后移走原件，真实 launchd 仍能从增强数据目录启动核心；停用后台接入后使用新版本重新开启会自动刷新常驻副本，登录项运行期间则拒绝静默覆盖并拒绝符号链接目标。本机实测 `com.apple.quarantine`：未批准的 `0083` 被 Gatekeeper 拦截；带系统设置「仍要打开」批准位 `00c3` 或 `xattr -dr` 清除后，`/bin/cp -p` 复制的副本即使删去「下载」原件，真实 `launchctl bootstrap` 仍以退出码 0 正常启动（记录在 `work/release-followup/mac-quarantine-verify.json`）。进程级自更新测试通过模拟发布源完成健康切换，常驻副本更新，下载原件未改动。 |
-| 全量回归与四平台打包 | 已按用户决定移除 Windows ARM64 发布目标（保留 `darwin/arm64`、`darwin/amd64`、`windows/amd64`、`linux/amd64`），并修正 `go.mod` 直接依赖标记（干净工作树 `go mod tidy -diff` 无差异）。四平台 `go vet`、`windows/amd64` 与 `linux/amd64` 测试二进制交叉编译、macOS ARM64 `go test -race -count=1 ./cmd/... ./internal/... ./plugins/...`（23 个测试包）、Web 类型检查和 296/296 项测试、`make build` 与 `scripts/acceptance.py` 27/27 全部通过。`VERSION=0.2.0` 四平台打包产物逐包校验了二进制、`LICENSE`、`THIRD_PARTY_NOTICES.txt`、`RUN.txt` 与 `SHA256SUMS`。 |
+| 发布平台与 CI | v0.2.0 发布归档为 `darwin-arm64`、`darwin-amd64` 和 `windows-amd64`。Linux x64 继续运行 Ubuntu CI 和交叉检查，覆盖不支持原生接入的平台拒绝路径。 |
 | Windows x64 重启后发布包复验 | `wssz-win` 于 2026-11-20 19:18 重启并登录控制台会话 1 后，将最终打包的 `enhanced-kimi-0.2.0-windows-amd64.zip` 与 `SHA256SUMS` 传至隔离目录实测：压缩包 SHA-256 校验通过，解压包含预期四项文件，`--version` 为 `0.2.0`；在中文空格数据目录注册登录任务并触发后，核心在会话 1 无窗口运行（`coreMainWindowHandle: 0`）、健康接口返回 `OK` / `0.2.0`，普通启动的隔离官方 1.3.2 自动完成保原 PID 接入（`hostPid: 8996`，`transport: "main-loopback-rpc"`）；卸载后登录任务、标记文件与 `windows-resident.vbs` 全部清空，临时目录已删除（记录见 `work/release-followup/windows-postboot-verify.json`）。 |
 | Windows x64 整机重启登录自动触发实测 | 将最终打包的 `enhanced-kimi-0.2.0-windows-amd64.zip` 预装至 `wssz-win` 隔离目录（含中文与空格数据目录 `数据 目录`）并注册登录任务 `KimiCodePlus-6104a0f6782ac9f0`（`MSFT_TaskLogonTrigger`、`Interactive`）后，用户于 2026-11-20 20:25:05 整机重启并在 20:26 登录控制台会话 1。Windows 任务计划程序于 20:26:22 自动触发该任务，常驻核心以 PID `10284` 在会话 1 无窗口运行（`coreMainWindowHandle: 0`），健康接口返回 `OK` / `0.2.0`；随后普通启动无调试参数的隔离官方 1.3.2（PID `8824`），自动拉起的核心直接完成保原 PID 主进程接入（`transport: "main-loopback-rpc"`）。卸载后登录任务、`windows-resident.vbs`、标记文件与隔离目录已全部清空（记录见 `work/release-followup/windows-logon-e2e.json`）。 |
 
-Windows 整机重启登录自动触发、无窗口常驻与自动接入已全链路实测通过。macOS 隔离属性使用本机构建二进制写入标准 `com.apple.quarantine` 标志实测，未走浏览器真实点击下载与系统设置界面点击。Windows ARM64 已从发布目标移除。
+Windows 整机重启登录自动触发、无窗口常驻与自动接入已全链路实测通过。macOS 隔离属性使用本机构建二进制写入标准 `com.apple.quarantine` 标志实测，未走浏览器真实点击下载与系统设置界面点击。发布目标为 macOS Apple Silicon、macOS Intel 和 Windows x64。
 
 ## v0.2.0 自动接入与登录常驻复验
 
