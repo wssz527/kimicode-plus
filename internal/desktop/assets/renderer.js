@@ -1575,6 +1575,7 @@ async function installNativeRenderer(options) {
         mount.dispose();
       };
       const handle = {
+        mode: definition?.mode === 'page' ? 'page' : 'split',
         setWidth: mount.setWidth,
         width: mount.width,
         dispose: release,
@@ -1708,8 +1709,6 @@ async function installNativeRenderer(options) {
         };
       }
       if (state.pluginPanels.has(pluginId)) state.pluginPanels.get(pluginId)?.dispose?.();
-      const body = panelBody();
-      if (!body || !document.querySelector(".ptb-tabs")) throw new Error("右侧面板契约未就绪");
       const wrapper = document.createElement("div");
       wrapper.className = "ptb-tab";
       wrapper.dataset.ekdpPluginPanel = pluginId;
@@ -1734,7 +1733,7 @@ async function installNativeRenderer(options) {
       host.className = "ekdp-panel-host";
       host.dataset.ekdpPlugin = pluginId;
       host.hidden = true;
-      body.append(host);
+      panelBody()?.append(host);
       const mountScope = localScope();
       try {
         mountScope.add(definition.render(host));

@@ -54,6 +54,17 @@ func TestV2HostsRegisterInThePluginScope(t *testing.T) {
 	}
 }
 
+func TestPluginMainAreaTracksPageModeForSessionNavigation(t *testing.T) {
+	for _, wanted := range []string{
+		"mode: definition?.mode === 'page' ? 'page' : 'split'",
+		"if (handle.mode === 'page') handle.dispose();",
+	} {
+		if !strings.Contains(rendererSource, wanted) {
+			t.Fatalf("renderer.js lost plugin page cleanup on session navigation: %s", wanted)
+		}
+	}
+}
+
 func TestNativeTabClickDeactivatesPluginRightPanelWithoutHidingPanel(t *testing.T) {
 	for _, wanted := range []string{
 		".ptb-tab:not([data-ekdp-plugin-panel])",
@@ -75,6 +86,9 @@ func TestPluginRightPanelTabIsDynamicAndPreservesOfficialWidth(t *testing.T) {
 	mountBlock := rendererSource[mountStart : mountStart+strings.Index(rendererSource[mountStart:], "const pluginLayoutHost")]
 	if strings.Contains(mountBlock, "tabs.append(wrapper)") {
 		t.Fatal("mount() must not pin plugin tab into .ptb-tabs before open()")
+	}
+	if !strings.Contains(mountBlock, "panelBody()?.append(host);") || strings.Contains(mountBlock, "右侧面板契约未就绪") {
+		t.Fatal("mount() must let plugins activate before the official right panel is available")
 	}
 	for _, wanted := range []string{
 		`close.className = "ptb-x";`,
