@@ -1206,15 +1206,20 @@ func (m *Manager) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+APIPrefix+"/plugins/{id}/assets/{file...}", m.handleAssets)
 }
 
-func (m *Manager) handleList(w http.ResponseWriter, _ *http.Request) {
+func (m *Manager) handleList(w http.ResponseWriter, r *http.Request) {
 	plugins := m.snapshot()
+	if m.platformFor(r.Context()) != m.platform {
+		for index := range plugins {
+			plugins[index] = m.pluginFor(r.Context(), plugins[index])
+		}
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"items":               plugins,
 		"total":               len(plugins),
 		"safeMode":            m.safe(),
 		"hostVersion":         m.host,
 		"apiVersion":          APIVersion,
-		"platformLimitations": PlatformLimitations(m.platform),
+		"platformLimitations": PlatformLimitations(m.platformFor(r.Context())),
 	})
 }
 
@@ -1287,7 +1292,7 @@ func (m *Manager) handleRestore(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, plugin)
+	httpx.JSON(w, http.StatusOK, m.pluginFor(r.Context(), plugin))
 }
 
 func (m *Manager) handleForceEnable(w http.ResponseWriter, r *http.Request) {
@@ -1307,7 +1312,7 @@ func (m *Manager) handleForceEnable(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, plugin)
+	httpx.JSON(w, http.StatusOK, m.pluginFor(r.Context(), plugin))
 }
 
 func (m *Manager) handleInstall(w http.ResponseWriter, r *http.Request) {
@@ -1320,7 +1325,7 @@ func (m *Manager) handleInstall(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, plugin)
+	httpx.JSON(w, http.StatusCreated, m.pluginFor(r.Context(), plugin))
 }
 
 func (m *Manager) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -1330,7 +1335,7 @@ func (m *Manager) handleGet(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件未安装")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, plugin)
+	httpx.JSON(w, http.StatusOK, m.pluginFor(r.Context(), plugin))
 }
 
 func (m *Manager) handleEnable(w http.ResponseWriter, r *http.Request) {
@@ -1341,7 +1346,7 @@ func (m *Manager) handleEnable(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, plugin)
+	httpx.JSON(w, http.StatusOK, m.pluginFor(r.Context(), plugin))
 }
 
 func (m *Manager) handleDisable(w http.ResponseWriter, r *http.Request) {

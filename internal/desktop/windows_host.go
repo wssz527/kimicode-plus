@@ -20,15 +20,15 @@ import (
 )
 
 const (
-	WindowsKimiExecutableName   = "Kimi Code.exe"
-	windowsLauncherStateFile    = "windows-launcher-state.json"
-	windowsLauncherConfigFile   = "launcher-config.json"
-	windowsLauncherScriptName   = "enhanced-kimi-launcher.vbs"
-	windowsPEHeaderOffsetField  = 0x3c
-	windowsPEMachineAMD64       = 0x8664
-	windowsPEMachineARM64       = 0xaa64
-	windowsFuseScanChunkSize    = 1 << 20
-	windowsFuseScanCarrySize    = len(fuseSentinelPrefix) + len(fuseSentinelSuffix) + fuseBlockPrefixLen + fuseMaxCount + 32
+	WindowsKimiExecutableName  = "Kimi Code.exe"
+	windowsLauncherStateFile   = "windows-launcher-state.json"
+	windowsLauncherConfigFile  = "launcher-config.json"
+	windowsLauncherScriptName  = "enhanced-kimi-launcher.vbs"
+	windowsPEHeaderOffsetField = 0x3c
+	windowsPEMachineAMD64      = 0x8664
+	windowsPEMachineARM64      = 0xaa64
+	windowsFuseScanChunkSize   = 1 << 20
+	windowsFuseScanCarrySize   = len(fuseSentinelPrefix) + len(fuseSentinelSuffix) + fuseBlockPrefixLen + fuseMaxCount + 32
 )
 
 var (
@@ -52,13 +52,14 @@ type WindowsProcessInfo struct {
 // port launched by our Windows launcher so we can distinguish launcher-managed
 // daily instances from unrelated debugging sessions.
 type WindowsLauncherState struct {
-	PID          int    `json:"pid"`
-	DebugPort    int    `json:"debugPort"`
-	OwnerSID     string `json:"ownerSid,omitempty"`
-	Executable   string `json:"executable"`
-	Started      string `json:"started"`
-	LaunchedByUs bool   `json:"launchedByUs"`
-	LaunchedAt   string `json:"launchedAt"`
+	PID           int    `json:"pid"`
+	DebugPort     int    `json:"debugPort"`
+	InspectorPort int    `json:"inspectorPort,omitempty"`
+	OwnerSID      string `json:"ownerSid,omitempty"`
+	Executable    string `json:"executable"`
+	Started       string `json:"started"`
+	LaunchedByUs  bool   `json:"launchedByUs"`
+	LaunchedAt    string `json:"launchedAt"`
 }
 
 // WindowsPortListener represents one TCP listening socket entry reported by the OS.
@@ -253,6 +254,9 @@ func IsWindowsDebugInstance(info WindowsProcessInfo, launcher *WindowsLauncherSt
 		arg := args[i]
 		lower := strings.ToLower(arg)
 		if matchesLauncher {
+			if launcher.InspectorPort > 0 && lower == "--inspect=127.0.0.1:"+strconv.Itoa(launcher.InspectorPort) {
+				continue
+			}
 			if lower == expectedPortFlag {
 				continue
 			}

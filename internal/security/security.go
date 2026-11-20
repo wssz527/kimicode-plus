@@ -1,6 +1,7 @@
 package security
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -13,6 +14,14 @@ import (
 )
 
 var Permissions = []string{"core:read", "settings:write", "models:read", "models:write", "usage:read", "usage:write", "tasks:read", "tasks:write", "chat:read", "chat:write", "plugins:read", "plugins:write", "adapter:write", "credentials:read", "credentials:write", "workspace:read", "workspace:write", "browser:read", "browser:write"}
+
+const ElectronMainPermission = "host:electron-main"
+
+type electronMainKey struct{}
+
+func HasElectronMain(ctx context.Context) bool {
+	return ctx.Value(electronMainKey{}) == true
+}
 
 type grant struct {
 	permissions map[string]bool
@@ -61,15 +70,18 @@ func (g *Guard) IssueSessionToken(requested []string) string {
 	g.grants[token] = grant{scopes, now.Add(12 * time.Hour)}
 	return token
 }
-func equal(a, b string) bool          { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
-func (g *Guard) permitted(token, permission string) bool {
+func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
+func (g *Guard) authorize(token, permission string) (allowed, electronMain bool) {
 	if equal(token, g.pairing) {
-		return true
+		return true, false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	v, ok := g.grants[token]
-	return ok && time.Now().Before(v.expires) && v.permissions[permission]
+	if !ok || !time.Now().Before(v.expires) || !v.permissions[permission] {
+		return false, false
+	}
+	return true, v.permissions[ElectronMainPermission]
 }
 func (g *Guard) limited() bool {
 	g.mu.Lock()
@@ -180,7 +192,7 @@ func (g *Guard) Pair(w http.ResponseWriter, r *http.Request) {
 	if requested == nil {
 		requested = Permissions
 	}
-	allowed := make(map[string]bool)
+	allowed := map[string]bool{ElectronMainPermission: true}
 	for _, p := range Permissions {
 		allowed[p] = true
 	}
@@ -239,9 +251,13 @@ func (g *Guard) Wrap(next http.Handler) http.Handler {
 				httpx.Fail(w, 401, "AUTH_REQUIRED", "请配对后访问增强服务")
 				return
 			}
-			if !g.permitted(strings.TrimPrefix(auth, "Bearer "), permission(r)) {
+			allowed, electronMain := g.authorize(strings.TrimPrefix(auth, "Bearer "), permission(r))
+			if !allowed {
 				httpx.Fail(w, 403, "PERMISSION_DENIED", "凭据无效、已过期或没有此资源权限")
 				return
+			}
+			if electronMain {
+				r = r.WithContext(context.WithValue(r.Context(), electronMainKey{}, true))
 			}
 		}
 		binaryUpload := r.Method == "POST" && r.URL.Path == "/enhance/v1/attachments" && r.Header.Get("Content-Type") == "application/octet-stream"

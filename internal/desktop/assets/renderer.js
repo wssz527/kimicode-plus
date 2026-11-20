@@ -1778,6 +1778,7 @@ async function installNativeRenderer(options) {
   // host's own core token or drive another plugin's scope.
   function publishNativeUI() {
     const ui = {
+      mainBridgeCore: options.coreURL || '',
       remove: () => state.remove(),
       mountSessions: extraIds => mountSessions(extraIds),
       pickSession: exclude => pickSession(exclude),

@@ -114,7 +114,7 @@ KimiCode+ 支持本地受信增强插件。插件是运行在宿主渲染进程�
 - 停用、卸载、故障、安全模式和核心关闭都会撤销身份令牌，并同时释放该插件的网页视图、命令注册与会话订阅；这些停止路径都会结束该插件创建且仍在运行的规划线程（历史保留）。
 - `commands` 只做身份与归属校验，命令本体在插件自己的渲染上下文里执行。调用不存在的命令返回 `404 PLUGIN_COMMAND_UNKNOWN`，所属插件未运行返回 `409 PLUGIN_COMMAND_UNAVAILABLE`，不会返回伪造的成功结果。
 - Windows 通过现有 loopback 桥使用核心命令授权，命令本体在当前渲染器中相应插件的作用域运行。ZIP 和文件夹选择优先使用官方客户端系统对话框，缺少客户端入口时由同一 Windows 交互桌面中的核心打开系统对话框。也可在安装页手动输入完整路径。
-- `GET /enhance/v1/plugins` 返回平台的 `platformLimitations`。安装预览和插件详情返回与该插件声明匹配的部分。每项含 `feature`、`capability` 和中文 `message`。Windows 当前限制为插件隔离网页视图（`browser.view`）、独立插件窗口（`window.popout`）和独立右侧 `+` 浮层同步（`entry.nativeOverlay`）。核心动作返回 `409 PLATFORM_UNSUPPORTED`，宿主桥也返回同一错误码。右侧面板标签、会话信息入口、右侧面板列表以及同一文档中的 `+` 菜单仍可挂载。
+- `GET /enhance/v1/plugins` 根据当前连接返回 `platformLimitations`。安装预览和插件详情返回与该插件声明匹配的部分。每项含 `feature`、`capability` 和中文 `message`。Windows 通过启动器接入 Electron 主进程后，支持插件隔离网页视图（`browser.view`）、独立插件窗口（`window.popout`）和官方独立右侧 `+` 浮层（`entry.nativeOverlay`）。Windows 工作台或仅接入渲染进程时，这三项仍列为受限，调用返回 `PLATFORM_UNSUPPORTED`。右侧面板标签、会话信息入口、右侧面板列表以及同一文档中的 `+` 菜单可继续挂载。
 
 ### v2 输入输出要点
 

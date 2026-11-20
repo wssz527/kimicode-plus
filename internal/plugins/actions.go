@@ -105,7 +105,7 @@ func (m *Manager) runAction(ctx context.Context, id, token, action string, param
 	grants := item.grants
 	switch {
 	case action == "runtime.info":
-		return m.runtimeInfo(item), nil
+		return m.runtimeInfo(ctx, item), nil
 	case action == "log":
 		var input struct {
 			Level   string `json:"level"`
@@ -152,7 +152,7 @@ func (m *Manager) runAction(ctx context.Context, id, token, action string, param
 		if err := m.verifyPrivilege(item); err != nil {
 			return nil, err
 		}
-		if err := CheckPlatformFeature(m.platform, FeatureBrowserView); err != nil {
+		if err := CheckPlatformFeature(m.platformFor(ctx), FeatureBrowserView); err != nil {
 			return nil, err
 		}
 		return m.browserAction(ctx, id, action, r, params)
@@ -194,7 +194,7 @@ func (m *Manager) runAction(ctx context.Context, id, token, action string, param
 		}
 		return m.sessionWatch(ctx, id, stringValue(input["id"]), action == "sessions.watch")
 	case action == "ui.popout":
-		if err := CheckPlatformFeature(m.platform, FeaturePopout); err != nil {
+		if err := CheckPlatformFeature(m.platformFor(ctx), FeaturePopout); err != nil {
 			return nil, err
 		}
 		return map[string]any{"pluginId": id}, nil
@@ -303,7 +303,7 @@ func (m *Manager) runAction(ctx context.Context, id, token, action string, param
 	return value, nil
 }
 
-func (m *Manager) runtimeInfo(item entry) map[string]any {
+func (m *Manager) runtimeInfo(ctx context.Context, item entry) map[string]any {
 	m.mu.Lock()
 	host := m.host
 	m.mu.Unlock()
@@ -312,7 +312,7 @@ func (m *Manager) runtimeInfo(item entry) map[string]any {
 		"id": item.manifest.ID, "name": item.manifest.Name, "version": item.manifest.Version,
 		"apiVersion": item.manifest.APIVersion, "hostVersion": host,
 		"capabilities": grants.Names(), "slots": grantedSlots(grants),
-		"platformLimitations": pluginPlatformLimitations(m.platform, item.declared),
+		"platformLimitations": pluginPlatformLimitations(m.platformFor(ctx), item.declared),
 	}
 }
 

@@ -1,6 +1,25 @@
 package plugins
 
-import "net/http"
+import (
+	"context"
+	"net/http"
+
+	"enhancedkimi/internal/security"
+)
+
+func (m *Manager) platformFor(ctx context.Context) string {
+	if m.platform == "windows" && security.HasElectronMain(ctx) {
+		return ""
+	}
+	return m.platform
+}
+
+func (m *Manager) pluginFor(ctx context.Context, plugin Plugin) Plugin {
+	if m.platformFor(ctx) != m.platform {
+		plugin.PlatformLimitations = nil
+	}
+	return plugin
+}
 
 const (
 	FeatureBrowserView   = "browser.view"

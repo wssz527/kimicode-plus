@@ -123,9 +123,9 @@ func TestSelectWindowsMainProcessesAndLauncherDebugExemption(t *testing.T) {
 
 	// Mismatched port, extra --inspect, or non-loopback address still counts as debug instance!
 	for name, cmd := range map[string]string{
-		"wrong port":       `"` + exe + `" --remote-debugging-port=9222`,
-		"extra inspect":    `"` + exe + `" --remote-debugging-port=54321 --inspect=9229`,
-		"all interfaces":   `"` + exe + `" --remote-debugging-port=54321 --remote-debugging-address=0.0.0.0`,
+		"wrong port":        `"` + exe + `" --remote-debugging-port=9222`,
+		"extra inspect":     `"` + exe + `" --remote-debugging-port=54321 --inspect=9229`,
+		"all interfaces":    `"` + exe + `" --remote-debugging-port=54321 --remote-debugging-address=0.0.0.0`,
 		"alternate profile": `"` + exe + `" --remote-debugging-port=54321 --user-data-dir=C:\tmp\alt`,
 	} {
 		p := selected[0]
@@ -463,7 +463,7 @@ func TestAttachWindowsCDPAndRunWindowsLauncherEndToEnd(t *testing.T) {
 	if state := ReadAttachState(dataDir); state == nil || state["debugPortWarning"] == "" {
 		t.Fatalf("attach-state.json missing debugPortWarning: %+v", state)
 	}
-	wantMethods := "Runtime.enable,Page.enable,Page.addScriptToEvaluateOnNewDocument,Runtime.evaluate"
+	wantMethods := "Runtime.enable,Page.enable,Runtime.evaluate,Page.addScriptToEvaluateOnNewDocument"
 	if strings.Join(gotMethods, ",") != wantMethods {
 		t.Fatalf("unexpected CDP call sequence: got %v, want %s", gotMethods, wantMethods)
 	}
@@ -488,6 +488,26 @@ func TestEncodeWindowsPowerShellCommandRoundTrip(t *testing.T) {
 	decoded := string(utf16.Decode(units))
 	if decoded != script {
 		t.Fatalf("decoded script mismatch:\ngot:  %q\nwant: %q", decoded, script)
+	}
+}
+
+func TestWindowsNodeTargetMustMatchLoopbackPortAndNodeIdentity(t *testing.T) {
+	const valid = "ws://127.0.0.1:12345/00000000-0000-4000-a000-000000000001"
+	for _, test := range []struct {
+		targets []WindowsCDPTarget
+		want    bool
+	}{
+		{[]WindowsCDPTarget{{Type: "node", WebSocketDebuggerURL: valid}}, true},
+		{[]WindowsCDPTarget{{Type: "page", WebSocketDebuggerURL: valid}}, false},
+		{[]WindowsCDPTarget{{Type: "node", WebSocketDebuggerURL: valid + "?extra"}}, false},
+		{[]WindowsCDPTarget{{Type: "node", WebSocketDebuggerURL: strings.Replace(valid, "12345", "12346", 1)}}, false},
+		{[]WindowsCDPTarget{{Type: "node", WebSocketDebuggerURL: strings.Replace(valid, "127.0.0.1", "localhost", 1)}}, false},
+		{[]WindowsCDPTarget{{Type: "node", WebSocketDebuggerURL: valid}, {Type: "page"}}, false},
+	} {
+		endpoint, err := windowsNodeTarget(test.targets, 12345)
+		if (err == nil) != test.want || (test.want && endpoint != valid) {
+			t.Errorf("targets %+v: got %q (%v)", test.targets, endpoint, err)
+		}
 	}
 }
 

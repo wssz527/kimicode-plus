@@ -192,6 +192,10 @@ func buildWindowsRendererBootstrap(optionsJSON string) string {
 	return fmt.Sprintf(`(async () => {
   const cfg = %s;
   const ua = navigator.userAgent || '';
+  const ui = window.__ekdNativeUI;
+  if (ui?.mainBridgeCore === cfg.endpoint) {
+    return {status: 'installed', transport: 'main-loopback-rpc', userAgent: ua};
+  }
   if (!cfg.appVersion) {
     const m = ua.match(/(?:kimi-code-app|kimi\s*code)\/([0-9][0-9A-Za-z._-]*)/i);
     if (m) cfg.appVersion = m[1];
@@ -302,6 +306,7 @@ func AttachWindowsCDP(ctx context.Context, opts WindowsCDPAttachOptions) (*Attac
 	}
 	script := buildWindowsRendererBootstrap(string(rendererConfig))
 
+	transport := "windows-cdp-loopback"
 	var detectedUA string
 	injectedCount := 0
 	for _, target := range targets {
@@ -313,6 +318,9 @@ func AttachWindowsCDP(ctx context.Context, opts WindowsCDPAttachOptions) (*Attac
 			return nil, fmt.Errorf("Windows 渲染页面未确认挂载成功（状态：%s）", pageRes.Status)
 		}
 		injectedCount++
+		if pageRes.Transport == "main-loopback-rpc" {
+			transport = pageRes.Transport
+		}
 		if pageRes.UserAgent != "" {
 			detectedUA = pageRes.UserAgent
 		}
@@ -349,7 +357,7 @@ func AttachWindowsCDP(ctx context.Context, opts WindowsCDPAttachOptions) (*Attac
 	verified := IsVerifiedHost(appVersion, electronVersion)
 	return &AttachResult{
 		Status:           "installed",
-		Transport:        "windows-cdp-loopback",
+		Transport:        transport,
 		Protocol:         1,
 		AppVersion:       appVersion,
 		Electron:         electronVersion,
@@ -366,6 +374,7 @@ func AttachWindowsCDP(ctx context.Context, opts WindowsCDPAttachOptions) (*Attac
 
 type windowsPageInjectResult struct {
 	Status    string `json:"status"`
+	Transport string `json:"transport"`
 	UserAgent string `json:"userAgent"`
 }
 
@@ -392,9 +401,6 @@ func injectWindowsPageTarget(ctx context.Context, wsURL, script string) (windows
 	if _, err := session.call(ctx, "Page.enable", map[string]any{}); err != nil {
 		return windowsPageInjectResult{}, err
 	}
-	_, _ = session.call(ctx, "Page.addScriptToEvaluateOnNewDocument", map[string]any{
-		"source": script,
-	})
 	raw, err := session.Evaluate(ctx, script)
 	if err != nil {
 		return windowsPageInjectResult{}, err
@@ -402,6 +408,9 @@ func injectWindowsPageTarget(ctx context.Context, wsURL, script string) (windows
 	var res windowsPageInjectResult
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return windowsPageInjectResult{}, err
+	}
+	if res.Transport != "main-loopback-rpc" {
+		_, _ = session.call(ctx, "Page.addScriptToEvaluateOnNewDocument", map[string]any{"source": script})
 	}
 	return res, nil
 }

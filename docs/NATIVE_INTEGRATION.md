@@ -45,6 +45,10 @@ EKD 由 `internal/desktop/inject.go`、`cdp.go`、`contracts.go`、`inspector_fu
 - 日常实例必须由用户在设置里显式同意（`--allow-daily-instance` / 设置页的同意勾选）。没有这份同意时返回"需要授权"，绝不静默附着。
 - 带 `--user-data-dir`、`--remote-debugging`、`--inspect` 的实例一律视为调试实例，不自动接入。
 
+### Windows 启动器与插件主进程桥
+
+Windows 启动器启动已校验的官方客户端时，在 Electron 开关允许的情况下使用临时环回 Node inspector。核对进程、监听属主、目标类型后，安装与 macOS 共用的主进程桥，并关闭 inspector。后续由主进程创建插件窗口、网页视图和独立菜单条目。兼容路径继续通过已验证的 Chromium 渲染端口接入。它保留右侧面板等渲染能力，并在安装预览和运行时报告三项独立能力的限制。现有 Windows 实例若只有渲染进程接入，正常退出客户端后通过启动器重新打开即可尝试主进程接入。
+
 ### 可选的 LaunchAgent 事件驱动接入
 
 `launch_agent.go` 提供默认关闭、用户显式开启的常驻接入：

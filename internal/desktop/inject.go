@@ -67,10 +67,11 @@ type AttachResult struct {
 	VersionNote string `json:"versionNote,omitempty"`
 	// Daily is true when the attached instance is the user's normal client rather
 	// than a disposable isolated host.
-	Daily            bool   `json:"daily"`
-	Platform         string `json:"platform,omitempty"`
-	DebugPort        int    `json:"debugPort,omitempty"`
-	DebugPortWarning string `json:"debugPortWarning,omitempty"`
+	Daily             bool   `json:"daily"`
+	Platform          string `json:"platform,omitempty"`
+	DebugPort         int    `json:"debugPort,omitempty"`
+	DebugPortWarning  string `json:"debugPortWarning,omitempty"`
+	MainBridgeWarning string `json:"mainBridgeWarning,omitempty"`
 }
 
 // ErrConsentRequired is returned when the only running client is the user's daily
@@ -231,7 +232,7 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (*AttachResu
 	config := map[string]any{
 		"coreURL": options.CoreURL, "pairingToken": options.PairingToken,
 		"expectedApp": realAppVersion, "expectedElectron": contract.Electron,
-		"reportedApp": contract.AppVersion,
+		"reportedApp":  contract.AppVersion,
 		"moduleSource": string(moduleSource), "cssSource": string(cssSource), "rendererSource": rendererBundle,
 	}
 	encoded, err := json.Marshal(config)

@@ -55,6 +55,7 @@ type WindowsLauncherDeps struct {
 	SpawnDetached       func(executable string, args []string) (int, error)
 	PickPort            func() (int, error)
 	AttachCDP           func(ctx context.Context, opts WindowsCDPAttachOptions) (*AttachResult, error)
+	SpawnInspectable    func(executable string, args []string) (*os.Process, error)
 	CheckCoreHealth     func(ctx context.Context, coreURL string) bool
 	SelfPID             func() int
 	CoreReadyTimeout    time.Duration
@@ -142,7 +143,8 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 	}
 
 	// Step 1: Verify Kimi Code.exe PE header + Electron + fuse before spawning anything.
-	if _, err := deps.VerifyBinary(opts.KimiExecutable); err != nil {
+	binary, err := deps.VerifyBinary(opts.KimiExecutable)
+	if err != nil {
 		return nil, err
 	}
 
@@ -206,7 +208,17 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 	}
 
 	var targetProc WindowsProcessInfo
-	var debugPort int
+	var debugPort, inspectorPort int
+	var spawned *os.Process
+	var inspectorClosed bool
+	defer func() {
+		if spawned != nil {
+			if !inspectorClosed {
+				_ = spawned.Kill()
+			}
+			_ = spawned.Release()
+		}
+	}()
 	kimiReused := false
 
 	if len(matches) > 1 {
@@ -239,7 +251,20 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 		if opts.Profile != "" {
 			kimiArgs = append(kimiArgs, "--user-data-dir="+opts.Profile)
 		}
-		if _, err := deps.SpawnDetached(opts.KimiExecutable, kimiArgs); err != nil {
+		if deps.SpawnInspectable != nil && binary.InspectorFuseOn && binary.FuseVersion == 1 && binary.FuseCount == 9 {
+			inspectorPort, err = deps.PickPort()
+			if err != nil {
+				return nil, err
+			}
+			if inspectorPort == port {
+				return nil, errors.New("无法为 Windows 主进程和渲染进程分配独立端口")
+			}
+			kimiArgs = append(kimiArgs, fmt.Sprintf("--inspect=127.0.0.1:%d", inspectorPort))
+			spawned, err = deps.SpawnInspectable(opts.KimiExecutable, kimiArgs)
+		} else {
+			_, err = deps.SpawnDetached(opts.KimiExecutable, kimiArgs)
+		}
+		if err != nil {
 			return nil, fmt.Errorf("无法启动 Kimi Code：%w", err)
 		}
 		debugPort = port
@@ -248,7 +273,7 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 			procs, listErr := deps.ListProcesses(ctx)
 			if listErr == nil {
 				found, selErr := SelectWindowsMainProcesses(sid, procs, opts.KimiExecutable, opts.Profile)
-				if selErr == nil && len(found) == 1 {
+				if selErr == nil && len(found) == 1 && (spawned == nil || spawned.Pid == found[0].PID) {
 					listeners, lErr := deps.ListListeners(ctx, debugPort)
 					if lErr == nil && VerifyWindowsDebugPortOwner(listeners, debugPort, found[0].PID) == nil {
 						targetProc = found[0]
@@ -266,13 +291,14 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 			}
 		}
 		lease := WindowsLauncherState{
-			PID:          targetProc.PID,
-			DebugPort:    debugPort,
-			OwnerSID:     targetProc.OwnerSID,
-			Executable:   targetProc.Executable,
-			Started:      targetProc.Started,
-			LaunchedByUs: true,
-			LaunchedAt:   time.Now().UTC().Format(time.RFC3339),
+			PID:           targetProc.PID,
+			DebugPort:     debugPort,
+			InspectorPort: inspectorPort,
+			OwnerSID:      targetProc.OwnerSID,
+			Executable:    targetProc.Executable,
+			Started:       targetProc.Started,
+			LaunchedByUs:  true,
+			LaunchedAt:    time.Now().UTC().Format(time.RFC3339),
 		}
 		if err := WriteWindowsLauncherState(opts.DataDir, lease); err != nil {
 			return nil, err
@@ -299,7 +325,7 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 		return nil, err
 	}
 
-	// Step 5: Inject via Chromium CDP and audit for any foreign debugging clients.
+	// Step 5: Attach the native bridge, with Chromium CDP as the compatibility path.
 	var auditFn func(ctx context.Context, port, hostPID int) ([]WindowsDebugClientAlert, error)
 	if deps.ListConnections != nil {
 		auditFn = func(auditCtx context.Context, port, hostPID int) ([]WindowsDebugClientAlert, error) {
@@ -311,7 +337,7 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 		}
 	}
 
-	attachResult, attachErr := deps.AttachCDP(ctx, WindowsCDPAttachOptions{
+	attachOptions := WindowsCDPAttachOptions{
 		DebugPort:          debugPort,
 		HostPID:            targetProc.PID,
 		CoreURL:            coreRec.URL,
@@ -320,11 +346,36 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 		Daily:              opts.Profile == "",
 		AppVersionOverride: opts.AppVersionOverride,
 		AuditClients:       auditFn,
-	})
+	}
+	var attachResult *AttachResult
+	var attachErr error
+	var mainWarning string
+	if inspectorPort != 0 {
+		attachResult, attachErr = attachWindowsMain(ctx, attachOptions, opts.DataDir, inspectorPort, func(verifyCtx context.Context) error {
+			listeners, err := deps.ListListeners(verifyCtx, inspectorPort)
+			if err != nil {
+				return err
+			}
+			return VerifyWindowsDebugPortOwner(listeners, inspectorPort, targetProc.PID)
+		})
+		inspectorClosed = windowsInspectorClosed(inspectorPort)
+		if !inspectorClosed {
+			err := errors.Join(attachErr, errors.New("Windows 临时主进程调试端口未关闭，已停止本次启动"))
+			_ = RecordAttach(opts.DataDir, err)
+			return nil, err
+		}
+		if attachErr != nil {
+			mainWarning = attachErr.Error()
+		}
+	}
+	if attachResult == nil {
+		attachResult, attachErr = deps.AttachCDP(ctx, attachOptions)
+	}
 	if attachErr != nil {
 		_ = RecordAttach(opts.DataDir, attachErr)
 		return nil, attachErr
 	}
+	attachResult.MainBridgeWarning = mainWarning
 	_ = RecordAttach(opts.DataDir, attachResult)
 
 	return &WindowsLaunchResult{

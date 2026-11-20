@@ -93,7 +93,7 @@ func (m *Manager) Preview(ctx context.Context, root string) (PackagePreview, err
 		Description: manifest.Description, Author: manifest.Author, License: manifest.License,
 		HostVersions: manifest.HostVersions, APIVersion: manifest.APIVersion,
 		Capabilities: capabilities, PrivilegedCapabilities: privilegedNames(capabilities),
-		PlatformLimitations: pluginPlatformLimitations(m.platform, capabilities),
+		PlatformLimitations: pluginPlatformLimitations(m.platformFor(ctx), capabilities),
 		Compatible:          compatible, Installed: installed, Source: SourceLocal,
 		Upstream: upstreamLabel(manifest), PluginUpstream: manifest.upstreamMetadata(),
 		HasNotice: hasNotice(staging.pluginDir()),

@@ -181,17 +181,25 @@ ConvertTo-Json -InputObject $items -Compress
 	return list, nil
 }
 
-func windowsSpawnDetached(executable string, args []string) (int, error) {
+func windowsSpawnInspectable(executable string, args []string) (*os.Process, error) {
 	cmd := exec.Command(executable, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: winCreateNewProcessGroup | winDetachedProcess,
 		HideWindow:    true,
 	}
 	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return cmd.Process, nil
+}
+
+func windowsSpawnDetached(executable string, args []string) (int, error) {
+	process, err := windowsSpawnInspectable(executable, args)
+	if err != nil {
 		return 0, err
 	}
-	pid := cmd.Process.Pid
-	_ = cmd.Process.Release()
+	pid := process.Pid
+	_ = process.Release()
 	return pid, nil
 }
 
@@ -442,16 +450,17 @@ func RunWindowsLauncherPlatform(ctx context.Context, opts WindowsLaunchOptions) 
 	}
 	opts.KimiExecutable = kimiExe
 	return RunWindowsLauncher(ctx, opts, WindowsLauncherDeps{
-		CurrentSID:      windowsCurrentSID,
-		ListProcesses:   windowsListProcesses,
-		ListListeners:   windowsListListeners,
-		ListConnections: windowsListConnections,
-		VerifyBinary:    VerifyWindowsBinaryFile,
-		SpawnDetached:   windowsSpawnDetached,
-		PickPort:        PickFreeLoopbackPort,
-		AttachCDP:       AttachWindowsCDP,
-		CheckCoreHealth: defaultCheckCoreHealth,
-		SelfPID:         os.Getpid,
+		CurrentSID:       windowsCurrentSID,
+		ListProcesses:    windowsListProcesses,
+		ListListeners:    windowsListListeners,
+		ListConnections:  windowsListConnections,
+		VerifyBinary:     VerifyWindowsBinaryFile,
+		SpawnDetached:    windowsSpawnDetached,
+		SpawnInspectable: windowsSpawnInspectable,
+		PickPort:         PickFreeLoopbackPort,
+		AttachCDP:        AttachWindowsCDP,
+		CheckCoreHealth:  defaultCheckCoreHealth,
+		SelfPID:          os.Getpid,
 	})
 }
 

@@ -4,6 +4,9 @@ async function installNativeBootstrap(options) {
   const http = req('node:http');
   const crypto = req('node:crypto');
   if (app.getVersion() !== options.expectedApp || process.versions.electron !== options.expectedElectron) throw new Error('宿主版本在接入时发生变化');
+  if (options.runtimePath && (typeof BrowserWindow !== 'function' || typeof WebContentsView !== 'function' || typeof ipcMain?.prependListener !== 'function')) {
+    throw new Error('Windows 官方宿主缺少插件窗口所需的 Electron 接口');
+  }
   if (globalThis.__ekdNative) await globalThis.__ekdNative.cleanup();
   const isMainRendererURL = url => {
     if (typeof url !== 'string' || !url.startsWith('app://renderer/')) return false;
@@ -13,13 +16,20 @@ async function installNativeBootstrap(options) {
   };
   const wc = webContents.getAllWebContents().find(item => !item.isDestroyed() && isMainRendererURL(item.getURL()));
   if (!wc) throw new Error('隔离主窗口未找到');
-  const pairResponse = await fetch(new URL('/enhance/v1/pair', options.coreURL), {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ pairingToken: options.pairingToken, permissions: ['core:read','settings:write','models:read','models:write','usage:read','usage:write','tasks:read','tasks:write','chat:read','chat:write','plugins:read','plugins:write','adapter:write','credentials:read','credentials:write','workspace:read','workspace:write','browser:read','browser:write'] }),
-  });
-  const pair = await pairResponse.json();
-  if (!pairResponse.ok) throw new Error(pair?.error?.message || '增强核心配对失败');
-  let coreToken = pair.sessionToken;
+  async function pairCore(pairingToken) {
+    const permissions = ['core:read','settings:write','models:read','models:write','usage:read','usage:write','tasks:read','tasks:write','chat:read','chat:write','plugins:read','plugins:write','adapter:write','credentials:read','credentials:write','workspace:read','workspace:write','browser:read','browser:write'];
+    if (process.platform === 'win32') permissions.push('host:electron-main');
+    const response = await fetch(new URL('/enhance/v1/pair', options.coreURL), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pairingToken, permissions }), signal: AbortSignal.timeout(5000), redirect: 'error',
+    });
+    const pair = await response.json();
+    if (!response.ok || !pair.sessionToken) throw new Error(pair?.error?.message || '增强核心配对失败');
+    return pair.sessionToken;
+  }
+  let coreToken = await pairCore(options.pairingToken);
+  let pairedWith = options.pairingToken;
+  let pairing = null;
   const state = { channels: new Map(), windows: new Map(), views: new Map(), pluginViews: new Map(), pluginViewTokens: new Map(), pluginViewOwners: new Map(), pluginViewQueues: new Map(), pluginCommands: new Map(), bounds: new Map(), browserWindow: null, server: null, cleanup: null, overlayEntries: [], activeOverlayMenu: null };
   globalThis.__ekdNative = state;
   const browserSession = session.fromPartition('persist:ekd-native-browser');
@@ -38,10 +48,30 @@ async function installNativeBootstrap(options) {
   async function coreFetch(path, init = {}) {
     const headers = new Headers(init.headers || {});
     headers.set('Accept', 'application/json');
-    headers.set('Authorization', 'Bearer ' + coreToken);
     if (init.body !== undefined && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-    const response = await fetch(new URL(path, options.coreURL), { ...init, headers, signal: AbortSignal.timeout(120000) });
-    return response;
+    const request = token => {
+      headers.set('Authorization', 'Bearer ' + token);
+      return fetch(new URL(path, options.coreURL), { ...init, headers, signal: AbortSignal.timeout(120000), redirect: 'error' });
+    };
+    const originalToken = coreToken;
+    const response = await request(originalToken);
+    if (response.status !== 403 || !options.runtimePath || state.cleaned || (await response.clone().json().catch(() => null))?.error?.code !== 'PERMISSION_DENIED') return response;
+    if (coreToken === originalToken) {
+      pairing ??= (async () => {
+        const runtime = JSON.parse(await req('node:fs/promises').readFile(options.runtimePath, 'utf8'));
+        if (runtime.url !== options.coreURL || typeof runtime.pairingToken !== 'string') return;
+        const refreshed = await pairCore(runtime.pairingToken);
+        if (state.cleaned) return;
+        const restarted = pairedWith !== runtime.pairingToken;
+        pairedWith = runtime.pairingToken;
+        coreToken = refreshed;
+        if (restarted) setImmediate(rebindWindowsRenderers);
+      })().finally(() => { pairing = null; });
+      await pairing;
+    }
+    if (coreToken === originalToken || state.cleaned) return response;
+    await response.body?.cancel();
+    return request(coreToken);
   }
   async function nativeAction(action, payload) {
     const response = await coreFetch('/enhance/v1/desktop/actions/' + action, { method: 'POST', body: JSON.stringify(payload || {}) });
@@ -238,10 +268,17 @@ async function installNativeBootstrap(options) {
     state.channels.set(target.id, { key, instanceId, expectedOrigin: target === wc ? 'app://renderer' : 'null' });
     const config = {
       endpoint: state.endpoint, bridgeKey: key, instanceId, moduleSource: options.moduleSource, cssSource: options.cssSource,
+      coreURL: options.runtimePath ? options.coreURL : '',
       appVersion: options.reportedApp || app.getVersion(), electron: process.versions.electron,
       surface, ...extra,
     };
     return target.executeJavaScript('(' + options.rendererSource + ')(' + JSON.stringify(config) + ')');
+  }
+  function rebindWindowsRenderers() {
+    if (state.cleaned || wc.isDestroyed()) return;
+    destroyPluginViews();
+    for (const win of state.windows.values()) if (!win.isDestroyed()) win.close();
+    void bindRenderer(wc, 'host').catch(error => console.warn('KimiCode+ host reconnection failed', error.message));
   }
   async function dispatch(target, message) {
     const payload = message.payload || {};

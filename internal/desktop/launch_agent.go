@@ -276,6 +276,9 @@ func RecordAttach(dataDir string, value any) error {
 		if result.DebugPortWarning != "" {
 			payload["debugPortWarning"] = result.DebugPortWarning
 		}
+		if result.MainBridgeWarning != "" {
+			payload["mainBridgeWarning"] = result.MainBridgeWarning
+		}
 		payload["daily"] = result.Daily
 	} else if err, ok := value.(error); ok && err != nil {
 		payload["status"] = "error"
