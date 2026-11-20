@@ -443,7 +443,8 @@ func newUpdater(native NativeOptions, cfg *config.Store) *updater.Manager {
 	options := updater.Options{
 		CurrentVersion: Version, DataDir: native.DataDir, Safe: cfg.Safe,
 		Executable: native.Executable, RestartState: native.RestartState, RequestRestart: native.RequestRestart,
-		APIBaseURL: native.UpdateAPIBaseURL, HTTPClient: native.UpdateHTTPClient,
+		TargetExecutable: func() string { return desktop.ManagedUpdateExecutable(native.DataDir) },
+		APIBaseURL:       native.UpdateAPIBaseURL, HTTPClient: native.UpdateHTTPClient,
 	}
 	options.Dispatch = func(fn func() error) error {
 		err := cfg.Dispatch(fn)

@@ -1,10 +1,11 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { api, ApiError, coreRequest, type KctMigrationResult, type PluginActivity, type PluginPlatformLimitation, type PluginPreview, type PluginRecord, type PluginUpstream } from "../api";
+import { api, ApiError, type KctMigrationResult, type PluginActivity, type PluginPlatformLimitation, type PluginPreview, type PluginRecord, type PluginUpstream } from "../api";
 import { pluginHostBridge, syncPluginHost } from "../plugin-runtime/host";
 import type { NativeHost } from "../native";
 import { Icon } from "./Icon";
 import { ActionButton, Badge, EmptyState, ErrorNotice, Field, InfoNote, Panel, SkeletonRows, StateBadge } from "./ui";
 import { PluginCredentials } from "./PluginCredentials";
+import { requestWindowsReopen } from "./WindowsAttachStatus";
 import { PageError } from "../AppShell";
 import { errorMessage, errorRecovery, useAction, useResource } from "../lib/useResource";
 import { fmtDateTime, stateLabel, stateTone } from "../lib/format";
@@ -80,10 +81,7 @@ function WindowsPluginReopen({ host }: { host: NativeHost | null }) {
     return () => window.clearTimeout(timeout);
   }, [reopening]);
   async function reopen() {
-    const result = await action.run(async () => {
-      if (host) return host.request<{ reopening: boolean }>("attach.reopen");
-      return (await coreRequest<{ value: { reopening: boolean } }>("/desktop/actions/attach.reopen", { method: "POST", body: {} })).value;
-    });
+    const result = await action.run(() => requestWindowsReopen(host));
     if (result?.reopening) setReopening(true);
   }
   return <InfoNote tone="warn">

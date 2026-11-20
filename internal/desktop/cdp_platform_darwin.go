@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,14 +30,28 @@ func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachRe
 	return attachNativeDarwin(ctx, options)
 }
 
-func autoAttachStatusPlatform(_ string) LaunchAgentState {
-	return LaunchAgentStatus()
+func autoAttachStatusPlatform(dataDir string) LaunchAgentState {
+	state := LaunchAgentStatus()
+	if state.Enabled && !managedCoreRegistered(dataDir) {
+		state.NeedsMigration = true
+	}
+	return state
 }
 
 func enableAutoAttachPlatform(config AttachConfig, allowDaily bool) (LaunchAgentState, error) {
+	if config.Profile == "" && !allowDaily {
+		return LaunchAgentState{}, ErrConsentRequired
+	}
+	if _, err := installManagedCore(config.Executable, config.DataDir); err != nil {
+		return LaunchAgentState{}, err
+	}
+	dataDir, err := filepath.EvalSymlinks(config.DataDir)
+	if err != nil {
+		return LaunchAgentState{}, err
+	}
 	return InstallLaunchAgent(LaunchAgentConfig{
-		DataDir: config.DataDir, KimiHome: config.KimiHome, Profile: config.Profile,
-		AllowDailyInstance: allowDaily, Executable: config.Executable,
+		DataDir: dataDir, KimiHome: config.KimiHome, Profile: config.Profile,
+		AllowDailyInstance: allowDaily, Executable: managedCoreExecutable(dataDir),
 	})
 }
 

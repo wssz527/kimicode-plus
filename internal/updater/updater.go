@@ -43,6 +43,7 @@ var (
 type Options struct {
 	CurrentVersion    string
 	Executable        string
+	TargetExecutable  func() string
 	DataDir           string
 	Safe              func() bool
 	Dispatch          func(func() error) error
@@ -355,12 +356,21 @@ func (m *Manager) selectAssets(assets []asset, latest string) (archive, checksum
 	return archive, checksums
 }
 
+func (m *Manager) targetExecutable() string {
+	if m.options.TargetExecutable != nil {
+		if path := m.options.TargetExecutable(); path != "" {
+			return path
+		}
+	}
+	return m.options.Executable
+}
+
 func (m *Manager) executableBlocker() string {
 	const manual = "，请前往 GitHub Releases 手动下载"
 	if m.options.GOOS != "darwin" && m.options.GOOS != "linux" && m.options.GOOS != "windows" {
 		return "当前系统不支持自动替换核心" + manual
 	}
-	file := m.options.Executable
+	file := m.targetExecutable()
 	if !filepath.IsAbs(file) || !filepath.IsAbs(m.options.DataDir) || m.options.RestartState == nil || m.options.RequestRestart == nil {
 		return "当前运行方式不支持自动替换核心" + manual
 	}

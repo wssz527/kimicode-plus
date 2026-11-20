@@ -264,7 +264,7 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 		if opts.Profile != "" {
 			kimiArgs = append(kimiArgs, "--user-data-dir="+opts.Profile)
 		}
-		if deps.SpawnInspectable != nil && binary.InspectorFuseOn && binary.FuseVersion == 1 && binary.FuseCount == 9 {
+		if deps.SpawnInspectable != nil && binary.supportsInspector() {
 			inspectorPort, err = deps.PickPort()
 			if err != nil {
 				return nil, err
@@ -389,6 +389,7 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 		return nil, attachErr
 	}
 	attachResult.MainBridgeWarning = mainWarning
+	attachResult.hostStarted = targetProc.Started
 	_ = RecordAttach(opts.DataDir, attachResult)
 
 	return &WindowsLaunchResult{

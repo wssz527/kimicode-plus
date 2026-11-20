@@ -18,7 +18,7 @@ import (
 
 func attachRunningWindowsMain(ctx context.Context, options AttachOptions, proc WindowsProcessInfo) (*AttachResult, error) {
 	binary, err := VerifyWindowsBinaryFile(proc.Executable)
-	if err != nil || !binary.RunAsNodeFuseOn || binary.FuseCount != 9 {
+	if err != nil || !binary.supportsLiveAttach() {
 		return nil, errors.New("当前 Windows 客户端不支持运行中接入")
 	}
 	if options.DataDir == "" {
@@ -58,7 +58,7 @@ func attachRunningWindowsMain(ctx context.Context, options AttachOptions, proc W
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	return attachWindowsMain(ctx, WindowsCDPAttachOptions{
+	result, err := attachWindowsMain(ctx, WindowsCDPAttachOptions{
 		HostPID: proc.PID, CoreURL: options.CoreURL, PairingToken: options.PairingToken,
 		Profile: options.Profile, Daily: options.Profile == "", AppVersionOverride: options.AppVersionOverride,
 	}, options.DataDir, InspectorPort, func(verifyCtx context.Context) error {
@@ -68,6 +68,10 @@ func attachRunningWindowsMain(ctx context.Context, options AttachOptions, proc W
 		}
 		return VerifyWindowsDebugPortOwner(listeners, InspectorPort, proc.PID)
 	})
+	if result != nil {
+		result.hostStarted = proc.Started
+	}
+	return result, err
 }
 
 func validateLiveWindowsHost(ctx context.Context, options AttachOptions, proc WindowsProcessInfo) error {

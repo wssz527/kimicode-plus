@@ -3,7 +3,15 @@ package desktop
 import (
 	"context"
 	"errors"
+	"runtime"
 )
+
+func ManagedUpdateExecutable(dataDir string) string {
+	if runtime.GOOS == "darwin" && managedCoreRegistered(dataDir) {
+		return managedCoreExecutable(dataDir)
+	}
+	return ""
+}
 
 // AttachConfig carries the core and host identities for native integration.
 type AttachConfig struct {
@@ -43,6 +51,9 @@ func (s *NativeService) attachStatus(ctx context.Context) map[string]any {
 		} else {
 			host = map[string]any{"running": false, "reason": err.Error()}
 		}
+	}
+	if s.safe() {
+		host["canReopen"] = false
 	}
 	agent := autoAttachStatusPlatform(config.DataDir)
 	payload := map[string]any{

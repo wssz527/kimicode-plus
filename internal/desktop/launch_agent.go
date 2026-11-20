@@ -181,6 +181,23 @@ func (systemLaunch) bootout(label string) error {
 
 var launches launchController = systemLaunch{}
 
+func managedCoreExecutable(dataDir string) string {
+	return filepath.Join(dataDir, "resident", "enhanced-kimi")
+}
+
+func managedCoreRegistered(dataDir string) bool {
+	if !filepath.IsAbs(dataDir) {
+		return false
+	}
+	path, err := LaunchAgentPath(managedCoreLabel)
+	if err != nil {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	prefix := "<key>ProgramArguments</key><array><string>" + xmlEscape(managedCoreExecutable(dataDir)) + "</string>"
+	return err == nil && strings.Contains(string(data), prefix)
+}
+
 func LaunchAgentStatus() LaunchAgentState {
 	path, err := LaunchAgentPath(LaunchAgentLabel)
 	if err != nil {
@@ -321,6 +338,12 @@ func RecordAttach(dataDir string, value any) error {
 		payload["appVersion"] = result.AppVersion
 		payload["electron"] = result.Electron
 		payload["verified"] = result.Verified
+		if result.Transport != "" {
+			payload["transport"] = result.Transport
+		}
+		if result.hostStarted != "" {
+			payload["hostStarted"] = result.hostStarted
+		}
 		if result.attachKey != "" {
 			payload["attachKey"] = result.attachKey
 		}
@@ -345,6 +368,10 @@ func RecordAttach(dataDir string, value any) error {
 		payload["error"] = err.Error()
 		payload["consentRequired"] = errors.Is(err, ErrConsentRequired)
 	}
+	return writeAttachState(dataDir, payload)
+}
+
+func writeAttachState(dataDir string, payload map[string]any) error {
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return err

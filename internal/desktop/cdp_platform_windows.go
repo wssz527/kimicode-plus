@@ -318,6 +318,10 @@ func discoverHostPlatform(ctx context.Context, profile, dataDir string) (map[str
 		return map[string]any{"running": false, "reason": err.Error()}, nil
 	}
 	if len(matches) != 1 {
+		state := ReadAttachState(dataDir)
+		if windowsCurrentAttachState(WindowsProcessInfo{}, state, false) == "reopening" {
+			return map[string]any{"running": false, "attachState": "reopening"}, nil
+		}
 		return map[string]any{"running": false, "reason": fmt.Sprintf("需要且只能找到一个 Kimi Code 主进程，实际找到 %d 个", len(matches))}, nil
 	}
 	proc := matches[0]
@@ -357,6 +361,9 @@ func discoverHostPlatform(ctx context.Context, profile, dataDir string) (map[str
 	if portWarning != "" {
 		res["debugPortWarning"] = portWarning
 	}
+	state := ReadAttachState(dataDir)
+	res["attachState"] = windowsCurrentAttachState(proc, state, hasPort)
+	res["canReopen"] = (!debug || profile != "") && fuse != "unknown-layout"
 	return res, nil
 }
 
@@ -395,7 +402,7 @@ func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachRe
 		}
 	}
 	if debugPort <= 0 || (lease != nil && !IsWindowsDebugInstance(proc, lease)) {
-		if binary.InspectorFuseOn && binary.RunAsNodeFuseOn && binary.FuseCount == 9 {
+		if binary.supportsLiveAttach() {
 			result, attachErr := attachRunningWindowsMain(ctx, options, proc)
 			if attachErr == nil || debugPort <= 0 {
 				return result, attachErr
@@ -427,6 +434,7 @@ func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachRe
 	return AttachWindowsCDP(ctx, WindowsCDPAttachOptions{
 		DebugPort:          debugPort,
 		HostPID:            proc.PID,
+		HostStarted:        proc.Started,
 		CoreURL:            options.CoreURL,
 		PairingToken:       options.PairingToken,
 		Profile:            options.Profile,
@@ -444,7 +452,7 @@ func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachRe
 
 func autoAttachStatusPlatform(dataDir string) LaunchAgentState {
 	if windowsAutoAttachEnabled(dataDir) {
-		return LaunchAgentState{Enabled: true, Path: windowsAutoAttachMarker(dataDir)}
+		return LaunchAgentState{Enabled: true, Path: windowsAutoAttachMarker(dataDir), NeedsMigration: windowsResidentNeedsMigration(dataDir)}
 	}
 	state := WindowsLauncherStatus(dataDir)
 	if state.Enabled {

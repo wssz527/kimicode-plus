@@ -35,6 +35,9 @@ func findWindowsAttachHost(ctx context.Context, dataDir, executable, profile str
 }
 
 func reopenWindowsHost(ctx context.Context, s *NativeService) (map[string]any, error) {
+	if s.safe() {
+		return nil, ErrSafeMode
+	}
 	if !s.attachOpMu.TryLock() {
 		return nil, errors.New("KimiCode+ 正在处理接入，请稍后重试")
 	}
@@ -58,20 +61,32 @@ func reopenWindowsHost(ctx context.Context, s *NativeService) (map[string]any, e
 	if _, err := VerifyWindowsBinaryFile(proc.Executable); err != nil && !errors.Is(err, ErrInspectorDisabled) {
 		return nil, errors.New("无法确认官方客户端，Kimi Code 保持打开")
 	}
-	conn, err := windowsCompatibilityBrowser(ctx, proc, cfg.Profile)
-	if err != nil {
+	_, hasDebugPort := extractDebugPortArg(SplitWindowsCommandLine(proc.CommandLine))
+	if hasDebugPort {
+		conn, err := windowsCompatibilityBrowser(ctx, proc, cfg.Profile)
+		if err != nil {
+			return nil, err
+		}
+		defer conn.CloseNow()
+		if err := confirmReopenIdle(ctx, cfg.KimiHome, proc.PID); err != nil {
+			return nil, err
+		}
+		if err := conn.Write(ctx, websocket.MessageText, []byte(`{"id":1,"method":"Browser.close"}`)); err != nil {
+			return nil, errors.New("无法请求 Kimi Code 正常退出。请从客户端菜单退出，再从 KimiCode+ 入口打开。")
+		}
+	} else if err := confirmReopenIdle(ctx, cfg.KimiHome, proc.PID); err != nil {
 		return nil, err
-	}
-	defer conn.CloseNow()
-	if err := confirmReopenIdle(ctx, cfg.KimiHome, proc.PID); err != nil {
-		return nil, err
-	}
-	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"id":1,"method":"Browser.close"}`)); err != nil {
-		return nil, errors.New("无法请求 Kimi Code 正常退出。请从客户端菜单退出，再从 KimiCode+ 入口打开。")
 	}
 	started = true
+	_ = recordWindowsAttachState(cfg.DataDir, proc, "reopening", nil)
 	go func() {
 		defer s.attachOpMu.Unlock()
+		if !hasDebugPort {
+			if err := quitWindowsApplication(proc); err != nil {
+				_ = recordWindowsAttachFailure(cfg.DataDir, proc, fmt.Errorf("Windows 无法让 Kimi Code 正常退出，请从客户端菜单退出：%w", err))
+				return
+			}
+		}
 		wait, cancel := context.WithTimeout(s.ctx, 20*time.Second)
 		defer cancel()
 		for {
@@ -90,7 +105,7 @@ func reopenWindowsHost(ctx context.Context, s *NativeService) (map[string]any, e
 			}
 			select {
 			case <-wait.Done():
-				_ = RecordAttach(cfg.DataDir, errors.New("Kimi Code 尚未退出，请从客户端菜单退出后再打开"))
+				_ = recordWindowsAttachFailure(cfg.DataDir, proc, errors.New("Kimi Code 尚未退出，请从客户端菜单退出后再打开"))
 				return
 			case <-time.After(400 * time.Millisecond):
 			}
@@ -102,7 +117,7 @@ func reopenWindowsHost(ctx context.Context, s *NativeService) (map[string]any, e
 			KimiExecutable: proc.Executable, AllowDailyInstance: cfg.Profile == "",
 		})
 		if err != nil {
-			_ = RecordAttach(cfg.DataDir, fmt.Errorf("无法重新打开 Kimi Code：%w", err))
+			_ = recordWindowsAttachFailure(cfg.DataDir, proc, fmt.Errorf("无法重新打开 Kimi Code：%w", err))
 		}
 	}()
 	return map[string]any{"reopening": true}, nil

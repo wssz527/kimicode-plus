@@ -116,8 +116,13 @@ func TestCoreUpdateProcesses(t *testing.T) {
 		{"success", updater.Updated, targetTestVersion, "", "EKD_F3_TEST_SUCCESS_RELEASE_DIR"},
 		{"exits", updater.RolledBack, previousTestVersion, "通过健康检查前退出", "EKD_F3_TEST_EXIT_RELEASE_DIR"},
 		{"timeout", updater.RolledBack, previousTestVersion, "检查超时", ""},
+		{"managed-copy", updater.Updated, targetTestVersion, "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			managed := tc.name == "managed-copy"
+			if managed && runtime.GOOS != "darwin" {
+				t.Skip("managed LaunchAgent copy is macOS only")
+			}
 			if tc.name == "timeout" && testing.Short() {
 				t.Skip("waits for the production health deadline")
 			}
@@ -132,7 +137,11 @@ func TestCoreUpdateProcesses(t *testing.T) {
 				archive = readFixtureFile(t, filepath.Join(dir, archiveName))
 				checksum = readFixtureFile(t, filepath.Join(dir, "SHA256SUMS"))
 			} else {
-				image := append(bytes.Clone(previous), releaseTrailer(tc.name)...)
+				scenario := tc.name
+				if managed {
+					scenario = "success"
+				}
+				image := append(bytes.Clone(previous), releaseTrailer(scenario)...)
 				archive = archiveTestBinary(t, "enhanced-kimi-"+target+executableExtension, image)
 				checksum = fmt.Appendf(nil, "%x  %s\n", sha256.Sum256(archive), archiveName)
 			}
@@ -148,6 +157,28 @@ func TestCoreUpdateProcesses(t *testing.T) {
 				t.Fatal(err)
 			}
 			dataDir := filepath.Join(t.TempDir(), "Kimi's runtime")
+			updateTarget := installed
+			fakeHome := t.TempDir()
+			var managedPlist string
+			if managed {
+				parent, err := filepath.EvalSymlinks(filepath.Dir(dataDir))
+				if err != nil {
+					t.Fatal(err)
+				}
+				dataDir = filepath.Join(parent, filepath.Base(dataDir))
+				updateTarget = filepath.Join(dataDir, "resident", "enhanced-kimi")
+				agents := filepath.Join(fakeHome, "Library", "LaunchAgents")
+				if err := os.MkdirAll(agents, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(filepath.Dir(updateTarget), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(updateTarget, previous, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				managedPlist = filepath.Join(agents, "com.user.enhanced-kimi.core-managed.plist")
+			}
 			runtimePath := filepath.Join(dataDir, "runtime.json")
 			updatePath := filepath.Join(dataDir, "updates", "result.json")
 			ctx, cancel := context.WithTimeout(t.Context(), 75*time.Second)
@@ -160,6 +191,9 @@ func TestCoreUpdateProcesses(t *testing.T) {
 			cmd.Stderr = os.Stderr
 			cmd.Env = append(os.Environ(), restartChildCert+"="+string(certificate), restartChildAPI+"="+releases.URL,
 				restartChildDir+"="+workDir, "EKD_UPDATE_REPO=f3/test-release")
+			if managed {
+				cmd.Env = append(cmd.Env, "HOME="+fakeHome)
+			}
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -180,6 +214,12 @@ func TestCoreUpdateProcesses(t *testing.T) {
 			})
 			if before.Version != previousTestVersion {
 				t.Fatalf("initial startup: version=%q", before.Version)
+			}
+			if managed {
+				plist := "<plist version=\"1.0\"><dict><key>ProgramArguments</key><array><string>" + strings.ReplaceAll(updateTarget, "'", "&apos;") + "</string></array></dict></plist>"
+				if err := os.WriteFile(managedPlist, []byte(plist), 0o600); err != nil {
+					t.Fatal(err)
+				}
 			}
 			var status updater.Status
 			if err := testCoreRequest(client, before, http.MethodPost, "update/check", http.StatusOK, &status); err != nil ||
@@ -226,18 +266,21 @@ func TestCoreUpdateProcesses(t *testing.T) {
 				stages, err := os.ReadDir(filepath.Join(dataDir, "updates", "downloads"))
 				return err == nil && len(stages) == 0
 			})
-			if _, err := os.Stat(installed + ".bak"); !errors.Is(err, os.ErrNotExist) {
+			if _, err := os.Stat(updateTarget + ".bak"); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("backup remained after %s: %v", tc.state, err)
 			}
-			current := readFixtureFile(t, installed)
+			if managed && !bytes.Equal(previous, readFixtureFile(t, installed)) {
+				t.Fatal("update changed the originally downloaded executable")
+			}
+			current := readFixtureFile(t, updateTarget)
 			if tc.state == updater.Updated {
 				if bytes.Equal(current, previous) {
 					t.Fatal("successful update did not replace the previous executable")
 				}
-				if string(readFixtureFile(t, filepath.Join(workDir, "THIRD_PARTY_NOTICES.txt"))) == "old notices" {
+				if string(readFixtureFile(t, filepath.Join(filepath.Dir(updateTarget), "THIRD_PARTY_NOTICES.txt"))) == "old notices" {
 					t.Fatal("successful update did not install notices")
 				}
-				if len(readFixtureFile(t, filepath.Join(workDir, "LICENSE"))) == 0 {
+				if len(readFixtureFile(t, filepath.Join(filepath.Dir(updateTarget), "LICENSE"))) == 0 {
 					t.Fatal("successful update installed an empty license")
 				}
 			} else {

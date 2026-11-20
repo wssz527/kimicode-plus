@@ -4,8 +4,10 @@ package desktop
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +15,8 @@ import (
 	"time"
 
 	"enhancedkimi/internal/platform"
+
+	"golang.org/x/sys/windows"
 )
 
 func init() {
@@ -36,6 +40,39 @@ func windowsAutoAttachEnabled(dir string) bool {
 	return err == nil
 }
 
+const windowsResidentVersion = "silent-v1\n"
+
+func windowsResidentScript(dir string) string {
+	return filepath.Join(dir, "windows-resident.vbs")
+}
+
+func installWindowsResidentScript(config AttachConfig) error {
+	args := []string{config.Executable, "--resident", "--data-dir", config.DataDir, "--kimi-home", config.KimiHome}
+	if config.Profile != "" {
+		args = append(args, "--host-profile", config.Profile)
+	}
+	for i := range args {
+		args[i] = syscall.EscapeArg(args[i])
+	}
+	script := "Option Explicit\r\nDim shell\r\nSet shell = CreateObject(\"WScript.Shell\")\r\n" +
+		"shell.Environment(\"Process\")(\"EKD_RESIDENT_COMMAND\") = \"" + escapeVBScriptString(strings.Join(args, " ")) + "\"\r\n" +
+		"WScript.Quit shell.Run(\"%EKD_RESIDENT_COMMAND%\", 0, True)\r\n"
+	text, err := windows.UTF16FromString(script)
+	if err != nil {
+		return err
+	}
+	data := []byte{0xff, 0xfe}
+	for _, code := range text[:len(text)-1] {
+		data = binary.LittleEndian.AppendUint16(data, code)
+	}
+	return platform.AtomicPrivateFile(windowsResidentScript(config.DataDir), data)
+}
+
+func windowsResidentNeedsMigration(dir string) bool {
+	data, err := os.ReadFile(windowsAutoAttachMarker(dir))
+	return err == nil && string(data) != windowsResidentVersion
+}
+
 func windowsResidentTask(config AttachConfig, install bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -50,25 +87,21 @@ if ($env:EKD_TASK_ENABLE -ne 'yes') {
   return
 }
 $user=[Security.Principal.WindowsIdentity]::GetCurrent().Name
-$action=New-ScheduledTaskAction -Execute $env:EKD_TASK_EXE -Argument $env:EKD_TASK_ARGS -WorkingDirectory $env:EKD_TASK_DIR
+$hostExe=Join-Path $env:SystemRoot 'System32\wscript.exe'
+if (!(Test-Path -LiteralPath $hostExe -PathType Leaf)) { throw 'Windows Script Host unavailable' }
+$action=New-ScheduledTaskAction -Execute $hostExe -Argument $env:EKD_TASK_ARGS -WorkingDirectory $env:EKD_TASK_DIR
 $trigger=New-ScheduledTaskTrigger -AtLogOn -User $user
 $principal=New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 $settings=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 `
-	args := []string{"--resident", "--data-dir", config.DataDir, "--kimi-home", config.KimiHome}
-	if config.Profile != "" {
-		args = append(args, "--host-profile", config.Profile)
-	}
-	for i := range args {
-		args[i] = syscall.EscapeArg(args[i])
-	}
+	args := "//B //Nologo " + syscall.EscapeArg(windowsResidentScript(config.DataDir))
 	enable := "no"
 	if install {
 		enable = "yes"
 	}
 	_, err := runWindowsPowerShell(ctx, script, "EKD_TASK_NAME="+windowsAutoAttachTask(config.DataDir),
-		"EKD_TASK_ENABLE="+enable, "EKD_TASK_EXE="+config.Executable, "EKD_TASK_ARGS="+strings.Join(args, " "), "EKD_TASK_DIR="+config.DataDir)
+		"EKD_TASK_ENABLE="+enable, "EKD_TASK_ARGS="+args, "EKD_TASK_DIR="+config.DataDir)
 	return err
 }
 
@@ -76,11 +109,14 @@ func installWindowsResident(config AttachConfig) (LaunchAgentState, error) {
 	if config.DataDir == "" || config.KimiHome == "" || !filepath.IsAbs(config.Executable) {
 		return LaunchAgentState{}, errors.New("后台接入缺少增强核心或 Kimi Code 数据目录")
 	}
+	if err := installWindowsResidentScript(config); err != nil {
+		return LaunchAgentState{}, fmt.Errorf("无法写入无窗口启动项：%w", err)
+	}
 	if err := windowsResidentTask(config, true); err != nil {
 		return LaunchAgentState{}, fmt.Errorf("无法注册 KimiCode+ 登录任务：%w", err)
 	}
 	marker := windowsAutoAttachMarker(config.DataDir)
-	if err := platform.AtomicPrivateFile(marker, []byte("enabled\n")); err != nil {
+	if err := platform.AtomicPrivateFile(marker, []byte(windowsResidentVersion)); err != nil {
 		return LaunchAgentState{}, errors.Join(err, windowsResidentTask(config, false))
 	}
 	return LaunchAgentState{Enabled: true, Path: marker}, nil
@@ -100,11 +136,14 @@ func removeWindowsResident(dir string) error {
 }
 
 func watchWindowsAttach(s *NativeService) {
+	var session uint32
+	if err := windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &session); err != nil || session == 0 {
+		return
+	}
 	ticker := time.NewTicker(6 * time.Second)
 	defer ticker.Stop()
-	var attached WindowsProcessInfo
-	var retryAfter time.Time
-	var tried WindowsProcessInfo
+	var observed map[uint32]windows.Filetime
+	var tried windows.Filetime
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -113,40 +152,48 @@ func watchWindowsAttach(s *NativeService) {
 		}
 		cfg := s.attachConfig()
 		if !windowsAutoAttachEnabled(cfg.DataDir) || s.safe() {
-			attached = WindowsProcessInfo{}
+			observed, tried = nil, windows.Filetime{}
 			continue
 		}
-		ctx, cancel := context.WithTimeout(s.ctx, 24*time.Second)
-		proc, err := findWindowsAttachHost(ctx, cfg.DataDir, "", cfg.Profile)
-		if err == nil && VerifyWindowsProcessIdentity(attached, proc) != nil &&
-			(VerifyWindowsProcessIdentity(tried, proc) != nil || time.Now().After(retryAfter)) {
-			tried, retryAfter = proc, time.Now().Add(time.Minute)
-			_, hasDebugPort := extractDebugPortArg(SplitWindowsCommandLine(proc.CommandLine))
-			if hasDebugPort || (cfg.Profile == "" && IsWindowsDebugInstance(proc, nil)) {
-				cancel()
-				continue
-			}
-			if !s.attachOpMu.TryLock() {
-				retryAfter = time.Now()
-				cancel()
-				continue
-			}
-			if !windowsAutoAttachEnabled(cfg.DataDir) || s.safe() {
-				s.attachOpMu.Unlock()
-				cancel()
-				continue
-			}
-			result, attachErr := attachRunningWindowsMain(ctx, AttachOptions{
-				DataDir: cfg.DataDir, CoreURL: cfg.CoreURL, PairingToken: cfg.PairingToken, Profile: cfg.Profile,
-			}, proc)
-			s.attachOpMu.Unlock()
-			if attachErr == nil {
-				attached = proc
-				_ = RecordAttach(cfg.DataDir, result)
-			} else if ctx.Err() == nil {
-				_ = RecordAttach(cfg.DataDir, attachErr)
-			}
+		candidates, err := windowsHostCandidates(session)
+		if err != nil || maps.Equal(observed, candidates) {
+			continue
 		}
-		cancel()
+		if len(candidates) == 0 {
+			observed, tried = nil, windows.Filetime{}
+			continue
+		}
+		if !s.attachOpMu.TryLock() {
+			continue
+		}
+		observed = candidates
+		tried = tryWindowsBackgroundAttach(s, cfg, candidates, tried)
+		s.attachOpMu.Unlock()
 	}
+}
+
+func tryWindowsBackgroundAttach(s *NativeService, cfg AttachConfig, candidates map[uint32]windows.Filetime, tried windows.Filetime) windows.Filetime {
+	if !windowsAutoAttachEnabled(cfg.DataDir) || s.safe() {
+		return tried
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 24*time.Second)
+	defer cancel()
+	proc, err := findWindowsAttachHost(ctx, cfg.DataDir, "", cfg.Profile)
+	started, found := candidates[uint32(proc.PID)]
+	if err != nil || !found || started == tried {
+		return tried
+	}
+	_, hasDebugPort := extractDebugPortArg(SplitWindowsCommandLine(proc.CommandLine))
+	if hasDebugPort || (cfg.Profile == "" && IsWindowsDebugInstance(proc, nil)) {
+		return started
+	}
+	result, err := attachRunningWindowsMain(ctx, AttachOptions{
+		DataDir: cfg.DataDir, CoreURL: cfg.CoreURL, PairingToken: cfg.PairingToken, Profile: cfg.Profile,
+	}, proc)
+	if err == nil {
+		_ = RecordAttach(cfg.DataDir, result)
+	} else if s.ctx.Err() == nil {
+		_ = recordWindowsAttachFailure(cfg.DataDir, proc, err)
+	}
+	return started
 }

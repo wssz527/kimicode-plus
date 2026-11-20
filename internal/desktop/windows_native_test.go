@@ -80,6 +80,29 @@ func TestVerifyWindowsPEAndFuses(t *testing.T) {
 	}
 }
 
+func TestWindowsFuseV1UsesKnownPositions(t *testing.T) {
+	for _, tc := range []struct {
+		bits          string
+		inspect, live bool
+	}{
+		{"1011", true, true}, {"10110000101r", true, true}, {"00110000101", true, false},
+		{"10100000101", false, false}, {"101", false, false},
+	} {
+		binary := syntheticWindowsPE(windowsPEMachineAMD64, true, tc.bits)
+		inMemory, _ := VerifyWindowsPEAndFuses(binary)
+		path := filepath.Join(t.TempDir(), WindowsKimiExecutableName)
+		if err := os.WriteFile(path, binary, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		streamed, _ := VerifyWindowsBinaryFile(path)
+		for _, info := range []WindowsBinaryInfo{inMemory, streamed} {
+			if info.supportsInspector() != tc.inspect || info.supportsLiveAttach() != tc.live {
+				t.Fatalf("fuses %q gave %+v", tc.bits, info)
+			}
+		}
+	}
+}
+
 func TestSelectWindowsMainProcessesAndLauncherDebugExemption(t *testing.T) {
 	sid := "S-1-5-21-1000-2000-1001"
 	exe := `C:\Users\Alice\AppData\Local\Programs\Kimi Code\Kimi Code.exe`

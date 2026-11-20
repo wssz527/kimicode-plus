@@ -41,6 +41,7 @@ type WindowsCDPVersion struct {
 type WindowsCDPAttachOptions struct {
 	DebugPort          int
 	HostPID            int
+	HostStarted        string
 	CoreURL            string
 	PairingToken       string
 	Profile            string
@@ -372,6 +373,7 @@ func AttachWindowsCDP(ctx context.Context, opts WindowsCDPAttachOptions) (*Attac
 		Platform:         "windows",
 		DebugPort:        opts.DebugPort,
 		DebugPortWarning: FormatDebugClientAlerts(alerts),
+		hostStarted:      opts.HostStarted,
 	}, nil
 }
 

@@ -43,6 +43,9 @@ def run_instructions(version, target, name):
     lines = [f'KimiCode+ {version}', '', 'Extract this archive into a folder you can write to.']
     if target.startswith('darwin'):
         lines.extend([
+            'If macOS blocks the first run, verify the downloaded archive against SHA256SUMS.',
+            'After trying to run it, open System Settings > Privacy & Security, choose Open Anyway, then confirm and retry.',
+            'See https://support.apple.com/en-us/102445 for the macOS steps.',
             'Open the official Kimi Code desktop client, then run these commands in Terminal:',
             f'  chmod +x ./{name}',
             f'  ./{name} --allow-daily-instance',

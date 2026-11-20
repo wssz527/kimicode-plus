@@ -45,7 +45,7 @@ my-plugin/
   NOTICE           # 可选：上游来源与版权说明（详情页可直接展开查看）
 ```
 
-Windows 支持本地 ZIP 和文件夹安装、插件命令、右侧标签和会话信息入口。通过 KimiCode+ 启动器打开官方客户端并成功接入 Electron 主进程后，插件还可使用独立网页视图、插件弹出窗和官方右侧「+」浮层。仅接入渲染进程时，安装预览会列出受限能力。
+Windows 支持本地 ZIP 和文件夹安装、插件命令、右侧标签和会话信息入口。开启自动接入后，照常打开官方 Kimi Code 即可接入 Electron 主进程，使用独立网页视图、插件弹出窗和官方右侧「+」浮层。兼容模式下，安装预览会列出受限能力和重开入口。
 
 可复制 [plugins/example-hello/](plugins/example-hello/) 开始开发。能力清单和挂载示例见 [增强插件开发文档](docs/PLUGINS.md)。
 
@@ -62,6 +62,8 @@ sh scripts/crossbuild.sh   # 交叉编译 macOS / Windows / Linux 产物
 
 ### macOS 接入官方客户端
 
+如果 macOS 首次拦截从 GitHub Releases 下载的核心，先核对压缩包与该版本 `SHA256SUMS` 中的摘要。尝试运行后，前往「系统设置 → 隐私与安全性」，点击「仍要打开」并确认，再运行下方命令。只为你已核实来源的文件授权。 [Apple 支持](https://support.apple.com/zh-cn/102445)
+
 ```bash
 # 1. 启动增强核心（接入日常客户端需显式 --allow-daily-instance）
 ./dist/enhanced-kimi --allow-daily-instance
@@ -75,7 +77,7 @@ sh scripts/crossbuild.sh   # 交叉编译 macOS / Windows / Linux 产物
   --pairing-token "<runtime.pairingToken>"
 ```
 
-可在 KimiCode+「状态与诊断」中一键开启或关闭「随 Kimi Code 启动自动接入」（`LaunchAgent`）。
+在 KimiCode+「状态与诊断」开启「随 Kimi Code 启动自动接入」后，产品会把核心复制到增强数据目录，登录项和自更新使用这份副本。之后可移动或清理下载的原文件。
 
 ### Windows 接入官方客户端
 
@@ -84,7 +86,7 @@ sh scripts/crossbuild.sh   # 交叉编译 macOS / Windows / Linux 产物
 .\dist\enhanced-kimi-windows-amd64.exe launch --allow-daily-instance
 ```
 
-首次接入后，在 KimiCode+「状态与诊断」开启「随 Kimi Code 启动自动接入」。之后登录 Windows 时会启动增强核心，从开始菜单、桌面或任务栏照常打开 Kimi Code 即可。兼容模式若提示需要重开，在增强插件页点击「立即重新打开」。
+首次接入后，在 KimiCode+「状态与诊断」开启「随 Kimi Code 启动自动接入」。之后登录 Windows 时会启动增强核心，从开始菜单、桌面或任务栏照常打开 Kimi Code 即可。若增强未接入，打开增强数据目录 `runtime.json` 中的配对地址，在独立工作台「设置 → Kimi Code 接入」查看状态。兼容模式也可从增强插件页点击「立即重新打开」。
 
 ### 隔离测试与验证命令
 

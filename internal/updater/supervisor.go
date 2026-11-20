@@ -2,9 +2,11 @@ package updater
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -43,8 +45,22 @@ func (m *Manager) prepareSupervisor(stage, target string, files extractedFiles) 
 	if err != nil {
 		return err
 	}
+	targetExe := m.targetExecutable()
+	if targetExe != m.options.Executable {
+		current, err := executableDigest(m.options.Executable)
+		if err != nil {
+			return err
+		}
+		installed, err := executableDigest(targetExe)
+		if err != nil {
+			return err
+		}
+		if current != installed {
+			return errors.New("正在运行的核心与登录项中的副本不同，请从登录项启动核心后再更新")
+		}
+	}
 	job := supervisorJob{
-		Executable: m.options.Executable, DataDir: m.options.DataDir, WorkingDir: cwd,
+		Executable: targetExe, DataDir: m.options.DataDir, WorkingDir: cwd,
 		Args: os.Args[1:], OldPID: os.Getpid(), Ticket: security.Random(), PreviousVersion: m.options.CurrentVersion,
 		TargetVersion: target, Restart: m.options.RestartState(), HasNotices: files.notices != "", HasLicense: files.license != "",
 	}
@@ -59,7 +75,7 @@ func (m *Manager) prepareSupervisor(stage, target string, files extractedFiles) 
 	if m.options.GOOS == "windows" {
 		helper += ".exe"
 	}
-	if err = atomicCopy(job.Executable, helper, 0o755); err != nil {
+	if err = atomicCopy(m.options.Executable, helper, 0o755); err != nil {
 		return err
 	}
 	if err = m.options.launchSupervisor(helper, jobPath); err != nil {
@@ -68,6 +84,21 @@ func (m *Manager) prepareSupervisor(stage, target string, files extractedFiles) 
 		}
 	}
 	return err
+}
+
+func executableDigest(path string) ([sha256.Size]byte, error) {
+	var sum [sha256.Size]byte
+	file, err := os.Open(path)
+	if err != nil {
+		return sum, err
+	}
+	defer file.Close()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return sum, err
+	}
+	copy(sum[:], digest.Sum(nil))
+	return sum, nil
 }
 
 func startSupervisor(executable, jobPath string) error {

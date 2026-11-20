@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type Settings } from "../api";
 import { useAuth } from "../auth";
 import { Icon } from "../components/Icon";
+import { StandaloneWindowsAttachStatus } from "../components/WindowsAttachStatus";
 import {
   ActionButton,
   Badge,
@@ -156,6 +157,7 @@ export function SettingsPage() {
 
       <div className="settings-grid">
         <div className="settings-main">
+          <StandaloneWindowsAttachStatus />
           <Panel title="安全模式" aside={<Badge tone={draft.safeMode ? "warn" : "success"}>{draft.safeMode ? "已开启" : "已关闭"}</Badge>}>
             <Toggle
               checked={draft.safeMode}

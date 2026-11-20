@@ -3,6 +3,7 @@ import { useAuth } from "../auth";
 import { Icon } from "./Icon";
 import { CacheSettings } from "./CacheSettings";
 import { PluginSettings } from "./PluginSettings";
+import { WindowsAttachStatusPanel, type WindowsAttachReport } from "./WindowsAttachStatus";
 import { errorText } from "./workbench/pieces";
 import { NativeSettings } from "./NativeSettings";
 import { AccountSettingsSection, FallbackNotice, LabSettingsSection } from "./OfficialSettingsSections";
@@ -130,7 +131,7 @@ export function SettingsWindow({
   );
 }
 
-type AttachStatus = {
+type AttachStatus = WindowsAttachReport & {
   platform?: string;
   autoAttachKind?: string;
   host: {
@@ -591,7 +592,13 @@ function DiagnosticsSection({
         </label>
       </div> : null}
       {status.agent.error ? <div className="ekds-row"><span className="ekds-row-label"><strong>后台接入状态</strong><small>{status.agent.error}</small></span></div> : null}
-      {status.last ? <div className="ekds-row">
+      {status.platform === "windows" ? <div className="ekds-row">
+        <div className="ekds-row-label">
+          <strong>当前接入</strong>
+          <WindowsAttachStatusPanel status={status} host={host} refresh={() => void reload()} />
+        </div>
+      </div> : null}
+      {status.last && status.platform !== "windows" ? <div className="ekds-row">
         <span className="ekds-row-label">
           <strong>上次接入</strong>
           <small>{status.last.error || `已接入进程 ${status.last.hostPid ?? "—"}（客户端 ${status.last.appVersion ?? "未知版本"}）`}</small>

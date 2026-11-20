@@ -47,13 +47,13 @@ EKD 由 `internal/desktop/inject.go`、`cdp.go`、`contracts.go`、`inspector_fu
 
 ### Windows 运行中接入与兼容重开
 
-开启「随 Kimi Code 启动自动接入」后，Windows 登录任务以当前用户的交互会话和普通权限启动增强核心。核心观察正常启动的官方客户端，同一桌面会话内可使用 Electron 自带的 Node 调试接口开启临时 inspector。接入前检查客户端路径、进程属主、启动时间、桌面会话及 Electron fuse，随后校验环回监听属主和 inspector 目标。安装与 macOS 共用的主进程桥后关闭临时端口。开始菜单、桌面和任务栏继续使用官方入口。旧版已改写的快捷方式在迁移时从备份恢复。
+开启「随 Kimi Code 启动自动接入」后，Windows 登录任务以当前用户的交互会话和普通权限启动增强核心。登录任务借助 Windows Script Host 隐藏核心控制台，直接运行 CLI 时保留标准输出。核心用 Win32 进程快照检测同一桌面会话中的候选 PID 和创建时间，候选变化时才执行完整校验。运行中的官方客户端可使用 Electron 自带的 Node 调试接口开启临时 inspector。接入前检查客户端路径、进程属主、启动时间、桌面会话及 Electron fuse，随后校验环回监听属主和 inspector 目标。安装与 macOS 共用的主进程桥后关闭临时端口。开始菜单、桌面和任务栏继续使用官方入口。旧版已改写的快捷方式在迁移时从备份恢复。
 
-通过 `enhanced-kimi launch` 打开客户端时，增强仍可使用经校验的 Chromium 端口接入渲染进程。该兼容模式保留右侧面板等能力。独立网页、插件窗口和右侧「+」浮层需要主进程桥，增强插件页会提示从 KimiCode+ 入口重新打开并提供「立即重新打开」。重开动作通过客户端实例记录与监听属主核对会话服务，发现活动回合、待处理交互或无法确认状态时保留当前客户端。空闲时请求 Electron 正常退出，确认旧进程结束后再启动。客户端未退出时可在「状态与诊断」查看原因。
+通过 `enhanced-kimi launch` 打开客户端时，增强仍可使用经校验的 Chromium 端口接入渲染进程。该兼容模式保留右侧面板等能力。独立网页、插件窗口和右侧「+」浮层需要主进程桥，增强插件页会提示从 KimiCode+ 入口重新打开并提供「立即重新打开」。重开动作通过客户端实例记录与监听属主核对会话服务，发现活动回合、待处理交互或无法确认状态时保留当前客户端。空闲时，兼容模式通过 Electron 请求正常退出，普通启动的实例通过 Windows Restart Manager 请求正常退出。确认旧进程退出后才启动。完全未接入时，可在独立工作台「设置 → Kimi Code 接入」查看状态和重开。
 
 ### macOS 登录常驻与事件驱动接入
 
-同一开关安装 `com.user.enhanced-kimi.core-managed` 和 `com.user.enhanced-kimi.attach`。核心项在登录时启动，并由 launchd 保持运行。若同一数据目录已有核心，常驻进程等待现有实例释放锁后再接管。接入项在加载时运行，并监听 `KIMI_CODE_HOME/server/instances`、`server.token` 和增强数据目录的 `runtime.json`，覆盖客户端重启和核心更换端口或凭据。同一个宿主和核心之间，实例心跳唤醒会复用已有接入。
+同一开关安装 `com.user.enhanced-kimi.core-managed` 和 `com.user.enhanced-kimi.attach`。开启时将核心复制到增强数据目录的 `resident/enhanced-kimi`。两个产品登录项和自更新使用该副本。核心项在登录时启动，并由 launchd 保持运行。若同一数据目录已有核心，常驻进程等待现有实例释放锁后再接管。接入项在加载时运行，并监听 `KIMI_CODE_HOME/server/instances`、`server.token` 和增强数据目录的 `runtime.json`，覆盖客户端重启和核心更换端口或凭据。同一个宿主和核心之间，实例心跳唤醒会复用已有接入。
 
 两个 plist 都使用 `0600` 和原子文件替换。接入项从对应数据目录读取并验证当前的环回地址和配对凭据。`attach.log`、`resident-core.log` 和 `attach-state.json` 用于查看启动和接入结果。
 

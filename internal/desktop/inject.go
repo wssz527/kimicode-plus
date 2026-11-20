@@ -75,6 +75,7 @@ type AttachResult struct {
 	DebugPortWarning  string `json:"debugPortWarning,omitempty"`
 	MainBridgeWarning string `json:"mainBridgeWarning,omitempty"`
 	attachKey         string
+	hostStarted       string
 }
 
 // ErrConsentRequired is returned when the only running client is the user's daily

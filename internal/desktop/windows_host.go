@@ -27,6 +27,8 @@ const (
 	windowsPEHeaderOffsetField = 0x3c
 	windowsPEMachineAMD64      = 0x8664
 	windowsPEMachineARM64      = 0xaa64
+	windowsRunAsNodeFuse       = 0
+	windowsInspectorFuse       = 3
 	windowsFuseScanChunkSize   = 1 << 20
 	windowsFuseScanCarrySize   = len(fuseSentinelPrefix) + len(fuseSentinelSuffix) + fuseBlockPrefixLen + fuseMaxCount + 32
 )
@@ -97,6 +99,14 @@ type WindowsBinaryInfo struct {
 	FuseCount       int    `json:"fuseCount"`
 	InspectorFuseOn bool   `json:"inspectorFuseOn"`
 	RunAsNodeFuseOn bool   `json:"runAsNodeFuseOn"`
+}
+
+func (info WindowsBinaryInfo) supportsInspector() bool {
+	return info.FuseVersion == 1 && info.FuseCount > windowsInspectorFuse && info.InspectorFuseOn
+}
+
+func (info WindowsBinaryInfo) supportsLiveAttach() bool {
+	return info.supportsInspector() && info.RunAsNodeFuseOn
 }
 
 // WindowsLauncherPaths returns the fixed launcher locations under dataDir.
@@ -412,7 +422,7 @@ func VerifyWindowsPEAndFuses(data []byte) (WindowsBinaryInfo, error) {
 	}
 	version := data[block]
 	count := int(data[block+1])
-	if version != 1 || count < 4 || count > fuseMaxCount || block+fuseBlockPrefixLen+count > len(data) {
+	if version != 1 || count <= windowsInspectorFuse || count > fuseMaxCount || block+fuseBlockPrefixLen+count > len(data) {
 		return WindowsBinaryInfo{}, ErrUnknownFuseLayout
 	}
 	fuses := data[block+fuseBlockPrefixLen : block+fuseBlockPrefixLen+count]
@@ -424,8 +434,8 @@ func VerifyWindowsPEAndFuses(data []byte) (WindowsBinaryInfo, error) {
 	info.ElectronPresent = true
 	info.FuseVersion = version
 	info.FuseCount = count
-	info.InspectorFuseOn = fuses[3] == '1'
-	info.RunAsNodeFuseOn = fuses[0] == '1'
+	info.InspectorFuseOn = fuses[windowsInspectorFuse] == '1'
+	info.RunAsNodeFuseOn = fuses[windowsRunAsNodeFuse] == '1'
 	if !info.InspectorFuseOn {
 		return info, ErrInspectorDisabled
 	}
@@ -501,7 +511,7 @@ func VerifyWindowsBinaryFile(executable string) (WindowsBinaryInfo, error) {
 						foundFuse = true
 					} else if block+fuseBlockPrefixLen+count <= len(window) {
 						version := window[block]
-						if version != 1 || count < 4 {
+						if version != 1 || count <= windowsInspectorFuse {
 							fuseErr = ErrUnknownFuseLayout
 						} else {
 							fuses := window[block+fuseBlockPrefixLen : block+fuseBlockPrefixLen+count]
@@ -517,8 +527,8 @@ func VerifyWindowsBinaryFile(executable string) (WindowsBinaryInfo, error) {
 							} else {
 								info.FuseVersion = version
 								info.FuseCount = count
-								info.InspectorFuseOn = fuses[3] == '1'
-								info.RunAsNodeFuseOn = fuses[0] == '1'
+								info.InspectorFuseOn = fuses[windowsInspectorFuse] == '1'
+								info.RunAsNodeFuseOn = fuses[windowsRunAsNodeFuse] == '1'
 								if !info.InspectorFuseOn {
 									fuseErr = ErrInspectorDisabled
 								}
