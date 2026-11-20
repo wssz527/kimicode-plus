@@ -30,11 +30,20 @@ func installManagedCore(source, dataDir string) (string, error) {
 	if err != nil || !dir.IsDir() || dir.Mode().Perm()&0o077 != 0 {
 		return "", errors.New("后台核心目录必须是当前用户的私有目录")
 	}
+	srcInfo, err := os.Stat(source)
+	if err != nil || !srcInfo.Mode().IsRegular() {
+		return "", errors.New("后台核心可执行文件无效")
+	}
 	if info, err := os.Lstat(dest); err == nil {
-		if !info.Mode().IsRegular() || info.Mode().Perm()&0o100 == 0 {
+		if !info.Mode().IsRegular() {
 			return "", errors.New("数据目录中的后台核心不可执行")
 		}
-		return dest, nil
+		if os.SameFile(srcInfo, info) || launches.loaded(managedCoreLabel) {
+			if info.Mode().Perm()&0o100 == 0 {
+				return "", errors.New("数据目录中的后台核心不可执行")
+			}
+			return dest, nil
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
@@ -54,7 +63,7 @@ func installManagedCore(source, dataDir string) (string, error) {
 	if err := os.Chmod(tmp, 0o700); err != nil {
 		return "", err
 	}
-	if err := os.Link(tmp, dest); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := os.Rename(tmp, dest); err != nil {
 		return "", err
 	}
 	return dest, nil

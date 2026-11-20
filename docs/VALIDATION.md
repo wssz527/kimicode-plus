@@ -6,13 +6,13 @@
 
 | 场景 | 结果 |
 |---|---|
-| Windows x64 真实交互桌面 | 在 `wssz-win` 的控制台会话手动触发两个版本的产品登录任务。旧版打开了核心对应的 Windows Terminal 标签。新版核心正常运行，其控制台窗口隐藏，Terminal 中无对应标签。直接调用 `launch` 和 `attach --status` 均输出预期 JSON。旧版标签截图和前后窗口探针保存在 `work/release-followup/`。 |
+| Windows x64 真实交互桌面 | 在 `wssz-win` 的控制台会话（2560×1440）触发产品登录任务并截取整屏桌面对比。旧版（`2e1c6eb` 直接任务）弹出可见的黑色 Windows Terminal 窗口（`consoleVisible: true`，`terminalHasCore: 1`）。新版将可执行文件和数据目录放在含空格与中文的路径（`测试 目录\enhanced-kimi.exe`、`数据 目录`），经 `wscript.exe` 无窗口入口启动后桌面无弹窗、无对应 Terminal 标签（`consoleVisible: false`，`terminalHasCore: 0`），核心健康检查通过，普通启动的隔离官方 1.3.2 自动完成保原 PID 接入（`transport: "main-loopback-rpc"`）。直接调用 `launch` 和 `attach --status` 均输出预期 JSON，关闭自动接入时一并移除登录任务、标记文件与 `windows-resident.vbs`。整屏对比截图与探针记录保存在 `work/release-followup/`（`windows-before-desktop.png`、`windows-after-desktop.png`、`verify-summary.json`）。 |
 | Windows 空闲后台 CPU | 两版在同一台 16 逻辑处理器机器上各采样约 64 秒，隔离 Kimi Code 未启动。旧版观察到 11 个 PowerShell 子进程，累计至少 3531 毫秒 CPU 时间，占整机 CPU 容量至少 0.344%。新版观察到 0 个此类子进程，核心 CPU 时间增量低于本次采样分辨率。该方法不计入共享 WMI 服务开销。 |
 | Windows 接入失败与重开 | 占用临时 inspector 端口，官方 1.3.2 的无调试参数隔离实例报告接入失败。释放端口后，重开动作在会话空闲时正常退出旧进程，新进程完成主进程接入。内置浏览器用已记录的状态验证独立设置页提示、会话运行时拒绝文案和刷新后的接入状态。Go 回归覆盖四位 fuse v1、末尾追加位和缺失或关闭所需位。 |
-| macOS 常驻路径 | 本机测试二进制可由 launchd 从「下载」直接运行。安装隔离常驻副本后移走原件，真实 launchd 仍能从增强数据目录启动核心。进程级自更新测试通过模拟发布源完成健康切换，比较了更新前后两处文件内容。常驻副本更新，下载原件未改动。 |
-| 全量回归 | Go 生产包测试和 vet 通过，Web 类型检查和 296 项测试通过。`make build`、`scripts/acceptance.py` 的 27 项验收、Windows x64 和 ARM64 交叉构建均通过。 |
+| macOS 常驻路径与隔离属性 | 本机测试二进制可由 launchd 从「下载」直接运行。安装隔离常驻副本后移走原件，真实 launchd 仍能从增强数据目录启动核心；停用后台接入后使用新版本重新开启会自动刷新常驻副本，登录项运行期间则拒绝静默覆盖并拒绝符号链接目标。本机实测 `com.apple.quarantine`：未批准的 `0083` 被 Gatekeeper 拦截；带系统设置「仍要打开」批准位 `00c3` 或 `xattr -dr` 清除后，`/bin/cp -p` 复制的副本即使删去「下载」原件，真实 `launchctl bootstrap` 仍以退出码 0 正常启动（记录在 `work/release-followup/mac-quarantine-verify.json`）。进程级自更新测试通过模拟发布源完成健康切换，常驻副本更新，下载原件未改动。 |
+| 全量回归 | Go 生产包测试和 vet（含 `GOOS=windows` 交叉检查）通过，Web 类型检查和 296 项测试通过。`make build`、`scripts/acceptance.py` 的 27 项验收、Windows x64 和 ARM64 交叉构建均通过。 |
 
-`wssz-win` 的唯一交互会话是现有控制台会话，SSH 位于会话 0 且未找到可用的远程重新登录入口。真实桌面任务触发已实测，真实注销重登仍待验。macOS 测试使用本机构建的二进制，未实测带浏览器下载隔离属性的发布包首次授权。Windows ARM64 未做真机测试。
+`wssz-win` 仅启用了日常账户 `wssz2`（需要密码，未配置自动登录且已关闭 RDP），实测新建 SSH 登录不会触发 `MSFT_TaskLogonTrigger`（`Interactive`），未注销其当前桌面会话以免锁屏；真实桌面任务触发已获整屏对比截图，完整注销再登录仍待本机控制台验证。macOS 隔离属性使用本机构建二进制写入标准 `com.apple.quarantine` 标志实测，未走浏览器真实点击下载与系统设置界面点击。Windows ARM64 仅通过交叉构建，未做真机测试。
 
 ## v0.2.0 自动接入与登录常驻复验
 

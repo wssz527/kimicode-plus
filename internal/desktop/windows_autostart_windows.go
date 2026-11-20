@@ -129,6 +129,9 @@ func removeWindowsResident(dir string) error {
 	if err := windowsResidentTask(AttachConfig{DataDir: dir}, false); err != nil {
 		return fmt.Errorf("无法移除 KimiCode+ 登录任务：%w", err)
 	}
+	if err := os.Remove(windowsResidentScript(dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	if err := os.Remove(windowsAutoAttachMarker(dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
