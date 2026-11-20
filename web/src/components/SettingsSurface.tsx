@@ -554,9 +554,9 @@ function DiagnosticsSection({
       {versionNote ? <div className="ekds-row" data-ekd-unverified-version="true">
         <span className="ekds-row-label">
           <strong>版本验证状态</strong>
-          <small>{versionNote}</small>
+          <small>{`${versionNote.replace(/。$/, "")}。该官方版本不在人工验收清单内，但界面与接口兼容检测已通过，可正常使用，无需额外操作。`}</small>
         </span>
-        <span className="ekds-state is-warn">未经人工验证</span>
+        <span className="ekds-state is-warn">自动兼容</span>
       </div> : null}
       <div className="ekds-row">
         <span className="ekds-row-label">

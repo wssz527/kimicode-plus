@@ -173,3 +173,16 @@ test("findOfficialSettingsPanel ignores hidden v-show panels and locates officia
   const evaluation = evaluateDOMContracts(doc as unknown as Document);
   assert.equal(evaluation.byId["dom.settings_agent"]?.status, "available");
 });
+
+test("embedded plugin settings space actions from list, align row status columns, and explain unverified host versions", () => {
+  const pluginSurfacesCss = source("src/styles/plugin-surfaces.css");
+  assert.match(pluginSurfacesCss, /\.ekds-plugins\s*\{[^}]*display:\s*flex[^}]*flex-direction:\s*column[^}]*gap:\s*14px/s);
+
+  const pagesCss = source("src/styles/pages.css");
+  assert.match(pagesCss, /\.plugin-open\s*>\s*\.state\s*\{[^}]*min-width:\s*68px/s);
+  assert.match(pagesCss, /\.plugin-count\s*\{[^}]*min-width:\s*5\.5em[^}]*text-align:\s*right/s);
+
+  const surface = source("src/components/SettingsSurface.tsx");
+  assert.ok(surface.includes("自动兼容"));
+  assert.ok(surface.includes("无需额外操作"));
+});

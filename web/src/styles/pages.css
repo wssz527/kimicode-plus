@@ -2260,8 +2260,16 @@
   color: var(--ink-muted);
 }
 
+.plugin-open > .state {
+  flex: none;
+  justify-content: center;
+  min-width: 68px;
+}
+
 .plugin-count {
   flex: none;
+  min-width: 5.5em;
+  text-align: right;
   font-size: 11px;
   color: var(--ink-faint);
   white-space: nowrap;
