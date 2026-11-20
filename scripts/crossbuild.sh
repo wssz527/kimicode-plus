@@ -6,7 +6,7 @@ ldflags='-s -w'
 if [ -n "${VERSION:-}" ]; then
   ldflags="$ldflags -X enhancedkimi/internal/server.Version=${VERSION#v}"
 fi
-for target in darwin/arm64 darwin/amd64 windows/amd64 windows/arm64 linux/amd64; do
+for target in darwin/arm64 darwin/amd64 windows/amd64 linux/amd64; do
   target_os=${target%/*}
   target_arch=${target#*/}
   suffix=''

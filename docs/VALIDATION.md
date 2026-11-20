@@ -10,9 +10,10 @@
 | Windows 空闲后台 CPU | 两版在同一台 16 逻辑处理器机器上各采样约 64 秒，隔离 Kimi Code 未启动。旧版观察到 11 个 PowerShell 子进程，累计至少 3531 毫秒 CPU 时间，占整机 CPU 容量至少 0.344%。新版观察到 0 个此类子进程，核心 CPU 时间增量低于本次采样分辨率。该方法不计入共享 WMI 服务开销。 |
 | Windows 接入失败与重开 | 占用临时 inspector 端口，官方 1.3.2 的无调试参数隔离实例报告接入失败。释放端口后，重开动作在会话空闲时正常退出旧进程，新进程完成主进程接入。内置浏览器用已记录的状态验证独立设置页提示、会话运行时拒绝文案和刷新后的接入状态。Go 回归覆盖四位 fuse v1、末尾追加位和缺失或关闭所需位。 |
 | macOS 常驻路径与隔离属性 | 本机测试二进制可由 launchd 从「下载」直接运行。安装隔离常驻副本后移走原件，真实 launchd 仍能从增强数据目录启动核心；停用后台接入后使用新版本重新开启会自动刷新常驻副本，登录项运行期间则拒绝静默覆盖并拒绝符号链接目标。本机实测 `com.apple.quarantine`：未批准的 `0083` 被 Gatekeeper 拦截；带系统设置「仍要打开」批准位 `00c3` 或 `xattr -dr` 清除后，`/bin/cp -p` 复制的副本即使删去「下载」原件，真实 `launchctl bootstrap` 仍以退出码 0 正常启动（记录在 `work/release-followup/mac-quarantine-verify.json`）。进程级自更新测试通过模拟发布源完成健康切换，常驻副本更新，下载原件未改动。 |
-| 全量回归 | Go 生产包测试和 vet（含 `GOOS=windows` 交叉检查）通过，Web 类型检查和 296 项测试通过。`make build`、`scripts/acceptance.py` 的 27 项验收、Windows x64 和 ARM64 交叉构建均通过。 |
+| 全量回归与四平台打包 | 已按用户决定移除 Windows ARM64 发布目标（保留 `darwin/arm64`、`darwin/amd64`、`windows/amd64`、`linux/amd64`），并修正 `go.mod` 直接依赖标记（干净工作树 `go mod tidy -diff` 无差异）。四平台 `go vet`、`windows/amd64` 与 `linux/amd64` 测试二进制交叉编译、macOS ARM64 `go test -race -count=1 ./cmd/... ./internal/... ./plugins/...`（23 个测试包）、Web 类型检查和 296/296 项测试、`make build` 与 `scripts/acceptance.py` 27/27 全部通过。`VERSION=0.2.0` 四平台打包产物逐包校验了二进制、`LICENSE`、`THIRD_PARTY_NOTICES.txt`、`RUN.txt` 与 `SHA256SUMS`。 |
+| Windows x64 重启后发布包复验 | `wssz-win` 于 2026-11-20 19:18 重启并登录控制台会话 1 后，将最终打包的 `enhanced-kimi-0.2.0-windows-amd64.zip` 与 `SHA256SUMS` 传至隔离目录实测：压缩包 SHA-256 校验通过，解压包含预期四项文件，`--version` 为 `0.2.0`；在中文空格数据目录注册登录任务并触发后，核心在会话 1 无窗口运行（`coreMainWindowHandle: 0`）、健康接口返回 `OK` / `0.2.0`，普通启动的隔离官方 1.3.2 自动完成保原 PID 接入（`hostPid: 8996`，`transport: "main-loopback-rpc"`）；卸载后登录任务、标记文件与 `windows-resident.vbs` 全部清空，临时目录已删除（记录见 `work/release-followup/windows-postboot-verify.json`）。 |
 
-`wssz-win` 仅启用了日常账户 `wssz2`（需要密码，未配置自动登录且已关闭 RDP），实测新建 SSH 登录不会触发 `MSFT_TaskLogonTrigger`（`Interactive`），未注销其当前桌面会话以免锁屏；真实桌面任务触发已获整屏对比截图，完整注销再登录仍待本机控制台验证。macOS 隔离属性使用本机构建二进制写入标准 `com.apple.quarantine` 标志实测，未走浏览器真实点击下载与系统设置界面点击。Windows ARM64 仅通过交叉构建，未做真机测试。
+`wssz-win` 在 19:18 重启前，上一轮隔离测试任务已按约定清理，因此本次重启登录瞬间未挂有 KimiCode+ 登录任务，系统自动触发 `MSFT_TaskLogonTrigger`（`Interactive`）尚未在冷启动/注销重登瞬间观测；真实控制台会话触发同一登录任务与无窗口自动接入已两轮实测通过。macOS 隔离属性使用本机构建二进制写入标准 `com.apple.quarantine` 标志实测，未走浏览器真实点击下载与系统设置界面点击。Windows ARM64 已从发布目标移除。
 
 ## v0.2.0 自动接入与登录常驻复验
 

@@ -13,7 +13,7 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ('darwin-arm64', 'darwin-amd64', 'windows-amd64', 'windows-arm64', 'linux-amd64')
+TARGETS = ('darwin-arm64', 'darwin-amd64', 'windows-amd64', 'linux-amd64')
 VERSION_PATTERN = re.compile(
     r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
     r'(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?'
