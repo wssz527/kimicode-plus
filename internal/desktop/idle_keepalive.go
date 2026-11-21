@@ -1095,6 +1095,16 @@ func gitStatusFingerprint(ctx context.Context, cwd string) (string, error) {
 	}
 	digest := sha256.New()
 	_, _ = io.WriteString(digest, rootPath+"\x00"+status+"\x00")
+	head, headErr := gitHeadRevision(ctx, rootPath)
+	if headErr != nil {
+		return "", headErr
+	}
+	_, _ = io.WriteString(digest, head+"\x00")
+	index, indexErr := gitIndexDigest(ctx, rootPath, head)
+	if indexErr != nil {
+		return "", indexErr
+	}
+	_, _ = io.WriteString(digest, index+"\x00")
 	scan := gitFingerprintScan{ctx: ctx, root: root, entries: gitFingerprintMaxEntries, bytes: gitFingerprintMaxTotalBytes}
 	for status != "" {
 		var entry string
@@ -1144,6 +1154,64 @@ func confirmNonGitDirectory(cwd string) error {
 		}
 		path = parent
 	}
+}
+
+// gitHeadRevision reads the current commit so a commit or reset during the
+// keepalive turn is noticed even when the working tree ends up identical. An
+// unborn branch has no HEAD and is represented by an empty revision rather than
+// an error, because `git add` before the first commit is a normal state.
+func gitHeadRevision(ctx context.Context, rootPath string) (string, error) {
+	out, truncated, err := runGitCapped(ctx, rootPath, gitFingerprintMaxStatus, "--no-optional-locks", "rev-parse", "--verify", "-q", "HEAD")
+	if err != nil {
+		var exitErr *exec.ExitError
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && strings.TrimSpace(out) == "" {
+			return "", nil
+		}
+		return "", fmt.Errorf("无法读取 Git HEAD：%w", err)
+	}
+	if truncated {
+		return "", errors.New("Git HEAD 超过大小上限")
+	}
+	revision := strings.TrimSpace(out)
+	if revision == "" {
+		return "", errors.New("Git HEAD 输出为空")
+	}
+	return revision, nil
+}
+
+// gitIndexDigest summarizes the staged content. `status --porcelain` only says a
+// path is staged; an MM file whose working tree returns to the original bytes
+// keeps the same status and the same working tree hash while its index blob
+// changed. Hashing the full blob ids closes that gap. A repository without HEAD
+// cannot diff against it, so the staged entries themselves are hashed instead.
+func gitIndexDigest(ctx context.Context, rootPath, head string) (string, error) {
+	digest := sha256.New()
+	if head == "" {
+		out, truncated, err := runGitCapped(ctx, rootPath, gitFingerprintMaxStatus, "--no-optional-locks", "ls-files", "--stage", "-z")
+		if err != nil {
+			return "", fmt.Errorf("无法读取 Git 暂存区：%w", err)
+		}
+		if truncated {
+			return "", errors.New("Git 暂存区超过大小上限")
+		}
+		_, _ = io.WriteString(digest, "unborn\x00"+out)
+		return fmt.Sprintf("%x", digest.Sum(nil)), nil
+	}
+	out, truncated, err := runGitCapped(ctx, rootPath, gitFingerprintMaxStatus, "--no-optional-locks", "diff", "--cached", "--raw", "-z", "--no-abbrev", "HEAD")
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("无法读取 Git 暂存区：%w", err)
+	}
+	if truncated {
+		return "", errors.New("Git 暂存区超过大小上限")
+	}
+	_, _ = io.WriteString(digest, "head\x00"+out)
+	return fmt.Sprintf("%x", digest.Sum(nil)), nil
 }
 
 type gitFingerprintScan struct {
@@ -1384,6 +1452,37 @@ func (s *NativeService) completeIdleKeepAlive(job idleKeepAliveJob) {
 			s.finishIdleKeepAliveWithoutUndo(job, "failed", "保活期间工作区文件发生变化，未自动撤回", true, "undo_skipped")
 			return
 		}
+	}
+
+	// The Git scan can take seconds. Re-read the turn list and the session after
+	// it so a prompt the user sent in that window is never undone.
+	latestTurns, err = s.nativeTurns(checkCtx, job.sessionID, 20)
+	if err != nil {
+		s.failIdleKeepAliveUndo(job, "撤回前无法确认最新回合："+err.Error())
+		return
+	}
+	if len(latestTurns) == 0 || latestTurns[len(latestTurns)-1].TurnID != keepAliveTurn.TurnID {
+		s.finishIdleKeepAliveWithoutUndo(job, verdict.State, verdict.Note+"；保活期间出现新回合，已跳过撤回", false, "")
+		return
+	}
+	finalTurn = latestTurns[len(latestTurns)-1]
+	if turnHasToolCall(finalTurn) {
+		s.finishIdleKeepAliveWithoutUndo(job, "failed", "保活回合意外触发工具调用，未自动撤回", true, "undo_skipped")
+		return
+	}
+	rawSession, err := s.kap.Request(checkCtx, http.MethodGet, "/sessions/"+url.PathEscape(job.sessionID), nil)
+	if err != nil {
+		s.failIdleKeepAliveUndo(job, "撤回前无法确认会话状态："+err.Error())
+		return
+	}
+	session, mapErr := mapNativeSession(rawSession)
+	if mapErr != nil {
+		s.failIdleKeepAliveUndo(job, "撤回前无法确认会话状态："+mapErr.Error())
+		return
+	}
+	if session.Busy || session.MainTurnActive || (session.PendingInteraction != "" && session.PendingInteraction != "none") {
+		s.finishIdleKeepAliveWithoutUndo(job, verdict.State, verdict.Note+"；会话已恢复活动，已跳过撤回", false, "")
+		return
 	}
 
 	if _, err := s.kap.UndoSession(checkCtx, job.sessionID, keepAliveTurn.TurnID, ""); err != nil {

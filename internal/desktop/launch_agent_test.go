@@ -283,3 +283,119 @@ func TestWatchPathsCoverTheInstanceRecord(t *testing.T) {
 		t.Fatal("an empty home produced watch paths")
 	}
 }
+
+// Disabling auto-attach from an isolated data directory must never delete the
+// login item the main configuration relies on.
+func TestDisableAutoAttachRefusesAnotherDataDirectory(t *testing.T) {
+	fake := withFakeLaunch(t)
+	mainDir := t.TempDir()
+	isolated := t.TempDir()
+	config := testAgentConfig()
+	config.DataDir = mainDir
+	config.Executable = filepath.Join(mainDir, "enhanced-kimi")
+	if _, err := InstallLaunchAgent(config); err != nil {
+		t.Fatal(err)
+	}
+	path, err := LaunchAgentPath(LaunchAgentLabel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corePath, err := LaunchAgentPath(managedCoreLabel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := UninstallLaunchAgentForDataDir(isolated)
+	if err == nil || !strings.Contains(err.Error(), "其他数据目录") {
+		t.Fatalf("isolated uninstall was not refused: %+v %v", state, err)
+	}
+	if state.Enabled || state.OwnerDataDir != filepath.Clean(mainDir) {
+		t.Fatalf("isolated status did not report the real owner: %+v", state)
+	}
+	if after, readErr := os.ReadFile(path); readErr != nil || string(after) != string(before) {
+		t.Fatalf("main plist changed after a refused uninstall: %v", readErr)
+	}
+	if !fake.loadedLabels[LaunchAgentLabel] || !fake.loadedLabels[managedCoreLabel] {
+		t.Fatalf("main login items were unloaded: %+v", fake.loadedLabels)
+	}
+	if _, statErr := os.Stat(corePath); statErr != nil {
+		t.Fatalf("managed core plist was removed: %v", statErr)
+	}
+	// The owning directory can still remove them.
+	if _, err := UninstallLaunchAgentForDataDir(mainDir); err != nil {
+		t.Fatalf("owning directory was refused: %v", err)
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("owning uninstall did not remove the plist: %v", statErr)
+	}
+}
+
+func TestAutoAttachStatusForIsolatedDirectoryReportsOwner(t *testing.T) {
+	withFakeLaunch(t)
+	mainDir := t.TempDir()
+	config := testAgentConfig()
+	config.DataDir = mainDir
+	config.Executable = filepath.Join(mainDir, "enhanced-kimi")
+	if _, err := InstallLaunchAgent(config); err != nil {
+		t.Fatal(err)
+	}
+	state := LaunchAgentStatusForDataDir(t.TempDir())
+	if state.Enabled {
+		t.Fatalf("an isolated directory claimed the main login item: %+v", state)
+	}
+	if state.OwnerDataDir != filepath.Clean(mainDir) || state.Note == "" {
+		t.Fatalf("owner was not reported: %+v", state)
+	}
+	if own := LaunchAgentStatusForDataDir(mainDir); !own.Enabled {
+		t.Fatalf("the owning directory lost its enabled state: %+v", own)
+	}
+}
+
+// The unload must happen before the plist disappears, otherwise launchd keeps
+// running a definition the user can no longer see.
+func TestRemoveLaunchAgentBootsOutBeforeDeletingThePlist(t *testing.T) {
+	fake := withFakeLaunch(t)
+	path, err := LaunchAgentPath(LaunchAgentLabel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.loadedLabels[LaunchAgentLabel] = true
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("plist"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeLaunchAgent(LaunchAgentLabel); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.bootedOut) != 1 || fake.bootedOut[0] != LaunchAgentLabel {
+		t.Fatalf("job was not unloaded: %v", fake.bootedOut)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("plist was not removed after the unload")
+	}
+}
+
+func TestRecordAttachRecordsTheRunningCorePID(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), []byte(`{"pid":4711}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordAttach(dir, &AttachResult{Status: "installed"}); err != nil {
+		t.Fatal(err)
+	}
+	if state := ReadAttachState(dir); state["corePid"] != float64(4711) {
+		t.Fatalf("corePid was not recorded: %+v", state)
+	}
+	empty := t.TempDir()
+	if err := RecordAttach(empty, &AttachResult{Status: "installed"}); err != nil {
+		t.Fatal(err)
+	}
+	if state := ReadAttachState(empty); state["corePid"] != float64(os.Getpid()) {
+		t.Fatalf("missing runtime.json did not fall back to the current process: %+v", state)
+	}
+}

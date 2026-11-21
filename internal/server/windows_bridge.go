@@ -28,6 +28,11 @@ import (
 
 var bridgeActionPattern = regexp.MustCompile(`^(?:[a-z]+\.){0,4}[a-zA-Z][a-zA-Z0-9]*$`)
 
+const (
+	windowsBridgeTTL         = 12 * time.Hour
+	windowsBridgeRenewWindow = 3 * time.Hour
+)
+
 type windowsBridgeSession struct {
 	key          string
 	sessionToken string
@@ -38,16 +43,43 @@ type windowsBridge struct {
 	mu       sync.Mutex
 	sessions map[string]windowsBridgeSession
 	dialogMu sync.Mutex
+	// ttl, renewWindow and now are the lifecycle knobs. They are fields rather
+	// than constants so a test can drive twelve hours of use in microseconds;
+	// zero values fall back to the production defaults.
+	ttl         time.Duration
+	renewWindow time.Duration
+	now         func() time.Time
 }
 
 func newWindowsBridge() *windowsBridge {
 	return &windowsBridge{sessions: map[string]windowsBridgeSession{}}
 }
 
+func (b *windowsBridge) clock() time.Time {
+	if b.now != nil {
+		return b.now()
+	}
+	return time.Now()
+}
+
+func (b *windowsBridge) lifetime() time.Duration {
+	if b.ttl > 0 {
+		return b.ttl
+	}
+	return windowsBridgeTTL
+}
+
+func (b *windowsBridge) renewalWindow() time.Duration {
+	if b.renewWindow > 0 {
+		return b.renewWindow
+	}
+	return windowsBridgeRenewWindow
+}
+
 func (b *windowsBridge) issue(guard *security.Guard) (string, time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	now := time.Now()
+	now := b.clock()
 	for k, s := range b.sessions {
 		if now.After(s.expiresAt) {
 			delete(b.sessions, k)
@@ -69,7 +101,7 @@ func (b *windowsBridge) issue(guard *security.Guard) (string, time.Time) {
 	}
 	key := security.Random()
 	sessionToken := guard.IssueSessionToken(security.Permissions)
-	expiresAt := now.Add(12 * time.Hour)
+	expiresAt := now.Add(b.lifetime())
 	b.sessions[key] = windowsBridgeSession{
 		key:          key,
 		sessionToken: sessionToken,
@@ -78,18 +110,28 @@ func (b *windowsBridge) issue(guard *security.Guard) (string, time.Time) {
 	return key, expiresAt
 }
 
-func (b *windowsBridge) lookup(key string) (windowsBridgeSession, bool) {
+// lookup resolves a bridge key and slides its session forward. A compatible
+// client keeps one bridge key for as long as the core runs, so a fixed expiry
+// made every compatible-mode request fail at the twelve-hour mark even though
+// nothing had actually changed; renewing inside the last three hours keeps a
+// long-running client connected without ever handing out an expired token.
+func (b *windowsBridge) lookup(key string, guard *security.Guard) (windowsBridgeSession, bool) {
 	if len(key) < 32 {
 		return windowsBridgeSession{}, false
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	now := time.Now()
+	now := b.clock()
 	for candidate, sess := range b.sessions {
 		if subtle.ConstantTimeCompare([]byte(candidate), []byte(key)) == 1 {
 			if now.After(sess.expiresAt) {
 				delete(b.sessions, candidate)
 				return windowsBridgeSession{}, false
+			}
+			if sess.expiresAt.Sub(now) < b.renewalWindow() {
+				sess.sessionToken = guard.IssueSessionToken(security.Permissions)
+				sess.expiresAt = now.Add(b.lifetime())
+				b.sessions[candidate] = sess
 			}
 			return sess, true
 		}
@@ -139,6 +181,10 @@ func writeBridgeJSON(w http.ResponseWriter, status int, origin string, value any
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+func bridgeFailure(w http.ResponseWriter, status int, origin, code, message string) {
+	writeBridgeJSON(w, status, origin, map[string]any{"error": map[string]any{"code": code, "message": message}})
+}
+
 func allowedBridgeOrigin(origin, host string) bool {
 	if origin == "" || origin == "app://renderer" || origin == "http://"+host {
 		return true
@@ -149,21 +195,35 @@ func allowedBridgeOrigin(origin, host string) bool {
 func (a *App) handleWindowsBridgeRPC(w http.ResponseWriter, r *http.Request, guard *security.Guard, coreHandler http.Handler) {
 	origin := r.Header.Get("Origin")
 	if r.Host != guard.Host() {
-		writeBridgeJSON(w, 403, "null", map[string]any{"error": map[string]any{"code": "HOST_DENIED", "message": "本地服务 Host 不匹配"}})
+		bridgeFailure(w, http.StatusForbidden, "null", "HOST_DENIED", "本地服务 Host 不匹配")
 		return
 	}
 	trustedOrigin := allowedBridgeOrigin(origin, guard.Host())
 	if r.Method == http.MethodOptions {
 		if !trustedOrigin {
-			writeBridgeJSON(w, 403, "null", map[string]any{})
+			writeBridgeJSON(w, http.StatusForbidden, "null", map[string]any{})
 			return
 		}
-		writeBridgeJSON(w, 204, origin, map[string]any{})
+		writeBridgeJSON(w, http.StatusNoContent, origin, map[string]any{})
 		return
 	}
-	sess, ok := a.winBridge.lookup(r.Header.Get("X-EKD-Bridge"))
-	if !trustedOrigin || !ok || r.Method != http.MethodPost {
-		writeBridgeJSON(w, 403, origin, map[string]any{"error": map[string]any{"code": "RPC_DENIED", "message": "增强桥来源或凭据无效"}})
+	// A request from a page that is not the renderer is refused before its
+	// credential is looked at: the answer must not confirm whether a key exists.
+	if !trustedOrigin {
+		bridgeFailure(w, http.StatusForbidden, origin, "ORIGIN_DENIED", "增强桥来源未获授权")
+		return
+	}
+	if r.Method != http.MethodPost {
+		bridgeFailure(w, http.StatusMethodNotAllowed, origin, "METHOD_DENIED", "增强桥只接受 POST 请求")
+		return
+	}
+	sess, ok := a.winBridge.lookup(r.Header.Get("X-EKD-Bridge"), guard)
+	if !ok {
+		// The bridge table lives in this process, so a core restart empties it
+		// while the page keeps its key. Answering a renewable condition as
+		// RPC_DENIED left the client retrying a credential that can never work;
+		// this code tells it to fetch a fresh bridge session instead.
+		bridgeFailure(w, http.StatusUnauthorized, origin, "BRIDGE_SESSION_EXPIRED", "增强桥会话已失效，正在等待重新接入")
 		return
 	}
 	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 24*1024*1024+1))

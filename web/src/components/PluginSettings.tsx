@@ -1027,7 +1027,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
         <div>
           {/* The settings dialog already prints this title above the section. */}
           {embedded ? null : <h2>增强插件</h2>}
-          <p>增强插件运行在当前界面里，可以读取你看到的会话内容，与官方插件市场相互独立。只安装你信任的增强插件。</p>
+          <p>增强插件运行在当前桌面界面中，与 KimiCode+ 共享同一运行环境，没有独立的系统沙箱：除当前界面会话内容外，还可能触及本机的增强能力与接口。因此只安装来源完全可信的第三方增强插件。能力清单用于声明与管理插件能调用哪些接口，不能替代你对插件代码的信任审查。</p>
         </div>
         <div className="plugins-list-actions">
           <ActionButton icon="refresh" onClick={plugins.reload} busy={plugins.loading}>
@@ -1085,6 +1085,10 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
               </dl>
               <PluginUpstreamInfo upstream={preview} />
               {preview.platformLimitations?.length ? <WindowsPluginReopen host={host} /> : null}
+              <InfoNote tone="warn">
+                <p><strong>安装第三方增强插件前请确认信任边界</strong></p>
+                <p>第三方增强插件运行在当前桌面界面中，与 KimiCode+ 共享同一运行环境，没有独立的系统沙箱：除当前界面会话内容外，还可能触及本机的增强能力与接口。因此只安装来源完全可信的插件。下面的能力清单用于声明与管理插件能调用哪些接口，不能替代你对插件代码的信任审查。</p>
+              </InfoNote>
               {preview.installed ? (
                 <InfoNote tone="warn">
                   <p>这个增强插件已经安装过。继续安装会替换它的文件，并按你下面勾选的能力重新授权；增强插件会保持停用，需要再手动启用。</p>

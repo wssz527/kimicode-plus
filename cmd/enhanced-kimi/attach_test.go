@@ -139,3 +139,54 @@ func TestResolveAttachCredentialsPrefersLiveRuntime(t *testing.T) {
 		t.Fatalf("unauthorized runtime.json did not fall back: %s", gotURL)
 	}
 }
+
+// A recorded, successful attach is replayed with the exact consent it was
+// recorded with. A Windows launcher lease must not widen that consent.
+func TestRestartStateReplaysRecordedAttach(t *testing.T) {
+	dir := t.TempDir()
+	payload, err := json.Marshal(map[string]any{"status": "installed", "daily": false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "attach-state.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := restartStateForCore(dir, 41234, "", false)
+	if state.Port != 41234 || !state.Reattach || state.ReattachDaily {
+		t.Fatalf("recorded attach was not replayed: %+v", state)
+	}
+	payload, err = json.Marshal(map[string]any{"status": "installed", "daily": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "attach-state.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state = restartStateForCore(dir, 41234, "", false)
+	if !state.Reattach || !state.ReattachDaily {
+		t.Fatalf("daily consent recorded by the user was dropped: %+v", state)
+	}
+}
+
+// A failed reattach has to be visible: the old installed record would otherwise
+// keep claiming the interface is attached after a restart.
+func TestRestartStateIgnoresFailedAttachRecord(t *testing.T) {
+	dir := t.TempDir()
+	payload, err := json.Marshal(map[string]any{"status": "error", "error": "宿主已退出", "daily": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "attach-state.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if state := restartStateForCore(dir, 41000, "", false); state.Reattach || state.ReattachDaily {
+		t.Fatalf("a failed attach record asked for a reattach: %+v", state)
+	}
+}
+
+func TestRestartStateIgnoresExpiredWindowsLease(t *testing.T) {
+	dir := t.TempDir()
+	if state := restartStateForCore(dir, 41000, "", true); state.Reattach || state.ReattachDaily {
+		t.Fatalf("a missing lease asked for a reattach: %+v", state)
+	}
+}

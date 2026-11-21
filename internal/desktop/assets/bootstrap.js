@@ -4,7 +4,7 @@ async function installNativeBootstrap(options) {
   const http = req('node:http');
   const crypto = req('node:crypto');
   if (app.getVersion() !== options.expectedApp || process.versions.electron !== options.expectedElectron) throw new Error('宿主版本在接入时发生变化');
-  if (options.runtimePath && (typeof BrowserWindow !== 'function' || typeof WebContentsView !== 'function' || typeof ipcMain?.prependListener !== 'function')) {
+  if (options.windowsMainBridge && (typeof BrowserWindow !== 'function' || typeof WebContentsView !== 'function' || typeof ipcMain?.prependListener !== 'function')) {
     throw new Error('Windows 官方宿主缺少插件窗口所需的 Electron 接口');
   }
   if (globalThis.__ekdNative) await globalThis.__ekdNative.cleanup();
@@ -14,10 +14,22 @@ async function installNativeBootstrap(options) {
     const path = url.slice('app://renderer/'.length).split(/[?#]/)[0];
     return path === '' || path === 'index.html' || !path.endsWith('.html');
   };
-  const wc = webContents.getAllWebContents().find(item => !item.isDestroyed() && isMainRendererURL(item.getURL()));
-  if (!wc) throw new Error('隔离主窗口未找到');
+  // The main window can be closed and reopened without this process exiting
+  // (Cmd+W on macOS, then reopening from the Dock). The reference therefore has
+  // to be replaceable: the host integration, the loopback server and the core
+  // session all outlive one window, and only the per-window state is dropped.
+  const findMainContents = () => webContents.getAllWebContents().find(item => !item.isDestroyed() && isMainRendererURL(item.getURL()));
+  const initialWC = findMainContents();
+  if (!initialWC) throw new Error('隔离主窗口未找到');
+  let currentWC = initialWC;
+  const mainWindow = () => (currentWC && !currentWC.isDestroyed() ? currentWC : null);
+  function requireMainWindow() {
+    const live = mainWindow();
+    if (!live) throw new Error('增强主窗口尚未打开，请从托盘菜单或 Dock 重新打开 Kimi Code 窗口');
+    return live;
+  }
   async function pairCore(pairingToken) {
-    const permissions = ['core:read','settings:write','models:read','models:write','usage:read','usage:write','tasks:read','tasks:write','chat:read','chat:write','plugins:read','plugins:write','adapter:write','credentials:read','credentials:write','workspace:read','workspace:write','browser:read','browser:write'];
+    const permissions = ['core:read','settings:write','models:read','models:write','usage:read','usage:write','tasks:read','tasks:write','chat:read','chat:write','plugins:read','plugins:write','adapter:write','credentials:read','credentials:write','workspace:read','workspace:write','browser:read','browser:write','update:read','update:write'];
     if (process.platform === 'win32') permissions.push('host:electron-main');
     const response = await fetch(new URL('/enhance/v1/pair', options.coreURL), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -25,9 +37,12 @@ async function installNativeBootstrap(options) {
     });
     const pair = await response.json();
     if (!response.ok || !pair.sessionToken) throw new Error(pair?.error?.message || '增强核心配对失败');
-    return pair.sessionToken;
+    const expiresAtMs = Date.parse(pair.expiresAt);
+    return { sessionToken: pair.sessionToken, expiresAtMs: Number.isFinite(expiresAtMs) ? expiresAtMs : Date.now() + 12 * 60 * 60 * 1000 };
   }
-  let coreToken = await pairCore(options.pairingToken);
+  const initialPair = await pairCore(options.pairingToken);
+  let coreToken = initialPair.sessionToken;
+  let coreTokenExpiresAtMs = initialPair.expiresAtMs;
   let pairedWith = options.pairingToken;
   let pairing = null;
   const state = { channels: new Map(), windows: new Map(), views: new Map(), pluginViews: new Map(), pluginViewTokens: new Map(), pluginViewOwners: new Map(), pluginViewQueues: new Map(), pluginCommands: new Map(), bounds: new Map(), browserWindow: null, server: null, cleanup: null, overlayEntries: [], activeOverlayMenu: null };
@@ -45,6 +60,31 @@ async function installNativeBootstrap(options) {
       request.on('error', reject);
     });
   }
+  // A session token lasts twelve hours. Renewing it is what keeps an attach
+  // alive past that, so the runtime record is the only input: it carries the
+  // token of the core that is running now, whether that is the same instance or
+  // a replacement after a restart.
+  function refreshCoreSession() {
+    pairing ??= (async () => {
+      if (!options.runtimePath || state.cleaned) return false;
+      const runtime = JSON.parse(await req('node:fs/promises').readFile(options.runtimePath, 'utf8'));
+      if (runtime.url !== options.coreURL || typeof runtime.pairingToken !== 'string' || runtime.pairingToken.length < 32) return false;
+      const refreshed = await pairCore(runtime.pairingToken);
+      if (state.cleaned) return false;
+      const restarted = pairedWith !== runtime.pairingToken;
+      coreToken = refreshed.sessionToken;
+      coreTokenExpiresAtMs = refreshed.expiresAtMs;
+      if (restarted) {
+        // Only a different pairing token means the core is a new instance, and
+        // only then is re-injecting the renderer safe. A plain token expiry on
+        // the same core must never tear down the windows the user has open.
+        pairedWith = runtime.pairingToken;
+        setImmediate(rebindRenderers);
+      }
+      return true;
+    })().finally(() => { pairing = null; });
+    return pairing;
+  }
   async function coreFetch(path, init = {}) {
     const headers = new Headers(init.headers || {});
     headers.set('Accept', 'application/json');
@@ -53,24 +93,25 @@ async function installNativeBootstrap(options) {
       headers.set('Authorization', 'Bearer ' + token);
       return fetch(new URL(path, options.coreURL), { ...init, headers, signal: AbortSignal.timeout(120000), redirect: 'error' });
     };
-    const originalToken = coreToken;
-    const response = await request(originalToken);
-    if (response.status !== 403 || !options.runtimePath || state.cleaned || (await response.clone().json().catch(() => null))?.error?.code !== 'PERMISSION_DENIED') return response;
-    if (coreToken === originalToken) {
-      pairing ??= (async () => {
-        const runtime = JSON.parse(await req('node:fs/promises').readFile(options.runtimePath, 'utf8'));
-        if (runtime.url !== options.coreURL || typeof runtime.pairingToken !== 'string') return;
-        const refreshed = await pairCore(runtime.pairingToken);
-        if (state.cleaned) return;
-        const restarted = pairedWith !== runtime.pairingToken;
-        pairedWith = runtime.pairingToken;
-        coreToken = refreshed;
-        if (restarted) setImmediate(rebindWindowsRenderers);
-      })().finally(() => { pairing = null; });
-      await pairing;
+    // Renew ahead of the expiry instead of waiting for a failure. This also
+    // covers a laptop that slept through the twelve-hour mark: the first request
+    // after waking renews before it is sent.
+    if (options.runtimePath && !state.cleaned && coreTokenExpiresAtMs > 0 && Date.now() >= coreTokenExpiresAtMs - 15 * 60 * 1000) {
+      await refreshCoreSession().catch(error => { console.warn('[EKD] proactive core session renewal failed:', error?.message || String(error)); });
     }
-    if (coreToken === originalToken || state.cleaned) return response;
+    const originalToken = coreToken;
+    let response = await request(originalToken);
+    // A 401 TOKEN_EXPIRED is the one renewable failure. A 403 means this
+    // credential is live but not scoped for the resource, which renewing cannot
+    // fix and would only spend the /pair rate limit on.
+    if (response.status !== 401 || !options.runtimePath || state.cleaned) return response;
+    const failure = await response.clone().json().catch(() => null);
+    if (failure?.error?.code !== 'TOKEN_EXPIRED') return response;
+    await refreshCoreSession().catch(error => { console.warn('[EKD] reactive core session renewal failed:', error?.message || String(error)); });
+    if (state.cleaned || coreToken === originalToken) return response;
     await response.body?.cancel();
+    // Exactly one retry: a renewed token that is still refused is a real
+    // authorization failure and must surface to the caller unchanged.
     return request(coreToken);
   }
   async function nativeAction(action, payload) {
@@ -217,7 +258,7 @@ async function installNativeBootstrap(options) {
       existing.show(); existing.focus();
       return { focused: true };
     }
-    const theme = await wc.executeJavaScript('document.documentElement.dataset.colorScheme||"dark"');
+    const theme = await requireMainWindow().executeJavaScript('document.documentElement.dataset.colorScheme||"dark"');
     const previous = state.bounds.get(kind);
     const plugin = kind.startsWith('plugin:');
     const win = new BrowserWindow({
@@ -265,20 +306,21 @@ async function installNativeBootstrap(options) {
     releaseOwnedPluginViews(target.id);
     const key = crypto.randomBytes(32).toString('base64url');
     const instanceId = crypto.randomBytes(16).toString('base64url');
-    state.channels.set(target.id, { key, instanceId, expectedOrigin: target === wc ? 'app://renderer' : 'null' });
+    state.channels.set(target.id, { key, instanceId, expectedOrigin: target === currentWC ? 'app://renderer' : 'null' });
     const config = {
       endpoint: state.endpoint, bridgeKey: key, instanceId, moduleSource: options.moduleSource, cssSource: options.cssSource,
-      coreURL: options.runtimePath ? options.coreURL : '',
+      coreURL: options.windowsMainBridge ? options.coreURL : '',
       appVersion: options.reportedApp || app.getVersion(), electron: process.versions.electron,
       surface, ...extra,
     };
     return target.executeJavaScript('(' + options.rendererSource + ')(' + JSON.stringify(config) + ')');
   }
-  function rebindWindowsRenderers() {
-    if (state.cleaned || wc.isDestroyed()) return;
+  function rebindRenderers() {
+    const target = mainWindow();
+    if (state.cleaned || !target) return;
     destroyPluginViews();
     for (const win of state.windows.values()) if (!win.isDestroyed()) win.close();
-    void bindRenderer(wc, 'host').catch(error => console.warn('KimiCode+ host reconnection failed', error.message));
+    void bindRenderer(target, 'host').catch(error => console.warn('KimiCode+ host reconnection failed', error.message));
   }
   async function dispatch(target, message) {
     const payload = message.payload || {};
@@ -298,7 +340,7 @@ async function installNativeBootstrap(options) {
         const result = Buffer.from(await response.arrayBuffer()).toString('base64');
         return { status: response.status, headers: [['Content-Type', response.headers.get('content-type') || 'application/json']], bodyBase64: result };
       }
-      case 'window.openSettings': return wc.executeJavaScript('window.__ekdNativeUI.openSettings(' + JSON.stringify(typeof payload.tab === 'string' ? payload.tab : '') + ')');
+      case 'window.openSettings': return requireMainWindow().executeJavaScript('window.__ekdNativeUI.openSettings(' + JSON.stringify(typeof payload.tab === 'string' ? payload.tab : '') + ')');
       case 'plugin.window.open': {
         const answer = await corePluginAction('ui.popout', payload.token, {});
         if (typeof answer?.pluginId !== 'string' || !/^[a-z0-9][a-z0-9.-]{0,63}$/.test(answer.pluginId)) throw new Error('核心返回的插件窗口归属无效');
@@ -312,11 +354,11 @@ async function installNativeBootstrap(options) {
         if (width > size[0]) win.setSize(Math.min(width, 3000), size[1]);
         return {};
       }
-      case 'host.openSession': return wc.executeJavaScript('window.__ekdNativeUI.openOfficial(' + JSON.stringify(payload.id) + ')');
-      case 'host.pickSession': return wc.executeJavaScript('window.__ekdNativeUI.pickSession(' + JSON.stringify(payload.exclude || []) + ')');
-      case 'host.activateSession': return wc.executeJavaScript('window.__ekdNativeUI.activateSession(' + JSON.stringify(payload.id) + ')');
+      case 'host.openSession': return requireMainWindow().executeJavaScript('window.__ekdNativeUI.openOfficial(' + JSON.stringify(payload.id) + ')');
+      case 'host.pickSession': return requireMainWindow().executeJavaScript('window.__ekdNativeUI.pickSession(' + JSON.stringify(payload.exclude || []) + ')');
+      case 'host.activateSession': return requireMainWindow().executeJavaScript('window.__ekdNativeUI.activateSession(' + JSON.stringify(payload.id) + ')');
       case 'host.syncOverlayEntries': {
-        if (target !== wc) return {};
+        if (target !== currentWC) return {};
         state.overlayEntries = sanitizeOverlayEntries(payload.entries);
         if (state.activeOverlayMenu) {
           const ov = webContents.getAllWebContents().find(item => !item.isDestroyed() && item.getURL().includes('browser-overlay'));
@@ -639,8 +681,9 @@ async function installNativeBootstrap(options) {
     void ov.executeJavaScript(expr).catch(() => {});
   }
   const onOverlayOpen = (event, payload) => {
-    if (event.sender !== wc || !state.overlayEntries.length || !isPanelAddMenuPayload(payload)) {
-      if (event.sender === wc) state.activeOverlayMenu = null;
+    const host = mainWindow();
+    if (!host || event.sender !== host || !state.overlayEntries.length || !isPanelAddMenuPayload(payload)) {
+      if (host && event.sender === host) state.activeOverlayMenu = null;
       return;
     }
     const officialCount = payload.items.length;
@@ -661,8 +704,9 @@ async function installNativeBootstrap(options) {
     const known = state.overlayEntries.some(entry => entry.action === action)
       || state.activeOverlayMenu?.entries?.some(entry => entry.action === action);
     state.activeOverlayMenu = null;
-    if (!known || wc.isDestroyed()) return;
-    void wc.executeJavaScript('window.__ekdNativeUI?.invokeEntry?.(' + JSON.stringify(action) + ')').catch(() => {});
+    const host = mainWindow();
+    if (!known || !host) return;
+    void host.executeJavaScript('window.__ekdNativeUI?.invokeEntry?.(' + JSON.stringify(action) + ')').catch(() => {});
   };
   const onOverlayClosed = () => { state.activeOverlayMenu = null; };
   if (ipcMain && typeof ipcMain.prependListener === 'function') {
@@ -675,14 +719,77 @@ async function installNativeBootstrap(options) {
   state.server = server;
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   state.endpoint = 'http://127.0.0.1:' + server.address().port;
-  wc.on('did-finish-load', state.reload = () => {
-    if (wc.getURL().startsWith('app://renderer/')) void bindRenderer(wc, 'host').catch(() => {});
-  });
-  wc.once('destroyed', () => { void state.cleanup(); });
+  // One window's listeners. They are installed per window and removed with that
+  // same window, so the reopen path cannot accumulate handlers across windows.
+  function unattachMainWebContents(contents) {
+    if (!contents) return;
+    // removeListener stays valid after destroyed, so the persistent reload
+    // handler is dropped here even when teardown follows a closed window.
+    try { contents.removeListener('did-finish-load', onMainDidFinishLoad); } catch {}
+    try { contents.removeListener('destroyed', onMainDestroyed); } catch {}
+  }
+  // Closing only the main window must not tear the integration down: the
+  // loopback server, the core session and the app listeners outlive it. Only the
+  // state that belonged to that window goes away, so a reopened window starts
+  // from a clean slate without a second integration or a leaked channel.
+  function dropMainWindowState(contentsId) {
+    state.channels.delete(contentsId);
+    for (const [key, owner] of [...state.pluginCommands]) if (owner === contentsId) state.pluginCommands.delete(key);
+    state.overlayEntries = [];
+    state.activeOverlayMenu = null;
+    void releaseOwnedPluginViews(contentsId);
+    const view = state.views.get(contentsId);
+    if (view) {
+      if (!view.webContents.isDestroyed()) view.webContents.close();
+      state.views.delete(contentsId);
+    }
+  }
+  const onMainDidFinishLoad = () => {
+    const contents = currentWC;
+    if (!contents || contents.isDestroyed()) return;
+    if (contents.getURL().startsWith('app://renderer/')) void bindRenderer(contents, 'host').catch(() => {});
+  };
+  const onMainDestroyed = () => {
+    const contents = currentWC;
+    if (!contents) return;
+    unattachMainWebContents(contents);
+    currentWC = null;
+    if (!state.cleaned) dropMainWindowState(contents.id);
+  };
+  function attachMainWebContents(next) {
+    if (!next || next.isDestroyed()) throw new Error('增强主窗口尚未打开，请从托盘菜单或 Dock 重新打开 Kimi Code 窗口');
+    currentWC = next;
+    next.on('did-finish-load', onMainDidFinishLoad);
+    next.once('destroyed', onMainDestroyed);
+  }
+  // macOS keeps the process alive after Cmd+W, and reopening from the Dock
+  // creates a brand-new webContents. Nothing else re-injects the host renderer,
+  // so the reopened window stayed unenhanced forever; this listener notices the
+  // replacement and binds it like the first window.
+  // Electron passes the event first, the new webContents second.
+  const onWebContentsCreated = (_event, contents) => {
+    if (state.cleaned || !contents || typeof contents.once !== 'function') return;
+    const adopt = () => {
+      if (state.cleaned || mainWindow()) return;
+      if (!isMainRendererURL(contents.getURL())) return;
+      try {
+        attachMainWebContents(contents);
+        void bindRenderer(contents, 'host').catch(error => console.warn('KimiCode+ host reconnection failed', error.message));
+      } catch {}
+    };
+    contents.once('did-finish-load', adopt);
+  };
+  const onBeforeQuit = () => { void state.cleanup(); };
+  if (typeof app?.on === 'function') app.on('web-contents-created', onWebContentsCreated);
+  if (typeof app?.once === 'function') app.once('before-quit', onBeforeQuit);
   state.cleanup = async () => {
     if (state.cleaned) return;
     state.cleaned = true;
     coreToken = '';
+    if (typeof app?.removeListener === 'function') {
+      app.removeListener('web-contents-created', onWebContentsCreated);
+      app.removeListener('before-quit', onBeforeQuit);
+    }
     if (ipcMain && typeof ipcMain.removeListener === 'function') {
       ipcMain.removeListener('kimi:browser-overlay-open', onOverlayOpen);
       ipcMain.removeListener('kimi:browser-overlay-rendered', onOverlayRendered);
@@ -692,7 +799,9 @@ async function installNativeBootstrap(options) {
     }
     state.overlayEntries = [];
     state.activeOverlayMenu = null;
-    if (state.reload) wc.removeListener('did-finish-load', state.reload);
+    const closing = currentWC;
+    unattachMainWebContents(closing);
+    currentWC = null;
     for (const win of state.windows.values()) if (!win.isDestroyed()) win.destroy();
     state.windows.clear();
     if (state.browserWindow && !state.browserWindow.isDestroyed()) state.browserWindow.destroy();
@@ -707,9 +816,10 @@ async function installNativeBootstrap(options) {
       server.closeAllConnections();
       await closed;
     }
-    if (!wc.isDestroyed()) await wc.executeJavaScript('window.__ekdNativeUI?.remove()').catch(() => {});
+    if (closing && !closing.isDestroyed()) await closing.executeJavaScript('window.__ekdNativeUI?.remove()').catch(() => {});
     if (globalThis.__ekdNative === state) delete globalThis.__ekdNative;
   };
-  const mounted = await bindRenderer(wc, 'host');
+  attachMainWebContents(initialWC);
+  const mounted = await bindRenderer(initialWC, 'host');
   return { status: mounted.status, transport: 'main-loopback-rpc', protocol: 1, appVersion: app.getVersion(), electron: process.versions.electron };
 }

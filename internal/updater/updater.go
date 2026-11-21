@@ -50,6 +50,8 @@ type Options struct {
 	RestartState      func() RestartState
 	RequestRestart    func()
 	launchSupervisor  func(string, string) error
+	Launchd           LaunchdOptions
+	HealthyModules    func() []string
 	APIBaseURL        string
 	AllowInsecureHTTP bool
 	AllowTemporaryExe bool
@@ -57,6 +59,19 @@ type Options struct {
 	GOARCH            string
 	HTTPClient        *http.Client
 	Now               func() time.Time
+}
+
+// LaunchdOptions describes the macOS login item that owns the resident core.
+// Enabled decides per update whether launchd, not the supervisor, starts the
+// candidate; the remaining fields are injectable for tests.
+type LaunchdOptions struct {
+	Label string
+	// Enabled reports whether targetExe is the managed copy in this data
+	// directory, which is the one launchd may start.
+	Enabled func(targetExe string) bool
+	// Managed reports whether the login item is loaded and keeps that copy alive.
+	// Only then is the candidate handed to launchd.
+	Managed func() bool
 }
 
 type Status struct {

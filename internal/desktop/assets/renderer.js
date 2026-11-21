@@ -1,6 +1,62 @@
 async function installNativeRenderer(options) {
   if (window.__ekdNativeUI) await window.__ekdNativeUI.remove();
+  // Third-party plugins share this page and can replace globals. Pin the
+  // primitives the host depends on before any enhancement or plugin module
+  // runs: a plugin that patches window.fetch could otherwise read the
+  // X-EKD-Bridge credential off every host request.
+  const nativeFetch = window.fetch.bind(window);
+  const nativeStringify = JSON.stringify;
+  const nativeParse = JSON.parse;
+  const freeze = Object.freeze;
   const windowsLoopback = options.transport === 'windows-cdp-loopback';
+  // A bridge 401/403 means the host-side channel was rebound or its key rotated,
+  // not that the official Kimi account lost its credentials. Keep the two apart
+  // in the code and in the message the user sees.
+  const bridgeCredentialCodes = new Set(['TOKEN_EXPIRED', 'BRIDGE_SESSION_EXPIRED', 'RPC_DENIED', 'RPC_OWNER', 'PAIRING_EXPIRED']);
+  const bridgeCredentialMessage = '增强核心本地通信凭据已刷新或正在重新连接；你的官方 Kimi 账号登录未受影响，请稍后重试。';
+  // Only these mean the request never reached the action: the bridge itself
+  // refused it. Anything else with a semantic code is a real answer from the
+  // core (for example PLUGIN_PRIVILEGE_DENIED) and must keep its own message
+  // and must never be retried, because the action may already have run.
+  const bridgeRejectedBeforeDispatch = code => !code || code === 'RPC_DENIED' || code === 'RPC_OWNER' || code.startsWith('HTTP_');
+  function bridgeCredentialFailure(status, code) {
+    return bridgeCredentialCodes.has(code) || ((status === 401 || status === 403) && bridgeRejectedBeforeDispatch(code));
+  }
+  async function bridgeRequest(action, payload) {
+    const id = typeof globalThis.crypto?.randomUUID === 'function'
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    let response;
+    let body;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      response = await nativeFetch(options.endpoint + '/ekd/native/v1', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-EKD-Bridge': options.bridgeKey },
+        body: nativeStringify({ protocol: 1, id, action, payload }),
+      });
+      body = await response.json().catch(() => null);
+      const refused = !response.ok || (body?.error && bridgeRejectedBeforeDispatch(body.error.code));
+      if (!refused || attempt === 1) break;
+      // A rotated bridge key or a rebinding window is visible for a few hundred
+      // milliseconds. One retry rides that out instead of surfacing an error
+      // that reads like the official account credentials were lost.
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    if (!response.ok || body?.error) {
+      const code = body?.error?.code || `HTTP_${response.status}`;
+      const error = new Error(body?.error?.message || `增强桥返回 HTTP ${response.status}`);
+      error.code = code;
+      error.status = response.status;
+      if (bridgeCredentialFailure(response.status, code)) {
+        error.message = bridgeCredentialMessage;
+        error.code = 'BRIDGE_SESSION_EXPIRED';
+        error.retryable = true;
+      }
+      throw error;
+    }
+    if (body?.protocol !== 1 || body?.id !== id) throw new Error('增强桥响应标识不匹配');
+    return body?.result;
+  }
   const transport = {
     async request(action, payload = {}) {
       if (windowsLoopback) {
@@ -39,22 +95,7 @@ async function installNativeRenderer(options) {
           return res?.canceled ? [] : (res?.filePaths || []).map(p => ({ path: p, name: String(p).split(/[\\/]/).pop() || p }));
         }
       }
-      const id = typeof globalThis.crypto?.randomUUID === 'function'
-        ? globalThis.crypto.randomUUID()
-        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-      const response = await fetch(options.endpoint + '/ekd/native/v1', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-EKD-Bridge': options.bridgeKey },
-        body: JSON.stringify({ protocol: 1, id, action, payload }),
-      });
-      const body = await response.json().catch(() => null);
-      if (!response.ok || body?.error) {
-        const error = new Error(body?.error?.message || `增强桥返回 HTTP ${response.status}`);
-        error.code = body?.error?.code || 'NATIVE_RPC';
-        throw error;
-      }
-      if (body?.protocol !== 1 || body?.id !== id) throw new Error('增强桥响应标识不匹配');
-      return body?.result;
+      return bridgeRequest(action, payload);
     },
   };
   const moduleURL = URL.createObjectURL(new Blob([options.moduleSource], { type: 'text/javascript' }));
@@ -128,9 +169,32 @@ async function installNativeRenderer(options) {
     lastContractDigest: '',
     contractReportTimer: null,
   };
+  // The official client is not a stable DOM contract. Every probe is allowed to
+  // fail after an official upgrade: the failure disables the one enhancement
+  // that needed it, with one clear contract note, and must never escape into
+  // the official renderer or its chat input.
+  const warnedContracts = new Set();
+  function contractDegraded(area, error) {
+    const detail = error?.message || String(error);
+    const key = area + ': ' + detail;
+    if (warnedContracts.has(key)) return;
+    warnedContracts.add(key);
+    console.warn(`[KimiCode+] ${area}契约探测失败，已停用对应增强入口；官方聊天区与输入不受影响。${detail}`);
+  }
+  function probe(area, run, fallback) {
+    try {
+      return run();
+    } catch (error) {
+      contractDegraded(area, error);
+      return fallback;
+    }
+  }
+  function piniaStore(name) {
+    return probe('官方 Vue-Pinia 状态仓库', () => document.querySelector('#app')?.__vue_app__?.config?.globalProperties?.$pinia?._s?.get?.(name) || null, null);
+  }
   const activeSession = () => {
     if (options.sourceSessionId) return options.sourceSessionId;
-    return document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia._s.get('kimi.sessions')?.activeSessionId || '';
+    return probe('官方会话状态', () => piniaStore('kimi.sessions')?.activeSessionId || '', '');
   };
   function makeHost(close) {
     return module.createNativeHost(transport, {
@@ -166,22 +230,24 @@ async function installNativeRenderer(options) {
     return () => window.removeEventListener(name, handler);
   }
   function panel() {
-    const shell = document.querySelector('.pt-shell');
-    let found;
-    const seen = new Set();
-    function walk(node) {
-      if (!node || seen.has(node) || found) return;
-      seen.add(node);
-      const component = node.component;
-      if (component) {
-        const candidate = component.props?.panel;
-        if (candidate?.showPanel && candidate?.activateTab && candidate?.previewWidth && candidate?.panelTabs && (component.subTree?.el === shell || component.subTree?.el?.contains?.(shell))) found = candidate;
-        walk(component.subTree);
+    return probe('官方右侧面板', () => {
+      const shell = document.querySelector('.pt-shell');
+      let found;
+      const seen = new Set();
+      function walk(node) {
+        if (!node || seen.has(node) || found) return;
+        seen.add(node);
+        const component = node.component;
+        if (component) {
+          const candidate = component.props?.panel;
+          if (candidate?.showPanel && candidate?.activateTab && candidate?.previewWidth && candidate?.panelTabs && (component.subTree?.el === shell || component.subTree?.el?.contains?.(shell))) found = candidate;
+          walk(component.subTree);
+        }
+        if (Array.isArray(node.children)) node.children.forEach(walk);
       }
-      if (Array.isArray(node.children)) node.children.forEach(walk);
-    }
-    walk(document.querySelector('#app')?._vnode);
-    return found;
+      walk(document.querySelector('#app')?._vnode);
+      return found;
+    }, undefined);
   }
   // Reference-counted sidebar collapse. The state before the first acquire is
   // remembered so the last release restores exactly what the user had, and a
@@ -216,6 +282,12 @@ async function installNativeRenderer(options) {
   }
   async function mountSessions(extraIds) {
     if (!state.features.multiSession) throw new Error('会话并排已关闭，请先在「实验室」设置中开启');
+    // `.chat-main` has exactly one enhancer layout at a time. The plugin split
+    // wraps every direct child of the column, so an open plugin main area must
+    // be unwrapped before the session host is appended: otherwise the session
+    // host ends up inside `.ekdp-main-split` and the session CSS hides the whole
+    // column.
+    for (const handle of [...state.pluginMainAreas.values()]) handle.dispose();
     closeSessions();
     const chat = document.querySelector('.chat');
     const composer = document.querySelector('.composer');
@@ -402,7 +474,7 @@ async function installNativeRenderer(options) {
       void refreshAccountsCache(false);
     }
     const accounts = Array.isArray(state.accountsCache?.accounts) ? state.accountsCache.accounts : [];
-    const digest = JSON.stringify(accounts.map(a => [a.id, a.label, a.current, a.status, a.avatar || '', a.plan || '']));
+    const digest = nativeStringify(accounts.map(a => [a.id, a.label, a.current, a.status, a.avatar || '', a.plan || '']));
     const existing = menu.querySelector('[data-ekd-account-menu]');
     if (accounts.length === 0) {
       existing?.remove();
@@ -950,12 +1022,17 @@ async function installNativeRenderer(options) {
     return activateSession(id);
   }
   function activateSession(id) {
-    const element = [...document.querySelectorAll('[data-session-id]')].find(item => item.dataset.sessionId === id)?.querySelector('.row');
+    const element = probe('官方会话行', () => [...document.querySelectorAll('[data-session-id]')].find(item => item.dataset.sessionId === id)?.querySelector('.row'), undefined);
     if (element) element.click();
     else {
-      const store = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia._s.get('kimi.sessions');
+      const store = piniaStore('kimi.sessions');
       if (typeof store?.setActiveSessionId !== 'function') throw new Error('官方会话选择契约未就绪');
-      store.setActiveSessionId(id);
+      try {
+        store.setActiveSessionId(id);
+      } catch (error) {
+        contractDegraded('官方会话选择', error);
+        throw new Error('官方会话选择契约未就绪');
+      }
     }
     if (activeSession() !== id) throw new Error('官方宿主没有接受会话切换');
     return { opened: true };
@@ -1100,7 +1177,7 @@ async function installNativeRenderer(options) {
   function syncOverlayEntries(entries) {
     if (options.popout || windowsLoopback) return;
     const next = entries.map(entry => ({ action: entry.action, title: entry.title, icon: entry.icon || '' }));
-    const encoded = JSON.stringify(next);
+    const encoded = nativeStringify(next);
     if (encoded === lastOverlayPayload) return;
     lastOverlayPayload = encoded;
     void transport.request('host.syncOverlayEntries', { entries: next }).catch(() => {});
@@ -1118,7 +1195,7 @@ async function installNativeRenderer(options) {
   }
   function scheduleContractReport(probes, immediate = false) {
     if (options.surface !== 'host' || state.removed) return;
-    const digest = JSON.stringify(probes.map(p => [p.id, p.status, p.reason || '', p.detail || '']));
+    const digest = nativeStringify(probes.map(p => [p.id, p.status, p.reason || '', p.detail || '']));
     if (digest === state.lastContractDigest) return;
     state.lastContractDigest = digest;
     const send = () => {
@@ -1166,6 +1243,13 @@ async function installNativeRenderer(options) {
   // gets its plugin row back without a stale module-level reference deciding
   // whether it "already exists".
   function syncNativeEntries() {
+    try {
+      syncNativeEntriesInner();
+    } catch (error) {
+      contractDegraded('官方界面同步', error);
+    }
+  }
+  function syncNativeEntriesInner() {
     const firstEvaluation = state.contracts === null;
     const evaluation = module.evaluateDOMContracts(document, state.contractState);
     state.contractState = evaluation.state;
@@ -1364,24 +1448,32 @@ async function installNativeRenderer(options) {
   let watchChain = Promise.resolve();
   function syncActiveSessionWatch(targetId) {
     watchChain = watchChain.then(async () => {
-      const next = state.removed ? '' : (targetId || '');
-      const prev = state.watchedSession || '';
-      if (next === prev) return;
-      if (prev) {
-        state.watchedSession = '';
-        await transport.request('session.unwatch', { id: prev }).catch(() => {});
-      }
-      if (next && !state.removed) {
-        try {
-          await transport.request('session.watch', { id: next });
+      try {
+        const next = state.removed ? '' : (targetId || '');
+        const prev = state.watchedSession || '';
+        if (next === prev) return;
+        if (prev) {
+          state.watchedSession = '';
+          await transport.request('session.unwatch', { id: prev }).catch(() => {});
+        }
+        if (next && !state.removed) {
+          const result = await transport.request('session.watch', { id: next });
           if (state.removed) {
             await transport.request('session.unwatch', { id: next }).catch(() => {});
+          } else if (result?.watching === false) {
+            // The read succeeded but the official stream did not open. No
+            // reference is held, so leave the watched id empty and let the next
+            // session change or plugin sync retry instead of pretending to watch.
+            state.watchedSession = '';
           } else {
             state.watchedSession = next;
           }
-        } catch {
-          // KAP may not have finished opening yet; next session change or plugin sync retries.
         }
+      } catch (error) {
+        // KAP may not have finished opening yet, or the bridge is reconnecting;
+        // the next session change or plugin sync retries. A rejected link in
+        // the chain would skip every later session transition.
+        contractDegraded('官方会话实时订阅', error);
       }
     });
     return watchChain;
@@ -1391,35 +1483,43 @@ async function installNativeRenderer(options) {
   }
   let previousSession = activeSession();
   if (previousSession) void syncActiveSessionWatch(previousSession);
-  const sessionStore = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia._s.get('kimi.sessions');
-  state.unsubscribeSession = sessionStore?.$subscribe(() => {
-    const id = activeSession();
-    if (id === previousSession) return;
-    previousSession = id;
-    if (!id && state.sessionHandle) closeSessions();
-    for (const handle of [...state.pluginMainAreas.values()]) {
-      if (handle.mode === 'page') handle.dispose();
+  const sessionStore = piniaStore('kimi.sessions');
+  state.unsubscribeSession = probe('官方会话状态订阅', () => sessionStore?.$subscribe?.(() => {
+    try {
+      const id = activeSession();
+      if (id === previousSession) return;
+      previousSession = id;
+      if (!id && state.sessionHandle) closeSessions();
+      for (const handle of [...state.pluginMainAreas.values()]) {
+        if (handle.mode === 'page') handle.dispose();
+      }
+      void syncActiveSessionWatch(id);
+      closeKeepAliveMenu();
+      if (id) void fetchSessionKeepAlive(id, true);
+      else syncSessionInfoKeepAlive();
+      window.dispatchEvent(new CustomEvent('ekd:active-session', { detail: id }));
+    } catch (error) {
+      contractDegraded('官方会话状态订阅', error);
     }
-    void syncActiveSessionWatch(id);
-    closeKeepAliveMenu();
-    if (id) void fetchSessionKeepAlive(id, true);
-    else syncSessionInfoKeepAlive();
-    window.dispatchEvent(new CustomEvent('ekd:active-session', { detail: id }));
-  }, { detached: true, flush: 'sync' });
-  const configStore = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia?._s?.get('kimi.config');
-  let lastConfigSnapshot = JSON.stringify(configStore?.config ?? null);
-  state.unsubscribeConfig = configStore?.$subscribe?.(() => {
-    const nextSnapshot = JSON.stringify(configStore?.config ?? null);
-    if (nextSnapshot === lastConfigSnapshot) return;
-    lastConfigSnapshot = nextSnapshot;
-    window.dispatchEvent(new CustomEvent('ekd:official-config-changed'));
-  }, { detached: true });
+  }, { detached: true, flush: 'sync' }), null);
+  const configStore = piniaStore('kimi.config');
+  let lastConfigSnapshot = nativeStringify(probe('官方配置', () => configStore?.config ?? null, null));
+  state.unsubscribeConfig = probe('官方配置订阅', () => configStore?.$subscribe?.(() => {
+    try {
+      const nextSnapshot = nativeStringify(probe('官方配置', () => configStore?.config ?? null, null));
+      if (nextSnapshot === lastConfigSnapshot) return;
+      lastConfigSnapshot = nextSnapshot;
+      window.dispatchEvent(new CustomEvent('ekd:official-config-changed'));
+    } catch (error) {
+      contractDegraded('官方配置订阅', error);
+    }
+  }, { detached: true }), null);
   const onConfigSaved = () => {
-    const store = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia?._s?.get('kimi.config');
+    const store = piniaStore('kimi.config');
     if (typeof store?.loadConfig === 'function') {
       void store.loadConfig().then(() => {
-        lastConfigSnapshot = JSON.stringify(store?.config ?? null);
-      });
+        lastConfigSnapshot = nativeStringify(probe('官方配置', () => store?.config ?? null, null));
+      }).catch(error => contractDegraded('官方配置刷新', error));
     }
   };
   window.addEventListener('ekd:config-saved', onConfigSaved);
@@ -1604,6 +1704,11 @@ async function installNativeRenderer(options) {
   const pluginMainAreaHost = {
     mount(pluginId, definition) {
       for (const handle of [...state.pluginMainAreas.values()]) handle.dispose();
+      // The wrapper takes the whole native chat column. A live session host is
+      // a direct child of that column, would be wrapped too, and is then hidden
+      // by the session CSS - the main area goes blank. Restore the official
+      // children first, then wrap them.
+      if (state.sessionHandle || state.sessionHostElement || state.sessionRelease) closeSessions();
       const container = document.querySelector(".composer")?.closest(".chat-main") || document.querySelector(".chat")?.closest(".chat-main");
       if (!container) throw new Error("主聊天区契约未就绪");
       const mount = module.mountMainAreaSurface({ document, container, pluginId, definition, window });
@@ -1832,6 +1937,10 @@ async function installNativeRenderer(options) {
       get sidebarRefs() { return state.sidebarRefs; },
       get sidebarCollapsed() { return state.sidebarCollapsed; },
     };
+    // A plugin can reach `window.__ekdNativeUI` too. Freezing the surface keeps
+    // the published entry points from being replaced or extended in place; the
+    // private closure stays out of reach either way.
+    if (freeze) freeze(ui);
     window.__ekdNativeUI = ui;
     return ui;
   }
@@ -1888,7 +1997,7 @@ async function installNativeRenderer(options) {
   const coreFetch = async (method, path, body) => {
     let encoded = '';
     if (body !== undefined) {
-      const bytes = new TextEncoder().encode(JSON.stringify(body ?? {}));
+      const bytes = new TextEncoder().encode(nativeStringify(body ?? {}));
       let binary = '';
       for (let index = 0; index < bytes.length; index += 0x8000) {
         binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
@@ -1904,11 +2013,21 @@ async function installNativeRenderer(options) {
     const text = result?.bodyBase64
       ? new TextDecoder().decode(Uint8Array.from(atob(result.bodyBase64), character => character.charCodeAt(0)))
       : '';
-    const parsed = text ? JSON.parse(text) : null;
+    const parsed = text ? nativeParse(text) : null;
     if (result?.status >= 400) {
+      const code = parsed?.error?.code || 'CORE_ERROR';
       const error = new Error(parsed?.error?.message || `核心返回 HTTP ${result.status}`);
-      error.code = parsed?.error?.code || 'CORE_ERROR';
+      error.code = code;
       error.status = result.status;
+      // A core answer is not a bridge refusal: only an expired local session or
+      // a bare HTTP status reads as "the local channel rotated". Everything else,
+      // including PERMISSION_DENIED and PLUGIN_PRIVILEGE_DENIED, keeps its own
+      // meaning and is never retried.
+      if (bridgeCredentialCodes.has(code) || ((result.status === 401 || result.status === 403) && bridgeRejectedBeforeDispatch(code))) {
+        error.message = bridgeCredentialMessage;
+        error.code = 'BRIDGE_SESSION_EXPIRED';
+        error.retryable = true;
+      }
       throw error;
     }
     return parsed;

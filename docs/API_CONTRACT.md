@@ -6,7 +6,7 @@ Base `/enhance/v1`. JSON fields camelCase; enums UPPER_SNAKE. Errors `{error:{co
 
 `POST /pair {pairingToken,permissions?}` exchanges this enhancement service's boot credential for an in-memory session, expiring after 12 hours or restart. Browser `#pair=` is consumed and removed; tokens stay in memory. The private runtime file belongs only to this enhancement service. A boot credential also authorizes local CLI requests. Each API checks exact Host, same-origin Origin when present, cross-site marker, resource permission and request limits. A loopback address alone is not authorization. No account Cookie is used.
 
-Permissions include `models:read/write`, `usage:read/write`, `tasks:read/write`, `chat:read/write`, `plugins:read/write`, `core:read`, `settings:write`, `adapter:write`, `credentials:read/write`, `workspace:read/write`, `browser:read/write`.
+Permissions include `models:read/write`, `usage:read/write`, `tasks:read/write`, `chat:read/write`, `plugins:read/write`, `update:read/write`, `core:read`, `settings:write`, `adapter:write`, `credentials:read/write`, `workspace:read/write`, `browser:read/write`. Expired or unknown bearer tokens return `401 TOKEN_EXPIRED`; valid tokens lacking a required scope return `403 PERMISSION_DENIED`.
 
 ## Core
 

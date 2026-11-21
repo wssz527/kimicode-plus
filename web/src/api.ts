@@ -42,6 +42,144 @@ export interface PairResult {
   expiresAt?: string;
 }
 
+const BRIDGE_CREDENTIAL_CODES = new Set([
+  "TOKEN_EXPIRED",
+  "BRIDGE_SESSION_EXPIRED",
+  "RPC_DENIED",
+  "RPC_OWNER",
+  "PAIRING_EXPIRED",
+]);
+
+/**
+ * True for a refreshed or reconnecting local enhancement-bridge credential.
+ * The official Kimi account login is a separate credential and is untouched by
+ * these, so the UI must not push the user to re-pair or re-login for them. The
+ * core's own `AUTH_REQUIRED` / `PERMISSION_DENIED` keep their own message: those
+ * are real authorization decisions, not a rotated local channel.
+ */
+export function isBridgeCredentialError(error: unknown): boolean {
+  const candidate = error as { code?: unknown; status?: unknown } | null | undefined;
+  if (!candidate || typeof candidate !== "object") return false;
+  const code = typeof candidate.code === "string" ? candidate.code : "";
+  if (BRIDGE_CREDENTIAL_CODES.has(code)) return true;
+  if (candidate.status !== 401 && candidate.status !== 403) return false;
+  // The bridge refused the request before any action ran: no semantic code, a
+  // bare HTTP status, or one of the two bridge-ownership codes. A real core
+  // answer such as AUTH_REQUIRED, PERMISSION_DENIED or PLUGIN_PRIVILEGE_DENIED
+  // keeps its own message - it is not a rotated local channel.
+  return !code || code.startsWith("HTTP_") || code === "RPC_DENIED" || code === "RPC_OWNER";
+}
+
+export const BRIDGE_RECONNECT_TEXT =
+  "增强核心本地通信凭据已刷新或正在重新连接；你的官方 Kimi 账号登录未受影响。稍后重试即可。";
+
+/** What `session.watch` answers. A core that predates the split answers with an
+ * error only, so the pane treats "no result" as "history read, live link not
+ * established". */
+export interface SessionWatchOutcome<V> {
+  view?: V;
+  watching?: boolean;
+  watchError?: string;
+}
+
+export interface SessionWatchBinding {
+  /** Reads and subscribes once. Resolves when the outcome is applied. */
+  start(): Promise<void>;
+  /** Releases the reference at most once, and only if one was acquired. */
+  dispose(): Promise<void>;
+  /** Whether this binding currently holds a live-subscription reference. */
+  held(): boolean;
+}
+
+/**
+ * The session pane's live-link lifecycle. A read and a subscribe fail for
+ * different reasons and must not be conflated: a transient official WebSocket
+ * drop makes the subscribe fail while the history was already read, so the pane
+ * renders the history, says the live link is down, and offers a retry. A retry
+ * never clears what is on screen, and exactly one `unwatch` is sent per
+ * acquired reference - a failed subscribe holds none and must not release
+ * another pane's.
+ */
+export function createSessionWatchBinding<V>(options: {
+  watch: () => Promise<SessionWatchOutcome<V> | undefined>;
+  /** Fallback read used when the core answers `session.watch` with an error. */
+  read: () => Promise<V | undefined>;
+  unwatch: () => Promise<unknown>;
+  onView: (view: V) => void;
+  /** Non-blocking live-link status; `null` means the link is up. */
+  onNote: (note: string | null) => void;
+  onError: (message: string) => void;
+  describeError: (error: unknown) => string;
+  /** False once the owning pane unmounted; suppresses every late callback. */
+  attached?: () => boolean;
+}): SessionWatchBinding {
+  const attached = options.attached ?? (() => true);
+  let held = false;
+  let disposed = false;
+  let started = false;
+
+  async function start(): Promise<void> {
+    if (started || disposed) return;
+    started = true;
+    let outcome: SessionWatchOutcome<V> | undefined;
+    try {
+      outcome = await options.watch();
+    } catch (cause) {
+      if (!attached() || disposed) return;
+      // An older core has no history-preserving answer. Read the view directly
+      // so the pane still shows what is stored, and report only the live link.
+      options.onNote(options.describeError(cause));
+      try {
+        const fallback = await options.read();
+        if (attached() && !disposed && fallback !== undefined) options.onView(fallback);
+      } catch {
+        if (attached() && !disposed) {
+          options.onNote(null);
+          options.onError(options.describeError(cause));
+        }
+      }
+      return;
+    }
+    if (!attached() || disposed) {
+      // The pane went away while the request was on the wire. A reference that
+      // was acquired anyway has to be released here, or the official stream
+      // stays open for a pane that no longer exists.
+      if (outcome !== undefined && outcome.watching !== false) {
+        held = true;
+        await release();
+      }
+      return;
+    }
+    if (outcome?.view !== undefined) options.onView(outcome.view);
+    if (outcome?.watching === false) {
+      options.onNote(outcome.watchError || "实时同步暂未连接");
+      return;
+    }
+    held = true;
+    options.onNote(null);
+  }
+
+  async function release(): Promise<void> {
+    if (!held) return;
+    held = false;
+    try {
+      await options.unwatch();
+    } catch {
+      // A core that already dropped the subscription refuses the release; the
+      // pane is going away either way, so an error here has no reader.
+    }
+  }
+
+  return {
+    start,
+    held: () => held,
+    async dispose() {
+      disposed = true;
+      await release();
+    },
+  };
+}
+
 export interface AuthSnapshot {
   status: "unpaired" | "pairing" | "paired" | "expired";
   permissions: string[];

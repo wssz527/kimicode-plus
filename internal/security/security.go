@@ -13,7 +13,7 @@ import (
 	"enhancedkimi/internal/httpx"
 )
 
-var Permissions = []string{"core:read", "settings:write", "models:read", "models:write", "usage:read", "usage:write", "tasks:read", "tasks:write", "chat:read", "chat:write", "plugins:read", "plugins:write", "adapter:write", "credentials:read", "credentials:write", "workspace:read", "workspace:write", "browser:read", "browser:write"}
+var Permissions = []string{"core:read", "settings:write", "models:read", "models:write", "usage:read", "usage:write", "tasks:read", "tasks:write", "chat:read", "chat:write", "plugins:read", "plugins:write", "adapter:write", "credentials:read", "credentials:write", "workspace:read", "workspace:write", "browser:read", "browser:write", "update:read", "update:write"}
 
 const ElectronMainPermission = "host:electron-main"
 
@@ -71,17 +71,35 @@ func (g *Guard) IssueSessionToken(requested []string) string {
 	return token
 }
 func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
-func (g *Guard) authorize(token, permission string) (allowed, electronMain bool) {
+
+type authStatus int
+
+const (
+	authOK authStatus = iota
+	authExpired
+	authDenied
+)
+
+// authorize separates "this credential is unknown or expired" from "this
+// credential is valid but not scoped for the resource". A host that restarted
+// clears its grant table, so every token survives as an unknown token; reporting
+// that as PERMISSION_DENIED told the client its permissions were wrong and left
+// it unable to recover. The distinct statuses let the bridge renew on the first
+// and leave the second alone.
+func (g *Guard) authorize(token, permission string) (status authStatus, electronMain bool) {
 	if equal(token, g.pairing) {
-		return true, false
+		return authOK, false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	v, ok := g.grants[token]
-	if !ok || !time.Now().Before(v.expires) || !v.permissions[permission] {
-		return false, false
+	if !ok || !time.Now().Before(v.expires) {
+		return authExpired, false
 	}
-	return true, v.permissions[ElectronMainPermission]
+	if !v.permissions[permission] {
+		return authDenied, false
+	}
+	return authOK, v.permissions[ElectronMainPermission]
 }
 func (g *Guard) limited() bool {
 	g.mu.Lock()
@@ -124,6 +142,8 @@ func permission(r *http.Request) string {
 		category = "workspace"
 	case strings.HasPrefix(p, "browser"):
 		category = "browser"
+	case strings.HasPrefix(p, "update"):
+		category = "update"
 	case p == "settings" && write:
 		category = "settings"
 	case p == "adapter" && write:
@@ -156,6 +176,10 @@ func nativeActionPermission(action string) string {
 		return "settings:write"
 	case "planner.get", "planner.threads":
 		return "chat:read"
+	case "update.status":
+		return "update:read"
+	case "update.check", "update.apply":
+		return "update:write"
 	default:
 		if strings.HasPrefix(action, "planner.") {
 			return "chat:write"
@@ -251,9 +275,13 @@ func (g *Guard) Wrap(next http.Handler) http.Handler {
 				httpx.Fail(w, 401, "AUTH_REQUIRED", "请配对后访问增强服务")
 				return
 			}
-			allowed, electronMain := g.authorize(strings.TrimPrefix(auth, "Bearer "), permission(r))
-			if !allowed {
-				httpx.Fail(w, 403, "PERMISSION_DENIED", "凭据无效、已过期或没有此资源权限")
+			status, electronMain := g.authorize(strings.TrimPrefix(auth, "Bearer "), permission(r))
+			switch status {
+			case authExpired:
+				httpx.Fail(w, 401, "TOKEN_EXPIRED", "增强核心会话凭据已失效或过期，正在重新连接")
+				return
+			case authDenied:
+				httpx.Fail(w, 403, "PERMISSION_DENIED", "当前凭据没有此资源权限")
 				return
 			}
 			if electronMain {

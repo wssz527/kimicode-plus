@@ -26,9 +26,11 @@ type fakeAccountKAP struct {
 	sessions          []map[string]any
 	models            map[string]any
 	hasManaged        bool
+	oauthKey          string
 	failModels        bool
 	failUser          int
 	wrongUID          string
+	rejectToken       string
 	failConfigRestore bool
 	failAfterPatch    bool
 	configRestores    int
@@ -43,6 +45,7 @@ func newFakeAccountKAP(t *testing.T) *fakeAccountKAP {
 		home:       home,
 		tokens:     map[string]AccountProfile{},
 		hasManaged: true,
+		oauthKey:   defaultManagedOAuthKey,
 		sessions: []map[string]any{
 			{"id": "sess-1", "title": "主会话", "updated_at": time.Now().UTC().Format(time.RFC3339Nano), "busy": false, "main_turn_active": false, "pending_interaction": "none"},
 			{"id": "sess-2", "title": "辅助会话", "updated_at": time.Now().UTC().Format(time.RFC3339Nano), "busy": false, "main_turn_active": false, "pending_interaction": "none"},
@@ -80,13 +83,24 @@ func newFakeAccountKAP(t *testing.T) *fakeAccountKAP {
 }
 
 func (f *fakeAccountKAP) credPath() string {
-	return filepath.Join(f.home, "credentials", "kimi-code.json")
+	return f.credPathFor(f.oauthKey)
+}
+
+func (f *fakeAccountKAP) credPathFor(oauthKey string) string {
+	return filepath.Join(f.home, "credentials", sanitizeOAuthKey(oauthKey)+".json")
 }
 
 func (f *fakeAccountKAP) writeDiskToken(t *testing.T, access, refresh string, expiresAt int64) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(f.credPath()), 0o700); err != nil {
+	if err := f.writeDiskTokenFor(f.oauthKey, access, refresh, expiresAt); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func (f *fakeAccountKAP) writeDiskTokenFor(oauthKey, access, refresh string, expiresAt int64) error {
+	path := f.credPathFor(oauthKey)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
 	}
 	data, err := json.Marshal(map[string]any{
 		"access_token":  access,
@@ -97,22 +111,25 @@ func (f *fakeAccountKAP) writeDiskToken(t *testing.T, access, refresh string, ex
 		"scope":         "kimi-code",
 	})
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
-	if err := os.WriteFile(f.credPath(), data, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	return os.WriteFile(path, data, 0o600)
 }
 
 func (f *fakeAccountKAP) readDiskToken(t *testing.T) rawOAuthTokenFields {
 	t.Helper()
-	data, err := os.ReadFile(f.credPath())
+	return f.readDiskTokenFor(t, f.oauthKey)
+}
+
+func (f *fakeAccountKAP) readDiskTokenFor(t *testing.T, oauthKey string) rawOAuthTokenFields {
+	t.Helper()
+	data, err := os.ReadFile(f.credPathFor(oauthKey))
 	if err != nil {
-		t.Fatalf("read disk token: %v", err)
+		t.Fatalf("read disk token for %s: %v", oauthKey, err)
 	}
 	var out rawOAuthTokenFields
 	if err := json.Unmarshal(data, &out); err != nil {
-		t.Fatalf("unmarshal disk token: %v", err)
+		t.Fatalf("unmarshal disk token for %s: %v", oauthKey, err)
 	}
 	return out
 }
@@ -137,7 +154,7 @@ func (f *fakeAccountKAP) handle(w http.ResponseWriter, r *http.Request) {
 				"apiKey":  "",
 				"oauth": map[string]any{
 					"storage": "file",
-					"key":     "oauth/kimi-code",
+					"key":     "oauth/" + sanitizeOAuthKey(f.oauthKey),
 				},
 			}
 		}
@@ -157,6 +174,12 @@ func (f *fakeAccountKAP) handle(w http.ResponseWriter, r *http.Request) {
 						w.WriteHeader(http.StatusInternalServerError)
 						_ = json.NewEncoder(w).Encode(map[string]any{"code": 500, "msg": "config restore rejected"})
 						return
+					}
+				} else if provider, ok := val.(map[string]any); ok {
+					if oauth, ok := provider["oauth"].(map[string]any); ok {
+						if key, ok := oauth["key"].(string); ok && strings.TrimSpace(key) != "" {
+							f.oauthKey = sanitizeOAuthKey(key)
+						}
 					}
 				}
 				f.hasManaged = val != nil
@@ -188,6 +211,10 @@ func (f *fakeAccountKAP) handle(w http.ResponseWriter, r *http.Request) {
 		var tok rawOAuthTokenFields
 		if json.Unmarshal(raw, &tok) != nil || tok.AccessToken == "" {
 			writeNativeTestEnvelope(w, map[string]any{"kind": "error", "status": 401, "message": "invalid token"})
+			return
+		}
+		if f.rejectToken != "" && tok.AccessToken == f.rejectToken {
+			writeNativeTestEnvelope(w, map[string]any{"kind": "error", "status": 401, "message": "token rejected"})
 			return
 		}
 		if rotated, ok := f.rotateNext[tok.AccessToken]; ok {
@@ -792,5 +819,236 @@ func TestAccountSwitchPausesSchedulerAndDetectsCLIAndUnknownQuota(t *testing.T) 
 	}
 	if pauser.paused.Load() != 0 || service.isAutomationPausedForSwitch() {
 		t.Fatalf("expected scheduler and automation resumed after switch")
+	}
+}
+
+func savedAccountSecret(t *testing.T, ctx context.Context, vault *credentials.Vault, accountID string) []byte {
+	t.Helper()
+	raw, err := vault.KimiAccountStore().Get(ctx, accountVaultRef(accountID))
+	if err != nil {
+		t.Fatalf("read saved secret for %s: %v", accountID, err)
+	}
+	return raw
+}
+
+func accountRowForTest(t *testing.T, ctx context.Context, service *NativeService, userID string) accountRow {
+	t.Helper()
+	row, err := service.loadAccountRowByUserID(ctx, userID)
+	if err != nil {
+		t.Fatalf("load account row for %s: %v", userID, err)
+	}
+	return row
+}
+
+// saveAccountUnderOAuthKey stores one account while the official provider points
+// at oauthKey, so the saved record and its credential file carry that key.
+func saveAccountUnderOAuthKey(t *testing.T, service *NativeService, fake *fakeAccountKAP, oauthKey, accessToken, refreshToken, label string) AccountSummary {
+	t.Helper()
+	ctx := context.Background()
+	fake.mu.Lock()
+	fake.oauthKey = oauthKey
+	fake.tokens[accessToken] = AccountProfile{UserID: "uid-" + oauthKey, Nickname: label, Plan: "Free", Region: "cn"}
+	fake.mu.Unlock()
+	if err := fake.writeDiskTokenFor(oauthKey, accessToken, refreshToken, time.Now().Add(time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]string{"label": label})
+	raw, err := service.Action(ctx, "accounts.saveCurrent", payload)
+	if err != nil {
+		t.Fatalf("save account for %s: %v", oauthKey, err)
+	}
+	return raw.(AccountSummary)
+}
+
+func TestAccountSwitchKeepsOAuthKeysIsolated(t *testing.T) {
+	ctx := context.Background()
+	staleToken := "tok-stale-target"
+
+	for _, tc := range []struct {
+		name       string
+		rollback   bool
+		wantErrKey string
+	}{
+		{name: "switches to a different OAuth key"},
+		{name: "rolls back a different OAuth key switch", rollback: true, wantErrKey: "客户端进程号发生变化"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, fake, vault := newAccountTestService(t)
+			accA := saveAccountUnderOAuthKey(t, service, fake, "account-a", "tok-a-v1", "ref-a-v1", "主号A")
+			accB := saveAccountUnderOAuthKey(t, service, fake, "account-b", "tok-b-v1", "ref-b-v1", "备号B")
+
+			// The target path already holds a resolvable token for another account.
+			fake.mu.Lock()
+			fake.tokens[staleToken] = AccountProfile{UserID: "uid-stale", Nickname: "旧账号"}
+			fake.mu.Unlock()
+			if err := fake.writeDiskTokenFor("account-b", staleToken, "ref-stale", time.Now().Add(time.Hour).Unix()); err != nil {
+				t.Fatal(err)
+			}
+			// Restore A as the account the official client currently uses, with a token
+			// rotated after A was saved: a re-snapshot may update A's record, and a
+			// rollback must put the stored record back exactly.
+			fake.mu.Lock()
+			fake.oauthKey = "account-a"
+			fake.tokens["tok-a-v2"] = AccountProfile{UserID: "uid-account-a", Nickname: "主号A", Plan: "Free", Region: "cn"}
+			fake.mu.Unlock()
+			if err := fake.writeDiskTokenFor("account-a", "tok-a-v2", "ref-a-v2", time.Now().Add(time.Hour).Unix()); err != nil {
+				t.Fatal(err)
+			}
+			targetBytes, err := os.ReadFile(fake.credPathFor("account-b"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			currentBytes, err := os.ReadFile(fake.credPathFor("account-a"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			secretBefore := savedAccountSecret(t, ctx, vault, accA.ID)
+			if !bytes.Contains(secretBefore, []byte("tok-a-v1")) {
+				t.Fatalf("saved account A record does not start from the pre-rotation token: %s", secretBefore)
+			}
+			rowBefore := accountRowForTest(t, ctx, service, accA.UserID)
+
+			if tc.rollback {
+				service.hostPIDProvider = func() int { return 9999 }
+			}
+			payload, _ := json.Marshal(map[string]any{"id": accB.ID, "expectedPid": 4242})
+			_, switchErr := service.Action(ctx, "accounts.switch", payload)
+			if tc.rollback {
+				if switchErr == nil || !strings.Contains(switchErr.Error(), tc.wantErrKey) || !strings.Contains(switchErr.Error(), "已自动恢复原账号") {
+					t.Fatalf("switch error = %v", switchErr)
+				}
+				if after := savedAccountSecret(t, ctx, vault, accA.ID); !bytes.Equal(after, secretBefore) {
+					t.Fatalf("outgoing account record was not restored:\nbefore=%s\nafter=%s", secretBefore, after)
+				}
+				if after := accountRowForTest(t, ctx, service, accA.UserID); after != rowBefore {
+					t.Fatalf("outgoing account row was not restored:\nbefore=%+v\nafter=%+v", rowBefore, after)
+				}
+				if after, err := os.ReadFile(fake.credPathFor("account-b")); err != nil || !bytes.Equal(after, targetBytes) {
+					t.Fatalf("target credential file was not restored: %v", err)
+				}
+				if after, err := os.ReadFile(fake.credPathFor("account-a")); err != nil || !bytes.Equal(after, currentBytes) {
+					t.Fatalf("current credential file changed during rollback: %v", err)
+				}
+				if key, _, _, exists, cfgErr := service.readManagedProviderConfig(ctx); cfgErr != nil || !exists || key != "account-a" {
+					t.Fatalf("provider oauth key after rollback = %q (exists=%t, err=%v)", key, exists, cfgErr)
+				}
+				if _, err := os.Lstat(fake.credPathFor("account-b") + ".ekd-bak"); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("recovery backup still present after complete rollback: %v", err)
+				}
+				return
+			}
+			if switchErr != nil {
+				t.Fatalf("switch: %v", switchErr)
+			}
+			// The stale token that lived at account-b.json must never reach A's record,
+			// and A's rotated disk token must reach it only through A's own record.
+			if after := savedAccountSecret(t, ctx, vault, accA.ID); bytes.Contains(after, []byte(staleToken)) {
+				t.Fatalf("outgoing account record received the target path's stale token")
+			}
+			if after := savedAccountSecret(t, ctx, vault, accA.ID); !bytes.Contains(after, []byte("tok-a-v2")) {
+				t.Fatalf("outgoing account record was not re-snapshotted from its own credential file: %s", after)
+			}
+			if after, err := os.ReadFile(fake.credPathFor("account-a")); err != nil || !bytes.Equal(after, currentBytes) {
+				t.Fatalf("current credential file changed: %v", err)
+			}
+			if got := fake.readDiskTokenFor(t, "account-b").AccessToken; got != "tok-b-v1" {
+				t.Fatalf("target file token = %q, want tok-b-v1", got)
+			}
+			if key, _, _, exists, cfgErr := service.readManagedProviderConfig(ctx); cfgErr != nil || !exists || key != "account-b" {
+				t.Fatalf("provider oauth key after switch = %q (exists=%t, err=%v)", key, exists, cfgErr)
+			}
+			if _, err := os.Lstat(fake.credPathFor("account-b") + ".ekd-bak"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("recovery backup still present after successful switch: %v", err)
+			}
+		})
+	}
+}
+
+func TestAccountSwitchRollsBackDatabaseOnSameOAuthKey(t *testing.T) {
+	ctx := context.Background()
+	service, fake, vault := newAccountTestService(t)
+	accA, accB := saveTwoTestAccounts(t, service, fake)
+
+	// The official client rotated A's token while the user was still signed in.
+	if err := fake.writeDiskTokenFor(defaultManagedOAuthKey, "tok-a-v2", "ref-a-v2", time.Now().Add(time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	fake.tokens["tok-a-v2"] = AccountProfile{UserID: "uid-a", Nickname: "账号A", Plan: "Moderato", Region: "cn"}
+	fake.mu.Unlock()
+	diskBefore, err := os.ReadFile(fake.credPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedABefore := savedAccountSecret(t, ctx, vault, accA.ID)
+	storedBBefore := savedAccountSecret(t, ctx, vault, accB.ID)
+	rowABefore := accountRowForTest(t, ctx, service, accA.UserID)
+	rowBBefore := accountRowForTest(t, ctx, service, accB.UserID)
+
+	service.hostPIDProvider = func() int { return 9999 }
+	payload, _ := json.Marshal(map[string]any{"id": accB.ID, "expectedPid": 4242})
+	if _, err := service.Action(ctx, "accounts.switch", payload); err == nil || !strings.Contains(err.Error(), "已自动恢复原账号") {
+		t.Fatalf("switch error = %v", err)
+	}
+
+	if after := savedAccountSecret(t, ctx, vault, accA.ID); !bytes.Equal(after, storedABefore) {
+		t.Fatalf("account A record was not restored after rollback:\nbefore=%s\nafter=%s", storedABefore, after)
+	}
+	if after := savedAccountSecret(t, ctx, vault, accB.ID); !bytes.Equal(after, storedBBefore) {
+		t.Fatalf("account B record changed during rollback")
+	}
+	if after := accountRowForTest(t, ctx, service, accA.UserID); after != rowABefore {
+		t.Fatalf("account A row was not restored:\nbefore=%+v\nafter=%+v", rowABefore, after)
+	}
+	if after := accountRowForTest(t, ctx, service, accB.UserID); after != rowBBefore {
+		t.Fatalf("account B row was not restored:\nbefore=%+v\nafter=%+v", rowBBefore, after)
+	}
+	if after, err := os.ReadFile(fake.credPath()); err != nil || !bytes.Equal(after, diskBefore) {
+		t.Fatalf("credential file was not restored: %v", err)
+	}
+	if _, err := os.Lstat(fake.credPath() + ".ekd-bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovery backup still present after complete rollback: %v", err)
+	}
+}
+
+func TestAccountSwitchRollsBackOnResnapshotFailure(t *testing.T) {
+	ctx := context.Background()
+	service, fake, vault := newAccountTestService(t)
+	accA, accB := saveTwoTestAccounts(t, service, fake)
+
+	if err := fake.writeDiskTokenFor(defaultManagedOAuthKey, "tok-a-v2", "ref-a-v2", time.Now().Add(time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	fake.tokens["tok-a-v2"] = AccountProfile{UserID: "uid-a", Nickname: "账号A", Plan: "Moderato", Region: "cn"}
+	fake.mu.Unlock()
+	diskBefore, err := os.ReadFile(fake.credPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedABefore := savedAccountSecret(t, ctx, vault, accA.ID)
+	rowABefore := accountRowForTest(t, ctx, service, accA.UserID)
+
+	// Fail only INSERT (used by upsertAccountWithSecret) while allowing UPDATE (used by restoreAccountRecord).
+	if _, err := service.db.ExecContext(ctx, `CREATE TRIGGER fail_kimi_accounts_insert BEFORE INSERT ON kimi_accounts BEGIN SELECT RAISE(ABORT, 'injected upsert failure'); END;`); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(map[string]any{"id": accB.ID, "expectedPid": 4242})
+	_, switchErr := service.Action(ctx, "accounts.switch", payload)
+	if switchErr == nil || !strings.Contains(switchErr.Error(), "切换前更新当前账号凭据快照失败") || !strings.Contains(switchErr.Error(), "已自动恢复原账号") {
+		t.Fatalf("switch error = %v", switchErr)
+	}
+	if after := savedAccountSecret(t, ctx, vault, accA.ID); !bytes.Equal(after, storedABefore) {
+		t.Fatalf("account A vault secret was not restored after resnapshot failure:\nbefore=%s\nafter=%s", storedABefore, after)
+	}
+	if after := accountRowForTest(t, ctx, service, accA.UserID); after != rowABefore {
+		t.Fatalf("account A row was not restored after resnapshot failure:\nbefore=%+v\nafter=%+v", rowABefore, after)
+	}
+	if after, err := os.ReadFile(fake.credPath()); err != nil || !bytes.Equal(after, diskBefore) {
+		t.Fatalf("credential file changed after pre-write rollback: %v", err)
+	}
+	if _, err := os.Lstat(fake.credPath() + ".ekd-bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovery backup still present after resnapshot rollback: %v", err)
 	}
 }

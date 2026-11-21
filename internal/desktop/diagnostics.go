@@ -22,23 +22,47 @@ const (
 // availability, so an empty panel is never mistaken for an empty log. Every
 // excerpt is redacted: the attach log carries the core URL and pairing material.
 func (s *NativeService) diagnosticsStatus() map[string]any {
+	dataDir := s.attachConfig().DataDir
 	return map[string]any{
-		"attachLog": diagnoseFile(filepath.Join(s.attachConfig().DataDir, "attach.log"), "tail", attachLogTailBytes),
-		"notices":   diagnoseFile(noticesFilePath(), "head", noticesHeadBytes),
+		"attachLog": diagnoseFile(filepath.Join(dataDir, "attach.log"), "tail", attachLogTailBytes),
+		"notices":   diagnoseFile(noticesFilePathFor(dataDir), "head", noticesHeadBytes),
 	}
 }
 
 // noticesFilePath resolves the notices next to the running binary, which is
 // where scripts/package.py puts them. No second copy is maintained by hand.
 func noticesFilePath() string {
+	return noticesFilePathFor("")
+}
+
+// noticesFilePathFor prefers the copy next to the running binary and falls back
+// to the resident copy the login item runs. The returned path is always the file
+// that is actually read, so the panel never claims a missing file exists.
+func noticesFilePathFor(dataDir string) string {
 	executable, err := os.Executable()
 	if err != nil {
-		return ""
+		return residentNoticesPath(dataDir)
 	}
 	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
 		executable = resolved
 	}
-	return filepath.Join(filepath.Dir(executable), noticesFileName)
+	path := filepath.Join(filepath.Dir(executable), noticesFileName)
+	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+		return path
+	}
+	if fallback := residentNoticesPath(dataDir); fallback != "" {
+		if info, err := os.Stat(fallback); err == nil && info.Mode().IsRegular() {
+			return fallback
+		}
+	}
+	return path
+}
+
+func residentNoticesPath(dataDir string) string {
+	if dataDir == "" {
+		return ""
+	}
+	return filepath.Join(dataDir, "resident", noticesFileName)
 }
 
 func diagnoseFile(path, section string, limit int) map[string]any {

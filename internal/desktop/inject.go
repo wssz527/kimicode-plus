@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -88,6 +89,26 @@ const (
 	darwinMountedGrace  = 1200 * time.Millisecond
 )
 
+// bootstrapConfig assembles the payload the host receives. The macOS path learns
+// the core's runtime record so it can renew its session; without a data
+// directory the record path is unknown and is omitted rather than sent empty.
+func bootstrapConfig(options AttachOptions, expectedApp, reportedApp, electron, moduleSource, cssSource string) (map[string]any, error) {
+	config := map[string]any{
+		"coreURL": options.CoreURL, "pairingToken": options.PairingToken,
+		"expectedApp": expectedApp, "expectedElectron": electron,
+		"reportedApp":  reportedApp,
+		"moduleSource": moduleSource, "cssSource": cssSource, "rendererSource": rendererBundle,
+	}
+	if options.DataDir != "" {
+		runtimePath, err := filepath.Abs(filepath.Join(options.DataDir, "runtime.json"))
+		if err != nil {
+			return nil, err
+		}
+		config["runtimePath"] = runtimePath
+	}
+	return config, nil
+}
+
 func missingNativeCapability(capabilities map[string]bool) string {
 	for _, capability := range []string{"ptShell", "ptBody", "sideColumn", "sideFooter"} {
 		if !capabilities[capability] {
@@ -133,7 +154,7 @@ func AttachNative(ctx context.Context, options AttachOptions) (*AttachResult, er
 	return attachNativePlatform(ctx, options)
 }
 
-func attachNativeDarwin(ctx context.Context, options AttachOptions) (*AttachResult, error) {
+func attachNativeDarwin(ctx context.Context, options AttachOptions) (result *AttachResult, retErr error) {
 	if options.CoreURL == "" || len(options.PairingToken) < AttachTokenMinLength {
 		return nil, errors.New("缺少增强核心地址或配对凭据")
 	}
@@ -167,7 +188,13 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (*AttachResu
 		if !succeeded {
 			_, _ = cdp.Evaluate(closeCtx, `(async()=>{if(globalThis.__ekdNative?.cleanup){await globalThis.__ekdNative.cleanup();return true;}return false;})()`)
 		}
-		_ = cdp.Close(closeCtx)
+		// A failed detach leaves 9229 listening on the client. That is a
+		// debugging endpoint nobody asked to keep, so it is reported instead of
+		// swallowed: the result must not claim success while the port is open.
+		if closeErr := cdp.Close(closeCtx); closeErr != nil {
+			result = nil
+			retErr = errors.Join(retErr, fmt.Errorf("未能确认关闭宿主临时调试端口，请正常退出并重新打开 Kimi Code：%w", closeErr))
+		}
 	}()
 	raw, err := cdp.Evaluate(attachCtx, `(()=>{const req=typeof require==='function'?require:process.mainModule.require.bind(process.mainModule);return{pid:process.pid,type:process.type,appVersion:req('electron').app.getVersion(),electron:process.versions.electron}})()`)
 	if err != nil {
@@ -233,11 +260,9 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (*AttachResu
 	if err != nil {
 		return nil, err
 	}
-	config := map[string]any{
-		"coreURL": options.CoreURL, "pairingToken": options.PairingToken,
-		"expectedApp": realAppVersion, "expectedElectron": contract.Electron,
-		"reportedApp":  contract.AppVersion,
-		"moduleSource": string(moduleSource), "cssSource": string(cssSource), "rendererSource": rendererBundle,
+	config, err := bootstrapConfig(options, realAppVersion, contract.AppVersion, contract.Electron, string(moduleSource), string(cssSource))
+	if err != nil {
+		return nil, err
 	}
 	encoded, err := json.Marshal(config)
 	if err != nil {
@@ -247,24 +272,24 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (*AttachResu
 	if err != nil {
 		return nil, err
 	}
-	var result AttachResult
-	if err = json.Unmarshal(raw, &result); err != nil {
+	var attached AttachResult
+	if err = json.Unmarshal(raw, &attached); err != nil {
 		return nil, err
 	}
-	if result.Status != "installed" || result.Transport != "main-loopback-rpc" || result.Protocol != 1 {
+	if attached.Status != "installed" || attached.Transport != "main-loopback-rpc" || attached.Protocol != 1 {
 		return nil, errors.New("宿主没有确认正式 RPC 已挂载")
 	}
-	result.AppVersion = contract.AppVersion
-	result.Electron = contract.Electron
-	result.Verified = contract.Verified
-	result.VersionNote = HostVersionNote(contract.AppVersion, contract.Electron)
-	result.HostPID = pid
-	result.DOMRevision = contract.DOMRevision
-	result.Daily = options.Profile == ""
-	result.Platform = "darwin"
-	result.attachKey = key
+	attached.AppVersion = contract.AppVersion
+	attached.Electron = contract.Electron
+	attached.Verified = contract.Verified
+	attached.VersionNote = HostVersionNote(contract.AppVersion, contract.Electron)
+	attached.HostPID = pid
+	attached.DOMRevision = contract.DOMRevision
+	attached.Daily = options.Profile == ""
+	attached.Platform = "darwin"
+	attached.attachKey = key
 	succeeded = true
-	return &result, nil
+	return &attached, nil
 }
 
 func darwinAttachKey(info ProcessInfo, options AttachOptions) string {

@@ -410,12 +410,18 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return map[string]any{"sessionId": stringInput(input, "id")}, err
 	case "session.watch":
 		id := stringInput(input, "id")
+		// The read and the subscribe fail for different reasons and must not be
+		// conflated: a transient official WebSocket drop makes the subscribe fail
+		// while the history was already read. Returning the error alone throws
+		// that history away and leaves the pane with nothing to show.
 		view, err := s.sessionView(ctx, id)
 		if err != nil {
 			return nil, err
 		}
-		if err = s.WatchSession(id); err != nil {
-			return nil, err
+		if watchErr := s.WatchSession(id); watchErr != nil {
+			// No reference is held here: WatchSession rolls its own count back on
+			// a failed first subscribe, so the caller must not unwatch.
+			return map[string]any{"watching": false, "view": view, "watchError": watchErr.Error()}, nil
 		}
 		return map[string]any{"watching": true, "view": view}, nil
 	case "session.unwatch":

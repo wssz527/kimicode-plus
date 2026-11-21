@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,13 +128,29 @@ func removeWindowsResident(dir string) error {
 	if err := windowsResidentTask(AttachConfig{DataDir: dir}, false); err != nil {
 		return fmt.Errorf("无法移除 KimiCode+ 登录任务：%w", err)
 	}
+	var failures []error
 	if err := os.Remove(windowsResidentScript(dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+		failures = append(failures, err)
 	}
+	// The marker is the only enablement source of truth, so always clear it even
+	// when the helper script was already missing or could not be deleted.
 	if err := os.Remove(windowsAutoAttachMarker(dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+		failures = append(failures, err)
 	}
-	return nil
+	return errors.Join(failures...)
+}
+
+// windowsAttachTargetFor identifies one process lifetime from the snapshot.
+func windowsAttachTargetFor(pid uint32, started windows.Filetime) windowsAttachTarget {
+	return windowsAttachTarget{PID: int(pid), Started: fmt.Sprintf("%d:%d", started.HighDateTime, started.LowDateTime)}
+}
+
+func windowsAttachTargets(candidates map[uint32]windows.Filetime) map[windowsAttachTarget]bool {
+	targets := make(map[windowsAttachTarget]bool, len(candidates))
+	for pid, started := range candidates {
+		targets[windowsAttachTargetFor(pid, started)] = true
+	}
+	return targets
 }
 
 func watchWindowsAttach(s *NativeService) {
@@ -145,8 +160,7 @@ func watchWindowsAttach(s *NativeService) {
 	}
 	ticker := time.NewTicker(6 * time.Second)
 	defer ticker.Stop()
-	var observed map[uint32]windows.Filetime
-	var tried windows.Filetime
+	var retries *windowsAttachRetries
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -155,48 +169,62 @@ func watchWindowsAttach(s *NativeService) {
 		}
 		cfg := s.attachConfig()
 		if !windowsAutoAttachEnabled(cfg.DataDir) || s.isSafe() {
-			observed, tried = nil, windows.Filetime{}
+			retries = nil
 			continue
 		}
 		candidates, err := windowsHostCandidates(session)
-		if err != nil || maps.Equal(observed, candidates) {
+		if err != nil {
 			continue
 		}
-		if len(candidates) == 0 {
-			observed, tried = nil, windows.Filetime{}
+		corePID := currentCorePID(cfg.DataDir)
+		if retries == nil {
+			retries = newWindowsAttachRetries(corePID)
+		} else {
+			retries.observeCore(corePID)
+		}
+		targets := windowsAttachTargets(candidates)
+		retries.prune(targets)
+		// The retry schedule, not a snapshot comparison, decides when the next
+		// attempt is allowed: a failed process must still be revisited once its
+		// backoff window elapses even though the process set never changed.
+		if !retries.discoveryAllowed(time.Now()) || !retries.dueAny(targets, time.Now()) {
 			continue
 		}
 		if !s.attachOpMu.TryLock() {
 			continue
 		}
-		observed = candidates
-		tried = tryWindowsBackgroundAttach(s, cfg, candidates, tried)
+		tryWindowsBackgroundAttach(s, cfg, candidates, retries, corePID)
 		s.attachOpMu.Unlock()
 	}
 }
 
-func tryWindowsBackgroundAttach(s *NativeService, cfg AttachConfig, candidates map[uint32]windows.Filetime, tried windows.Filetime) windows.Filetime {
+func tryWindowsBackgroundAttach(s *NativeService, cfg AttachConfig, candidates map[uint32]windows.Filetime, retries *windowsAttachRetries, corePID int) {
 	if !windowsAutoAttachEnabled(cfg.DataDir) || s.isSafe() {
-		return tried
+		return
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, 24*time.Second)
 	defer cancel()
-	proc, err := findWindowsAttachHost(ctx, cfg.DataDir, "", cfg.Profile)
-	started, found := candidates[uint32(proc.PID)]
-	if err != nil || !found || started == tried {
-		return tried
-	}
-	_, hasDebugPort := extractDebugPortArg(SplitWindowsCommandLine(proc.CommandLine))
-	if hasDebugPort || (cfg.Profile == "" && IsWindowsDebugInstance(proc, nil)) {
-		return started
-	}
-	result, err := attachRunningWindowsMain(ctx, AttachOptions{
-		DataDir: cfg.DataDir, CoreURL: cfg.CoreURL, PairingToken: cfg.PairingToken, Profile: cfg.Profile,
-	}, proc)
-	if err == nil {
-		_ = RecordAttach(cfg.DataDir, result)
-	} else if s.ctx.Err() == nil {
-		_ = recordWindowsAttachFailure(cfg.DataDir, proc, err)
-	}
-	return started
+	runWindowsBackgroundAttachStep(ctx, cfg, retries, corePID, windowsBackgroundAttachDeps{
+		now:          time.Now,
+		serviceAlive: func() bool { return s.ctx.Err() == nil },
+		discoverHost: func(ctx context.Context) (WindowsProcessInfo, error) {
+			return findWindowsAttachHost(ctx, cfg.DataDir, "", cfg.Profile)
+		},
+		targetForPID: func(pid int) (windowsAttachTarget, bool) {
+			started, found := candidates[uint32(pid)]
+			if !found {
+				return windowsAttachTarget{}, false
+			}
+			return windowsAttachTargetFor(uint32(pid), started), true
+		},
+		readLease:       func() *WindowsLauncherState { return ReadWindowsLauncherState(cfg.DataDir) },
+		readAttachState: func() map[string]any { return ReadAttachState(cfg.DataDir) },
+		attach:          AttachNative,
+		recordInstalled: func(proc WindowsProcessInfo, result *AttachResult) error {
+			return recordWindowsAttachInstalled(cfg.DataDir, proc, result)
+		},
+		recordFailure: func(proc WindowsProcessInfo, err error) error {
+			return recordWindowsAttachFailure(cfg.DataDir, proc, err)
+		},
+	})
 }

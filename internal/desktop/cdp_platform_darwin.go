@@ -31,7 +31,7 @@ func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachRe
 }
 
 func autoAttachStatusPlatform(dataDir string) LaunchAgentState {
-	state := LaunchAgentStatus()
+	state := LaunchAgentStatusForDataDir(dataDir)
 	if state.Enabled && !managedCoreRegistered(dataDir) {
 		state.NeedsMigration = true
 	}
@@ -55,8 +55,8 @@ func enableAutoAttachPlatform(config AttachConfig, allowDaily bool) (LaunchAgent
 	})
 }
 
-func disableAutoAttachPlatform(_ string) (LaunchAgentState, error) {
-	return UninstallLaunchAgent()
+func disableAutoAttachPlatform(dataDir string) (LaunchAgentState, error) {
+	return UninstallLaunchAgentForDataDir(dataDir)
 }
 
 // RunWindowsLauncherPlatform is only available on Windows hosts.

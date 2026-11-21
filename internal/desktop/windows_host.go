@@ -242,6 +242,33 @@ func isWindowsDebugArg(arg string) bool {
 	return false
 }
 
+// windowsLauncherOwnsProcess reports whether the lease describes exactly this
+// process lifetime: the launcher's pid, start time, owner and executable.
+func windowsLauncherOwnsProcess(launcher *WindowsLauncherState, info WindowsProcessInfo) bool {
+	return launcher != nil &&
+		launcher.LaunchedByUs &&
+		launcher.PID == info.PID &&
+		launcher.OwnerSID != "" && launcher.OwnerSID == info.OwnerSID &&
+		launcher.Started != "" &&
+		launcher.Started == info.Started &&
+		WindowsPathEqual(launcher.Executable, info.Executable)
+}
+
+// windowsLauncherLeaseExpired reports whether a saved lease points at a process
+// that no longer exists in the active process list. Leases are matched by pid
+// and start time so pid reuse cannot keep an old lease alive.
+func windowsLauncherLeaseExpired(lease *WindowsLauncherState, processes []WindowsProcessInfo) bool {
+	if lease == nil {
+		return false
+	}
+	for _, proc := range processes {
+		if proc.PID == lease.PID && lease.Started != "" && proc.Started == lease.Started {
+			return false
+		}
+	}
+	return true
+}
+
 // IsWindowsDebugInstance determines whether a Windows Kimi Code command line
 // represents an external debugging/test instance. An instance launched by our
 // launcher whose PID, start time, executable, and loopback debugging port all
@@ -249,14 +276,7 @@ func isWindowsDebugArg(arg string) bool {
 // any other debug/alternate-profile flag is still treated as a debug instance.
 func IsWindowsDebugInstance(info WindowsProcessInfo, launcher *WindowsLauncherState) bool {
 	args := SplitWindowsCommandLine(info.CommandLine)
-	matchesLauncher := launcher != nil &&
-		launcher.LaunchedByUs &&
-		launcher.DebugPort > 0 &&
-		launcher.PID == info.PID &&
-		launcher.OwnerSID != "" && launcher.OwnerSID == info.OwnerSID &&
-		launcher.Started != "" &&
-		launcher.Started == info.Started &&
-		WindowsPathEqual(launcher.Executable, info.Executable)
+	matchesLauncher := windowsLauncherOwnsProcess(launcher, info) && launcher.DebugPort > 0
 
 	expectedPortFlag := ""
 	if matchesLauncher {
@@ -698,6 +718,20 @@ func ReadWindowsLauncherState(dataDir string) *WindowsLauncherState {
 		return nil
 	}
 	return &state
+}
+
+// ClearWindowsLauncherState removes a launcher lease that no longer describes a
+// live process. Only the dedicated lease file is touched.
+func ClearWindowsLauncherState(dataDir string) error {
+	if strings.TrimSpace(dataDir) == "" {
+		return errors.New("缺少增强数据目录，无法清理启动器状态")
+	}
+	_, _, _, statePath := WindowsLauncherPaths(dataDir)
+	err := os.Remove(statePath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // PickFreeLoopbackPort allocates an unused ephemeral TCP port on 127.0.0.1.

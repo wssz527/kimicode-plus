@@ -147,6 +147,10 @@ type LaunchAgentState struct {
 	BackupDir         string `json:"backupDir,omitempty"`
 	NeedsMigration    bool   `json:"needsMigration,omitempty"`
 	LegacyCorePresent bool   `json:"legacyCorePresent,omitempty"`
+	// OwnerDataDir names the data directory the installed login item belongs
+	// to when it is not the directory being asked about.
+	OwnerDataDir string `json:"ownerDataDir,omitempty"`
+	Note         string `json:"note,omitempty"`
 }
 
 type launchController interface {
@@ -185,6 +189,46 @@ func managedCoreExecutable(dataDir string) string {
 	return filepath.Join(dataDir, "resident", "enhanced-kimi")
 }
 
+// LaunchdManagedCore reports whether the resident copy in dataDir is the login
+// item launchd keeps alive. Only then must an update hand the candidate to
+// launchd instead of starting a second detached --resident process. The loaded
+// job's own program path is checked too: another installation may have a job
+// with the same label, and handing the candidate to it would start the wrong
+// binary.
+func LaunchdManagedCore(dataDir string) bool {
+	if !managedCoreRegistered(dataDir) {
+		return false
+	}
+	path, err := LaunchAgentPath(managedCoreLabel)
+	if err != nil {
+		return false
+	}
+	if !launches.installed(path) || !launches.loaded(managedCoreLabel) {
+		return false
+	}
+	program, err := loadedLaunchProgram(managedCoreLabel)
+	if err != nil {
+		return false
+	}
+	return program == "" || program == managedCoreExecutable(dataDir)
+}
+
+// loadedLaunchProgram reads the program path of a loaded job from launchctl.
+func loadedLaunchProgram(label string) (string, error) {
+	output, err := exec.Command("/bin/launchctl", "print", fmt.Sprintf("gui/%d/%s", os.Getuid(), label)).Output()
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "program = ") {
+			continue
+		}
+		return strings.TrimSpace(strings.TrimPrefix(line, "program = ")), nil
+	}
+	return "", nil
+}
+
 func managedCoreRegistered(dataDir string) bool {
 	if !filepath.IsAbs(dataDir) {
 		return false
@@ -199,6 +243,14 @@ func managedCoreRegistered(dataDir string) bool {
 }
 
 func LaunchAgentStatus() LaunchAgentState {
+	return LaunchAgentStatusForDataDir("")
+}
+
+// LaunchAgentStatusForDataDir reports the login items as they apply to one data
+// directory. A plist that belongs to a different directory is not this core's
+// login item, so the isolated directory reports it as disabled and says whose
+// it is instead of claiming it is already enabled.
+func LaunchAgentStatusForDataDir(dataDir string) LaunchAgentState {
 	path, err := LaunchAgentPath(LaunchAgentLabel)
 	if err != nil {
 		return LaunchAgentState{Error: err.Error()}
@@ -207,11 +259,21 @@ func LaunchAgentStatus() LaunchAgentState {
 	legacyPath, _ := LaunchAgentPath(legacyCoreLabel)
 	attached := launches.installed(path) && launches.loaded(LaunchAgentLabel)
 	core := launches.installed(corePath) && launches.loaded(managedCoreLabel)
-	return LaunchAgentState{
+	state := LaunchAgentState{
 		Enabled: attached || core, Path: path, CorePath: corePath,
 		NeedsMigration:    attached != core,
 		LegacyCorePresent: launches.installed(legacyPath) || launches.loaded(legacyCoreLabel),
 	}
+	if dataDir == "" || !state.Enabled {
+		return state
+	}
+	owner, known := launchAgentOwner()
+	if known && owner != "" && !sameDataDir(owner, dataDir) {
+		state.Enabled = false
+		state.OwnerDataDir = owner
+		state.Note = "当前登录项属于其他数据目录（" + owner + "），未在此目录启用"
+	}
+	return state
 }
 
 func InstallLaunchAgent(config LaunchAgentConfig) (LaunchAgentState, error) {
@@ -224,13 +286,13 @@ func InstallLaunchAgent(config LaunchAgentConfig) (LaunchAgentState, error) {
 	}
 	undoAttach, err := replaceLaunchAgent(LaunchAgentLabel, plist)
 	if err != nil {
-		return LaunchAgentStatus(), err
+		return LaunchAgentStatusForDataDir(config.DataDir), err
 	}
 	if _, err := replaceLaunchAgent(managedCoreLabel, managedCorePlist(config)); err != nil {
 		err = errors.Join(err, undoAttach())
-		return LaunchAgentStatus(), err
+		return LaunchAgentStatusForDataDir(config.DataDir), err
 	}
-	return LaunchAgentStatus(), nil
+	return LaunchAgentStatusForDataDir(config.DataDir), nil
 }
 
 func replaceLaunchAgent(label, plist string) (func() error, error) {
@@ -285,13 +347,128 @@ func replaceLaunchAgent(label, plist string) (func() error, error) {
 }
 
 func UninstallLaunchAgent() (LaunchAgentState, error) {
+	return UninstallLaunchAgentForDataDir("")
+}
+
+// UninstallLaunchAgentForDataDir removes the login items only when they belong
+// to dataDir. Disabling auto-attach from an isolated data directory must never
+// delete the login item the main configuration relies on.
+func UninstallLaunchAgentForDataDir(dataDir string) (LaunchAgentState, error) {
+	if err := ensureLaunchAgentOwner(dataDir); err != nil {
+		return LaunchAgentStatusForDataDir(dataDir), err
+	}
 	if err := removeLaunchAgent(LaunchAgentLabel); err != nil {
-		return LaunchAgentStatus(), err
+		return LaunchAgentStatusForDataDir(dataDir), err
 	}
 	if err := removeLaunchAgent(managedCoreLabel); err != nil {
-		return LaunchAgentStatus(), err
+		return LaunchAgentStatusForDataDir(dataDir), err
 	}
-	return LaunchAgentStatus(), nil
+	return LaunchAgentStatusForDataDir(dataDir), nil
+}
+
+// launchAgentOwner reads the data directory an installed plist belongs to. known
+// is false when the plist records no data directory at all (an older install).
+func launchAgentOwner() (owner string, known bool) {
+	for _, label := range []string{LaunchAgentLabel, managedCoreLabel} {
+		path, err := LaunchAgentPath(label)
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if owner := plistDataDir(string(data)); owner != "" {
+			return owner, true
+		}
+	}
+	return "", false
+}
+
+func ensureLaunchAgentOwner(dataDir string) error {
+	if dataDir == "" {
+		return nil
+	}
+	owner, known := launchAgentOwner()
+	if !known {
+		return nil
+	}
+	if sameDataDir(owner, dataDir) {
+		return nil
+	}
+	return errors.New("当前登录项属于其他数据目录，已拒绝从隔离目录移除")
+}
+
+func sameDataDir(left, right string) bool {
+	if filepath.Clean(left) == filepath.Clean(right) {
+		return true
+	}
+	resolvedLeft, leftErr := filepath.EvalSymlinks(left)
+	resolvedRight, rightErr := filepath.EvalSymlinks(right)
+	return leftErr == nil && rightErr == nil && resolvedLeft == resolvedRight
+}
+
+// plistDataDir resolves the data directory a rendered plist belongs to. The
+// WorkingDirectory is authoritative; the --data-dir argument is the fallback for
+// agents rendered without one.
+func plistDataDir(plist string) string {
+	if working := plistStringValue(plist, "WorkingDirectory"); working != "" {
+		return filepath.Clean(working)
+	}
+	args := plistStringArray(plist, "ProgramArguments")
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == "--data-dir" {
+			return filepath.Clean(args[index+1])
+		}
+	}
+	return ""
+}
+
+func plistStringValue(plist, key string) string {
+	marker := "<key>" + key + "</key><string>"
+	start := strings.Index(plist, marker)
+	if start < 0 {
+		return ""
+	}
+	rest := plist[start+len(marker):]
+	end := strings.Index(rest, "</string>")
+	if end < 0 {
+		return ""
+	}
+	return unescapePlistText(rest[:end])
+}
+
+func plistStringArray(plist, key string) []string {
+	marker := "<key>" + key + "</key><array>"
+	start := strings.Index(plist, marker)
+	if start < 0 {
+		return nil
+	}
+	rest := plist[start+len(marker):]
+	end := strings.Index(rest, "</array>")
+	if end < 0 {
+		return nil
+	}
+	rest = rest[:end]
+	var values []string
+	for {
+		open := strings.Index(rest, "<string>")
+		if open < 0 {
+			return values
+		}
+		rest = rest[open+len("<string>"):]
+		close := strings.Index(rest, "</string>")
+		if close < 0 {
+			return values
+		}
+		values = append(values, unescapePlistText(rest[:close]))
+		rest = rest[close+len("</string>"):]
+	}
+}
+
+func unescapePlistText(value string) string {
+	replacer := strings.NewReplacer("&lt;", "<", "&gt;", ">", "&quot;", `"`, "&apos;", "'", "&amp;", "&")
+	return replacer.Replace(value)
 }
 
 func removeLaunchAgent(label string) error {
@@ -299,13 +476,18 @@ func removeLaunchAgent(label string) error {
 	if err != nil {
 		return err
 	}
+	self := label == managedCoreLabel && os.Getenv(managedCoreEnv) == "1"
+	if !self && launches.loaded(label) {
+		// Unload first: deleting the plist while the job is loaded leaves launchd
+		// running a definition the user can no longer see or change.
+		if err := launches.bootout(label); err != nil {
+			return fmt.Errorf("无法卸载后台接入任务：%w", err)
+		}
+	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("无法移除后台接入定义：%w", err)
 	}
-	if !launches.loaded(label) {
-		return nil
-	}
-	if label == managedCoreLabel && os.Getenv(managedCoreEnv) == "1" {
+	if self && launches.loaded(label) {
 		// bootout stops the server itself. Let it finish serving this request.
 		controller := launches
 		time.AfterFunc(time.Second, func() {
@@ -313,9 +495,8 @@ func removeLaunchAgent(label string) error {
 				fmt.Fprintln(os.Stderr, "无法卸载核心登录项：", err)
 			}
 		})
-		return nil
 	}
-	return launches.bootout(label)
+	return nil
 }
 
 // AttachOnce bounds an attachment initiated by a background job or restart.
@@ -331,7 +512,7 @@ func RecordAttach(dataDir string, value any) error {
 	if dataDir == "" {
 		return nil
 	}
-	payload := map[string]any{"at": time.Now().UTC().Format(time.RFC3339Nano)}
+	payload := map[string]any{"at": time.Now().UTC().Format(time.RFC3339Nano), "corePid": corePID(dataDir)}
 	if result, ok := value.(*AttachResult); ok && result != nil {
 		payload["status"] = result.Status
 		payload["hostPid"] = result.HostPID
@@ -369,6 +550,19 @@ func RecordAttach(dataDir string, value any) error {
 		payload["consentRequired"] = errors.Is(err, ErrConsentRequired)
 	}
 	return writeAttachState(dataDir, payload)
+}
+
+// corePID lets a later reader tell whether the recorded state belongs to the
+// core that is running now, instead of trusting a stale file.
+func corePID(dataDir string) int {
+	data, err := os.ReadFile(filepath.Join(dataDir, "runtime.json"))
+	if err == nil {
+		var record struct{ PID int }
+		if json.Unmarshal(data, &record) == nil && record.PID > 0 {
+			return record.PID
+		}
+	}
+	return os.Getpid()
 }
 
 func writeAttachState(dataDir string, payload map[string]any) error {

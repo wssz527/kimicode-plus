@@ -95,8 +95,15 @@ type idleTestHarness struct {
 	undoFail        bool
 	appendExtraTurn bool
 	emitToolCall    bool
-	mutateWorkspace func() error
-	nextTurnNum     int
+	turnsReads      int
+	promptTurnsBase int
+	// onTurnsRead runs with h.mu held when the configured turn read after the
+	// keepalive prompt is served. It stands in for a user action that lands while
+	// the pre-undo Git scan runs.
+	onTurnsRead      func()
+	onTurnsReadIndex int
+	mutateWorkspace  func() error
+	nextTurnNum      int
 }
 
 func newIdleTestHarness(model string) *idleTestHarness {
@@ -155,6 +162,10 @@ func (h *idleTestHarness) handler(t *testing.T) http.Handler {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions/s1":
 			writeNativeTestEnvelope(w, h.session)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions/s1/agents/main/turns":
+			h.turnsReads++
+			if h.onTurnsRead != nil && h.turnsReads-h.promptTurnsBase == h.onTurnsReadIndex {
+				h.onTurnsRead()
+			}
 			cp := append([]NativeTurn(nil), h.turns...)
 			writeNativeTestEnvelope(w, map[string]any{"turns": cp})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions/s1/goal":
@@ -165,6 +176,7 @@ func (h *idleTestHarness) handler(t *testing.T) http.Handler {
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			h.prompts = append(h.prompts, body)
+			h.promptTurnsBase = h.turnsReads
 			turnID := "turn-ka-" + string(rune('0'+h.nextTurnNum))
 			userMsgID := "msg-ka-u-" + string(rune('0'+h.nextTurnNum))
 			h.nextTurnNum++
@@ -819,4 +831,181 @@ func TestIdleKeepAliveUndoSafetyChecks(t *testing.T) {
 		}
 		h.mu.Unlock()
 	})
+}
+
+func TestGitStatusFingerprintCoversIndex(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("MM index blob change with identical working tree", func(t *testing.T) {
+		repo := newIdleTestGitRepository(t)
+		path := filepath.Join(repo, "mm.txt")
+		writeIdleTestFile(t, path, "base\n")
+		runIdleTestGit(t, repo, "add", "mm.txt")
+		runIdleTestGit(t, repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init")
+
+		writeIdleTestFile(t, path, "staged-v1\n")
+		runIdleTestGit(t, repo, "add", "mm.txt")
+		writeIdleTestFile(t, path, "worktree\n")
+		if status := runIdleTestGit(t, repo, "status", "--porcelain=v1", "-z"); !bytes.HasPrefix(status, []byte("MM mm.txt")) {
+			t.Fatalf("fixture is not MM: %q", status)
+		}
+		before, err := gitStatusFingerprint(ctx, repo)
+		if err != nil || before == "" {
+			t.Fatalf("fingerprint = %q, %v", before, err)
+		}
+
+		// Change the index blob only, then put the working tree bytes back
+		// byte-for-byte: status and working tree hash stay the same.
+		writeIdleTestFile(t, path, "staged-v2-longer\n")
+		runIdleTestGit(t, repo, "add", "mm.txt")
+		writeIdleTestFile(t, path, "worktree\n")
+		if status := runIdleTestGit(t, repo, "status", "--porcelain=v1", "-z"); !bytes.HasPrefix(status, []byte("MM mm.txt")) {
+			t.Fatalf("status after index change = %q", status)
+		}
+		after, err := gitStatusFingerprint(ctx, repo)
+		if err != nil || after == "" {
+			t.Fatalf("fingerprint after index change = %q, %v", after, err)
+		}
+		if after == before {
+			t.Fatal("index-only change with identical working tree was not detected")
+		}
+	})
+
+	t.Run("unborn branch staged content", func(t *testing.T) {
+		repo := newIdleTestGitRepository(t)
+		path := filepath.Join(repo, "first.txt")
+		writeIdleTestFile(t, path, "one\n")
+		runIdleTestGit(t, repo, "add", "first.txt")
+		before, err := gitStatusFingerprint(ctx, repo)
+		if err != nil || before == "" {
+			t.Fatalf("unborn fingerprint = %q, %v", before, err)
+		}
+		if repeated, err := gitStatusFingerprint(ctx, repo); err != nil || repeated != before {
+			t.Fatalf("unborn fingerprint is unstable: %q, %q, %v", before, repeated, err)
+		}
+		writeIdleTestFile(t, path, "two\n")
+		runIdleTestGit(t, repo, "add", "first.txt")
+		after, err := gitStatusFingerprint(ctx, repo)
+		if err != nil || after == "" {
+			t.Fatalf("unborn fingerprint after restage = %q, %v", after, err)
+		}
+		if after == before {
+			t.Fatal("restaged content on an unborn branch was not detected")
+		}
+	})
+
+	t.Run("HEAD move with identical working tree", func(t *testing.T) {
+		repo := newIdleTestGitRepository(t)
+		path := filepath.Join(repo, "a.txt")
+		writeIdleTestFile(t, path, "a\n")
+		runIdleTestGit(t, repo, "add", "a.txt")
+		runIdleTestGit(t, repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "one")
+		before, err := gitStatusFingerprint(ctx, repo)
+		if err != nil || before == "" {
+			t.Fatalf("fingerprint = %q, %v", before, err)
+		}
+		runIdleTestGit(t, repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "two")
+		after, err := gitStatusFingerprint(ctx, repo)
+		if err != nil || after == "" {
+			t.Fatalf("fingerprint after commit = %q, %v", after, err)
+		}
+		if after == before {
+			t.Fatal("a new commit was not reflected in the fingerprint")
+		}
+	})
+
+	t.Run("unchanged repository stays stable", func(t *testing.T) {
+		repo := newIdleTestGitRepository(t)
+		writeIdleTestFile(t, filepath.Join(repo, "stable.txt"), "stable\n")
+		runIdleTestGit(t, repo, "add", "stable.txt")
+		runIdleTestGit(t, repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init")
+		before, err := gitStatusFingerprint(ctx, repo)
+		if err != nil || before == "" {
+			t.Fatalf("fingerprint = %q, %v", before, err)
+		}
+		if after, err := gitStatusFingerprint(ctx, repo); err != nil || after != before {
+			t.Fatalf("clean repository fingerprint changed: %q, %q, %v", before, after, err)
+		}
+	})
+}
+
+func TestIdleKeepAliveRechecksActivityAfterGitScan(t *testing.T) {
+	// The pre-undo Git scan can take seconds; a user turn that arrives while it
+	// runs must cancel the undo. Both cases inject the change on the turn read
+	// that follows the scan.
+	for _, tc := range []struct {
+		name       string
+		inject     func(h *idleTestHarness)
+		wantNote   string
+		wantReason string
+	}{
+		{
+			name: "new user turn during the scan",
+			inject: func(h *idleTestHarness) {
+				h.turns = append(h.turns, NativeTurn{
+					TurnID: "turn-user-late",
+					Items: []NativeItem{
+						{ItemID: "msg-late-u", Type: "user_message", Text: "用户插话"},
+						{ItemID: "msg-late-a", Type: "assistant_message", Text: "收到"},
+					},
+				})
+			},
+			wantNote: "保活期间出现新回合，已跳过撤回",
+		},
+		{
+			name: "session becomes busy during the scan",
+			inject: func(h *idleTestHarness) {
+				h.session["busy"] = true
+				h.session["main_turn_active"] = true
+			},
+			wantNote: "会话已恢复活动，已跳过撤回",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newIdleTestGitRepository(t)
+			writeIdleTestFile(t, filepath.Join(repo, "a.txt"), "initial\n")
+			runIdleTestGit(t, repo, "add", "a.txt")
+			runIdleTestGit(t, repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init")
+
+			home := t.TempDir()
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			keepAliveFixture{home: home, mainAge: 26 * time.Minute}.write(t, "kimi-code/kimi-for-coding")
+			h := newIdleTestHarness("kimi-code/kimi-for-coding")
+			h.session["metadata"] = map[string]any{"cwd": repo}
+			h.onTurnsReadIndex = 3
+			h.onTurnsRead = func() { tc.inject(h) }
+			service := startIdleKeepAliveService(t, h, home, now.Add(-26*time.Minute))
+			settings := defaultAutomationSettings()
+			settings.IdleKeepAlive.Enabled = true
+			if err := service.storeAutomationSettings(context.Background(), settings); err != nil {
+				t.Fatal(err)
+			}
+
+			service.runIdleKeepAliveOnce(context.Background(), settings, "s1", now)
+			waitUntilIdleDone(t, service, "s1")
+
+			h.mu.Lock()
+			prompts, undos, reads := len(h.prompts), len(h.undos), h.turnsReads
+			h.mu.Unlock()
+			if prompts != 1 {
+				t.Fatalf("prompts = %d, want 1", prompts)
+			}
+			if reads < 3 {
+				t.Fatalf("turn reads = %d, the post-scan recheck did not run", reads)
+			}
+			if undos != 0 {
+				t.Fatalf("undos = %d, want 0 when activity resumed during the Git scan", undos)
+			}
+			view, err := service.sessionKeepAliveView(context.Background(), "s1", now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if view.StoppedReason != "" || !strings.Contains(view.LastNote, tc.wantNote) {
+				t.Fatalf("keepalive view = %+v, want note containing %q", view, tc.wantNote)
+			}
+			if after := runIdleTestGit(t, repo, "status", "--porcelain=v1", "-z"); len(after) != 0 {
+				t.Fatalf("test repository was modified: %q", after)
+			}
+		})
+	}
 }

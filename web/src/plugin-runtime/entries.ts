@@ -361,6 +361,14 @@ const mainAreaReleases = new WeakMap<HTMLElement, () => void>();
 
 export function mountMainAreaSurface(options: MainAreaMountOptions): MainAreaHandle {
   const { document, container, pluginId, definition } = options;
+  // `.chat-main` carries one enhancer layout at a time. If the same-screen
+  // session host is still a direct child, wrapping the column would move the
+  // session host inside the split row, where the session CSS hides the whole
+  // column and the main area goes blank. Refusing here leaves the official chat
+  // and the session view untouched; the renderer closes the session view first.
+  if (Array.from(container.children).some(child => child.classList.contains("ekd-session-host"))) {
+    throw new Error("主聊天区仍被同屏会话占用，请先退出同屏模式");
+  }
   mainAreaReleases.get(container)?.();
   const hostWindow = options.window ?? null;
   const mode = definition?.mode === "page" ? "page" : "split";

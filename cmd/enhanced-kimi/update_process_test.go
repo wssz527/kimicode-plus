@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"enhancedkimi/internal/server"
+	"enhancedkimi/internal/storage"
 	"enhancedkimi/internal/updater"
 )
 
@@ -34,6 +35,7 @@ const (
 	restartChildCert    = "EKD_F3_TEST_CERTIFICATE"
 	restartChildAPI     = "EKD_F3_TEST_API"
 	restartChildDir     = "EKD_F3_TEST_WORKDIR"
+	restartChildAltDir  = "EKD_F3_TEST_ALT_WORKDIR"
 )
 
 func TestMain(m *testing.M) {
@@ -52,13 +54,10 @@ func runUpdateTestChild(certificate string) error {
 	if err != nil {
 		return err
 	}
-	actualDir, err := os.Stat(cwd)
-	if err != nil {
-		return err
-	}
-	wantedDir, err := os.Stat(os.Getenv(restartChildDir))
-	if err != nil || !os.SameFile(actualDir, wantedDir) {
-		return fmt.Errorf("working directory was not preserved: %q: %w", cwd, err)
+	// A resident copy may run from the data directory instead of the download
+	// directory; both are allowed, any other directory is not.
+	if !sameTestDirectory(cwd, os.Getenv(restartChildDir)) && !sameTestDirectory(cwd, os.Getenv(restartChildAltDir)) {
+		return fmt.Errorf("working directory was not preserved: %q", cwd)
 	}
 	path, err := os.Executable()
 	if err != nil {
@@ -84,6 +83,14 @@ func runUpdateTestChild(certificate string) error {
 		for {
 			time.Sleep(time.Hour)
 		}
+	case bytes.HasSuffix(trailer[:], []byte(releaseTrailer("schema"))):
+		// The candidate migrates the database forward and then dies before the
+		// health check. The previous release cannot open that schema, so a
+		// binary-only rollback would leave the plugins module FAULTED.
+		if err := breakSchemaCompatibility(); err != nil {
+			return err
+		}
+		os.Exit(24)
 	case bytes.HasSuffix(trailer[:], []byte(releaseTrailer("success"))):
 		server.Version = targetTestVersion
 	}
@@ -96,7 +103,45 @@ func runUpdateTestChild(certificate string) error {
 	return runCore(os.Getenv(restartChildAPI), &http.Client{Transport: transport})
 }
 
+func sameTestDirectory(actual, expected string) bool {
+	if expected == "" {
+		return false
+	}
+	actualInfo, err := os.Stat(actual)
+	if err != nil {
+		return false
+	}
+	expectedInfo, err := os.Stat(expected)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(actualInfo, expectedInfo)
+}
+
 func releaseTrailer(scenario string) string { return "\nEKD_F3_TEST_RELEASE:" + scenario + "\n" }
+
+// breakSchemaCompatibility commits a schema version the previous release refuses
+// to open, which is exactly what a real forward migration would do.
+func breakSchemaCompatibility() error {
+	dir := ""
+	for index := 0; index+1 < len(os.Args); index++ {
+		if os.Args[index] == "--data-dir" {
+			dir = os.Args[index+1]
+		}
+	}
+	if dir == "" {
+		return errors.New("candidate core did not receive --data-dir")
+	}
+	db, err := storage.Open(filepath.Join(dir, "enhancement.db"))
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`UPDATE schema_versions SET version = 99 WHERE module = 'plugins'`)
+	if closeErr := db.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
 
 func TestCoreUpdateProcesses(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" && runtime.GOOS != "windows" {
@@ -117,6 +162,7 @@ func TestCoreUpdateProcesses(t *testing.T) {
 		{"exits", updater.RolledBack, previousTestVersion, "通过健康检查前退出", "EKD_F3_TEST_EXIT_RELEASE_DIR"},
 		{"timeout", updater.RolledBack, previousTestVersion, "检查超时", ""},
 		{"managed-copy", updater.Updated, targetTestVersion, "", ""},
+		{"db-rollback", updater.RolledBack, previousTestVersion, "通过健康检查前退出", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			managed := tc.name == "managed-copy"
@@ -140,6 +186,9 @@ func TestCoreUpdateProcesses(t *testing.T) {
 				scenario := tc.name
 				if managed {
 					scenario = "success"
+				}
+				if scenario == "db-rollback" {
+					scenario = "schema"
 				}
 				image := append(bytes.Clone(previous), releaseTrailer(scenario)...)
 				archive = archiveTestBinary(t, "enhanced-kimi-"+target+executableExtension, image)
@@ -189,10 +238,14 @@ func TestCoreUpdateProcesses(t *testing.T) {
 			cmd := exec.CommandContext(ctx, installed, "--data-dir", dataDir, "--workspace", workDir, "--port", "0")
 			cmd.Dir = workDir
 			cmd.Stderr = os.Stderr
+			// The resident copy must not inherit the download directory as its
+			// working directory, so the managed scenario starts in the data dir.
 			cmd.Env = append(os.Environ(), restartChildCert+"="+string(certificate), restartChildAPI+"="+releases.URL,
 				restartChildDir+"="+workDir, "EKD_UPDATE_REPO=f3/test-release")
 			if managed {
-				cmd.Env = append(cmd.Env, "HOME="+fakeHome)
+				// The restarted resident copy must run from the data directory, not
+				// from the download folder the user may delete.
+				cmd.Env = append(cmd.Env, "HOME="+fakeHome, restartChildAltDir+"="+dataDir)
 			}
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
@@ -261,6 +314,38 @@ func TestCoreUpdateProcesses(t *testing.T) {
 			var saved updater.UpdateResult
 			if err := json.Unmarshal(readFixtureFile(t, updatePath), &saved); err != nil || saved != *updateStatus.LastAttempt {
 				t.Fatalf("result was not persisted: %+v: %v", saved, err)
+			}
+			if tc.name == "db-rollback" {
+				// The rollback restored the database: the previous release restarted
+				// with every module READY rather than FAULTED.
+				modules := readTestModules(t, client, after)
+				for _, module := range modules {
+					if module.State == "FAULTED" {
+						t.Fatalf("module %s stayed faulted after rollback: %+v", module.ID, module)
+					}
+				}
+				ready := false
+				for _, module := range modules {
+					if module.ID == "plugins" && module.State == "READY" {
+						ready = true
+					}
+				}
+				if !ready {
+					t.Fatalf("plugins module was not restored: %+v", modules)
+				}
+				waitUpdateCondition(t, ctx, "transaction backup to be cleaned", func() bool {
+					entries, err := os.ReadDir(filepath.Join(dataDir, "updates"))
+					if err != nil {
+						return false
+					}
+					for _, entry := range entries {
+						if entry.IsDir() && strings.HasPrefix(entry.Name(), "tx-") {
+							return false
+						}
+					}
+					_, activeErr := os.Stat(filepath.Join(dataDir, "updates", "active-tx.json"))
+					return errors.Is(activeErr, os.ErrNotExist)
+				})
 			}
 			waitUpdateCondition(t, ctx, "staged files to be cleaned", func() bool {
 				stages, err := os.ReadDir(filepath.Join(dataDir, "updates", "downloads"))
@@ -335,6 +420,15 @@ func waitUpdateCondition(t *testing.T, ctx context.Context, description string, 
 			t.Fatalf("timed out waiting for %s: %v", description, ctx.Err())
 		}
 	}
+}
+
+func readTestModules(t *testing.T, client *http.Client, record testRuntime) []server.Module {
+	t.Helper()
+	var health struct{ Modules []server.Module }
+	if err := testCoreRequest(client, record, http.MethodGet, "health", http.StatusOK, &health); err != nil {
+		t.Fatalf("cannot read module health: %v", err)
+	}
+	return health.Modules
 }
 
 func healthyTestCore(client *http.Client, record testRuntime) bool {

@@ -39,6 +39,69 @@ def source_version():
     return match[1]
 
 
+def binary_name(target):
+    return f'enhanced-kimi-{target}{".exe" if target.startswith("windows") else ""}'
+
+
+def load_build_manifest(dist, version):
+    """Read the manifest scripts/crossbuild.sh wrote and verify the binaries.
+
+    A package must never mix a binary from an earlier build with a new version
+    string. The manifest records the version and the digest of every binary that
+    build produced, so both have to match before anything is archived.
+    """
+    manifest_path = dist / 'build-manifest.json'
+    if not manifest_path.is_file():
+        raise SystemExit(
+            f'Missing {manifest_path.name}. Rebuild the binaries for {version} first: '
+            f'VERSION={version} sh scripts/crossbuild.sh'
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            f'{manifest_path.name} is not valid JSON ({error}). '
+            f'Rebuild the binaries: VERSION={version} sh scripts/crossbuild.sh'
+        )
+    if not isinstance(manifest, dict):
+        raise SystemExit(f'{manifest_path.name} must contain a JSON object')
+    recorded = manifest.get('version')
+    if recorded != version:
+        raise SystemExit(
+            f'{manifest_path.name} was built for version {recorded!r}, but this package is {version!r}. '
+            f'Rebuild with: VERSION={version} sh scripts/crossbuild.sh'
+        )
+    entries = manifest.get('binaries')
+    if not isinstance(entries, list) or not entries:
+        raise SystemExit(f'{manifest_path.name} lists no binaries. Rebuild: VERSION={version} sh scripts/crossbuild.sh')
+    digests = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SystemExit(f'{manifest_path.name} has a malformed binary entry')
+        name, digest = entry.get('name'), entry.get('sha256')
+        if not isinstance(name, str) or not isinstance(digest, str):
+            raise SystemExit(f'{manifest_path.name} has a binary entry without name/sha256')
+        digests[name] = digest
+    for target in TARGETS:
+        name = binary_name(target)
+        expected = digests.get(name)
+        if expected is None:
+            raise SystemExit(
+                f'{manifest_path.name} does not record {name}. '
+                f'Rebuild: VERSION={version} sh scripts/crossbuild.sh'
+            )
+        path = dist / name
+        if not path.is_file():
+            raise SystemExit(f'Missing cross build: {name}')
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != expected:
+            raise SystemExit(
+                f'{name} does not match {manifest_path.name} (built binary changed after the manifest was written). '
+                f'Rebuild: VERSION={version} sh scripts/crossbuild.sh'
+            )
+    return manifest
+
+
 def run_instructions(version, target, name):
     lines = [f'KimiCode+ {version}', '', 'Extract this archive into a folder you can write to.']
     if target.startswith('darwin'):
@@ -96,7 +159,11 @@ def main():
         raise SystemExit('Run scripts/notices.py first')
     notice_data = notices.read_bytes()
     license_data = (ROOT / 'LICENSE').read_bytes()
-    binaries = [dist / f'enhanced-kimi-{target}{".exe" if target.startswith("windows") else ""}' for target in TARGETS]
+    # Every binary must be the one this version's cross build produced. Doing
+    # this before the first archive is written means a mismatch leaves no
+    # half-published release directory behind.
+    load_build_manifest(dist, version)
+    binaries = [dist / binary_name(target) for target in TARGETS]
     for binary in binaries:
         if not binary.is_file():
             raise SystemExit(f'Missing cross build: {binary.name}')

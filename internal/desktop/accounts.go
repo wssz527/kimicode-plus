@@ -484,6 +484,82 @@ func (s *NativeService) loadAccountRowByUserID(ctx context.Context, userID strin
 	return row, err
 }
 
+// accountRecordSnapshot is the exact pre-switch state of one saved account
+// record. The credential secret and the row metadata are captured together so a
+// failed switch can put the database back the way it was instead of leaving the
+// outgoing account's rotated token behind.
+type accountRecordSnapshot struct {
+	row       accountRow
+	secret    []byte
+	hadSecret bool
+}
+
+func (s *NativeService) snapshotAccountRecord(ctx context.Context, userID string) (*accountRecordSnapshot, error) {
+	row, err := s.loadAccountRowByUserID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	vault := s.currentAccountVault()
+	if vault == nil {
+		return nil, errors.New("加密凭据库不可用")
+	}
+	snapshot := &accountRecordSnapshot{row: row}
+	secret, err := vault.Get(ctx, accountVaultRef(row.ID))
+	if errors.Is(err, credentials.ErrNotFound) {
+		return snapshot, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	snapshot.secret = secret
+	snapshot.hadSecret = true
+	return snapshot, nil
+}
+
+func (s *NativeService) restoreAccountRecord(ctx context.Context, snapshot *accountRecordSnapshot) error {
+	if snapshot == nil {
+		return nil
+	}
+	vault := s.currentAccountVault()
+	if vault == nil {
+		return errors.New("加密凭据库不可用")
+	}
+	var restoreErrs []error
+	if snapshot.hadSecret {
+		restoreErrs = append(restoreErrs, vault.Put(ctx, accountVaultRef(snapshot.row.ID), snapshot.secret))
+	} else if err := vault.Delete(ctx, accountVaultRef(snapshot.row.ID)); err != nil && !errors.Is(err, credentials.ErrNotFound) {
+		restoreErrs = append(restoreErrs, err)
+	}
+	row := snapshot.row
+	_, err := s.db.ExecContext(ctx, `UPDATE kimi_accounts SET user_id=?,label=?,nickname=?,avatar=?,plan=?,region=?,oauth_key=?,oauth_host=?,base_url=?,status=?,status_reason=?,quota_json=?,models_json=?,last_seen_at=?,created_at=?,updated_at=? WHERE id=?`,
+		row.UserID, row.Label, row.Nickname, row.Avatar, row.Plan, row.Region, row.OAuthKey, row.OAuthHost, row.BaseURL, row.Status, row.StatusReason, row.QuotaJSON, row.ModelsJSON, row.LastSeenAt, row.CreatedAt, row.UpdatedAt, row.ID)
+	restoreErrs = append(restoreErrs, err)
+	return errors.Join(restoreErrs...)
+}
+
+// readManagedProviderObject reads the raw managed:kimi-code provider object so a
+// switch can change only the OAuth key and restore the complete object on
+// rollback without dropping fields this service does not model.
+func (s *NativeService) readManagedProviderObject(ctx context.Context) (map[string]any, bool, error) {
+	raw, err := s.kap.Request(ctx, http.MethodGet, "/config", nil)
+	if err != nil {
+		return nil, false, err
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return nil, false, err
+	}
+	providers, ok := cfg["providers"].(map[string]any)
+	if !ok {
+		return nil, false, nil
+	}
+	managed, ok := providers[defaultManagedProviderID].(map[string]any)
+	if !ok || managed == nil {
+		return nil, false, nil
+	}
+	return managed, true, nil
+}
+
 func (s *NativeService) accountRowToSummary(ctx context.Context, row accountRow, currentUserID string) AccountSummary {
 	var quotaSummary *AccountQuotaSummary
 	if strings.TrimSpace(row.QuotaJSON) != "" {
@@ -1285,11 +1361,11 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 	// Step 3: Re-snapshot outgoing current account's latest kimi-code.json (tokens may have rotated).
 	currentOAuthKey, currentOAuthHost, currentBaseURL, providerExists, configErr := s.readManagedProviderConfig(ctx)
 	targetOAuthKey := firstNonEmpty(targetSecret.OAuthKey, targetRow.OAuthKey, currentOAuthKey, defaultManagedOAuthKey)
-	credPath, err := s.kimiCredentialPath(targetOAuthKey)
+	targetCredPath, err := s.kimiCredentialPath(targetOAuthKey)
 	if err != nil {
 		return AccountSwitchResult{}, err
 	}
-	backupPath := credPath + ".ekd-bak"
+	backupPath := targetCredPath + ".ekd-bak"
 	backupExistsErr := fmt.Errorf("切换已停止，请先处理留存的恢复备份：%s", backupPath)
 	if _, err := os.Lstat(backupPath); err == nil {
 		return AccountSwitchResult{}, backupExistsErr
@@ -1302,15 +1378,31 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 	currentProfile, _, _ := s.readOfficialUserInfo(ctx)
 	s.waitForOAuthRefreshLock(ctx, targetOAuthKey)
 
-	backupBytes, readErr := os.ReadFile(credPath)
-	hadCredential := readErr == nil
+	// Each OAuth key owns a separate credential file. The outgoing account must be
+	// re-snapshotted from its own file; the target path can already hold a stale
+	// token for a different account and must never be written into currentProfile.
+	keysDiffer := sanitizeOAuthKey(currentOAuthKey) != sanitizeOAuthKey(targetOAuthKey)
+	resnapshotCurrent := providerExists && strings.TrimSpace(currentOAuthKey) != ""
+	var currentCredPath string
+	if resnapshotCurrent {
+		currentCredPath, err = s.kimiCredentialPath(currentOAuthKey)
+		if err != nil {
+			return AccountSwitchResult{}, err
+		}
+		if keysDiffer {
+			s.waitForOAuthRefreshLock(ctx, currentOAuthKey)
+		}
+	}
+
+	targetBackupBytes, readErr := os.ReadFile(targetCredPath)
+	hadTargetCredential := readErr == nil
 	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-		return AccountSwitchResult{}, fmt.Errorf("无法读取当前凭据文件：%w", readErr)
+		return AccountSwitchResult{}, fmt.Errorf("无法读取目标凭据文件：%w", readErr)
 	}
 
 	// Step 4: Reserve the recovery backup before changing credentials or configuration.
-	backupData := backupBytes
-	if !hadCredential {
+	backupData := targetBackupBytes
+	if !hadTargetCredential {
 		backupData = []byte("EKD: no credential file existed before the switch\n")
 	}
 	if err := writeAccountSwitchBackup(backupPath, backupData); err != nil {
@@ -1319,53 +1411,86 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 		}
 		return AccountSwitchResult{}, fmt.Errorf("写入恢复备份 %s 失败：%w", backupPath, err)
 	}
-	if hadCredential && currentProfile != nil {
-		if fields, parseErr := parseRawTokenFields(backupBytes); parseErr == nil && !tokenIsRevokedOrEmpty(fields) {
-			if existingRow, findErr := s.loadAccountRowByUserID(ctx, currentProfile.UserID); findErr == nil {
-				_, _ = s.upsertAccountWithSecret(ctx, currentProfile, backupBytes, currentOAuthKey, currentOAuthHost, currentBaseURL, existingRow.Label)
-			}
-		}
-	}
-
 	removeBackup := func() error {
 		if err := os.Remove(backupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("无法删除恢复备份 %s：%w", backupPath, err)
 		}
 		return nil
 	}
+	var currentRecordSnapshot *accountRecordSnapshot
+	targetCredentialWritten := false
 	configPatchAttempted := false
+	var previousProvider map[string]any
 	rollback := func(cause error) (AccountSwitchResult, error) {
-		var credentialErr, configErr error
-		if hadCredential {
-			credentialErr = writeFileAtomic0600(credPath, backupBytes)
-		} else if err := os.Remove(credPath); !errors.Is(err, os.ErrNotExist) {
-			credentialErr = err
+		var credentialErr, recordErr, configErr error
+		if targetCredentialWritten {
+			if hadTargetCredential {
+				credentialErr = writeFileAtomic0600(targetCredPath, targetBackupBytes)
+			} else if err := os.Remove(targetCredPath); !errors.Is(err, os.ErrNotExist) {
+				credentialErr = err
+			}
+			if credentialErr != nil {
+				credentialErr = fmt.Errorf("恢复凭据文件失败：%w", credentialErr)
+			}
 		}
-		if credentialErr != nil {
-			credentialErr = fmt.Errorf("恢复凭据文件失败：%w", credentialErr)
+		rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer rbCancel()
+		if err := s.restoreAccountRecord(rbCtx, currentRecordSnapshot); err != nil {
+			recordErr = fmt.Errorf("恢复当前账号凭据库记录失败：%w", err)
 		}
 		if configPatchAttempted {
-			rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer rbCancel()
+			var restoreProvider any
+			if previousProvider != nil {
+				restoreProvider = previousProvider
+			}
 			_, configErr = s.kap.Request(rbCtx, http.MethodPost, "/config", map[string]any{
-				"providers": map[string]any{defaultManagedProviderID: nil},
+				"providers": map[string]any{defaultManagedProviderID: restoreProvider},
 			})
 			if configErr != nil {
 				configErr = fmt.Errorf("恢复官方供应商配置失败：%w", configErr)
 			}
 		}
-		if err := errors.Join(credentialErr, configErr); err != nil {
+		if err := errors.Join(credentialErr, recordErr, configErr); err != nil {
 			return AccountSwitchResult{}, fmt.Errorf("切换失败，且未能完全恢复原账号，备份保留在 %s：%w", backupPath, errors.Join(cause, err))
 		}
 		return AccountSwitchResult{}, errors.Join(fmt.Errorf("%w，已自动恢复原账号", cause), removeBackup())
 	}
 
-	if err := s.writeCredentialFile(credPath, targetSecret.RawCredential); err != nil {
+	if resnapshotCurrent && currentProfile != nil {
+		currentBytes, currentReadErr := os.ReadFile(currentCredPath)
+		if currentReadErr != nil && !errors.Is(currentReadErr, os.ErrNotExist) {
+			return AccountSwitchResult{}, errors.Join(fmt.Errorf("无法读取当前账号凭据文件：%w", currentReadErr), removeBackup())
+		}
+		if currentReadErr == nil {
+			if fields, parseErr := parseRawTokenFields(currentBytes); parseErr == nil && !tokenIsRevokedOrEmpty(fields) {
+				existingRow, findErr := s.loadAccountRowByUserID(ctx, currentProfile.UserID)
+				if findErr != nil && !errors.Is(findErr, sql.ErrNoRows) {
+					return AccountSwitchResult{}, errors.Join(fmt.Errorf("切换前查询当前账号记录失败：%w", findErr), removeBackup())
+				}
+				if findErr == nil {
+					snapshot, snapErr := s.snapshotAccountRecord(ctx, currentProfile.UserID)
+					if snapErr != nil {
+						return AccountSwitchResult{}, errors.Join(fmt.Errorf("切换前无法保存当前账号凭据快照：%w", snapErr), removeBackup())
+					}
+					currentRecordSnapshot = snapshot
+					if _, upsertErr := s.upsertAccountWithSecret(ctx, currentProfile, currentBytes, currentOAuthKey, currentOAuthHost, currentBaseURL, existingRow.Label); upsertErr != nil {
+						return rollback(fmt.Errorf("切换前更新当前账号凭据快照失败：%w", upsertErr))
+					}
+				}
+			}
+		}
+	}
+
+	targetCredentialWritten = true
+	if err := s.writeCredentialFile(targetCredPath, targetSecret.RawCredential); err != nil {
 		return rollback(fmt.Errorf("写入目标账号凭据失败：%w", err))
 	}
 
 	// If managed:kimi-code provider was absent (signed-out state), provision it so /auth and /oauth/userinfo recognize the credential.
-	if !providerExists {
+	// When it exists but points at another OAuth key, move that pointer to the
+	// target file; otherwise the client would keep reading the outgoing account.
+	switch {
+	case !providerExists:
 		oauthObj := map[string]any{
 			"storage": "file",
 			"key":     "oauth/" + sanitizeOAuthKey(targetOAuthKey),
@@ -1387,6 +1512,40 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 		configPatchAttempted = true
 		if _, err := s.kap.Request(ctx, http.MethodPost, "/config", patch); err != nil {
 			return rollback(fmt.Errorf("补回官方账号供应商配置失败：%w", err))
+		}
+	case keysDiffer:
+		currentProvider, ok, err := s.readManagedProviderObject(ctx)
+		if err != nil {
+			return rollback(fmt.Errorf("读取官方供应商配置失败：%w", err))
+		}
+		if !ok {
+			return rollback(errors.New("切换期间官方供应商配置发生变化"))
+		}
+		previousProvider = currentProvider
+		updatedProvider := make(map[string]any, len(currentProvider))
+		for key, value := range currentProvider {
+			updatedProvider[key] = value
+		}
+		oauthObj := map[string]any{}
+		if existing, ok := currentProvider["oauth"].(map[string]any); ok {
+			for key, value := range existing {
+				oauthObj[key] = value
+			}
+		}
+		oauthObj["key"] = "oauth/" + sanitizeOAuthKey(targetOAuthKey)
+		if _, ok := oauthObj["storage"]; !ok {
+			oauthObj["storage"] = "file"
+		}
+		if h := firstNonEmpty(targetSecret.OAuthHost, targetRow.OAuthHost); h != "" {
+			oauthObj["oauthHost"] = h
+		}
+		updatedProvider["oauth"] = oauthObj
+		// An error response can arrive after the configuration change was applied.
+		configPatchAttempted = true
+		if _, err := s.kap.Request(ctx, http.MethodPost, "/config", map[string]any{
+			"providers": map[string]any{defaultManagedProviderID: updatedProvider},
+		}); err != nil {
+			return rollback(fmt.Errorf("同步官方账号凭据路径失败：%w", err))
 		}
 	}
 
@@ -1423,10 +1582,13 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 		}
 	}
 
+	warnings := []string{"切换后各会话的第一次请求不会命中提示词缓存（缓存按账号计算）。"}
 	// Capture refreshed disk token if official Ee.ensureFresh() rotated it during /oauth/userinfo.
-	if refreshedBytes, readErr := os.ReadFile(credPath); readErr == nil {
+	if refreshedBytes, readErr := os.ReadFile(targetCredPath); readErr == nil {
 		if fields, parseErr := parseRawTokenFields(refreshedBytes); parseErr == nil && !tokenIsRevokedOrEmpty(fields) {
-			_, _ = s.upsertAccountWithSecret(ctx, verifiedProfile, refreshedBytes, targetOAuthKey, firstNonEmpty(targetSecret.OAuthHost, targetRow.OAuthHost), firstNonEmpty(targetSecret.BaseURL, targetRow.BaseURL, defaultManagedBaseURL), targetRow.Label)
+			if _, upsertErr := s.upsertAccountWithSecret(ctx, verifiedProfile, refreshedBytes, targetOAuthKey, firstNonEmpty(targetSecret.OAuthHost, targetRow.OAuthHost), firstNonEmpty(targetSecret.BaseURL, targetRow.BaseURL, defaultManagedBaseURL), targetRow.Label); upsertErr != nil {
+				warnings = append(warnings, fmt.Sprintf("切换已生效，但同步目标账号最新令牌到凭据库失败：%v", upsertErr))
+			}
 		}
 	}
 
@@ -1435,7 +1597,6 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 		updatedRow = targetRow
 	}
 	summary := s.accountRowToSummary(ctx, updatedRow, verifiedProfile.UserID)
-	warnings := []string{"切换后各会话的第一次请求不会命中提示词缓存（缓存按账号计算）。"}
 	var backupCleanupWarning string
 	if err := removeBackup(); err != nil {
 		backupCleanupWarning = err.Error()

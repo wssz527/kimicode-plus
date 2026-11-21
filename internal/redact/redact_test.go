@@ -99,6 +99,32 @@ func TestTextIsIdempotentAndFindingsDoNotLeak(t *testing.T) {
 	}
 }
 
+func TestCorePairingSessionAndBridgeTokensAreRedacted(t *testing.T) {
+	input := `{"pairingToken":"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4","sessionToken":"f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3","bridgeKey":"b9a8c7d6e5f4b9a8c7d6e5f4b9a8c7d6","refresh_token":"r1e2f3r4e5s6h7t8o9k0","pairingUrl":"http://127.0.0.1:54194/#pair=deadbeefcafebabe1234567890"}` + "\n" +
+		"X-EKD-Bridge: headerbridgekey998877665544\n" +
+		"enhanced-kimi attach --pairing-token clisecretvalue11223344"
+	out := Text(input)
+	for _, secret := range []string{
+		"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+		"f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3",
+		"b9a8c7d6e5f4b9a8c7d6e5f4b9a8c7d6",
+		"r1e2f3r4e5s6h7t8o9k0",
+		"deadbeefcafebabe1234567890",
+		"headerbridgekey998877665544",
+		"clisecretvalue11223344",
+	} {
+		if strings.Contains(out, secret) {
+			t.Fatalf("core secret %q leaked in %q", secret, out)
+		}
+	}
+	if Text(out) != out {
+		t.Fatalf("redaction not idempotent: %q", out)
+	}
+	if findings := Findings(out); len(findings) != 0 {
+		t.Fatalf("redacted output still reports findings: %#v", findings)
+	}
+}
+
 func TestOrdinaryChineseTextIsPreserved(t *testing.T) {
 	input := "先实现桥接，再核对回执。没有密钥。"
 	if got := Text(input); got != input {

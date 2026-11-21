@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
+import { createSessionWatchBinding, type SessionWatchOutcome } from "../../api";
 import type { DemoHost, NativeSession, SessionView } from "../../native";
 import { Icon } from "../Icon";
 import { EmptyState, Spinner } from "../ui";
@@ -53,6 +54,11 @@ export function SessionPane({
   const [pickingFiles, setPickingFiles] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // A live subscription that is not established is not an error: the history is
+  // already on screen, and the pane says so in its own banner with a retry.
+  const [syncNote, setSyncNote] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [recoverTicket, setRecoverTicket] = useState(0);
   const [replying, setReplying] = useState<string | null>(null);
   const sid = sessionId;
   const draft = inputs[sid]?.draft ?? "";
@@ -65,9 +71,15 @@ export function SessionPane({
   const setModel = (value: string) => updateInput({ model: value });
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // A session change is the only thing that empties the pane. A retry of the
+  // live link keeps whatever history is already on screen.
   useEffect(() => {
     setView(null);
     setError(null);
+    setSyncNote(null);
+  }, [sid]);
+
+  useEffect(() => {
     if (!sid) return;
     let alive = true;
     let receivedEvent = false;
@@ -75,22 +87,50 @@ export function SessionPane({
       if (!alive || next.session.id !== sid) return;
       receivedEvent = true;
       setView(next);
+      setSyncNote(null);
     });
-    const watching = host.request<{ view: SessionView }>("session.watch", { id: sid });
-    watching.then(({ view: initial }) => {
-      if (alive && !receivedEvent && initial.session.id === sid) setView(initial);
-    }).catch(cause => { if (alive) setError(errorText(cause)); });
+    const binding = createSessionWatchBinding<SessionView>({
+      watch: () => host.request<SessionWatchOutcome<SessionView>>("session.watch", { id: sid }),
+      read: () => host.request<SessionView>("session.view", { id: sid }),
+      unwatch: () => host.request("session.unwatch", { id: sid }),
+      onView: initial => {
+        if (receivedEvent || initial?.session?.id !== sid) return;
+        setView(initial);
+      },
+      onNote: note => {
+        setSyncNote(note);
+        // The history is on screen, so a live-link note is not a blocking error.
+        if (note) setError(null);
+      },
+      onError: message => {
+        setError(message);
+        setSyncNote(null);
+      },
+      describeError: errorText,
+      attached: () => alive,
+    });
+    void binding.start().finally(() => {
+      if (alive) setSyncing(false);
+    });
     return () => {
       alive = false;
       unsubscribe();
-      void watching.then(() => host.request("session.unwatch", { id: sid })).catch(() => {});
+      // One release per acquired reference: a failed subscribe holds none.
+      void binding.dispose();
     };
-  }, [host, sid]);
+  }, [host, sid, recoverTicket]);
 
   useEffect(() => {
     if (!view) return;
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [view?.messages, view?.session.busy]);
+
+  function retryLiveSync() {
+    if (!sid || syncing) return;
+    setSyncing(true);
+    setError(null);
+    setRecoverTicket(ticket => ticket + 1);
+  }
 
   async function createSession() {
     setBusy(true);
@@ -198,6 +238,17 @@ export function SessionPane({
               ? `等待额度恢复自动继续${recovery.nextAt ? ` · 下次检测 ${fmtClock(recovery.nextAt)}` : ""}`
               : "因限流暂停，未开启自动继续"}
           </span>
+        </p>
+      ) : null}
+
+      {syncNote && view ? (
+        <p className="wb-exec-recovery" role="status" title={syncNote}>
+          <Icon name="clock" size={12} />
+          <span>历史已加载，实时同步暂未连接</span>
+          <button type="button" className="wb-link" disabled={syncing} onClick={() => retryLiveSync()}>
+            {syncing ? <Spinner size={11} /> : null}
+            {syncing ? "正在重连" : "重试同步"}
+          </button>
         </p>
       ) : null}
 

@@ -40,6 +40,64 @@ func main() {
 	}
 }
 
+const restartLeaseProbeTimeout = 3 * time.Second
+
+// restartStateForCore decides how the restarted core reattaches. An installed
+// attach record is replayed exactly as recorded. A Windows launcher lease is
+// only trusted when the host it names is actually running: an expired lease must
+// not widen consent to the daily instance.
+func restartStateForCore(dataDir string, port int, hostProfile string, allowDaily bool) updater.RestartState {
+	state := updater.RestartState{Port: port}
+	last := desktop.ReadAttachState(dataDir)
+	if last["status"] == "installed" {
+		state.Reattach = true
+		state.ReattachDaily = last["daily"] == true
+	}
+	if desktop.HostPlatformName() != "windows" {
+		return state
+	}
+	lease := desktop.ReadWindowsLauncherState(dataDir)
+	if lease == nil {
+		return state
+	}
+	if dataDir != "" && desktop.AutoAttachStatus(dataDir).Enabled {
+		state.Reattach = true
+		state.ReattachDaily = state.ReattachDaily || last["daily"] == true
+		return state
+	}
+	if !liveWindowsLauncherLease(dataDir, lease) {
+		return state
+	}
+	// A live, matching lease means the launcher still owns the host. Daily
+	// consent is only widened when this run was explicitly allowed to touch the
+	// client the user is actually using.
+	state.Reattach = true
+	state.ReattachDaily = last["daily"] == true || (hostProfile == "" && allowDaily)
+	return state
+}
+
+// liveWindowsLauncherLease confirms the lease still describes the running host:
+// same PID, same loopback debugging port and not a debug instance.
+func liveWindowsLauncherLease(dataDir string, lease *desktop.WindowsLauncherState) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), restartLeaseProbeTimeout)
+	defer cancel()
+	discovered, err := desktop.DiscoverHostWithDataDir(ctx, "", dataDir)
+	if err != nil || discovered == nil {
+		return false
+	}
+	running, _ := discovered["running"].(bool)
+	pid, _ := discovered["pid"].(int)
+	if !running || pid != lease.PID {
+		return false
+	}
+	port, _ := discovered["debugPort"].(int)
+	if port != lease.DebugPort {
+		return false
+	}
+	debug, _ := discovered["debugInstance"].(bool)
+	return !debug
+}
+
 // newHTTPServer keeps the process-wide budgets in one place. WriteTimeout is
 // deliberately unset: a single server-wide value would cap generation, so the
 // Deadlines handler owns the per-path write budget instead.
@@ -138,7 +196,7 @@ func runCore(updateAPIBaseURL string, updateHTTPClient *http.Client) error {
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
-		return err
+		cwd = instance.Dir
 	}
 	if *workspace != "" {
 		if !filepath.IsAbs(*workspace) {
@@ -162,14 +220,7 @@ func runCore(updateAPIBaseURL string, updateHTTPClient *http.Client) error {
 		Profile: *hostProfile, CoreURL: "http://" + listener.Addr().String(), PairingToken: guard.PairingToken(),
 		UpdateAPIBaseURL: updateAPIBaseURL, UpdateHTTPClient: updateHTTPClient,
 		RestartState: func() updater.RestartState {
-			state := updater.RestartState{Port: listener.Addr().(*net.TCPAddr).Port}
-			last := desktop.ReadAttachState(instance.Dir)
-			state.Reattach = last["status"] == "installed"
-			state.ReattachDaily = state.Reattach && last["daily"] == true
-			if desktop.HostPlatformName() == "windows" && desktop.ReadWindowsLauncherState(instance.Dir) != nil {
-				state.Reattach, state.ReattachDaily = true, *hostProfile == ""
-			}
-			return state
+			return restartStateForCore(instance.Dir, listener.Addr().(*net.TCPAddr).Port, *hostProfile, *allowDaily)
 		},
 		RequestRestart: func() {
 			select {
@@ -216,6 +267,9 @@ func runCore(updateAPIBaseURL string, updateHTTPClient *http.Client) error {
 		if err != nil {
 			hostError = err.Error()
 			log.Printf("native enhancement not attached: %s", hostError)
+			// A stale installed record would otherwise keep claiming the interface
+			// is attached after a restart that failed to reattach.
+			_ = desktop.RecordAttach(instance.Dir, err)
 		} else if hostResult != nil {
 			_ = desktop.RecordAttach(instance.Dir, hostResult)
 		}

@@ -175,3 +175,37 @@ func lastLines(text string, count int) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// The resident copy is what runs after the download is deleted, so its notices
+// must be readable when the running binary has none next to it.
+func TestNoticesPathFallsBackToResidentCopy(t *testing.T) {
+	dir := t.TempDir()
+	resident := filepath.Join(dir, "resident")
+	if err := os.MkdirAll(resident, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(resident, noticesFileName), []byte("resident notices"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Skip("no executable path in this environment")
+	}
+	resolved, err := filepath.EvalSymlinks(executable)
+	if err == nil {
+		executable = resolved
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(executable), noticesFileName)); err == nil {
+		t.Skip("a notices file exists next to the test binary; the fallback is not exercised")
+	}
+	path := noticesFilePathFor(dir)
+	if path != filepath.Join(resident, noticesFileName) {
+		t.Fatalf("notices path = %q", path)
+	}
+	if status := diagnoseFile(path, "head", noticesHeadBytes); status["available"] != true {
+		t.Fatalf("resident notices were not readable: %+v", status)
+	}
+	if got := noticesFilePathFor(""); got != filepath.Join(filepath.Dir(executable), noticesFileName) {
+		t.Fatalf("empty data dir did not keep the binary path: %q", got)
+	}
+}

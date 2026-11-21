@@ -26,9 +26,11 @@ var rules = []rule{
 	{name: "HUGGINGFACE_TOKEN", re: regexp.MustCompile(`\bhf_[A-Za-z0-9]{20,}`), repl: "[REDACTED:HUGGINGFACE_TOKEN]"},
 	{name: "NPM_TOKEN", re: regexp.MustCompile(`\bnpm_[A-Za-z0-9]{20,}`), repl: "[REDACTED:NPM_TOKEN]"},
 	{name: "GOOGLE_OAUTH", re: regexp.MustCompile(`\bya29\.[A-Za-z0-9_-]{20,}`), repl: "[REDACTED:GOOGLE_OAUTH]"},
-	{name: "SECRET_ASSIGNMENT", re: regexp.MustCompile(`(?i)\b(api[_-]?key|apikey|secret|token|password|passwd|pwd|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token)\b(\s*[:=]\s*["']?)([^\s"'\[\]]{6,})`), repl: "$1$2[REDACTED:SECRET_ASSIGNMENT]"},
+	{name: "SECRET_ASSIGNMENT", re: regexp.MustCompile(`(?i)\b(api[_-]?key|apikey|secret|token|password|passwd|pwd|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|pairing[_-]?token|session[_-]?token|access[_-]?token|refresh[_-]?token|gateway[_-]?token|bridge[_-]?key|x-ekd-bridge)\b(["']?\s*[:=]\s*["']?)([^\s"',\[\]]{6,})`), repl: "$1$2[REDACTED:SECRET_ASSIGNMENT]"},
+	{name: "CLI_TOKEN", re: regexp.MustCompile(`(?i)(--pairing-token(?:\s+|=)["']?)([^\s"'\[\]]{6,})`), repl: "$1[REDACTED:CLI_TOKEN]"},
 	{name: "URL_CREDENTIALS", re: regexp.MustCompile(`(?i)\b(https?://)([^/\s:@]+):([^/\s@]+)@`), repl: "$1[REDACTED-URL-USERINFO]@"},
 	{name: "URL_QUERY", re: regexp.MustCompile(`(?i)([?&](?:access_token|api_key|apikey|token|secret|password|key)=)[^&\s#\[]+`), repl: "$1[REDACTED:URL_QUERY]"},
+	{name: "PAIRING_URL", re: regexp.MustCompile(`(?i)(#pair=)[^\s"'\[\]&]+`), repl: "$1[REDACTED:PAIRING_URL]"},
 	{name: "EMAIL", re: regexp.MustCompile(`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b`), repl: "[REDACTED:EMAIL]"},
 }
 

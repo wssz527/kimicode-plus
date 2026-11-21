@@ -331,7 +331,7 @@ func closeInspectorExpression(pid int) string {
 	return fmt.Sprintf(`(()=>{clearTimeout(globalThis.__ekdDeadline);if(process.pid===%d&&process.type==='browser'){setTimeout(()=>{try{(typeof require==='function'?require:process.mainModule.require.bind(process.mainModule))('node:inspector').close()}catch{}},25)}return true;})()`, pid)
 }
 
-func Attach(ctx context.Context, pid int) (*CDP, error) {
+func Attach(ctx context.Context, pid int) (cdp *CDP, retErr error) {
 	if pid <= 0 {
 		return nil, errors.New("宿主 PID 无效")
 	}
@@ -339,11 +339,26 @@ func Attach(ctx context.Context, pid int) (*CDP, error) {
 		return nil, ErrUnsupportedPlatform
 	}
 	if inspectorOpen(ctx) {
-		return nil, errors.New("9229 调试端口已被占用，拒绝附着未知进程")
+		return nil, errors.New("9229 调试端口已被其他调试进程（如 VS Code、Node.js 或残留调试会话）占用，请关闭对应调试会话或重启 Kimi Code 后重试")
 	}
 	if err := activateInspector(pid); err != nil {
 		return nil, err
 	}
+	// The signal above can leave the port listening even when everything after
+	// it fails, so nothing below may return without closing it. The deferred
+	// cleanup only acts when this call does not hand back a session; a returned
+	// *CDP closes the port through its own Close.
+	installed := false
+	defer func() {
+		if installed {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := closeInspectorPort(cleanupCtx, pid); err != nil {
+			retErr = errors.Join(retErr, err)
+		}
+	}()
 	var endpoint string
 	for range 50 {
 		// Re-check identity on every poll: a PID reused by another process must
@@ -396,15 +411,60 @@ func Attach(ctx context.Context, pid int) (*CDP, error) {
 		return nil, err
 	}
 	conn.SetReadLimit(32 << 20)
-	cdp := &CDP{pid: pid, conn: conn, pending: map[int]chan cdpResponse{}, closed: make(chan struct{})}
-	go cdp.read()
+	session := &CDP{pid: pid, conn: conn, pending: map[int]chan cdpResponse{}, closed: make(chan struct{})}
+	go session.read()
 	// The fuse is the very first command, before any identity read or payload
 	// load, so a stalled attach still closes its own port within 12 seconds.
-	if _, err = cdp.Evaluate(ctx, inspectorDeadlineExpression(pid)); err != nil {
-		cdp.Close(context.Background())
+	if _, err = session.Evaluate(ctx, inspectorDeadlineExpression(pid)); err != nil {
+		session.Close(context.Background())
 		return nil, err
 	}
-	return cdp, nil
+	installed = true
+	return session, nil
+}
+
+// closeInspectorPort closes the temporary inspector only when the port still
+// belongs to the expected host. A port that never opened is already closed; a
+// port owned by another process is left alone, because closing it would be
+// acting on a process this attach never signalled.
+func closeInspectorPort(ctx context.Context, pid int) error {
+	if !inspectorOpen(ctx) {
+		return nil
+	}
+	owner, err := inspectorPortOwner(ctx)
+	if err != nil || owner != strconv.Itoa(pid) {
+		if err != nil {
+			return errors.Join(errors.New(inspectorCloseGuidance), err)
+		}
+		// Another process now holds 9229; it is not ours to close.
+		return nil
+	}
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:"+strconv.Itoa(InspectorPort)+"/json/list", nil)
+	if response, getErr := client.Do(req); getErr == nil {
+		var targets []struct {
+			Type string `json:"type"`
+			URL  string `json:"webSocketDebuggerUrl"`
+		}
+		_ = json.NewDecoder(response.Body).Decode(&targets)
+		response.Body.Close()
+		for _, target := range targets {
+			if target.Type != "node" {
+				continue
+			}
+			if conn, _, dialErr := websocket.Dial(ctx, target.URL, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{"http://127.0.0.1:" + strconv.Itoa(InspectorPort)}}}); dialErr == nil {
+				session := &CDP{pid: pid, conn: conn, pending: map[int]chan cdpResponse{}, closed: make(chan struct{})}
+				go session.read()
+				_, _ = session.Evaluate(ctx, closeInspectorExpression(pid))
+				_ = conn.CloseNow()
+			}
+			break
+		}
+	}
+	if WaitInspectorGone(ctx, 3*time.Second) {
+		return nil
+	}
+	return errors.New(inspectorCloseGuidance)
 }
 
 func (c *CDP) read() {
@@ -508,13 +568,16 @@ func (c *CDP) Close(ctx context.Context) error {
 	var err error
 	c.once.Do(func() {
 		_, _ = c.Evaluate(ctx, closeInspectorExpression(c.pid))
-		err = c.conn.Close(websocket.StatusNormalClosure, "ekd detach")
+		// V8's inspector.close() closes the WebSocket from the host side (often with
+		// StatusNoStatusRcvd) as soon as the expression runs, so conn.Close commonly
+		// returns a peer-closed error on the healthy path. Always drop the local
+		// socket and treat WaitInspectorGone as the source of truth.
+		closeErr := c.conn.Close(websocket.StatusNormalClosure, "ekd detach")
+		_ = c.conn.CloseNow()
 		if WaitInspectorGone(ctx, 15*time.Second) {
 			return
 		}
-		if err == nil {
-			err = errors.New("临时调试端点没有关闭，请正常退出客户端后重试")
-		}
+		err = errors.Join(errors.New("临时调试端点没有关闭，请正常退出客户端后重试"), closeErr)
 	})
 	return err
 }

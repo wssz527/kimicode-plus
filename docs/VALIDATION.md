@@ -2,6 +2,15 @@
 
 验收使用本项目 `work/` 下的隔离数据目录和独立宿主 profile（Windows 端使用独立临时隔离目录）。当前范围为核心 M0–M6、插件接口 v2（A1）、规划插件（A3）、修正轮（R0–R4）及下一轮（N0–N6）。多屏会话插件 A2 延期。
 
+## v0.2.1 稳定性修复与双端实机验收
+
+| 场景 | 结果 |
+|---|---|
+| 全仓单测与并发检查 | `go vet`（macOS + Windows）零告警；全仓 23/23 包 `go test -race -count=1` 全部通过（含进程级更新与 SQLite 数据库回滚矩阵）；前端 TypeScript 类型检查与 308/308 单测通过；`scripts/test_package.py` 9/9 通过；真实二进制 `scripts/acceptance.py` 27/27 通过。 |
+| macOS ARM64 实机隔离验收（官方 1.4.2） | 归档 `enhanced-kimi-0.2.1-darwin-arm64.tar.gz` 摘要校验与解压完整，`--version` 输出 `0.2.1`。实测 `401 TOKEN_EXPIRED` 与 `403 PERMISSION_DENIED` 拆分及 `update:read/write` 权限边界；原生 `main-loopback-rpc` 保原 PID 附着 Kimi Code 1.4.2 成功，临时 9229 调试端口确认关闭（修复 `CDP.Close` 在 `StatusNoStatusRcvd` 时的误报），`attach-state.json` 写入 `corePid`；1.4.2 `sessions.list`/`session.create`/`session.watch`/`session.unwatch` 通过；停止旧核心后同端口以 `--resident` 启动新核心（不重新附着），既有 `bootstrap.js` 自动读取 `runtime.json` 完成续期并恢复长轮询连接。日常实例零干扰。 |
+| macOS ARM64 真实 `launchd` 登录项与自更新实机验收 | 实测 `attach --install` 首次同步 `LICENSE` 与 `THIRD_PARTY_NOTICES.txt`；删除模拟下载目录后经真实 `launchctl kickstart -k` 正常启动且诊断页可读常驻许可；跨数据目录 `attach --uninstall` 被拦截且不干扰运行中核心。真实 `launchd`（`KeepAlive=true`）下完成 `0.2.0 → 0.2.1` 健康单进程交接（修复 `launchdLabelFor` 误排除常驻自身与 `AcquireCore` 交接误回滚），以及候选破坏 SQLite `schema_versions` 后的 `bootout` 止损、数据库与二进制原子回滚及 `bootstrap/kickstart` 恢复（`plugins` 模块 `READY`，单进程，事务与备份自动清理）。 |
+| Windows x64 实机隔离验收（`wssz-win`，官方 1.4.2） | 归档 `enhanced-kimi-0.2.1-windows-amd64.zip` 摘要校验与解压完整，`--version` 输出 `0.2.1`。实测 401/403 与 `update:read/write` 边界、`diagnostics.get` 许可读取、Session 1 原生 `main-loopback-rpc` 保原 PID 附着、9229 端口确认关闭、`corePid` 落盘、1.4.2 `session.create`/`session.watch`/`session.unwatch` 及 Core 重启免重接自动续期全部通过。日常核心与日常客户端全程零干扰，远端临时目录已清理。 |
+
 ## v0.2.0 同屏会话与发布回归
 
 | 场景 | 结果 |

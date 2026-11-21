@@ -170,15 +170,26 @@ func confirmReopenIdle(ctx context.Context, home string, pid int) error {
 	if err != nil || VerifyWindowsDebugPortOwner(listeners, port, pid) != nil {
 		return unknown
 	}
-	probe, cancel := context.WithTimeout(ctx, 4*time.Second)
+	probe, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	kap := NewKAPClient(home)
 	kap.base, kap.token = base, token
 	kap.client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	defer kap.client.CloseIdleConnections()
-	raw, err := kap.send(probe, http.MethodGet, "/sessions?page_size=100", nil)
-	if err != nil {
-		return unknown
+	scan := newReopenSessionsScan()
+	query := url.Values{"page_size": {strconv.Itoa(reopenSessionPageSize)}}
+	for {
+		raw, err := kap.send(probe, http.MethodGet, "/sessions?"+query.Encode(), nil)
+		if err != nil {
+			return unknown
+		}
+		hasMore, nextToken, err := scan.checkPage(raw)
+		if err != nil {
+			return err
+		}
+		if !hasMore {
+			return nil
+		}
+		query.Set("page_token", nextToken)
 	}
-	return checkReopenSessions(raw)
 }

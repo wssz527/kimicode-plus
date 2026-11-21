@@ -16,7 +16,7 @@ import (
 	"github.com/gofrs/flock"
 )
 
-func attachRunningWindowsMain(ctx context.Context, options AttachOptions, proc WindowsProcessInfo) (*AttachResult, error) {
+func attachRunningWindowsMain(ctx context.Context, options AttachOptions, proc WindowsProcessInfo) (result *AttachResult, attachErr error) {
 	binary, err := VerifyWindowsBinaryFile(proc.Executable)
 	if err != nil || !binary.supportsLiveAttach() {
 		return nil, errors.New("当前 Windows 客户端不支持运行中接入")
@@ -48,6 +48,27 @@ func attachRunningWindowsMain(ctx context.Context, options AttachOptions, proc W
 	if _, err := cmd.Output(); err != nil {
 		return nil, fmt.Errorf("无法开启 Windows 客户端的临时调试端口：%w", err)
 	}
+	verify := func(verifyCtx context.Context) error {
+		listeners, err := windowsListListeners(verifyCtx, InspectorPort)
+		if err != nil {
+			return err
+		}
+		return VerifyWindowsDebugPortOwner(listeners, InspectorPort, proc.PID)
+	}
+	// From this point a debugging port exists on the client. Any failure below —
+	// the port never becoming ready, the target lookup, the ownership check or the
+	// WebSocket handshake — has to close it, or it stays open until the host is
+	// restarted. The successful path closes it through its own session, so the
+	// guard only acts when this function does not return an attach result.
+	portClosed := false
+	defer func() {
+		if portClosed {
+			return
+		}
+		if closeErr := ensureWindowsInspectorClosed(InspectorPort, proc.PID, verify); closeErr != nil {
+			attachErr = errors.Join(attachErr, closeErr)
+		}
+	}()
 	for attempt := 0; windowsInspectorClosed(InspectorPort); attempt++ {
 		if attempt == 30 {
 			return nil, errors.New("Windows 客户端的临时调试端口未就绪")
@@ -58,20 +79,18 @@ func attachRunningWindowsMain(ctx context.Context, options AttachOptions, proc W
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	result, err := attachWindowsMain(ctx, WindowsCDPAttachOptions{
+	attached, err := attachWindowsMain(ctx, WindowsCDPAttachOptions{
 		HostPID: proc.PID, CoreURL: options.CoreURL, PairingToken: options.PairingToken,
 		Profile: options.Profile, Daily: options.Profile == "", AppVersionOverride: options.AppVersionOverride,
-	}, options.DataDir, InspectorPort, func(verifyCtx context.Context) error {
-		listeners, err := windowsListListeners(verifyCtx, InspectorPort)
-		if err != nil {
-			return err
-		}
-		return VerifyWindowsDebugPortOwner(listeners, InspectorPort, proc.PID)
-	})
-	if result != nil {
-		result.hostStarted = proc.Started
+	}, options.DataDir, InspectorPort, verify)
+	if err != nil {
+		return nil, err
 	}
-	return result, err
+	portClosed = true
+	if attached != nil {
+		attached.hostStarted = proc.Started
+	}
+	return attached, nil
 }
 
 func validateLiveWindowsHost(ctx context.Context, options AttachOptions, proc WindowsProcessInfo) error {

@@ -35,7 +35,7 @@ func TestCheckCoreHealthRequiresNewRuntimeAndMatchingHealth(t *testing.T) {
 	}
 	validate := func(reason string) {
 		t.Helper()
-		err := checkCoreHealth(t.Context(), server.Client(), path, server.URL, 87, "0.2.1")
+		err := checkCoreHealth(t.Context(), server.Client(), path, server.URL, 87, "0.2.1", nil)
 		if (err == nil) != (reason == "") || err != nil && !strings.Contains(err.Error(), reason) {
 			t.Fatalf("health check returned %v, expected %q", err, reason)
 		}
@@ -47,7 +47,7 @@ func TestCheckCoreHealthRequiresNewRuntimeAndMatchingHealth(t *testing.T) {
 	validate("运行记录版本")
 	writeRecord(87, "v0.2.1")
 	validate("")
-	if err := checkCoreHealth(t.Context(), server.Client(), path, server.URL, 87, "0.2.1+build"); err == nil {
+	if err := checkCoreHealth(t.Context(), server.Client(), path, server.URL, 87, "0.2.1+build", nil); err == nil {
 		t.Fatal("different build metadata matched the target version")
 	}
 	wrongHealth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -57,7 +57,7 @@ func TestCheckCoreHealthRequiresNewRuntimeAndMatchingHealth(t *testing.T) {
 	if err := writeUpdateJSON(path, map[string]any{"pid": 87, "url": wrongHealth.URL, "version": "0.2.1", "pairingToken": "test-token"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkCoreHealth(t.Context(), wrongHealth.Client(), path, wrongHealth.URL, 87, "0.2.1"); err == nil || !strings.Contains(err.Error(), "健康接口未确认") {
+	if err := checkCoreHealth(t.Context(), wrongHealth.Client(), path, wrongHealth.URL, 87, "0.2.1", nil); err == nil || !strings.Contains(err.Error(), "健康接口未确认") {
 		t.Fatalf("health version mismatch: %v", err)
 	}
 }
@@ -149,23 +149,23 @@ func TestHealthyUpdateReportsLicenseCopyFailure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(stage, licenseName), []byte("new license"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	backup := job.Executable + ".bak"
-	if err := os.WriteFile(backup, []byte(oldBinary), 0o755); err != nil {
+	tx := &updateTransaction{dir: filepath.Join(dir, "updates", "tx-test")}
+	if err := os.MkdirAll(tx.dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	receipt := updateReceipt{UpdateResult: UpdateResult{TargetVersion: "0.3.0", PreviousVersion: "0.2.0"}}
 	if err := receipt.finish(dir, Updated, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := job.cleanUpBackup(receipt, Updated, "", backup, job.installReleaseLicenses(stage)); err != nil {
+	if err := job.cleanUpTransaction(tx, receipt, Updated, "", job.installReleaseLicenses(stage)); err != nil {
 		t.Fatal(err)
 	}
 	checkFile(t, filepath.Join(dir, licenseName), "new license")
 	if result := readResult(dir); result.State != Updated || !strings.Contains(result.Error, "无法更新 "+noticesName) {
 		t.Fatalf("license copy problem missing from update result: %+v", result.UpdateResult)
 	}
-	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("backup was not cleaned: %v", err)
+	if _, err := os.Stat(tx.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("transaction backup was not cleaned: %v", err)
 	}
 }
 
@@ -184,5 +184,35 @@ func TestStatusSurfacesFailedSupervisorHandoffWhileOldCoreRuns(t *testing.T) {
 	}
 	if status := m.Status(); status.State != Failed || status.Error != reason || status.LastAttempt == nil || status.LastAttempt.Error != reason {
 		t.Fatalf("failure missing while old core still runs: %+v", status)
+	}
+}
+
+// The supervisor must never start a second --resident process while launchd
+// keeps one alive. These tests cover the handover bookkeeping only: the process
+// launch itself belongs to launchd and is exercised by the desktop package.
+func TestLaunchdHandoverRequiresALoadedLoginItem(t *testing.T) {
+	target := "/data/resident/enhanced-kimi"
+	options := Options{GOOS: "darwin", Executable: "/Applications/core", DataDir: "/data"}
+	managed := &Options{GOOS: "darwin", Executable: "/Applications/core", DataDir: "/data",
+		Launchd: LaunchdOptions{Enabled: func(p string) bool { return p == target }, Managed: func() bool { return false }}}
+	if label := launchdLabelFor(options, target); label != "" {
+		t.Fatalf("a managed target without an installed login item requested a handover: %s", label)
+	}
+	if label := launchdLabelFor(*managed, target); label != "" {
+		t.Fatalf("an unloaded login item still requested a handover: %s", label)
+	}
+	managed.Launchd.Managed = func() bool { return true }
+	if label := launchdLabelFor(*managed, target); label != launchdDefaultLabel {
+		t.Fatalf("handover label = %q", label)
+	}
+	if label := launchdLabelFor(*managed, managed.Executable); label != "" {
+		t.Fatalf("a non-managed target requested a handover: %s", label)
+	}
+	// When the core itself is running from the launchd-managed resident copy,
+	// options.Executable == targetExe and handover MUST still be selected.
+	residentSelf := *managed
+	residentSelf.Executable = target
+	if label := launchdLabelFor(residentSelf, target); label != launchdDefaultLabel {
+		t.Fatalf("resident self-update handover label = %q, want %q", label, launchdDefaultLabel)
 	}
 }

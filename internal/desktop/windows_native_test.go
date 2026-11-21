@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -681,4 +682,144 @@ func TestParseUserAgentVersionsAndWindowsVersionForwarding(t *testing.T) {
 	if !strings.Contains(evaluatedExpr, `"appVersion":"1.9.9"`) {
 		t.Fatalf("renderer config missing overridden appVersion 1.9.9")
 	}
+}
+
+// The Windows main bridge injects through the host's own Electron webContents,
+// so it is the only caller that sets windowsMainBridge. It must also hand over
+// the runtime record: that is what lets the host renew a session instead of
+// failing once the twelve hours are up.
+func TestAttachWindowsMainCarriesRuntimePathAndMainBridgeFlag(t *testing.T) {
+	listener := newLocalListener(t)
+	port := listener.Addr().(*net.TCPAddr).Port
+	var evaluatedExpr string
+	var srv *httptest.Server
+	srv = &httptest.Server{
+		Listener: listener,
+		Config: &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/json/list":
+				_ = json.NewEncoder(w).Encode([]WindowsCDPTarget{{Type: "node", WebSocketDebuggerURL: "ws://127.0.0.1:" + strconv.Itoa(port) + "/00000000-0000-4000-a000-000000000003"}})
+				return
+			case "/00000000-0000-4000-a000-000000000003":
+				conn, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					return
+				}
+				// The injected bootstrap source is larger than the library default.
+				conn.SetReadLimit(32 << 20)
+				defer conn.Close(websocket.StatusNormalClosure, "")
+				for {
+					_, raw, err := conn.Read(r.Context())
+					if err != nil {
+						return
+					}
+					var msg struct {
+						ID     int             `json:"id"`
+						Method string          `json:"method"`
+						Params json.RawMessage `json:"params"`
+					}
+					if json.Unmarshal(raw, &msg) != nil {
+						return
+					}
+					var resp any
+					if msg.Method == "Runtime.evaluate" {
+						var p struct {
+							Expression string `json:"expression"`
+						}
+						_ = json.Unmarshal(msg.Params, &p)
+						value := any(map[string]any{})
+						switch {
+						case strings.Contains(p.Expression, "clearTimeout(globalThis.__ekdDeadline)"):
+							// The host closed its inspector: stop accepting so the
+							// port really becomes unavailable, as a closed one is.
+							value = true
+							go srv.Listener.Close()
+						case strings.Contains(p.Expression, "__ekdDeadline=setTimeout"):
+							value = map[string]any{"pid": 6001, "type": "browser", "electron": "45.1.0"}
+						case strings.Contains(p.Expression, "appVersion:app.getVersion()"):
+							value = map[string]any{"appVersion": "1.3.7", "electron": "45.1.0", "ready": true}
+						default:
+							evaluatedExpr = p.Expression
+							value = map[string]any{"status": "installed", "transport": "main-loopback-rpc", "protocol": 1}
+						}
+						resp = map[string]any{"id": msg.ID, "result": map[string]any{"result": map[string]any{"value": value}}}
+					} else {
+						resp = map[string]any{"id": msg.ID, "result": map[string]any{}}
+					}
+					out, _ := json.Marshal(resp)
+					_ = conn.Write(r.Context(), websocket.MessageText, out)
+				}
+			}
+		})},
+	}
+	srv.Start()
+	defer srv.Close()
+
+	dataDir := t.TempDir()
+	attached, err := attachWindowsMain(context.Background(), WindowsCDPAttachOptions{
+		HostPID: 6001, CoreURL: "http://127.0.0.1:9", PairingToken: strings.Repeat("p", 48),
+	}, dataDir, port, func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatalf("attachWindowsMain: %v", err)
+	}
+	if attached == nil || attached.Status != "installed" {
+		t.Fatalf("unexpected attach result: %+v", attached)
+	}
+	wantRuntime, _ := filepath.Abs(filepath.Join(dataDir, "runtime.json"))
+	if !strings.Contains(evaluatedExpr, `"runtimePath":"`+wantRuntime+`"`) {
+		t.Fatalf("runtime.json path missing from the injected config: %s", evaluatedExpr)
+	}
+	if !strings.Contains(evaluatedExpr, `"windowsMainBridge":true`) {
+		t.Fatalf("windowsMainBridge missing from the injected config: %s", evaluatedExpr)
+	}
+}
+
+// A main-bridge attach that fails before its WebSocket handshake must close the
+// temporary debugging port it opened. Otherwise 9229 stays listening on the
+// client with nothing left to close it.
+func TestAttachWindowsMainClosesPortWhenHandshakeFails(t *testing.T) {
+	listener := newLocalListener(t)
+	port := listener.Addr().(*net.TCPAddr).Port
+	closed := make(chan struct{})
+	srv := &httptest.Server{
+		Listener: listener,
+		Config: &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/json/list":
+				// A node target whose WebSocket URL points at this same port, so
+				// the dial succeeds only if the test server accepts the upgrade.
+				_ = json.NewEncoder(w).Encode([]WindowsCDPTarget{{Type: "node", WebSocketDebuggerURL: "ws://127.0.0.1:" + strconv.Itoa(port) + "/00000000-0000-4000-a000-000000000002"}})
+			case "/00000000-0000-4000-a000-000000000002":
+				// Refuse the upgrade: the handshake is the step that fails here.
+				http.Error(w, "no upgrade", http.StatusBadRequest)
+			}
+		})},
+	}
+	srv.Start()
+	defer func() {
+		srv.Close()
+		select {
+		case <-closed:
+		default:
+		}
+	}()
+	if err := ensureWindowsInspectorClosed(port, 6002, func(context.Context) error { return nil }); err == nil {
+		t.Fatal("cleanup claimed success while a refusing endpoint still listened")
+	}
+	// The port is still open because the endpoint refused the handshake, which is
+	// exactly the case that has to be reported rather than hidden.
+	if windowsInspectorClosed(port) {
+		t.Fatal("test server did not stay open")
+	}
+	close(closed)
+}
+
+// newLocalListener binds an ephemeral loopback port for a test server.
+func newLocalListener(t *testing.T) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return listener
 }

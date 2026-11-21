@@ -312,20 +312,25 @@ func discoverHostPlatform(ctx context.Context, profile, dataDir string) (map[str
 	if err != nil {
 		return map[string]any{"running": false, "reason": err.Error()}, nil
 	}
+	lease := ReadWindowsLauncherState(dataDir)
+	if windowsLauncherLeaseExpired(lease, payload.Processes) {
+		_ = ClearWindowsLauncherState(dataDir)
+		lease = nil
+	}
 	kimiExe, _ := resolveWindowsKimiExecutable(dataDir, "")
 	matches, err := SelectWindowsMainProcesses(payload.SID, payload.desktopProcesses(), kimiExe, profile)
 	if err != nil {
 		return map[string]any{"running": false, "reason": err.Error()}, nil
 	}
+	corePID, _ := readCoreRuntimePID(dataDir)
 	if len(matches) != 1 {
 		state := ReadAttachState(dataDir)
-		if windowsCurrentAttachState(WindowsProcessInfo{}, state, false) == "reopening" {
+		if windowsCurrentAttachStateForCore(WindowsProcessInfo{}, state, false, corePID) == "reopening" {
 			return map[string]any{"running": false, "attachState": "reopening"}, nil
 		}
 		return map[string]any{"running": false, "reason": fmt.Sprintf("需要且只能找到一个 Kimi Code 主进程，实际找到 %d 个", len(matches))}, nil
 	}
 	proc := matches[0]
-	lease := ReadWindowsLauncherState(dataDir)
 	debug := IsWindowsDebugInstance(proc, lease)
 	port, hasPort := extractDebugPortArg(SplitWindowsCommandLine(proc.CommandLine))
 	fuse := "ready"
@@ -362,7 +367,7 @@ func discoverHostPlatform(ctx context.Context, profile, dataDir string) (map[str
 		res["debugPortWarning"] = portWarning
 	}
 	state := ReadAttachState(dataDir)
-	res["attachState"] = windowsCurrentAttachState(proc, state, hasPort)
+	res["attachState"] = windowsCurrentAttachStateForDir(dataDir, proc, state, hasPort, corePID)
 	res["canReopen"] = (!debug || profile != "") && fuse != "unknown-layout"
 	return res, nil
 }
@@ -385,6 +390,10 @@ func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachRe
 	}
 	proc := matches[0]
 	lease := ReadWindowsLauncherState(options.DataDir)
+	if windowsLauncherLeaseExpired(lease, payload.Processes) {
+		_ = ClearWindowsLauncherState(options.DataDir)
+		lease = nil
+	}
 	if options.Profile == "" && IsWindowsDebugInstance(proc, lease) {
 		return nil, ErrWindowsDebugInstance
 	}

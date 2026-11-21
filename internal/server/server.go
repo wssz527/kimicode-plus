@@ -32,7 +32,7 @@ import (
 	bundledPlugins "enhancedkimi/plugins"
 )
 
-var Version = "0.2.0"
+var Version = "0.2.1"
 
 type Module struct {
 	ID      string `json:"id"`
@@ -110,7 +110,10 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /enhance/v1/pair", guard.Pair)
 	app.adapter.Register(mux)
-	app.updater = newUpdater(native, cfg)
+	// The health list is read at update time, after every module has been
+	// registered, so the updater compares the candidate against the modules this
+	// core actually reports as READY.
+	app.updater = newUpdater(native, cfg, app.healthyModules)
 	registerUpdateRoutes(mux, app.updater)
 	add := func(id string, init func() error) {
 		if !settings.Modules[id] {
@@ -439,12 +442,31 @@ func (a *App) Close() error {
 	}
 	return nil
 }
-func newUpdater(native NativeOptions, cfg *config.Store) *updater.Manager {
+
+// healthyModules reports the modules this core has running right now.
+func (a *App) healthyModules() []string {
+	ids := make([]string, 0, len(a.modules))
+	for _, module := range a.modules {
+		if module.State == "READY" {
+			ids = append(ids, module.ID)
+		}
+	}
+	return ids
+}
+
+func newUpdater(native NativeOptions, cfg *config.Store, healthyModules func() []string) *updater.Manager {
 	options := updater.Options{
 		CurrentVersion: Version, DataDir: native.DataDir, Safe: cfg.Safe,
 		Executable: native.Executable, RestartState: native.RestartState, RequestRestart: native.RequestRestart,
 		TargetExecutable: func() string { return desktop.ManagedUpdateExecutable(native.DataDir) },
-		APIBaseURL:       native.UpdateAPIBaseURL, HTTPClient: native.UpdateHTTPClient,
+		HealthyModules:   healthyModules,
+		Launchd: updater.LaunchdOptions{
+			Label:   "com.user.enhanced-kimi.core-managed",
+			Enabled: func(target string) bool { return target == desktop.ManagedUpdateExecutable(native.DataDir) },
+			// The login item, not the supervisor, owns the resident process.
+			Managed: func() bool { return desktop.LaunchdManagedCore(native.DataDir) },
+		},
+		APIBaseURL: native.UpdateAPIBaseURL, HTTPClient: native.UpdateHTTPClient,
 	}
 	options.Dispatch = func(fn func() error) error {
 		err := cfg.Dispatch(fn)

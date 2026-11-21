@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ApiError } from "../api";
+import { ApiError, BRIDGE_RECONNECT_TEXT, isBridgeCredentialError } from "../api";
 
 export interface Resource<T> {
   data: T | null;
@@ -110,12 +110,16 @@ export function useAction<T = unknown>(): ActionState<T> {
 }
 
 export function errorMessage(error: unknown): string {
+  if (isBridgeCredentialError(error)) return BRIDGE_RECONNECT_TEXT;
   if (error instanceof ApiError) return error.message;
   if (error instanceof Error) return error.message;
   return "操作未完成，请重试。";
 }
 
 export function errorRecovery(error: unknown): string | null {
+  if (isBridgeCredentialError(error)) {
+    return "这是本地增强核心与界面之间的通信凭据，不是官方 Kimi 账号凭据。等待几秒后重试；持续出现时在「状态与诊断」确认增强核心仍在运行。";
+  }
   if (!(error instanceof ApiError)) return null;
   switch (error.code) {
     case "AUTH_REQUIRED":

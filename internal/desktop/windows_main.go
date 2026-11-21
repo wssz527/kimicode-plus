@@ -41,6 +41,64 @@ func windowsInspectorClosed(port int) bool {
 	return false
 }
 
+const inspectorCloseGuidance = "临时调试端口未能确认关闭，请正常退出并重新打开 Kimi Code"
+
+// ensureWindowsInspectorClosed is the last line of defence for the temporary
+// main-process debugging port. A trigger that fails before a session exists would
+// otherwise leave port 9229 listening on the client with nothing left to close
+// it. Ownership is verified first: a port held by anything other than the
+// expected host process is never touched.
+func ensureWindowsInspectorClosed(port, hostPID int, verify func(context.Context) error) error {
+	if windowsInspectorClosed(port) {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if verify != nil {
+		if err := verify(ctx); err != nil {
+			return errors.Join(errors.New(inspectorCloseGuidance), err)
+		}
+	}
+	closeViaEndpoint(ctx, port, hostPID)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if windowsInspectorClosed(port) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New(inspectorCloseGuidance)
+		}
+		select {
+		case <-ctx.Done():
+			return errors.New(inspectorCloseGuidance)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// closeViaEndpoint finds the node target on the port and asks the host itself to
+// close the inspector. Every step is best effort: the caller polls the port to
+// learn whether it actually took effect.
+func closeViaEndpoint(ctx context.Context, port, hostPID int) {
+	var targets []WindowsCDPTarget
+	if err := fetchWindowsCDPJSON(ctx, port, "/json/list", &targets); err != nil {
+		return
+	}
+	endpoint, err := windowsNodeTarget(targets, port)
+	if err != nil {
+		return
+	}
+	client := &http.Client{Transport: &http.Transport{}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	conn, _, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: client})
+	if err != nil {
+		return
+	}
+	defer conn.CloseNow()
+	session := &CDP{conn: conn, pending: map[int]chan cdpResponse{}, closed: make(chan struct{})}
+	go session.read()
+	_, _ = session.Evaluate(ctx, closeInspectorExpression(hostPID))
+}
+
 func attachWindowsMain(ctx context.Context, opts WindowsCDPAttachOptions, dataDir string, port int, verify func(context.Context) error) (attached *AttachResult, attachErr error) {
 	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
@@ -49,19 +107,21 @@ func attachWindowsMain(ctx context.Context, opts WindowsCDPAttachOptions, dataDi
 	}
 	var targets []WindowsCDPTarget
 	if err := fetchWindowsCDPJSON(ctx, port, "/json/list", &targets); err != nil {
-		return nil, err
+		return nil, errors.Join(err, ensureWindowsInspectorClosed(port, opts.HostPID, verify))
 	}
 	endpoint, err := windowsNodeTarget(targets, port)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, ensureWindowsInspectorClosed(port, opts.HostPID, verify))
 	}
 	if err := verify(ctx); err != nil {
-		return nil, err
+		return nil, errors.Join(err, ensureWindowsInspectorClosed(port, opts.HostPID, verify))
 	}
 	client := &http.Client{Transport: &http.Transport{}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	conn, _, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: client})
 	if err != nil {
-		return nil, err
+		// The port is open but this process never held a session on it, so the
+		// only way to close it is through the endpoint the host still exposes.
+		return nil, errors.Join(err, ensureWindowsInspectorClosed(port, opts.HostPID, verify))
 	}
 	conn.SetReadLimit(32 << 20)
 	cdp := &CDP{pid: opts.HostPID, conn: conn, pending: map[int]chan cdpResponse{}, closed: make(chan struct{})}
@@ -125,7 +185,8 @@ func attachWindowsMain(ctx context.Context, opts WindowsCDPAttachOptions, dataDi
 	}
 	config, err := json.Marshal(map[string]any{
 		"coreURL": opts.CoreURL, "pairingToken": opts.PairingToken, "runtimePath": runtimePath,
-		"expectedApp": identity.AppVersion, "expectedElectron": identity.Electron, "reportedApp": appVersion,
+		"windowsMainBridge": true,
+		"expectedApp":       identity.AppVersion, "expectedElectron": identity.Electron, "reportedApp": appVersion,
 		"moduleSource": string(module), "cssSource": string(css), "rendererSource": rendererBundle,
 	})
 	if err != nil {

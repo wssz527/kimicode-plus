@@ -1,11 +1,15 @@
 import { useId, useState, type ReactNode } from "react";
+import { BRIDGE_RECONNECT_TEXT, isBridgeCredentialError } from "../../api";
 import type { DemoMessage } from "../../native";
 import { Icon } from "../Icon";
 import { Badge, Spinner } from "../ui";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+export { BRIDGE_RECONNECT_TEXT, isBridgeCredentialError } from "../../api";
+
 export function errorText(error: unknown): string {
+  if (isBridgeCredentialError(error)) return BRIDGE_RECONNECT_TEXT;
   if (error instanceof Error && error.message) return error.message;
   if (typeof error === "string" && error) return error;
   return "操作没有完成，请稍后重试。";
