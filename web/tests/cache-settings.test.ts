@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
   CACHE_NOT_REPORTED,
@@ -12,6 +13,8 @@ import {
   speedLabel,
   tokenLabel,
 } from "../src/native.js";
+
+const cacheSource = readFileSync("src/components/CacheSettings.tsx", "utf8");
 
 const policy = {
   keepAlive: { enabled: false, minutes: 25 },
@@ -130,4 +133,26 @@ test("merging idleKeepAlive preserves nested providerTTL fields", () => {
   assert.equal(merged.idleKeepAlive.defaultCount, 3);
   assert.equal(merged.idleKeepAlive.providerTTL.subscriptionMinutes, 40);
   assert.equal(merged.idleKeepAlive.providerTTL.otherMinutes, 12);
+});
+
+test("the model retention dropdown resets to 全部模型 when the selected model disappears", () => {
+  // A stale value would render an empty <select> whose label no longer matches any
+  // observation row, so the component clears it as soon as the model is missing.
+  assert.match(cacheSource, /if \(!retentionModel\) return;[\s\S]*?setRetentionModel\(""\)/);
+  assert.match(cacheSource, /retention\?\.byModel\?\.some\(item => item\.model === retentionModel\)/);
+  // Options carry the sample count so two same-named buckets stay distinguishable.
+  assert.match(cacheSource, /typeof item\.samples === "number" && item\.samples > 0/);
+  assert.match(cacheSource, /（\$\{item\.samples\} 次）/);
+});
+
+test("the sparkline scales against a single peak and marks empty buckets", () => {
+  // One peak per render, not one per bar: the previous implementation recomputed it
+  // inside the map, and empty buckets drew a full-accessibility accent bar.
+  assert.equal(cacheSource.match(/reduce\(/g)?.length, 1);
+  assert.equal(cacheSource.includes("Math.max(...history.points.map"), false);
+  assert.match(cacheSource, /const peakTokens = historyPoints\.reduce/);
+  assert.match(cacheSource, /const empty = total === 0/);
+  assert.match(cacheSource, /eks-spark-bar\$\{empty \? " is-empty" : ""\}/);
+  assert.match(cacheSource, /height: empty \? "2px"/);
+  assert.match(cacheSource, /：无记录/);
 });

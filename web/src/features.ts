@@ -5,7 +5,13 @@ export interface WorkspaceLayout { columns: number; panes: { HostID: string; Ses
 export interface Migration { id: string; target: string; browser: string; mode: string; count: number; conflicts: string[]; skipped: number; state: string }
 export interface ProviderThread extends ChatThread { providerId?: string; projectId?: string; lastRequest?: { id: string; state: string; note: string } }
 export const features = {
-  vault: () => coreRequest<{ unlocked: boolean; refs: string[]; backend: string }>("/credentials"),
+  vault: () =>
+    coreRequest<{ unlocked: boolean; refs: string[]; backend: string; osKeychain?: boolean; osKeychainAvailable?: boolean; osKeychainBackend?: string; legacyPasswordVault?: boolean }>("/credentials"),
+  resetVault: () =>
+    coreRequest<{ unlocked: boolean; refs: string[]; backend: string; osKeychain?: boolean; osKeychainAvailable?: boolean; osKeychainBackend?: string; legacyPasswordVault?: boolean }>("/credentials/reset", {
+      method: "POST",
+      body: { confirm: true },
+    }),
   unlock: (password: string) => coreRequest("/credentials/unlock", { method: "POST", body: { password } }),
   lock: () => coreRequest("/credentials/lock", { method: "POST", body: {} }),
   saveSecret: (ref: string, value: string) => coreRequest("/credentials", { method: "PUT", body: { ref, value } }),

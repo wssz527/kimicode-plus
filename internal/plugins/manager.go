@@ -94,8 +94,8 @@ func WithResolver(resolver *net.Resolver) Option {
 }
 
 // EnableGate lets another component refuse an enable before the plugin becomes
-// live. The KCT migration uses it so the adapter cannot start while the
-// standalone injector is still loaded. A gate answers a code the page can act
+// live. The KCT and Monitor migrations use it so a plugin cannot start while a
+// standalone injector is still installed. A gate answers a code the page can act
 // on, or an empty code to allow the enable.
 type EnableGate interface {
 	CheckEnable(ctx context.Context, id string) (code, message string)
@@ -206,7 +206,7 @@ type Manager struct {
 	vault    *credentials.Vault
 	bundled  func() (map[string]map[string][]byte, error)
 	now      func() time.Time
-	gate     EnableGate
+	gates    []EnableGate
 
 	officialDigests OfficialDigests
 	views           map[string]map[string]*browserView
@@ -307,12 +307,16 @@ func (m *Manager) UseStopPluginWork(stop func(ctx context.Context, id string) er
 	m.mu.Unlock()
 }
 
-// UseEnableGate attaches the gate after construction for the same reason as
-// UseCore: the migration service needs the data directory and the store, which
-// the server knows only once the manager exists.
+// UseEnableGate registers a gate after construction for the same reason as
+// UseCore: the migration services need the data directory and the store, which
+// the server knows only once the manager exists. Gates accumulate; an enable is
+// refused with the first non-empty answer.
 func (m *Manager) UseEnableGate(gate EnableGate) {
+	if gate == nil {
+		return
+	}
 	m.mu.Lock()
-	m.gate = gate
+	m.gates = append(m.gates, gate)
 	m.mu.Unlock()
 }
 
@@ -762,9 +766,12 @@ func (m *Manager) enable(ctx context.Context, id string, force bool) (Plugin, er
 	}
 
 	m.mu.Lock()
-	gate := m.gate
+	gates := append([]EnableGate(nil), m.gates...)
 	m.mu.Unlock()
-	if gate != nil {
+	for _, gate := range gates {
+		if gate == nil {
+			continue
+		}
 		if code, message := gate.CheckEnable(ctx, id); code != "" {
 			m.fail(ctx, id, StateBlocked, message, ActivityBlocked, now)
 			return m.Get2(id), apiError(http.StatusConflict, code, message)

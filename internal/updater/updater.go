@@ -41,24 +41,27 @@ var (
 )
 
 type Options struct {
-	CurrentVersion    string
-	Executable        string
-	TargetExecutable  func() string
-	DataDir           string
-	Safe              func() bool
-	Dispatch          func(func() error) error
-	RestartState      func() RestartState
-	RequestRestart    func()
-	launchSupervisor  func(string, string) error
-	Launchd           LaunchdOptions
-	HealthyModules    func() []string
-	APIBaseURL        string
-	AllowInsecureHTTP bool
-	AllowTemporaryExe bool
-	GOOS              string
-	GOARCH            string
-	HTTPClient        *http.Client
-	Now               func() time.Time
+	CurrentVersion        string
+	Executable            string
+	TargetExecutable      func() string
+	DataDir               string
+	Safe                  func() bool
+	Dispatch              func(func() error) error
+	RestartState          func() RestartState
+	RequestRestart        func()
+	launchSupervisor      func(string, string) error
+	Launchd               LaunchdOptions
+	HealthyModules        func() []string
+	APIBaseURL            string
+	AllowInsecureHTTP     bool
+	AllowTemporaryExe     bool
+	GOOS                  string
+	GOARCH                string
+	HTTPClient            *http.Client
+	Now                   func() time.Time
+	OnStatusChange        func(Status)
+	AutoCheckInitialDelay time.Duration
+	AutoCheckInterval     time.Duration
 }
 
 // LaunchdOptions describes the macOS login item that owns the resident core.
@@ -90,6 +93,7 @@ type Status struct {
 	DownloadedBytes   int64         `json:"downloadedBytes"`
 	TotalBytes        int64         `json:"totalBytes"`
 	LastAttempt       *UpdateResult `json:"lastAttempt,omitempty"`
+	AutoCheck         bool          `json:"autoCheck"`
 }
 
 type asset struct {
@@ -120,6 +124,15 @@ type Manager struct {
 	status    Status
 	archive   asset
 	checksums asset
+
+	statusWake       chan struct{}
+	publishedState   string
+	publishedPercent int
+	lastCheck        time.Time
+
+	autoCheckWake chan struct{}
+	autoCheckOnce sync.Once
+	autoCheckDone chan struct{}
 }
 
 func New(options Options) *Manager {
@@ -142,7 +155,8 @@ func New(options Options) *Manager {
 		options.Executable = executable
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	m := &Manager{options: options, ctx: ctx, cancel: cancel, status: Status{State: Idle, CurrentVersion: strings.TrimPrefix(options.CurrentVersion, "v")}}
+	m := &Manager{options: options, ctx: ctx, cancel: cancel, status: Status{State: Idle, CurrentVersion: strings.TrimPrefix(options.CurrentVersion, "v")}, autoCheckWake: make(chan struct{}, 1)}
+	m.status.AutoCheck = readAutoCheck(options.DataDir)
 	if options.HTTPClient != nil {
 		m.client = *options.HTTPClient
 	}
@@ -184,6 +198,10 @@ func New(options Options) *Manager {
 	} else {
 		m.status.State, m.status.Error = Failed, m.configErr.Error()
 	}
+	if options.OnStatusChange != nil {
+		m.statusWake = make(chan struct{}, 1)
+		go m.runStatusNotifier()
+	}
 	return m
 }
 
@@ -215,8 +233,56 @@ func (m *Manager) Status() Status {
 
 func (m *Manager) change(update func(*Status)) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	update(&m.status)
+	notify := m.statusAdvanced(m.status)
+	m.mu.Unlock()
+	if notify {
+		m.announce()
+	}
+}
+
+// commit replaces the whole status but keeps the auto-check preference, which
+// can change while a check that snapshotted the status is still in flight.
+func (m *Manager) commit(status Status) {
+	m.change(func(s *Status) {
+		status.AutoCheck = s.AutoCheck
+		*s = status
+	})
+}
+
+func (m *Manager) statusAdvanced(status Status) bool {
+	percent := 0
+	if status.State == Downloading && status.TotalBytes > 0 {
+		percent = int(min(status.DownloadedBytes, status.TotalBytes) * 100 / status.TotalBytes)
+	}
+	if status.State == m.publishedState && percent < m.publishedPercent+5 {
+		return false
+	}
+	m.publishedState, m.publishedPercent = status.State, percent
+	return true
+}
+
+func (m *Manager) announce() {
+	if m.statusWake == nil {
+		return
+	}
+	select {
+	case m.statusWake <- struct{}{}:
+	default:
+	}
+}
+
+// Status changes are delivered from this goroutine so a slow subscriber can
+// never stall a check, download, or restart.
+func (m *Manager) runStatusNotifier() {
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-m.statusWake:
+			m.options.OnStatusChange(m.Status())
+		}
+	}
 }
 
 func (m *Manager) Close() {
@@ -248,13 +314,22 @@ func (m *Manager) Check(ctx context.Context) (Status, error) {
 	return m.check(ctx)
 }
 
-func (m *Manager) check(ctx context.Context) (response Status, err error) {
+// check performs a foreground check for callers that already own m.operation.
+func (m *Manager) check(ctx context.Context) (Status, error) {
+	return m.checkInternal(ctx, false)
+}
+
+func (m *Manager) checkInternal(ctx context.Context, silent bool) (response Status, err error) {
 	if m.configErr != nil {
 		return m.Status(), m.configErr
 	}
+	m.mu.RLock()
+	previous := m.status
+	m.mu.RUnlock()
+	previousArchive, previousChecksums := m.archive, m.checksums
 	status := Status{State: Checking, CurrentVersion: strings.TrimPrefix(m.options.CurrentVersion, "v"), ReleaseURL: "https://github.com/" + m.repo + "/releases"}
 	m.archive, m.checksums = asset{}, asset{}
-	m.change(func(s *Status) { *s = status })
+	m.commit(status)
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	stop := context.AfterFunc(m.ctx, cancel)
@@ -262,7 +337,18 @@ func (m *Manager) check(ctx context.Context) (response Status, err error) {
 	published, err := m.latest(ctx)
 	status.CheckedAt = m.options.Now().UTC().Format(time.RFC3339)
 	defer func() {
-		m.change(func(s *Status) { *s = status })
+		if err != nil && silent && preservedOnSilentFailure(previous.State) {
+			m.archive, m.checksums = previousArchive, previousChecksums
+			m.commit(previous)
+			response = m.Status()
+			return
+		}
+		if err == nil {
+			m.mu.Lock()
+			m.lastCheck = m.options.Now()
+			m.mu.Unlock()
+		}
+		m.commit(status)
 		response = m.Status()
 	}()
 	if err != nil {

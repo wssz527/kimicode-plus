@@ -164,7 +164,7 @@ func nativeActionPermission(action string) string {
 		return "core:read"
 	case "accounts.list", "accounts.switchPreflight":
 		return "credentials:read"
-	case "accounts.saveCurrent", "accounts.beginAdd", "accounts.completeAdd", "accounts.rename", "accounts.delete", "accounts.refreshQuotas", "accounts.switch", "accounts.cancelPending":
+	case "accounts.saveCurrent", "accounts.beginAdd", "accounts.completeAdd", "accounts.rename", "accounts.delete", "accounts.refreshQuotas", "accounts.switch", "accounts.cancelPending", "accounts.resetVault":
 		return "credentials:write"
 	case "contracts.report":
 		return "adapter:write"
@@ -178,7 +178,7 @@ func nativeActionPermission(action string) string {
 		return "chat:read"
 	case "update.status":
 		return "update:read"
-	case "update.check", "update.apply":
+	case "update.check", "update.apply", "update.autoCheck":
 		return "update:write"
 	default:
 		if strings.HasPrefix(action, "planner.") {

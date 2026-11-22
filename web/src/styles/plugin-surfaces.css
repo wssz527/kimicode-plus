@@ -61,30 +61,249 @@
 .ekdp-settings {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 14px 16px;
-  border: 1px solid var(--color-line, rgba(128, 128, 128, 0.25));
-  border-radius: 10px;
+  gap: 12px;
+  color: var(--ekds-text, var(--color-text, var(--ink, inherit)));
+  font-size: 13px;
+  line-height: 1.55;
 }
 
 .ekdp-settings h3 {
   margin: 0;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
 }
 
 .ekdp-settings p {
   margin: 0;
-  line-height: 1.6;
-  color: var(--color-text-secondary, inherit);
+  line-height: 1.55;
+  color: var(--ekds-muted, var(--color-text-muted, var(--color-text-secondary, var(--ink-muted, inherit))));
+  font-size: 12.5px;
+}
+
+.ekdp-intro {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--ekds-muted, var(--color-text-muted, var(--color-text-secondary, var(--ink-muted, inherit))));
+}
+
+.ekdp-group {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: var(--ekds-hairline, 1px solid var(--color-line, var(--line, rgba(128, 128, 128, 0.22))));
+  border-radius: var(--ekds-radius, 12px);
+  background: var(--ekds-surface, var(--color-surface, var(--surface-raised, transparent)));
+}
+
+.ekdp-group[hidden] {
+  display: none;
+}
+
+.ekdp-setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  border-top: var(--ekds-hairline, 1px solid var(--color-line, var(--line, rgba(128, 128, 128, 0.2))));
+}
+
+.ekdp-setting-row:first-child {
+  border-top: 0;
+}
+
+.ekdp-setting-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.ekdp-setting-control {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.ekdp-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 16px;
+  border-top: var(--ekds-hairline, 1px solid var(--color-line, var(--line, rgba(128, 128, 128, 0.2))));
+}
+
+.ekdp-field:first-child {
+  border-top: 0;
+}
+
+.ekdp-label {
   font-size: 13px;
+  font-weight: 500;
+  color: var(--ekds-text, var(--color-text, var(--ink-strong, inherit)));
+}
+
+.ekdp-hint {
+  display: block;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ekds-muted, var(--color-text-muted, var(--color-text-secondary, var(--ink-muted, inherit))));
+}
+
+.ekdp-select,
+.ekdp-input {
+  height: 32px;
+  padding: 0 10px;
+  border: var(--ekds-hairline, 1px solid var(--color-line, var(--line, rgba(128, 128, 128, 0.28))));
+  border-radius: 8px;
+  background: var(--ekds-bg, var(--color-bg, var(--paper, transparent)));
+  color: var(--ekds-text, var(--color-text, var(--ink, inherit)));
+  font: 12.5px/1.4 var(--font-ui, var(--font-sans, system-ui, sans-serif));
+  box-sizing: border-box;
+}
+
+.ekdp-select {
+  min-width: 152px;
+  cursor: pointer;
+}
+
+.ekdp-input {
+  width: 100%;
+  min-width: 0;
+}
+
+.ekdp-select:focus-visible,
+.ekdp-input:focus-visible,
+.ekdp-button:focus-visible,
+.ekdp-switch:focus-visible {
+  outline: none;
+  box-shadow: var(--ekds-ring, 0 0 0 2px var(--color-accent, var(--accent, #2563eb)));
+}
+
+.ekdp-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.ekdp-input-row .ekdp-input {
+  flex: 1 1 auto;
+}
+
+.ekdp-switch {
+  flex: none;
+  width: 36px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--ekds-line, rgba(128, 128, 128, 0.3)) 85%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ekds-muted, #888) 26%, transparent);
+  cursor: pointer;
+  position: relative;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.ekdp-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: transform 140ms ease;
+}
+
+.ekdp-switch[aria-checked="true"] {
+  border-color: transparent;
+  background: var(--ekds-accent, var(--color-accent, var(--accent, #2563eb)));
+}
+
+.ekdp-switch[aria-checked="true"]::after {
+  transform: translateX(16px);
+}
+
+.ekdp-switch:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.ekdp-button {
+  flex: none;
+  height: 30px;
+  padding: 0 12px;
+  border: var(--ekds-hairline, 1px solid var(--color-line, var(--line, rgba(128, 128, 128, 0.28))));
+  border-radius: 8px;
+  background: var(--ekds-bg, var(--color-bg, var(--surface-raised, transparent)));
+  color: var(--ekds-text, var(--color-text, var(--ink, inherit)));
+  font: 500 12px/1 var(--font-ui, var(--font-sans, system-ui, sans-serif));
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 120ms ease, filter 120ms ease;
+}
+
+.ekdp-button:hover:not(:disabled) {
+  background: var(--ekds-hover, var(--color-hover, rgba(128, 128, 128, 0.12)));
+}
+
+.ekdp-button-primary {
+  border-color: transparent;
+  background: var(--ekds-accent, var(--color-accent, var(--accent, #2563eb)));
+  color: var(--color-text-on-accent, #fff);
+}
+
+.ekdp-button-primary:hover:not(:disabled) {
+  background: var(--ekds-accent, var(--color-accent, var(--accent, #2563eb)));
+  filter: brightness(1.08);
+}
+
+.ekdp-button-quiet {
+  background: transparent;
+}
+
+.ekdp-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ekdp-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ekdp-status {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ekds-muted, var(--color-text-muted, var(--ink-muted, inherit)));
+}
+
+.ekdp-status[data-tone="ok"] {
+  color: var(--success, #27865a);
+}
+
+.ekdp-status[data-tone="error"] {
+  color: var(--color-danger, var(--danger, #c64b52));
+}
+
+.ekdp-diag {
+  margin: 0;
+  font-size: 11px;
+  color: var(--ekds-faint, var(--color-text-faint, var(--ink-faint, inherit)));
 }
 
 .ekdp-muted {
-  margin-top: 10px;
-  color: var(--color-text-secondary, inherit);
+  margin-top: 6px;
+  color: var(--ekds-muted, var(--color-text-secondary, inherit));
   font-size: 12px;
-  opacity: 0.75;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -146,10 +365,178 @@
   flex-direction: column;
   gap: 14px;
   min-width: 0;
+  color: var(--ekds-text, var(--color-text, inherit));
 }
 
-.ekds-plugins .plugins-list-head p {
+/* These rows are scoped to the settings surfaces: the same component also
+   renders the standalone 增强插件 page, which keeps its card affordance. */
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .panel {
+  border: var(--ekds-hairline, 1px solid var(--color-line, transparent));
+  border-radius: var(--ekds-radius, 12px);
+  background: color-mix(in srgb, var(--ekds-muted, #888) 6%, transparent);
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .panel-title {
+  color: var(--ekds-text, var(--color-text, inherit));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins ul.plugin-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow: hidden;
+  border: var(--ekds-hairline, 1px solid var(--color-line, transparent));
+  border-radius: var(--ekds-radius, 14px);
+  background: var(--ekds-surface, var(--color-surface, transparent));
+}
+
+/* A row is a list item, not a card: the left side stays the hit target and a
+   sibling quick toggle sits at the trailing edge instead of wrapping under it. */
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-list > li.plugin {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border: 0;
+  border-top: var(--ekds-hairline, 1px solid var(--color-line, transparent));
+  border-radius: 0;
+  background: transparent;
+  transition: background 120ms ease;
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-list > li.plugin:first-child {
+  border-top: 0;
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-list > li.plugin:hover {
+  background: var(--ekds-hover, var(--color-hover, rgba(128, 128, 128, 0.08)));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-list > li.plugin.muted {
+  background: transparent;
+  color: var(--ekds-muted, var(--color-text-secondary, inherit));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-list > li.plugin.muted:hover {
+  background: var(--ekds-hover, var(--color-hover, rgba(128, 128, 128, 0.08)));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-open {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
+  align-items: center;
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-row-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-line {
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 3px;
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-line strong {
+  color: var(--ekds-text, var(--color-text, inherit));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-line .num {
+  color: var(--ekds-faint, var(--color-text-faint, inherit));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-desc {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ekds-muted, var(--color-text-secondary, inherit));
+  font-size: 12px;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-tag {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  padding: 0 7px;
+  border: 1px solid var(--ekds-line, var(--color-line, transparent));
+  border-radius: 999px;
+  color: var(--ekds-muted, var(--color-text-secondary, inherit));
+  font-size: 11px;
+  line-height: 1.65;
+  white-space: nowrap;
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-glyph {
+  background: color-mix(in srgb, var(--ekds-muted, #888) 12%, transparent);
+  color: var(--ekds-muted, var(--color-text-secondary, inherit));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-chevron {
+  color: var(--ekds-faint, var(--color-text-faint, inherit));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-open:hover .plugin-chevron {
+  color: var(--ekds-text, var(--color-text, inherit));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugins-detail-head h2,
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugins-list-head h2,
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-section-head h3 {
+  color: var(--ekds-text, var(--color-text, inherit));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugins-detail-desc,
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugins-list-head p {
   margin-top: 0;
+  color: var(--ekds-muted, var(--color-text-secondary, inherit));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-settings-disabled,
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-details-disclosure,
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-danger-bar {
+  border: var(--ekds-hairline, 1px solid var(--color-line, transparent));
+  border-radius: var(--ekds-radius, 12px);
+  background: var(--ekds-surface, var(--color-surface, transparent));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-details-disclosure > summary {
+  color: var(--ekds-text, var(--color-text, inherit));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-details-disclosure > summary .num {
+  color: var(--ekds-faint, var(--color-text-faint, inherit));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-details-body {
+  border-top: var(--ekds-hairline, 1px solid var(--color-line, transparent));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .input {
+  height: 32px;
+  padding: 0 10px;
+  border: var(--ekds-hairline, 1px solid var(--color-line, rgba(128, 128, 128, 0.28)));
+  border-radius: 8px;
+  background: var(--ekds-bg, var(--color-bg, transparent));
+  color: var(--ekds-text, var(--color-text, inherit));
+  font: 12.5px/1.4 var(--font-ui, var(--font-sans, system-ui, sans-serif));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .input:focus-visible {
+  outline: none;
+  box-shadow: var(--ekds-ring, 0 0 0 2px var(--color-accent, #2563eb));
 }
 
 .ekds-plugins .notice-error .notice-copy p {

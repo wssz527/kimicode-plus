@@ -107,17 +107,31 @@ export function PluginCredentials({ plugin }: { plugin: PluginRecord }) {
   const granted = grantedCredentialNames(plugin);
   const vault = useResource("vault", features.vault);
   const action = useAction<unknown>();
+  const resetAction = useAction<unknown>();
   const [password, setPassword] = useState("");
+  const [confirmReset, setConfirmReset] = useState(false);
 
   if (names.length === 0) return null;
 
   const unlocked = Boolean(vault.data?.unlocked);
+  const osKeychain = vault.data?.osKeychain === true;
+  const osKeychainAvailable = vault.data?.osKeychainAvailable === true;
+  const legacyPasswordVault = vault.data?.legacyPasswordVault === true;
   const refs = new Set(vault.data?.refs ?? []);
   const ungranted = names.filter(name => !granted.has(name));
 
   async function unlock() {
     const done = await action.run(() => features.unlock(password));
     if (done) {
+      setPassword("");
+      vault.reload();
+    }
+  }
+
+  async function reset() {
+    const done = await resetAction.run(() => features.resetVault());
+    if (done) {
+      setConfirmReset(false);
       setPassword("");
       vault.reload();
     }
@@ -138,6 +152,13 @@ export function PluginCredentials({ plugin }: { plugin: PluginRecord }) {
       {vault.error ? (
         <ErrorNotice message={errorMessage(vault.error)} recovery={errorRecovery(vault.error)} />
       ) : null}
+      {unlocked && osKeychain ? (
+        <InfoNote>
+          <p>
+            凭据由系统凭据库自动托管（macOS 钥匙串 / Windows DPAPI），无需再记密码；换机或清空系统钥匙串后才需要重新解锁。
+          </p>
+        </InfoNote>
+      ) : null}
       {!unlocked && !vault.error ? (
         <form
           className="plugin-credential-unlock"
@@ -147,9 +168,17 @@ export function PluginCredentials({ plugin }: { plugin: PluginRecord }) {
           }}
         >
           <Field
-            label="解锁口令"
+            label={legacyPasswordVault ? "原解锁口令" : "解锁口令"}
             htmlFor="plugin-credential-password"
-            hint="首次设置需至少 12 个字符。口令只在内存中用于解密，重启后需要重新输入。"
+            hint={
+              legacyPasswordVault
+                ? osKeychainAvailable
+                  ? "输入一次原口令即可解锁，随后会转入系统凭据库自动托管，以后不再询问。"
+                  : "这是旧版密码保护的凭据库。输入原口令解锁；忘记口令可重置。"
+                : osKeychainAvailable
+                  ? "首次设置需至少 12 个字符。设置后会存入系统凭据库，重启时自动解锁。"
+                  : "首次设置需至少 12 个字符。口令只在内存中用于解密，重启后需要重新输入。"
+            }
           >
             <input
               id="plugin-credential-password"
@@ -157,19 +186,51 @@ export function PluginCredentials({ plugin }: { plugin: PluginRecord }) {
               type="password"
               autoComplete="current-password"
               value={password}
-              disabled={action.busy}
+              disabled={action.busy || resetAction.busy}
               onChange={event => setPassword(event.target.value)}
             />
           </Field>
           <div className="inline-actions">
-            <ActionButton type="submit" icon="lock" busy={action.busy} disabled={password.length < 12}>
-              解锁 / 初始化凭据库
+            <ActionButton type="submit" icon="lock" busy={action.busy} disabled={password.length < 12 || resetAction.busy}>
+              {legacyPasswordVault ? (osKeychainAvailable ? "解锁并转为自动托管" : "解锁") : "解锁 / 初始化凭据库"}
             </ActionButton>
           </div>
           {action.error ? (
             <ErrorNotice message={errorMessage(action.error)} recovery={errorRecovery(action.error)} onDismiss={action.clearError} />
           ) : null}
         </form>
+      ) : null}
+      {!unlocked && !vault.error && (legacyPasswordVault || osKeychainAvailable) ? (
+        confirmReset ? (
+          <div className="plugin-credential-form" role="group" aria-label="重置凭据库确认">
+            <p className="plugin-credential-detail">
+              {osKeychainAvailable
+                ? "重置会清空旧凭据库中已加密的全部凭据，并立即建立一个由系统凭据库托管、已解锁的新库。已保存的凭据值无法恢复，需要重新填写。"
+                : "重置会清空旧凭据库中已加密的全部凭据，随后需要设置一个新的解锁口令。已保存的凭据值无法恢复，需要重新填写。"}
+            </p>
+            <div className="inline-actions">
+              <ActionButton variant="danger" icon="check" busy={resetAction.busy} onClick={() => void reset()}>
+                确认重置凭据库
+              </ActionButton>
+              <ActionButton variant="quiet" disabled={resetAction.busy} onClick={() => setConfirmReset(false)}>
+                取消
+              </ActionButton>
+            </div>
+            {resetAction.error ? (
+              <ErrorNotice
+                message={errorMessage(resetAction.error)}
+                recovery={errorRecovery(resetAction.error)}
+                onDismiss={resetAction.clearError}
+              />
+            ) : null}
+          </div>
+        ) : (
+          <div className="inline-actions">
+            <ActionButton variant="quiet" icon="refresh" disabled={action.busy || resetAction.busy} onClick={() => setConfirmReset(true)}>
+              忘记旧密码？重置凭据库
+            </ActionButton>
+          </div>
+        )
       ) : null}
       <ul className="plugin-credential-list">
         {names.map(name => (

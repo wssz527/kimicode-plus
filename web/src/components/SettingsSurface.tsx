@@ -2,11 +2,16 @@ import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "../auth";
 import { Icon } from "./Icon";
 import { CacheSettings } from "./CacheSettings";
-import { PluginSettings } from "./PluginSettings";
 import { WindowsAttachStatusPanel, type WindowsAttachReport } from "./WindowsAttachStatus";
 import { errorText } from "./workbench/pieces";
 import { NativeSettings } from "./NativeSettings";
-import { AccountSettingsSection, FallbackNotice, LabSettingsSection } from "./OfficialSettingsSections";
+import { Toggle } from "./ui";
+import {
+  AccountSettingsSection,
+  FallbackNotice,
+  LabSettingsSection,
+  PluginsSettingsSection,
+} from "./OfficialSettingsSections";
 import { resolveSettingsFallbacks } from "../plugin-runtime/contracts";
 import type { NativeHost } from "../native";
 import "../styles/native-settings-surface.css";
@@ -30,11 +35,20 @@ export interface ContractReport {
   probes: ContractProbe[];
 }
 
+const FEATURE_ENTRIES = [
+  { label: "缓存与用量", where: "「缓存与用量」标签页", note: "命中率、会话空闲时长、保活与压缩策略。" },
+  { label: "插件", where: "官方「插件 → KimiCode+」", note: "本地增强插件、配置与授权管理。" },
+  { label: "实验室", where: "官方「实验室」标签页", note: "会话并排与规划等实验性功能。" },
+  { label: "账户", where: "官方「账户」标签页", note: "多账号切换、额度与登录状态。" },
+  { label: "智能体与会话", where: "官方「智能体与会话」标签页", note: "模型、权限与子智能体设置。" },
+];
+
 /**
- * The KimiCode+ settings tab renders three flat sections (缓存, 增强插件,
- * 状态与诊断). Features that belong to official tabs (账户, 智能体与会话,
- * 实验室) mount directly into those official tabs and only fall back here when
- * their corresponding DOM probe is disabled.
+ * The KimiCode+ settings tab is a single diagnostics surface plus a quiet
+ * overview of where every KimiCode+ feature lives. Cache owns the dedicated
+ * 「缓存与用量」tab; enhanced plugins mount into the official 「插件」tab. Features
+ * that belong to official tabs (账户, 智能体与会话, 插件, 实验室) only fall back
+ * here when their corresponding DOM probe is disabled.
  */
 export function SettingsWindow({
   host,
@@ -44,7 +58,6 @@ export function SettingsWindow({
   initialContracts?: ContractReport | null;
 }) {
   const [contracts, setContracts] = useState<ContractReport | null>(initialContracts);
-  const [pluginDetailOpen, setPluginDetailOpen] = useState(false);
 
   const loadContracts = useCallback(async () => {
     try {
@@ -63,31 +76,35 @@ export function SettingsWindow({
 
   return (
     <div className="ekds ekds-flat" data-ekd-settings-root="flat">
-      <section className="ekds-sec" data-ekd-section="cache" hidden={pluginDetailOpen}>
+      <section className="ekds-sec" data-ekd-section="diagnostics">
         <div className="ekds-sec-head">
-          <h2 className="ekds-sec-title">缓存</h2>
+          <h2 className="ekds-sec-title">状态与诊断</h2>
         </div>
         <p className="ekds-sec-desc">
-          查看本机缓存命中、会话空闲时长和实际用量，配置保活、空闲压缩与额度恢复。
+          查看增强核心与官方客户端的接入状态、各项契约检测结果、接入日志与开源许可。
         </p>
-        <CacheSettings host={host} />
+        <DiagnosticsSection host={host} contracts={contracts} onContractsChange={setContracts} />
       </section>
 
-      <section className="ekds-sec" data-ekd-section="plugins">
-        {pluginDetailOpen ? null : (
-          <>
-            <div className="ekds-sec-head">
-              <h2 className="ekds-sec-title">增强插件</h2>
+      <section className="ekds-sec" data-ekd-section="entries">
+        <div className="ekds-sec-head">
+          <h2 className="ekds-sec-title">功能入口</h2>
+        </div>
+        <p className="ekds-sec-desc">KimiCode+ 的各项功能都放在官方设置里对应的位置，不在这里重复提供开关。</p>
+        <div className="ekds-group" data-ekd-entry-summary="true">
+          {FEATURE_ENTRIES.map(entry => (
+            <div className="ekds-row" key={entry.label}>
+              <span className="ekds-row-label">
+                <strong>{entry.label}</strong>
+                <small>{entry.note}</small>
+              </span>
+              <span className="ekds-row-aside">{entry.where}</span>
             </div>
-            <p className="ekds-sec-desc">
-              管理 KimiCode+ 的本地增强插件、授权能力与运行状态，与官方插件市场相互独立。
-            </p>
-          </>
-        )}
-        <PluginSettings embedded host={host} onDetailChange={setPluginDetailOpen} />
+          ))}
+        </div>
       </section>
 
-      {!pluginDetailOpen && fallbacks.account ? (
+      {fallbacks.account ? (
         <section className="ekds-sec" data-ekd-fallback="account">
           <AccountSettingsSection
             host={host}
@@ -96,7 +113,7 @@ export function SettingsWindow({
         </section>
       ) : null}
 
-      {!pluginDetailOpen && fallbacks.agent ? (
+      {fallbacks.agent ? (
         <section className="ekds-sec" data-ekd-fallback="agent">
           <div className="ekds-sec-head">
             <h2 className="ekds-sec-title">智能体与会话</h2>
@@ -109,7 +126,16 @@ export function SettingsWindow({
         </section>
       ) : null}
 
-      {!pluginDetailOpen && fallbacks.lab ? (
+      {fallbacks.plugins ? (
+        <section className="ekds-sec" data-ekd-fallback="plugins">
+          <PluginsSettingsSection
+            host={host}
+            fallbackReason={fallbacks.plugins.reason || "官方「插件」设置页结构已变"}
+          />
+        </section>
+      ) : null}
+
+      {fallbacks.lab ? (
         <section className="ekds-sec" data-ekd-fallback="lab">
           <LabSettingsSection
             host={host}
@@ -117,15 +143,25 @@ export function SettingsWindow({
           />
         </section>
       ) : null}
+    </div>
+  );
+}
 
-      <section className="ekds-sec" data-ekd-section="diagnostics" hidden={pluginDetailOpen}>
+/**
+ * The dedicated 「缓存与用量」 settings tab. Cache data is read-only history plus
+ * opt-in policies, so it stands alone instead of sitting under 诊断.
+ */
+export function CacheSettingsSurface({ host }: { host: NativeHost }) {
+  return (
+    <div className="ekds ekds-flat" data-ekd-settings-root="cache">
+      <section className="ekds-sec" data-ekd-section="cache">
         <div className="ekds-sec-head">
-          <h2 className="ekds-sec-title">状态与诊断</h2>
+          <h2 className="ekds-sec-title">缓存与用量</h2>
         </div>
         <p className="ekds-sec-desc">
-          查看增强核心与官方客户端的接入状态、各项契约检测结果、接入日志与开源许可。
+          查看本机缓存命中、会话空闲时长和实际用量，配置保活、空闲压缩与额度恢复。
         </p>
-        <DiagnosticsSection host={host} contracts={contracts} onContractsChange={setContracts} />
+        <CacheSettings host={host} />
       </section>
     </div>
   );
@@ -203,6 +239,7 @@ export interface CoreUpdateStatus {
   updateAvailable: boolean;
   canApply: boolean;
   cannotApplyReason?: string;
+  autoCheck?: boolean;
   note?: string;
   error?: string;
   downloadedBytes: number;
@@ -259,6 +296,13 @@ export function checkCoreUpdate(host: Pick<NativeHost, "request">): Promise<Core
   return host.request<CoreUpdateStatus>("update.check");
 }
 
+export function setCoreAutoCheck(
+  host: Pick<NativeHost, "request">,
+  enabled: boolean,
+): Promise<CoreUpdateStatus> {
+  return host.request<CoreUpdateStatus>("update.autoCheck", { enabled });
+}
+
 export async function watchCoreUpdate(
   host: Pick<NativeHost, "request">,
   observe: (status: CoreUpdateStatus | null, reconnecting: boolean) => void,
@@ -298,7 +342,7 @@ function CoreUpdateSection({ host, fallbackVersion, onVersion, onRecovered }: {
   onRecovered: () => void;
 }) {
   const [status, setStatus] = useState<CoreUpdateStatus | null>(null);
-  const [pending, setPending] = useState<"check" | "apply" | null>(null);
+  const [pending, setPending] = useState<"check" | "apply" | "auto" | null>(null);
   const [tracking, setTracking] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const [error, setError] = useState("");
@@ -319,6 +363,12 @@ function CoreUpdateSection({ host, fallbackVersion, onVersion, onRecovered }: {
     });
     return () => { active = false; };
   }, [host, receive]);
+
+  // Background auto-checks and top-bar update actions publish the same status, so
+  // the card stays in sync without polling while the user is reading it.
+  useEffect(() => host.subscribe<CoreUpdateStatus>("update", next => {
+    if (next && typeof next === "object" && "state" in next) receive(next);
+  }), [host, receive]);
 
   useEffect(() => {
     if (!tracking) return;
@@ -380,7 +430,23 @@ function CoreUpdateSection({ host, fallbackVersion, onVersion, onRecovered }: {
     }
   }
 
+  async function toggleAutoCheck(enabled: boolean) {
+    if (pending !== null) return;
+    setPending("auto");
+    setError("");
+    try {
+      receive(await setCoreAutoCheck(host, enabled));
+    } catch (cause) {
+      setError(errorText(cause));
+      const next = await host.request<CoreUpdateStatus>("update.status").catch(() => null);
+      if (next) receive(next);
+    } finally {
+      setPending(null);
+    }
+  }
+
   const busy = pending !== null || tracking;
+  const autoCheck = status?.autoCheck !== false;
   const checked = dateText(status?.checkedAt);
   const published = dateText(status?.publishedAt, true);
   const message = pending === "check" ? "正在检查更新…" : pending === "apply" ? "正在准备下载…" : coreUpdateText(status, reconnecting);
@@ -400,6 +466,18 @@ function CoreUpdateSection({ host, fallbackVersion, onVersion, onRecovered }: {
       {status?.state === "downloading" && status.totalBytes > 0 && !reconnecting ? (
         <progress value={Math.min(status.downloadedBytes, status.totalBytes)} max={status.totalBytes} aria-label="更新下载进度" />
       ) : null}
+    </div>
+    <div className="ekds-row">
+      <span className="ekds-row-label">
+        <strong>自动检查更新</strong>
+        <small>后台定期检测 KimiCode+ 新版本；发现新版本时在主界面顶栏显示更新提示，不会自动重启客户端。</small>
+      </span>
+      <Toggle
+        label="自动检查更新"
+        checked={autoCheck}
+        disabled={pending !== null}
+        onChange={value => void toggleAutoCheck(value)}
+      />
     </div>
     {status?.updateAvailable ? <>
       <div className="ekds-row">

@@ -5,7 +5,9 @@ import {
   formatAccountQuotaLine,
   listAccounts,
   preflightAccountSwitch,
+  resetAccountVault,
   switchAccount,
+  type AccountsState,
   type NativeHost,
 } from "../src/native.js";
 
@@ -46,4 +48,66 @@ test("N3 account management stays in official account tab and user-menu without 
   assert.ok(renderer.includes("refreshOfficialAuth"));
   assert.ok(renderer.includes("ekd:account-switched"));
   assert.ok(renderer.includes("account-switch-modal"));
+});
+
+test("resetAccountVault asks the core for an explicit confirmed reset", async () => {
+  const calls: { action: string; payload: unknown }[] = [];
+  const host = {
+    request: async (action: string, payload?: unknown) => {
+      calls.push({ action, payload });
+      return {} as never;
+    },
+  } as unknown as NativeHost;
+
+  await resetAccountVault(host);
+
+  // The core refuses a reset without confirm:true, so the wrapper must send it.
+  assert.deepEqual(calls, [{ action: "accounts.resetVault", payload: { confirm: true } }]);
+});
+
+test("AccountsState carries the OS key store fields the vault reports", () => {
+  const state: AccountsState = {
+    vaultUnlocked: true,
+    vaultOsKeychain: true,
+    vaultOsKeychainAvailable: true,
+    vaultOsKeychainBackend: "MACOS_KEYCHAIN",
+    legacyPasswordVault: false,
+    signedIn: true,
+    accounts: [],
+    cliRunning: false,
+  };
+  assert.equal(state.vaultOsKeychain, true);
+  assert.equal(state.vaultOsKeychainBackend, "MACOS_KEYCHAIN");
+  assert.equal(state.legacyPasswordVault, false);
+
+  // A core that predates OS key management answers without these fields; the
+  // panel must not treat that as "no key store" or crash on the missing keys.
+  const legacy: AccountsState = { vaultUnlocked: false, signedIn: false, accounts: [], cliRunning: false };
+  assert.equal(legacy.vaultOsKeychain, undefined);
+  assert.equal(legacy.vaultOsKeychainAvailable, undefined);
+  assert.equal(legacy.legacyPasswordVault, undefined);
+});
+
+test("the accounts section hides the password prompt once the OS vault auto-unlocks", () => {
+  const section = readFileSync("src/components/AccountsSection.tsx", "utf8");
+  // Unlocked: only a calm status line, never the password form.
+  assert.ok(section.includes("state.vaultUnlocked && state.vaultOsKeychain"), "no OS-managed unlocked branch");
+  assert.ok(section.includes("由 macOS 钥匙串自动解锁"), "macOS keychain hint missing");
+  assert.ok(section.includes("由 Windows DPAPI 自动解锁"), "Windows DPAPI hint missing");
+  assert.ok(section.includes("系统凭据库已自动解锁"), "generic key store hint missing");
+  // The unlock form stays keyed on a locked vault alone.
+  assert.ok(section.includes("{state && !state.vaultUnlocked ? ("), "the unlock form must only render while locked");
+});
+
+test("a forgotten legacy vault password can be reset in two steps and says what is lost", () => {
+  const section = readFileSync("src/components/AccountsSection.tsx", "utf8");
+  assert.ok(section.includes("检测到旧版密码保护的凭据库"), "the legacy vault is not explained");
+  assert.ok(section.includes("解锁并转为自动托管"), "the migrating unlock action is missing");
+  assert.ok(section.includes("忘记密码，重置凭据库"), "the reset entry is missing");
+  assert.ok(section.includes("确认重置凭据库"), "the second confirmation step is missing");
+  assert.ok(section.includes("resetAccountVault(host)"), "the reset does not go through the host action");
+  assert.ok(section.includes("已重置并切换为系统自动托管"), "a successful reset is not confirmed");
+  // The copy must be honest about the destructive part and the untouched login.
+  assert.ok(section.includes("不会让你退出当前官方"), "the copy does not say the official login survives");
+  assert.ok(section.includes("state.legacyPasswordVault || state.vaultOsKeychainAvailable"), "both legacy markers should offer the reset");
 });

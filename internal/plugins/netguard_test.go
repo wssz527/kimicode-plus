@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -124,6 +125,52 @@ func ipLookup(addresses ...string) func(context.Context, string) ([]net.IPAddr, 
 	}
 }
 
+// TestFakeIPAnswersAreApproved pins the TUN case: Clash, Mihomo, Surge and
+// sing-box Fake-IP mode answer every DNS query inside 198.18.0.0/15, and the TUN
+// stack maps the connection back to the requested name. Refusing the range
+// rejects every translation request on such a machine, while the range cannot
+// reach a local service on its own.
+func TestFakeIPAnswersAreApproved(t *testing.T) {
+	ctx := context.Background()
+	for _, address := range []string{"198.18.0.1", "198.19.255.254"} {
+		if isBlockedAddress(net.ParseIP(address)) {
+			t.Fatalf("%s was treated as a private address", address)
+		}
+		addr, err := resolveApprovedAddr(ctx, ipLookup(address), "edge.microsoft.com")
+		if err != nil {
+			t.Fatalf("Fake-IP answer %s refused: %v", address, err)
+		}
+		if addr.String() != address {
+			t.Fatalf("approved %s for %s", addr, address)
+		}
+	}
+	// A mixed answer still loses to the real local address: allowing one
+	// Fake-IP answer must not turn the "every answer" rule into "any answer".
+	if _, err := resolveApprovedAddr(ctx, ipLookup("198.18.0.9", "192.168.1.10"), "mixed.example"); err == nil {
+		t.Fatal("a mixed Fake-IP/private answer was approved")
+	}
+	if _, err := resolveApprovedAddr(ctx, ipLookup("198.18.0.9", "127.0.0.1"), "mixed.example"); err == nil {
+		t.Fatal("a mixed Fake-IP/loopback answer was approved")
+	}
+}
+
+// TestResolveApprovedAddrMapsLocalhost covers the explicit exception for the one
+// name that is only a spelling of loopback. Any other name that resolves to
+// loopback is still refused, and no resolver is consulted for the alias.
+func TestResolveApprovedAddrMapsLocalhost(t *testing.T) {
+	neverCalled := func(context.Context, string) ([]net.IPAddr, error) {
+		t.Fatal("localhost was resolved through DNS")
+		return nil, nil
+	}
+	addr, err := resolveApprovedAddr(context.Background(), neverCalled, "localhost")
+	if err != nil {
+		t.Fatalf("localhost was refused: %v", err)
+	}
+	if addr.String() != "127.0.0.1" {
+		t.Fatalf("localhost mapped to %s", addr)
+	}
+}
+
 // TestResolveApprovedAddrRejectsPrivateAnswers is the rebinding shape: a name the
 // user approved, whose current answer points at the machine or the local network.
 func TestResolveApprovedAddrRejectsPrivateAnswers(t *testing.T) {
@@ -191,6 +238,7 @@ func TestResolveApprovedAddrReportsDNSFailure(t *testing.T) {
 // literal, so the loopback listener is reachable; the same address reached
 // through an ungranted name is not.
 func TestProxyDialsTheApprovedAddress(t *testing.T) {
+	noEnvironmentProxy(t)
 	var hits int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
@@ -242,6 +290,7 @@ func TestProxyDialsTheApprovedAddress(t *testing.T) {
 // TestProxyRefusesUngrantedIP keeps the deny path honest: a literal the user did
 // not approve is refused before any connection is attempted.
 func TestProxyRefusesUngrantedIP(t *testing.T) {
+	noEnvironmentProxy(t)
 	manager := newTestManager(t)
 	grants, err := ParseCapabilities([]string{"net:example.com"})
 	if err != nil {
@@ -266,6 +315,7 @@ func TestProxyRefusesUngrantedIP(t *testing.T) {
 // name is granted, but the answer points at the machine, so no connection is
 // made and the injected credential never leaves the core.
 func TestProxyRefusesNameResolvingToLoopback(t *testing.T) {
+	noEnvironmentProxy(t)
 	var hits int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
@@ -357,5 +407,192 @@ func TestResolveApprovedAddrAcceptsIPv6LiteralNotBracketed(t *testing.T) {
 	}
 	if addr.String() != "::1" {
 		t.Fatalf("approved %s", addr)
+	}
+}
+
+// noEnvironmentProxy pins the direct path so a machine with HTTP_PROXY exported
+// exercises the dial guard rather than its proxy.
+func noEnvironmentProxy(t *testing.T) {
+	t.Helper()
+	previous := proxyFromEnvironment
+	proxyFromEnvironment = func(*http.Request) (*url.URL, error) { return nil, nil }
+	t.Cleanup(func() { proxyFromEnvironment = previous })
+}
+
+func TestNetHTTPSGrantCoversAnyHostOverTLSOnly(t *testing.T) {
+	grants, err := ParseCapabilities([]string{"net:https"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !grants.Has(CapNetHTTPS) {
+		t.Fatal("net:https did not parse as the broad network grant")
+	}
+	if !contains(grants.Names(), CapNetHTTPS) {
+		t.Fatalf("net:https did not round-trip through Names: %v", grants.Names())
+	}
+	secure, err := url.Parse("https://api.example.com/v1/chat/completions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := grants.AuthorizeNetURL("net.fetch", secure); err != nil {
+		t.Fatalf("a remote HTTPS endpoint was refused: %v", err)
+	}
+	clear, err := url.Parse("http://api.example.com/v1/chat/completions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = grants.AuthorizeNetURL("net.fetch", clear)
+	var pluginErr *Error
+	if !errors.As(err, &pluginErr) || pluginErr.Code != "PLUGIN_CAPABILITY_DENIED" {
+		t.Fatalf("cleartext to an arbitrary host was authorized: %v", err)
+	}
+}
+
+// TestIsDNSFailureOnlyIgnoresLookups pins the one proxied-path error that is
+// tolerated. A host-denied answer must stay final even when a proxy is set.
+func TestIsDNSFailureOnlyIgnoresLookups(t *testing.T) {
+	if !isDNSFailure(apiError(502, "PLUGIN_NET_DNS_FAILED", "无法解析示例")) {
+		t.Fatal("a lookup failure was not recognized")
+	}
+	if isDNSFailure(apiError(403, "PLUGIN_NET_HOST_DENIED", "内网地址")) {
+		t.Fatal("a host denial was treated as a lookup failure")
+	}
+	if isDNSFailure(nil) {
+		t.Fatal("nil was treated as a lookup failure")
+	}
+}
+
+func TestProxyForTargetSkipsLoopback(t *testing.T) {
+	previous := proxyFromEnvironment
+	t.Cleanup(func() { proxyFromEnvironment = previous })
+	configured, err := url.Parse("http://127.0.0.1:7890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyFromEnvironment = func(*http.Request) (*url.URL, error) { return configured, nil }
+
+	for _, host := range []string{"127.0.0.1", "::1", "localhost"} {
+		if got := proxyForTarget("https", host, "443"); got != nil {
+			t.Fatalf("loopback target %s was routed to a proxy %s", host, got)
+		}
+	}
+	got := proxyForTarget("https", "translate.googleapis.com", "443")
+	if got == nil || got.String() != configured.String() {
+		t.Fatalf("a remote target did not use the configured proxy: %v", got)
+	}
+}
+
+func TestProxyNeverProxiesLoopbackTarget(t *testing.T) {
+	var proxyHits, directHits int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&proxyHits, 1)
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := proxyFromEnvironment
+	t.Cleanup(func() { proxyFromEnvironment = previous })
+	proxyFromEnvironment = func(*http.Request) (*url.URL, error) { return proxyURL, nil }
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&directHits, 1)
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manager := newTestManager(t)
+	grants, err := ParseCapabilities([]string{"net:127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("POST", "/enhance/v1/plugin-runtime/net.fetch", nil)
+	params := json.RawMessage(`{"url":"http://127.0.0.1:` + port + `/v1"}`)
+	value, err := manager.proxy(context.Background(), "test.sample", grants, noVault(), "net.fetch", request, params)
+	if err != nil {
+		t.Fatalf("explicit loopback grant was refused: %v", err)
+	}
+	if result, ok := value.(proxyResponse); !ok || result.Status != 200 {
+		t.Fatalf("unexpected response: %#v", value)
+	}
+	if atomic.LoadInt32(&directHits) != 1 || atomic.LoadInt32(&proxyHits) != 0 {
+		t.Fatalf("loopback target reached direct=%d proxy=%d", directHits, proxyHits)
+	}
+}
+
+// TestProxyRoutesRemoteTargetThroughEnvironmentProxy is the proxy-only network
+// case: the target name never resolves locally, the environment names a proxy,
+// and the request has to be addressed to that proxy instead of failing on DNS.
+func TestProxyRoutesRemoteTargetThroughEnvironmentProxy(t *testing.T) {
+	var hits int32
+	var seen string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		seen = r.URL.String()
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := proxyFromEnvironment
+	t.Cleanup(func() { proxyFromEnvironment = previous })
+	proxyFromEnvironment = func(*http.Request) (*url.URL, error) { return proxyURL, nil }
+
+	manager := newTestManager(t)
+	grants, err := ParseCapabilities([]string{"net:upstream.invalid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("POST", "/enhance/v1/plugin-runtime/net.fetch", nil)
+	params := json.RawMessage(`{"url":"http://upstream.invalid:8080/v1?q=1"}`)
+	value, err := manager.proxy(context.Background(), "test.sample", grants, noVault(), "net.fetch", request, params)
+	if err != nil {
+		t.Fatalf("a proxied target was refused: %v", err)
+	}
+	result, ok := value.(proxyResponse)
+	if !ok || result.Status != 200 {
+		t.Fatalf("unexpected response: %#v", value)
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("proxy saw %d requests", hits)
+	}
+	if seen != "http://upstream.invalid:8080/v1?q=1" {
+		t.Fatalf("proxy saw %q", seen)
+	}
+}
+
+// TestProxyBroadGrantRefusesBlockedLiterals covers the broad `net:https` grant:
+// an address the user did not name in `net:` receives no loopback/private
+// exception just because the scheme is encrypted.
+func TestProxyBroadGrantRefusesBlockedLiterals(t *testing.T) {
+	noEnvironmentProxy(t)
+	manager := newTestManager(t)
+	grants, err := ParseCapabilities([]string{"net:https"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("POST", "/enhance/v1/plugin-runtime/net.fetch", nil)
+	for _, target := range []string{
+		"https://127.0.0.1:1/v1",
+		"https://[::1]/v1",
+		"https://localhost/v1",
+		"https://LOCALHOST./v1",
+		"https://169.254.169.254/latest/meta-data",
+		"https://10.0.0.5/admin",
+	} {
+		params := json.RawMessage(`{"url":"` + target + `"}`)
+		_, err := manager.proxy(context.Background(), "test.sample", grants, noVault(), "net.fetch", request, params)
+		var pluginErr *Error
+		if !errors.As(err, &pluginErr) || pluginErr.Code != "PLUGIN_NET_HOST_DENIED" {
+			t.Fatalf("%s refused with %v", target, err)
+		}
 	}
 }

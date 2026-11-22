@@ -6,7 +6,7 @@
 
 .eks {
   --eks-text: var(--color-text, var(--ink));
-  --eks-muted: var(--color-text-secondary, var(--ink-muted));
+  --eks-muted: var(--color-text-muted, var(--color-text-secondary, var(--ink-muted)));
   --eks-faint: var(--color-text-faint, var(--ink-faint));
   --eks-line: var(--color-line, var(--line));
   --eks-surface: var(--color-surface, var(--surface-raised));
@@ -513,6 +513,7 @@
 .eks-spark-bar {
   flex: 1 1 0;
   min-width: 2px;
+  max-width: 18px;
   border-radius: 2px 2px 0 0;
   background: var(--eks-accent);
   opacity: 0.55;
@@ -520,6 +521,15 @@
 
 .eks-spark-bar:hover {
   opacity: 0.9;
+}
+
+.eks-spark-bar.is-empty {
+  background: var(--eks-line);
+  opacity: 0.45;
+}
+
+.eks-spark-bar.is-empty:hover {
+  opacity: 0.6;
 }
 
 .eks-totals {

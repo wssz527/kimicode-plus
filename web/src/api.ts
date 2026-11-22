@@ -484,6 +484,31 @@ export interface KctMigrationResult {
   message: string;
 }
 
+/** Mirrors monitormigration.Report: the handover state, with no secret in it. */
+export interface MonitorMigrationReport {
+  pluginId: string;
+  distDir: string;
+  payloadDir: string;
+  backupPath: string;
+  detected: boolean;
+  payloadPresent: boolean;
+  indexPatched: boolean;
+  backupPresent: boolean;
+  migrated: boolean;
+  needsConfirmation: boolean;
+  migratedAt?: string;
+  detail?: string;
+}
+
+/** Mirrors monitormigration.Result. */
+export interface MonitorMigrationResult {
+  report: MonitorMigrationReport;
+  restoredIndex: boolean;
+  removedPayload: boolean;
+  alreadyMigrated: boolean;
+  message: string;
+}
+
 export interface ChatSource {
   id: string;
   name: string;
@@ -854,6 +879,9 @@ export const api = {
      * is disabled at the moment the page needs it. */
     kctMigration: () => request<KctMigrationReport>("/kct/migration"),
     confirmKctMigration: () => request<KctMigrationResult>("/kct/migration/confirm", { method: "POST", body: {} }),
+    /** The standalone Monitor handover, routed through the core while the plugin is blocked. */
+    monitorMigration: () => request<MonitorMigrationReport>("/plugins/monitor/migration"),
+    confirmMonitorMigration: () => request<MonitorMigrationResult>("/plugins/monitor/migration/confirm", { method: "POST", body: {} }),
   },
   chat: {
     sources: async () => asList<ChatSource>(await request<unknown>("/chat/sources")),

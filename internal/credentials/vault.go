@@ -19,12 +19,27 @@ import (
 )
 
 var ErrLocked = errors.New("credential vault is locked")
+
+var errVaultPassword = errors.New("cannot unlock vault")
+
 var refPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,199}$`)
 
 type Vault struct {
-	db  *sql.DB
-	mu  sync.Mutex
-	key []byte
+	db        *sql.DB
+	mu        sync.Mutex
+	key       []byte
+	keyStore  OSKeyStore
+	osManaged bool
+}
+
+type VaultStatus struct {
+	Unlocked            bool     `json:"unlocked"`
+	Refs                []string `json:"refs"`
+	Backend             string   `json:"backend"`
+	OSKeychain          bool     `json:"osKeychain"`
+	OSKeychainAvailable bool     `json:"osKeychainAvailable"`
+	OSKeychainBackend   string   `json:"osKeychainBackend"`
+	LegacyPasswordVault bool     `json:"legacyPasswordVault"`
 }
 
 func NewVault(db *sql.DB) (*Vault, error) {
@@ -66,10 +81,27 @@ func open(key, data []byte, ref string) ([]byte, error) {
 	}
 	return gcm.Open(nil, data[:gcm.NonceSize()], data[gcm.NonceSize():], []byte(ref))
 }
+func validVaultSecret(secret string) bool { return len(secret) >= 12 && len(secret) <= 1024 }
+
 func (v *Vault) Unlock(ctx context.Context, password string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if len(password) < 12 || len(password) > 1024 {
+	if err := v.unlockLocked(ctx, password); err != nil {
+		return err
+	}
+	// A manual password is the only way into a vault that predates OS key
+	// management, so remembering it here is what retires the password prompt.
+	// A key store failure must not turn a successful unlock into an error.
+	if v.keyStore != nil && v.keyStore.Available() {
+		if err := v.keyStore.Save(ctx, password); err == nil {
+			v.osManaged = true
+		}
+	}
+	return nil
+}
+
+func (v *Vault) unlockLocked(ctx context.Context, password string) error {
+	if !validVaultSecret(password) {
 		return errors.New("vault password must contain 12–1024 bytes")
 	}
 	var salt, check []byte
@@ -98,13 +130,169 @@ func (v *Vault) Unlock(ctx context.Context, password string) error {
 	}
 	if err != nil {
 		clear(key)
-		return errors.New("cannot unlock vault")
+		return errVaultPassword
 	}
 	clear(v.key)
 	v.key = key
 	return nil
 }
 func (v *Vault) Lock() { v.mu.Lock(); defer v.mu.Unlock(); clear(v.key); v.key = nil }
+
+func (v *Vault) UseKeyStore(store OSKeyStore) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.keyStore = store
+}
+
+func (v *Vault) metaExistsLocked(ctx context.Context) (bool, error) {
+	var one int
+	err := v.db.QueryRowContext(ctx, `SELECT 1 FROM vault_meta WHERE id=1`).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// AutoUnlock opens the vault with the key kept by the OS. It is safe to call on
+// every start: without a usable key store, or when the stored key does not open
+// an existing vault, the vault stays locked and waits for a manual password.
+func (v *Vault) AutoUnlock(ctx context.Context) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if len(v.key) > 0 {
+		return nil
+	}
+	if v.keyStore == nil || !v.keyStore.Available() {
+		return nil
+	}
+	initialized, err := v.metaExistsLocked(ctx)
+	if err != nil {
+		return err
+	}
+	secret, found, loadErr := v.keyStore.Load(ctx)
+	if !initialized {
+		if loadErr != nil || !found || !validVaultSecret(secret) {
+			if secret, err = randomVaultSecret(); err != nil {
+				return err
+			}
+			if err = v.keyStore.Save(ctx, secret); err != nil {
+				return err
+			}
+		}
+		if err = v.unlockLocked(ctx, secret); err != nil {
+			return err
+		}
+		v.osManaged = true
+		return nil
+	}
+	if loadErr != nil || !found || !validVaultSecret(secret) {
+		return nil
+	}
+	if err = v.unlockLocked(ctx, secret); err != nil {
+		if errors.Is(err, errVaultPassword) {
+			return nil
+		}
+		return err
+	}
+	v.osManaged = true
+	return nil
+}
+
+// Reset discards every stored secret and starts a fresh key, which is the only
+// recovery path for a forgotten manual password. With an OS key store the new
+// vault is unlocked again in the same call.
+func (v *Vault) Reset(ctx context.Context) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	tx, err := v.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	for _, stmt := range []string{
+		`DELETE FROM vault_meta`,
+		`DELETE FROM vault_entries`,
+		`DELETE FROM vault_browser_entries`,
+		`DELETE FROM vault_kimi_accounts`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	clear(v.key)
+	v.key = nil
+	v.osManaged = false
+	if v.keyStore != nil {
+		_ = v.keyStore.Delete(ctx)
+	}
+	if v.keyStore == nil || !v.keyStore.Available() {
+		return nil
+	}
+	secret, err := randomVaultSecret()
+	if err != nil {
+		return err
+	}
+	if err := v.keyStore.Save(ctx, secret); err != nil {
+		return err
+	}
+	if err := v.unlockLocked(ctx, secret); err != nil {
+		return err
+	}
+	v.osManaged = true
+	return nil
+}
+
+// Status reports vault metadata without disclosing secrets. LegacyPasswordVault
+// marks an initialized vault that stays locked because no OS key opened it, so
+// the UI can offer the password prompt or the reset path.
+func (v *Vault) Status(ctx context.Context) VaultStatus {
+	status, _ := v.status(ctx)
+	return status
+}
+
+func (v *Vault) status(ctx context.Context) (VaultStatus, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	refs := []string{}
+	rows, err := v.db.QueryContext(ctx, `SELECT ref FROM vault_entries ORDER BY ref`)
+	if err != nil {
+		return VaultStatus{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ref string
+		if err = rows.Scan(&ref); err != nil {
+			return VaultStatus{}, err
+		}
+		refs = append(refs, ref)
+	}
+	if err = rows.Err(); err != nil {
+		return VaultStatus{}, err
+	}
+	initialized, err := v.metaExistsLocked(ctx)
+	if err != nil {
+		return VaultStatus{}, err
+	}
+	backend := "NONE"
+	if v.keyStore != nil {
+		backend = v.keyStore.BackendName()
+	}
+	return VaultStatus{
+		Unlocked:            len(v.key) > 0,
+		Refs:                refs,
+		Backend:             "AES256_GCM_PBKDF2",
+		OSKeychain:          v.osManaged,
+		OSKeychainAvailable: v.keyStore != nil && v.keyStore.Available(),
+		OSKeychainBackend:   backend,
+		LegacyPasswordVault: initialized && len(v.key) == 0 && !v.osManaged,
+	}, nil
+}
 
 // Unlocked reports whether this process currently holds the vault key. It says
 // nothing about which entries exist, so it is safe to show a plugin.
@@ -187,27 +375,12 @@ func (v *Vault) Delete(ctx context.Context, ref string) error {
 }
 func (v *Vault) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /enhance/v1/credentials", func(w http.ResponseWriter, r *http.Request) {
-		v.mu.Lock()
-		defer v.mu.Unlock()
-		refs := []string{}
-		rows, err := v.db.QueryContext(r.Context(), `SELECT ref FROM vault_entries ORDER BY ref`)
+		status, err := v.status(r.Context())
 		if err != nil {
 			httpx.Fail(w, 500, "VAULT_STORAGE", "无法读取凭据库")
 			return
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var ref string
-			if err = rows.Scan(&ref); err != nil {
-				break
-			}
-			refs = append(refs, ref)
-		}
-		if err != nil || rows.Err() != nil {
-			httpx.Fail(w, 500, "VAULT_STORAGE", "无法读取凭据库")
-			return
-		}
-		httpx.JSON(w, 200, map[string]any{"unlocked": len(v.key) > 0, "refs": refs, "backend": "AES256_GCM_PBKDF2", "osKeychain": false})
+		httpx.JSON(w, 200, status)
 	})
 	mux.HandleFunc("POST /enhance/v1/credentials/unlock", func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
@@ -225,6 +398,28 @@ func (v *Vault) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /enhance/v1/credentials/lock", func(w http.ResponseWriter, r *http.Request) {
 		v.Lock()
 		httpx.JSON(w, 200, map[string]bool{"unlocked": false})
+	})
+	mux.HandleFunc("POST /enhance/v1/credentials/reset", func(w http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Confirm bool `json:"confirm"`
+		}
+		if !httpx.Decode(w, r, &in) {
+			return
+		}
+		if !in.Confirm {
+			httpx.Fail(w, 400, "VAULT_RESET_CONFIRM_REQUIRED", "重置凭据库会删除全部已存密钥，请确认后重试")
+			return
+		}
+		if err := v.Reset(r.Context()); err != nil {
+			httpx.Fail(w, 500, "VAULT_RESET", "无法重置凭据库")
+			return
+		}
+		status, err := v.status(r.Context())
+		if err != nil {
+			httpx.Fail(w, 500, "VAULT_STORAGE", "无法读取凭据库")
+			return
+		}
+		httpx.JSON(w, 200, status)
 	})
 	mux.HandleFunc("PUT /enhance/v1/credentials", func(w http.ResponseWriter, r *http.Request) {
 		var in struct {

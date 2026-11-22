@@ -105,6 +105,7 @@ type NativeService struct {
 	contractUpdatedAt  string
 	domProbes          map[string]ContractProbe
 
+	vault                     *credentials.Vault
 	accountVault              *credentials.KimiAccountVault
 	accountMu                 sync.Mutex
 	switchMu                  sync.Mutex
@@ -483,7 +484,7 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.attachStatus(ctx), nil
 	case "diagnostics.get":
 		return s.diagnosticsStatus(), nil
-	case "update.status", "update.check", "update.apply":
+	case "update.status", "update.check", "update.apply", "update.autoCheck":
 		s.mu.Lock()
 		manager := s.updater
 		s.mu.Unlock()
@@ -495,6 +496,12 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 			return manager.Check(ctx)
 		case "update.apply":
 			return manager.StartApply(ctx)
+		case "update.autoCheck":
+			enabled, ok := input["enabled"].(bool)
+			if !ok {
+				return nil, errors.New("缺少 enabled 开关参数")
+			}
+			return manager.SetAutoCheck(enabled)
 		default:
 			return manager.Status(), nil
 		}
@@ -568,6 +575,8 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.accountsSwitch(ctx, input)
 	case "accounts.cancelPending":
 		return s.accountsCancelPending(), nil
+	case "accounts.resetVault":
+		return s.accountsResetVault(ctx, input)
 	default:
 		return nil, fmt.Errorf("未知或未经允许的宿主动作：%s", action)
 	}

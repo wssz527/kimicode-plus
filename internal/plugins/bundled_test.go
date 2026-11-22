@@ -86,12 +86,17 @@ func TestKCTAdapterManifest(t *testing.T) {
 			t.Fatalf("KCT does not declare %s", name)
 		}
 	}
-	// The adapter reaches two public endpoints and a local one; a credential is
-	// only useful for the local endpoint, where the core injects it.
-	for _, host := range []string{"edge.microsoft.com", "translate.googleapis.com", "127.0.0.1", "::1"} {
+	// The adapter reaches two public endpoints, a local one, and the
+	// OpenAI-compatible endpoint the user configures after install (any host,
+	// TLS only). A credential is only useful for the custom endpoint, where the
+	// core injects it.
+	for _, host := range []string{"edge.microsoft.com", "translate.googleapis.com", "127.0.0.1", "::1", "localhost"} {
 		if !grants.AllowsHost(host) {
 			t.Fatalf("KCT cannot reach %s", host)
 		}
+	}
+	if !grants.Has(CapNetHTTPS) {
+		t.Fatal("KCT cannot reach a user-configured remote HTTPS endpoint")
 	}
 	if !grants.AllowsCredential("translator") {
 		t.Fatal("KCT cannot use the translator credential")

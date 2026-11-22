@@ -44,7 +44,25 @@
 .session-resizer::after { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 1px; background: transparent; }
 .session-resizer:hover::after, .session-resizer:focus-visible::after { background: var(--accent); }
 .session-resizer:focus-visible { outline: 0; }
-.ekd-surface-settings { height: auto; min-height: 100%; overflow: visible; }
+/* Every settings surface is a mount container, never a painted page: the host's
+   own settings background must show through, and an opaque fallback would read as
+   a white strip during the first Shadow DOM paint. */
+.ekd-surface-settings,
+.ekd-surface-settings-cache,
+.ekd-surface-settings-plugins,
+.ekd-surface-settings-account,
+.ekd-surface-settings-agent-permissions,
+.ekd-surface-settings-agent-subagent,
+.ekd-surface-settings-lab {
+  height: auto;
+  min-height: 0;
+  overflow: visible;
+  background: transparent;
+}
+
+.ekd-surface-settings {
+  min-height: 100%;
+}
 @media (prefers-reduced-motion: reduce) {
   .ekd-surface *, .ekd-surface *::before, .ekd-surface *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }

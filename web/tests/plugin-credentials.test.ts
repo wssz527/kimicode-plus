@@ -97,3 +97,29 @@ test("deleting a credential refreshes state even when the core answers HTTP 204 
   const panel = source("src/components/PluginCredentials.tsx");
   assert.ok(panel.includes("deleteCredential(action.run,"), "remove() must use deleteCredential so 204/undefined still refreshes");
 });
+
+test("an OS-managed vault is described as automatic, not as a password to remember", () => {
+  const panel = source("src/components/PluginCredentials.tsx");
+  assert.ok(panel.includes("vault.data?.osKeychain"), "the panel ignores the OS keychain flag");
+  assert.ok(panel.includes("vault.data?.osKeychainAvailable"), "the panel ignores whether a key store exists");
+  assert.ok(panel.includes("vault.data?.legacyPasswordVault"), "the panel ignores the legacy password vault flag");
+  assert.ok(panel.includes("凭据由系统凭据库自动托管"), "no reassuring note for the auto-managed vault");
+  assert.ok(panel.includes("macOS 钥匙串 / Windows DPAPI"), "the note does not name the OS stores");
+  // Telling the user a restart will ask again would be false once a key store holds the key.
+  assert.ok(
+    panel.includes("输入一次原口令即可解锁，随后会转入系统凭据库自动托管"),
+    "the migrating unlock hint is missing",
+  );
+  assert.ok(panel.includes("重启后需要重新输入") && panel.includes("旧版密码保护的凭据库"), "the restart warning survives only for a manual vault");
+});
+
+test("a forgotten legacy vault password can be reset from the credential panel", () => {
+  const panel = source("src/components/PluginCredentials.tsx");
+  assert.ok(panel.includes("features.resetVault()"), "the reset does not go through the vault reset API");
+  assert.ok(panel.includes("忘记旧密码？重置凭据库"), "the reset entry is missing");
+  assert.ok(panel.includes("确认重置凭据库"), "the second confirmation step is missing");
+  assert.ok(panel.includes("vault.reload()"), "a successful reset must reload the vault state");
+  assert.ok(panel.includes("已保存的凭据值无法恢复"), "the copy does not say the stored values are lost");
+  // The reset is only offered where a password vault actually exists.
+  assert.ok(panel.includes("legacyPasswordVault || osKeychainAvailable"), "the reset is offered without a legacy vault");
+});

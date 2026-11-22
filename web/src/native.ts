@@ -122,7 +122,7 @@ export interface CacheRetentionBucket {
 
 export interface CacheRetention {
   idleBuckets: CacheRetentionBucket[];
-  byModel?: { model: string; idleBuckets: CacheRetentionBucket[] }[];
+  byModel?: { model: string; idleBuckets: CacheRetentionBucket[]; samples?: number; lastSeen?: string }[];
   note: string;
 }
 
@@ -757,6 +757,10 @@ export interface AccountAddFlow {
 
 export interface AccountsState {
   vaultUnlocked: boolean;
+  vaultOsKeychain?: boolean;
+  vaultOsKeychainAvailable?: boolean;
+  vaultOsKeychainBackend?: string;
+  legacyPasswordVault?: boolean;
   signedIn: boolean;
   currentAccountId?: string;
   currentProfile?: AccountProfile | null;
@@ -849,6 +853,12 @@ export function switchAccount(host: NativeHost, id: string, waitUntilIdle = fals
 
 export function cancelPendingAccountSwitch(host: NativeHost): Promise<{ cancelled: boolean }> {
   return host.request("accounts.cancelPending", {});
+}
+
+/** Clears the old encrypted tokens and immediately provisions a fresh
+ * system-managed vault, so a forgotten legacy password stops being a dead end. */
+export function resetAccountVault(host: NativeHost): Promise<AccountsState> {
+  return host.request<AccountsState>("accounts.resetVault", { confirm: true });
 }
 
 export function createCoreTransport(host: NativeHost) {

@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import {
   createDOMContractState,
   evaluateDOMContracts,
+  findChatHeaderTail,
   findOfficialSettingsPanel,
   findOfficialSettingsTab,
+  resolveSettingsFallbacks,
 } from "../src/plugin-runtime/contracts.js";
 import { createEntryMountManager, type EntryPlan, type SidebarNavPlan } from "../src/plugin-runtime/entries.js";
 import { FakeDocument, FakeElement } from "./helpers/fake-dom.js";
@@ -28,8 +30,8 @@ interface SnapshotOptions {
   sidebarMode?: "standard" | "multi-tab";
   renameNewChatClass?: boolean;
   includeSettings?: boolean;
-  activeTab?: "account" | "agent" | "providers" | "lab";
-  omitTabs?: Array<"account" | "agent" | "providers" | "lab">;
+  activeTab?: "account" | "agent" | "providers" | "plugins" | "lab";
+  omitTabs?: Array<"account" | "agent" | "providers" | "plugins" | "lab">;
   includeAccountMenu?: boolean;
 }
 
@@ -125,15 +127,16 @@ function buildOfficialSnapshot(opts: SnapshotOptions = {}): {
     list.className = "settings-tab-list";
     list.setAttribute("role", "tablist");
 
-    const defs: Array<{ key: "account" | "agent" | "providers" | "lab" | "archived"; zh: string; en: string }> = [
+    const defs: Array<{ key: "account" | "agent" | "providers" | "plugins" | "lab" | "archived"; zh: string; en: string }> = [
       { key: "account", zh: "账户", en: "Account" },
       { key: "agent", zh: "智能体与会话", en: "Agent & Sessions" },
       { key: "providers", zh: "模型供应商", en: "Model Providers" },
+      { key: "plugins", zh: "插件", en: "Plugins" },
       { key: "lab", zh: "实验室", en: "Lab" },
       { key: "archived", zh: "已归档的会话", en: "Archived Sessions" },
     ];
     for (const def of defs) {
-      if (opts.omitTabs?.includes(def.key as "account" | "agent" | "providers" | "lab")) continue;
+      if (opts.omitTabs?.includes(def.key as "account" | "agent" | "providers" | "plugins" | "lab")) continue;
       const selected = opts.activeTab === def.key;
       const tab = makeButton(doc, selected ? "tab on" : "tab", zh ? def.zh : def.en, {
         role: "tab",
@@ -156,6 +159,10 @@ function buildOfficialSnapshot(opts: SnapshotOptions = {}): {
       table.append(row);
       form.append(table);
       body.append(form);
+    } else if (opts.activeTab === "plugins") {
+      const panel = doc.createElement("section");
+      panel.className = "plugins-panel";
+      body.append(panel);
     } else if (opts.activeTab) {
       const panel = doc.createElement("div");
       panel.className = "panel";
@@ -175,7 +182,7 @@ function buildOfficialSnapshot(opts: SnapshotOptions = {}): {
 test("DOM contract probes pass across 1.3.4/1.3.5/1.3.7/unknown snapshots in zh and en", () => {
   for (const locale of ["zh", "en"] as const) {
     let state = createDOMContractState();
-    for (const activeTab of ["account", "agent", "providers", "lab"] as const) {
+    for (const activeTab of ["account", "agent", "providers", "plugins", "lab"] as const) {
       const { doc } = buildOfficialSnapshot({ locale, includeSettings: true, activeTab });
       const evaluation = evaluateDOMContracts(doc as unknown as Document, state);
       state = evaluation.state;
@@ -192,6 +199,7 @@ test("DOM contract probes pass across 1.3.4/1.3.5/1.3.7/unknown snapshots in zh 
       "dom.settings_account",
       "dom.settings_agent",
       "dom.settings_providers",
+      "dom.settings_plugins",
       "dom.settings_lab",
       "dom.sidebar_footer",
       "dom.account_menu",
@@ -261,4 +269,67 @@ test("omitting a single official settings tab marks only that tab probe disabled
   assert.equal(evaluation.byId["dom.settings_lab"]?.status, "disabled");
   assert.equal(evaluation.byId["dom.settings_agent"]?.status, "untested");
   assert.equal(evaluation.byId["dom.settings_providers"]?.status, "untested");
+});
+
+test("plugins tab probes the official plugins panel and feeds the KimiCode+ fallback", () => {
+  const { doc } = buildOfficialSnapshot({ includeSettings: true, activeTab: "plugins" });
+  const evaluation = evaluateDOMContracts(doc as unknown as Document);
+  assert.equal(evaluation.byId["dom.settings_plugins"]?.status, "available");
+  assert.equal(evaluation.byId["dom.settings_plugins"]?.label, "官方「插件」设置页内容区");
+  const panel = findOfficialSettingsPanel(doc as unknown as Document, "plugins");
+  assert.ok(panel?.classList.contains("plugins-panel"), "plugins panel should resolve to .plugins-panel");
+});
+
+test("a missing plugins tab disables only the plugins insertion and its fallback", () => {
+  const { doc } = buildOfficialSnapshot({ includeSettings: true, activeTab: "account", omitTabs: ["plugins"] });
+  const evaluation = evaluateDOMContracts(doc as unknown as Document);
+  assert.equal(evaluation.byId["dom.settings_plugins"]?.status, "disabled");
+  assert.equal(evaluation.byId["dom.settings_account"]?.status, "available");
+  assert.equal(evaluation.byId["dom.settings_dialog"]?.status, "available");
+
+  const fallbacks = resolveSettingsFallbacks(evaluation.probes);
+  assert.equal(fallbacks.plugins?.id, "dom.settings_plugins");
+  assert.equal(fallbacks.account, null);
+  assert.equal(fallbacks.plugins?.reason?.includes("插件"), true);
+});
+
+test("settings fallbacks keep plugins null while the official panel is healthy", () => {
+  const { doc } = buildOfficialSnapshot({ includeSettings: true, activeTab: "plugins" });
+  const evaluation = evaluateDOMContracts(doc as unknown as Document);
+  assert.equal(resolveSettingsFallbacks(evaluation.probes).plugins, null);
+});
+
+test("findChatHeaderTail prefers the chat header and falls back to a loose .ch-tail", () => {
+  const loose = new FakeDocument();
+  const side = loose.createElement("div");
+  side.className = "side";
+  const strayTail = loose.createElement("div");
+  strayTail.className = "ch-tail";
+  side.append(strayTail);
+  loose.body.append(side);
+  assert.equal(findChatHeaderTail(loose as unknown as Document), strayTail, "querySelector fallback covers a loose .ch-tail");
+
+  const headed = new FakeDocument();
+  const header = headed.createElement("header");
+  header.className = "chat-header";
+  const tail = headed.createElement("div");
+  tail.className = "ch-tail";
+  header.append(tail);
+  headed.body.append(header);
+  assert.equal(findChatHeaderTail(headed as unknown as Document), tail, "header.chat-header .ch-tail wins");
+
+  const chat = new FakeDocument();
+  const chatRoot = chat.createElement("div");
+  chatRoot.className = "chat";
+  const chatTail = chat.createElement("div");
+  chatTail.className = "ch-tail";
+  chatRoot.append(chatTail);
+  chat.body.append(chatRoot);
+  assert.equal(findChatHeaderTail(chat as unknown as Document), chatTail, ".ch .ch-tail covers hosts without a chat header");
+
+  const empty = new FakeDocument();
+  const unrelated = empty.createElement("div");
+  unrelated.className = "side-footer";
+  empty.body.append(unrelated);
+  assert.equal(findChatHeaderTail(empty as unknown as Document), null);
 });

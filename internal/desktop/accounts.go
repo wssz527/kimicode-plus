@@ -92,8 +92,12 @@ type AccountAddFlow struct {
 }
 
 type AccountsState struct {
-	VaultUnlocked    bool                  `json:"vaultUnlocked"`
-	SignedIn         bool                  `json:"signedIn"`
+	VaultUnlocked            bool                  `json:"vaultUnlocked"`
+	VaultOSKeychain          bool                  `json:"vaultOsKeychain"`
+	VaultOSKeychainAvailable bool                  `json:"vaultOsKeychainAvailable"`
+	VaultOSKeychainBackend   string                `json:"vaultOsKeychainBackend,omitempty"`
+	LegacyPasswordVault      bool                  `json:"legacyPasswordVault"`
+	SignedIn                 bool                  `json:"signedIn"`
 	CurrentAccountID string                `json:"currentAccountId,omitempty"`
 	CurrentProfile   *AccountProfile       `json:"currentProfile,omitempty"`
 	Accounts         []AccountSummary      `json:"accounts"`
@@ -170,12 +174,19 @@ type pendingSwitchState struct {
 
 func (s *NativeService) UseVault(vault *credentials.Vault) {
 	s.mu.Lock()
+	s.vault = vault
 	if vault == nil {
 		s.accountVault = nil
 	} else {
 		s.accountVault = vault.KimiAccountStore()
 	}
 	s.mu.Unlock()
+}
+
+func (s *NativeService) currentVault() *credentials.Vault {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.vault
 }
 
 func (s *NativeService) currentAccountVault() *credentials.KimiAccountVault {
@@ -674,16 +685,49 @@ func (s *NativeService) accountsList(ctx context.Context, input map[string]any) 
 	}
 	s.accountMu.Unlock()
 
+	rawVault := s.currentVault()
+	var vaultStatus credentials.VaultStatus
+	if rawVault != nil {
+		vaultStatus = rawVault.Status(ctx)
+	}
+
 	return AccountsState{
-		VaultUnlocked:    unlocked,
-		SignedIn:         profile != nil,
-		CurrentAccountID: currentAccountID,
-		CurrentProfile:   profile,
-		Accounts:         accounts,
-		PendingSwitch:    pending,
-		AddFlow:          addFlow,
-		CLIRunning:       s.detectRunningKimiCLI(ctx),
+		VaultUnlocked:            unlocked,
+		VaultOSKeychain:          vaultStatus.OSKeychain,
+		VaultOSKeychainAvailable: vaultStatus.OSKeychainAvailable,
+		VaultOSKeychainBackend:   vaultStatus.OSKeychainBackend,
+		LegacyPasswordVault:      vaultStatus.LegacyPasswordVault,
+		SignedIn:                 profile != nil,
+		CurrentAccountID:         currentAccountID,
+		CurrentProfile:           profile,
+		Accounts:                 accounts,
+		PendingSwitch:            pending,
+		AddFlow:                  addFlow,
+		CLIRunning:               s.detectRunningKimiCLI(ctx),
 	}, nil
+}
+
+func (s *NativeService) accountsResetVault(ctx context.Context, input map[string]any) (AccountsState, error) {
+	confirm, _ := input["confirm"].(bool)
+	if !confirm {
+		return AccountsState{}, errors.New("重置凭据库需要明确确认")
+	}
+	rawVault := s.currentVault()
+	if rawVault == nil {
+		return AccountsState{}, errors.New("加密凭据库不可用")
+	}
+	s.accountsCancelPending()
+	s.accountMu.Lock()
+	s.addFlow = nil
+	s.accountMu.Unlock()
+	if err := rawVault.Reset(ctx); err != nil {
+		return AccountsState{}, err
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM kimi_accounts`); err != nil {
+		return AccountsState{}, err
+	}
+	s.bus.Publish("accounts", map[string]any{"type": "vault.reset"})
+	return s.accountsList(ctx, nil)
 }
 
 func (s *NativeService) saveCurrentAccountLocked(ctx context.Context, labelOverride string) (AccountSummary, error) {

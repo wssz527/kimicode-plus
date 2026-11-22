@@ -199,8 +199,8 @@ func TestConfirmStopsLoaderAndMigrates(t *testing.T) {
 	if got := len(f.called("bootout")); got != 1 {
 		t.Fatalf("bootout called %d times, want 1 (%v)", got, f.calls)
 	}
-	if got := f.called("bootout")[0]; len(got) != 2 || got[1] != "gui/501" {
-		t.Fatalf("bootout used the wrong domain: %v", got)
+	if got := f.called("bootout")[0]; len(got) != 2 || got[1] != "gui/501/"+Label {
+		t.Fatalf("bootout used the wrong target: %v", got)
 	}
 	if _, err := os.Stat(f.plistPath()); !os.IsNotExist(err) {
 		t.Fatalf("plist is still in place: %v", err)
@@ -223,6 +223,36 @@ func TestConfirmStopsLoaderAndMigrates(t *testing.T) {
 	}
 	if strings.Contains(result.Message, "设置未能写入") {
 		t.Fatalf("success message reports a settings failure: %q", result.Message)
+	}
+}
+
+// `launchctl bootout gui/<uid>` ends the whole GUI session. Only the exact KCT
+// job target may reach launchctl, and a refusal must happen before it runs.
+func TestBootoutRequiresExactJobTarget(t *testing.T) {
+	f := newFake(t)
+	service := newService(t, f, newStore())
+	unsafe := [][]string{
+		{"bootout"},
+		{"bootout", "gui/501"},
+		{"bootout", "gui/501/"},
+		{"bootout", "gui/501/" + Label + "/extra"},
+		{"bootout", "gui/501/other.job"},
+	}
+	for _, args := range unsafe {
+		if _, err := service.launchctl(context.Background(), args...); !errors.Is(err, errUnsafeBootout) {
+			t.Fatalf("launchctl(%v) = %v, want errUnsafeBootout", args, err)
+		}
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("an unsafe bootout reached launchctl: %v", f.calls)
+	}
+
+	f.runErr = nil
+	if _, err := service.launchctl(context.Background(), "bootout", "gui/501/"+Label); err != nil {
+		t.Fatalf("the exact job target was refused: %v", err)
+	}
+	if len(f.calls) != 1 || len(f.calls[0]) != 2 || f.calls[0][1] != "gui/501/"+Label {
+		t.Fatalf("the exact job target was not passed through: %v", f.calls)
 	}
 }
 

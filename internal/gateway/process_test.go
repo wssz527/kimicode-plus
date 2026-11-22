@@ -118,6 +118,7 @@ func TestGatewayThroughRealProcess(t *testing.T) {
 	defer upstream.Close()
 
 	cmd := exec.Command(bin, "-data-dir", dataDir, "-port", "0")
+	cmd.Env = append(os.Environ(), "EKD_DISABLE_OS_KEYCHAIN=1", "EKD_DISABLE_AUTO_UPDATE_CHECK=1")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)

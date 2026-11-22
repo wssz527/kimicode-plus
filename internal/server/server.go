@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"enhancedkimi/internal/bridge"
@@ -21,6 +22,7 @@ import (
 	"enhancedkimi/internal/gateway"
 	"enhancedkimi/internal/httpx"
 	"enhancedkimi/internal/kctmigration"
+	"enhancedkimi/internal/monitormigration"
 	"enhancedkimi/internal/plugins"
 	"enhancedkimi/internal/provider"
 	"enhancedkimi/internal/registry"
@@ -32,7 +34,7 @@ import (
 	bundledPlugins "enhancedkimi/plugins"
 )
 
-var Version = "0.2.1"
+var Version = "0.2.2"
 
 type Module struct {
 	ID      string `json:"id"`
@@ -49,8 +51,11 @@ type NativeOptions struct {
 	PairingToken     string
 	RestartState     func() updater.RestartState
 	RequestRestart   func()
-	UpdateAPIBaseURL string
-	UpdateHTTPClient *http.Client
+	UpdateAPIBaseURL      string
+	UpdateHTTPClient      *http.Client
+	VaultKeyStore         credentials.OSKeyStore
+	EnableOSKeyStore      bool
+	EnableAutoUpdateCheck bool
 }
 
 type App struct {
@@ -67,8 +72,9 @@ type App struct {
 	gateway       *gateway.Gateway
 	planner       *chat.PlannerService
 	scheduler     *scheduler.Engine
-	kctMigration  *kctmigration.Service
-	winBridge     *windowsBridge
+	kctMigration     *kctmigration.Service
+	monitorMigration *monitormigration.Service
+	winBridge        *windowsBridge
 	gatewayErr    string
 	gatewayBase   string
 }
@@ -110,10 +116,16 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /enhance/v1/pair", guard.Pair)
 	app.adapter.Register(mux)
+	var nativeRef atomic.Pointer[desktop.NativeService]
+	onUpdateStatus := func(status updater.Status) {
+		if ns := nativeRef.Load(); ns != nil {
+			ns.Events().Publish("update", status)
+		}
+	}
 	// The health list is read at update time, after every module has been
 	// registered, so the updater compares the candidate against the modules this
 	// core actually reports as READY.
-	app.updater = newUpdater(native, cfg, app.healthyModules)
+	app.updater = newUpdater(native, cfg, app.healthyModules, onUpdateStatus)
 	registerUpdateRoutes(mux, app.updater)
 	add := func(id string, init func() error) {
 		if !settings.Modules[id] {
@@ -186,6 +198,11 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 				migration.Register(mux)
 				s.UseEnableGate(migration)
 				app.kctMigration = migration
+
+				monitorMig := monitormigration.New(native.DataDir, monitormigration.System{})
+				monitorMig.Register(mux)
+				s.UseEnableGate(monitorMig)
+				app.monitorMigration = monitorMig
 			}
 			if bundled, bundleErr := bundledPlugins.BundledPlugins(); bundleErr == nil {
 				if releaseErr := s.ReleaseBundled(context.Background(), bundled); releaseErr != nil {
@@ -199,10 +216,24 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 	credentialStatus := "UNAVAILABLE"
 	vault, vaultErr := credentials.NewVault(db)
 	if vaultErr == nil {
+		keyStore := native.VaultKeyStore
+		if keyStore == nil && native.EnableOSKeyStore && native.DataDir != "" {
+			keyStore = credentials.NewOSKeyStore(native.DataDir)
+		}
+		if keyStore != nil {
+			vault.UseKeyStore(keyStore)
+			if autoErr := vault.AutoUnlock(context.Background()); autoErr != nil {
+				log.Printf("credential vault auto-unlock failed: %v", autoErr)
+			}
+		}
 		vault.Register(mux)
 		providerClient = provider.New(db, vault)
 		providerClient.Register(mux)
-		credentialStatus = "ENCRYPTED_VAULT_MANUAL_UNLOCK"
+		if vault.Status(context.Background()).OSKeychain {
+			credentialStatus = "ENCRYPTED_VAULT_OS_KEYCHAIN"
+		} else {
+			credentialStatus = "ENCRYPTED_VAULT_MANUAL_UNLOCK"
+		}
 		if app.pluginManager != nil {
 			// The plugin host gets this App's vault, not a second locked one.
 			app.pluginManager.UseVault(vault)
@@ -264,6 +295,7 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 			nativeService.UseUpdater(app.updater)
 			nativeService.Register(mux)
 			app.native = nativeService
+			nativeRef.Store(nativeService)
 			if app.pluginManager != nil {
 				app.pluginManager.UseCore(pluginCore{service: nativeService})
 				app.pluginManager.UseOnChange(func() {
@@ -345,8 +377,19 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 		compactionStatus = "NATIVE_SCHEDULER_WITH_RECEIPTS"
 	}
 	mux.HandleFunc("GET /enhance/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		httpx.JSON(w, 200, map[string]any{"status": "OK", "version": Version, "safeMode": cfg.Safe(), "modules": app.modules, "uptimeMs": time.Since(app.started).Milliseconds(), "adapter": app.adapter.Status(r.Context()), "compaction": compactionStatus, "credentials": credentialStatus})
+		currentCredentials := credentialStatus
+		if vaultErr == nil && vault != nil {
+			if vault.Status(r.Context()).OSKeychain {
+				currentCredentials = "ENCRYPTED_VAULT_OS_KEYCHAIN"
+			} else {
+				currentCredentials = "ENCRYPTED_VAULT_MANUAL_UNLOCK"
+			}
+		}
+		httpx.JSON(w, 200, map[string]any{"status": "OK", "version": Version, "safeMode": cfg.Safe(), "modules": app.modules, "uptimeMs": time.Since(app.started).Milliseconds(), "adapter": app.adapter.Status(r.Context()), "compaction": compactionStatus, "credentials": currentCredentials})
 	})
+	if native.EnableAutoUpdateCheck && app.updater != nil {
+		app.updater.StartAutoCheck()
+	}
 	mux.HandleFunc("GET /enhance/v1/settings", func(w http.ResponseWriter, r *http.Request) {
 		v, e := cfg.Get()
 		if e != nil {
@@ -454,12 +497,13 @@ func (a *App) healthyModules() []string {
 	return ids
 }
 
-func newUpdater(native NativeOptions, cfg *config.Store, healthyModules func() []string) *updater.Manager {
+func newUpdater(native NativeOptions, cfg *config.Store, healthyModules func() []string, onStatusChange func(updater.Status)) *updater.Manager {
 	options := updater.Options{
 		CurrentVersion: Version, DataDir: native.DataDir, Safe: cfg.Safe,
 		Executable: native.Executable, RestartState: native.RestartState, RequestRestart: native.RequestRestart,
 		TargetExecutable: func() string { return desktop.ManagedUpdateExecutable(native.DataDir) },
 		HealthyModules:   healthyModules,
+		OnStatusChange:   onStatusChange,
 		Launchd: updater.LaunchdOptions{
 			Label:   "com.user.enhanced-kimi.core-managed",
 			Enabled: func(target string) bool { return target == desktop.ManagedUpdateExecutable(native.DataDir) },
@@ -499,6 +543,21 @@ func registerUpdateRoutes(mux *http.ServeMux, manager *updater.Manager) {
 			return
 		}
 		httpx.JSON(w, http.StatusAccepted, status)
+	})
+	mux.HandleFunc("POST /enhance/v1/update/auto-check", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if !httpx.Decode(w, r, &body) || body.Enabled == nil {
+			httpx.Fail(w, http.StatusBadRequest, "INVALID_INPUT", "缺少 enabled 开关参数")
+			return
+		}
+		status, err := manager.SetAutoCheck(*body.Enabled)
+		if err != nil {
+			httpx.Fail(w, http.StatusInternalServerError, "UPDATE_PREFS_FAILED", err.Error())
+			return
+		}
+		httpx.JSON(w, http.StatusOK, status)
 	})
 }
 

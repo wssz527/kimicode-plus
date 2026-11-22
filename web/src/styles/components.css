@@ -187,13 +187,13 @@
 
 .btn-danger {
   background: transparent;
-  border-color: #e0b4b4;
+  border-color: color-mix(in srgb, var(--danger, #c64b52) 42%, transparent);
   color: var(--danger);
 }
 
 .btn-danger:hover:not(:disabled) {
   background: var(--danger-soft);
-  border-color: #cf9999;
+  border-color: color-mix(in srgb, var(--danger, #c64b52) 58%, transparent);
 }
 
 .btn-full {
@@ -357,9 +357,9 @@
   display: inline-flex;
   align-items: center;
   padding: 0 5px;
-  border: 1px dashed #c7a868;
+  border: 1px dashed color-mix(in srgb, var(--warn, #b7791f) 52%, transparent);
   border-radius: 3px;
-  background: #fdf8ec;
+  background: color-mix(in srgb, var(--warn, #b7791f) 12%, transparent);
   color: var(--warn);
   font-size: 11px;
   font-family: var(--font-mono);
@@ -425,8 +425,8 @@
   width: 34px;
   height: 20px;
   border-radius: 999px;
-  background: #c3ccd8;
-  border: 1px solid #b0bcca;
+  background: color-mix(in srgb, var(--ink-muted, #888) 34%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ink-muted, #888) 26%, transparent);
   transition: background 150ms ease-out;
   margin-top: 1px;
 }
@@ -437,7 +437,7 @@
   width: 14px;
   height: 14px;
   border-radius: 50%;
-  background: #fff;
+  background: var(--surface-raised, #fff);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
   transition: transform 150ms cubic-bezier(0.22, 0.61, 0.36, 1);
 }
@@ -620,7 +620,12 @@
 .skeleton-cell {
   height: 10px;
   border-radius: 3px;
-  background: linear-gradient(90deg, #e5eaf1, #eef2f7, #e5eaf1);
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--ink-muted, #888) 12%, transparent),
+    color-mix(in srgb, var(--ink-muted, #888) 22%, transparent),
+    color-mix(in srgb, var(--ink-muted, #888) 12%, transparent)
+  );
   background-size: 200% 100%;
   animation: shimmer 1.4s linear infinite;
 }

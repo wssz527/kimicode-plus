@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -177,7 +179,17 @@ func (s *Store) Scan(ctx context.Context, now time.Time, force bool) (ScanResult
 			return result, err
 		}
 	}
-	return result, s.prune(ctx)
+	if err = s.prune(ctx); err != nil {
+		return result, err
+	}
+	// A budget-limited pass only saw part of the sessions directory, so it cannot
+	// prove any session outside the window was deleted.
+	if !result.BudgetLimited {
+		if err = s.pruneMissing(ctx, home, sessions); err != nil {
+			return result, err
+		}
+	}
+	return result, nil
 }
 
 // ScanResult reports what one scan did, for diagnostics and tests.
@@ -289,6 +301,92 @@ func (s *Store) prune(ctx context.Context) error {
 	cutoff := storage.SortableTime(time.Now().UTC().Add(-31 * 24 * time.Hour))
 	_, err := s.db.ExecContext(ctx, `DELETE FROM cache_steps WHERE time < ?`, cutoff)
 	return err
+}
+
+// pruneMissing deletes the rows of sessions that no longer exist on disk. It must
+// only run after a complete discovery pass: when a scan is budget-limited, the
+// session list says nothing about the sessions outside it.
+func (s *Store) pruneMissing(ctx context.Context, home string, sessions []sessionDir) error {
+	// A missing sessions root is not evidence that every session was deleted; it is
+	// usually a wrong or not-yet-populated KIMI_CODE_HOME, and the derived history
+	// must survive that.
+	root := filepath.Join(home, "sessions")
+	if info, err := os.Stat(root); err != nil || !info.IsDir() {
+		return nil
+	}
+	live := make(map[string]bool, len(sessions))
+	for _, session := range sessions {
+		live[session.ID] = true
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT session_id FROM cache_sessions UNION SELECT session_id FROM cache_steps UNION SELECT session_id FROM cache_live`)
+	if err != nil {
+		return err
+	}
+	stale := []string{}
+	for rows.Next() {
+		var sessionID string
+		if err = rows.Scan(&sessionID); err != nil {
+			rows.Close()
+			return err
+		}
+		if !live[sessionID] {
+			stale = append(stale, sessionID)
+		}
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	// The pool holds a single connection, so the cursor must be closed before the
+	// delete transaction can take it.
+	rows.Close()
+	if len(stale) > 0 {
+		if err = storage.Transaction(ctx, s.db, func(tx *sql.Tx) error {
+			for _, table := range []string{"cache_steps", "cache_sessions", "cache_live"} {
+				if err := deleteSessionRows(ctx, tx, table, stale); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	s.forgetStaleFiles(sessions)
+	return nil
+}
+
+func deleteSessionRows(ctx context.Context, tx *sql.Tx, table string, sessionIDs []string) error {
+	statement, err := tx.PrepareContext(ctx, `DELETE FROM `+table+` WHERE session_id=?`)
+	if err != nil {
+		return err
+	}
+	defer statement.Close()
+	for _, sessionID := range sessionIDs {
+		if _, err = statement.ExecContext(ctx, sessionID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// forgetStaleFiles drops incremental readers the discovered sessions no longer
+// cover: without it a deleted session keeps a parser and its pending usage list
+// alive forever.
+func (s *Store) forgetStaleFiles(sessions []sessionDir) {
+	live := make(map[string]bool)
+	for _, session := range sessions {
+		for _, agent := range session.Agents {
+			live[session.Dir+"/agents/"+agent+"/wire.jsonl"] = true
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for path := range s.files {
+		if !live[path] {
+			delete(s.files, path)
+		}
+	}
 }
 
 // LiveSignals is what keepalive needs about one session's current state.

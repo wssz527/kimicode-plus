@@ -2,8 +2,10 @@ package plugins
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -34,13 +36,18 @@ func isBlockedAddress(ip net.IP) bool {
 	}
 	if ip4 := ip.To4(); ip4 != nil {
 		// 100.64/10 carrier-grade NAT, 192.0.0/24 IETF protocol assignments,
-		// 198.18/15 benchmarking, 240/4 reserved and 255.255.255.255 broadcast.
+		// 240/4 reserved and 255.255.255.255 broadcast.
+		//
+		// 198.18.0.0/15 is deliberately not blocked: Clash, Mihomo, Surge and
+		// sing-box TUN mode answer every DNS query with a Fake-IP in that range
+		// and map the connection back to the requested name. Treating it as a
+		// forbidden target rejects every request on such machines, while the
+		// range reaches no local service: the TUN stack turns it into the
+		// original destination, not into an address of its own.
 		switch {
 		case ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127:
 			return true
 		case ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 0:
-			return true
-		case ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19):
 			return true
 		case ip4[0] >= 240:
 			return true
@@ -55,6 +62,15 @@ func isBlockedAddress(ip net.IP) bool {
 		}
 	}
 	return false
+}
+
+// isDNSFailure reports the one lookup outcome a proxied request may ignore:
+// the proxy resolves the target itself, so a local resolver failure says
+// nothing about whether the request can succeed. Every other refusal, notably
+// an answer pointing at a local address, is final.
+func isDNSFailure(err error) bool {
+	var pluginErr *Error
+	return errors.As(err, &pluginErr) && pluginErr.Code == "PLUGIN_NET_DNS_FAILED"
 }
 
 // A user who wrote `net:127.0.0.1` explicitly approved that address, so it is
@@ -72,6 +88,13 @@ func resolveApprovedAddr(ctx context.Context, lookupHost func(context.Context, s
 		// The user named this address in the grant: approving it in `net:` is the
 		// explicit decision that lets a local or private target through.
 		return parsed, nil
+	}
+	// `localhost` is the one name that is only a spelling of loopback: granting
+	// `net:localhost` is the same explicit decision as granting `net:127.0.0.1`,
+	// so it maps without asking the resolver. Any other name that resolves to
+	// loopback stays refused below.
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		return net.ParseIP("127.0.0.1"), nil
 	}
 	addresses, err := lookupHost(ctx, host)
 	if err != nil {

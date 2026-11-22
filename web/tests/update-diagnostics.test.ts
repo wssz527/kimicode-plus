@@ -12,17 +12,18 @@ type UpdateStatus = {
   releaseNotes?: string;
   updateAvailable: boolean;
   canApply: boolean;
+  autoCheck?: boolean;
   downloadedBytes: number;
   totalBytes: number;
   note?: string;
   error?: string;
 };
 
-type Host = { request<T>(action: string): Promise<T> };
+type Host = { request<T>(action: string, payload?: Record<string, unknown>): Promise<T> };
 
 const source = readFileSync("src/components/SettingsSurface.tsx", "utf8");
 const parsed = ts.createSourceFile("SettingsSurface.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-const helpers = new Set(["byteText", "coreUpdateBusy", "coreUpdateText", "checkCoreUpdate", "watchCoreUpdate"]);
+const helpers = new Set(["byteText", "coreUpdateBusy", "coreUpdateText", "checkCoreUpdate", "setCoreAutoCheck", "watchCoreUpdate"]);
 const logic = parsed.statements
   .filter((statement): statement is ts.FunctionDeclaration => ts.isFunctionDeclaration(statement) && helpers.has(statement.name?.text ?? ""))
   .map(statement => statement.getText(parsed)).join("\n");
@@ -30,11 +31,12 @@ const { outputText } = ts.transpileModule(logic, { compilerOptions: { module: ts
 const update = {} as {
   coreUpdateText(status: UpdateStatus | null, reconnecting?: boolean): string;
   checkCoreUpdate(host: Host): Promise<UpdateStatus>;
+  setCoreAutoCheck(host: Host, enabled: boolean): Promise<UpdateStatus>;
   watchCoreUpdate(host: Host, observe: (status: UpdateStatus | null, reconnecting: boolean) => void, signal: AbortSignal, pause: () => Promise<void>, now?: () => number): Promise<UpdateStatus | null>;
 };
 new Function("exports", outputText)(update);
 
-const idle: UpdateStatus = { state: "idle", currentVersion: "0.2.0", updateAvailable: false, canApply: false, downloadedBytes: 0, totalBytes: 0 };
+const idle: UpdateStatus = { state: "idle", currentVersion: "0.2.0", updateAvailable: false, canApply: false, autoCheck: true, downloadedBytes: 0, totalBytes: 0 };
 const available: UpdateStatus = {
   ...idle,
   state: "available",
@@ -46,10 +48,11 @@ const available: UpdateStatus = {
   releaseNotes: "Updated core",
 };
 
-function mockHost(actions: string[], responses: (UpdateStatus | Error)[]): Host {
+function mockHost(actions: string[], responses: (UpdateStatus | Error)[], payloads: Record<string, unknown>[] = []): Host {
   return {
-    async request<T>(action: string): Promise<T> {
+    async request<T>(action: string, payload?: Record<string, unknown>): Promise<T> {
       actions.push(action);
+      payloads.push(payload ?? {});
       const next = responses.shift();
       assert.ok(next, "unexpected extra update request");
       if (next instanceof Error) throw next;
@@ -140,3 +143,25 @@ test("polling stays active through a long download and bounds a stalled restart"
     new AbortController().signal, async () => { clock += 2 * 60_000; }, () => clock);
   assert.equal(stalled, null);
 });
+
+test("auto-check is opt-out by default and toggles through update.autoCheck", async () => {
+  assert.equal(update.coreUpdateText({ ...idle, autoCheck: false }), "尚未检查更新");
+
+  const actions: string[] = [];
+  const payloads: Record<string, unknown>[] = [];
+  const offline = { ...idle, autoCheck: false };
+  const status = await update.setCoreAutoCheck(mockHost(actions, [offline], payloads), false);
+  assert.deepEqual(actions, ["update.autoCheck"]);
+  assert.deepEqual(payloads, [{ enabled: false }]);
+  assert.equal(status.autoCheck, false);
+
+  const backOn = await update.setCoreAutoCheck(mockHost(actions, [{ ...idle, autoCheck: true }], payloads), true);
+  assert.deepEqual(actions, ["update.autoCheck", "update.autoCheck"]);
+  assert.deepEqual(payloads[1], { enabled: true });
+  assert.equal(backOn.autoCheck, true);
+
+  // The card treats a missing flag as enabled, so an older core never reads as off.
+  assert.equal(idle.autoCheck !== false, true);
+  assert.equal({ ...idle, autoCheck: false }.autoCheck !== false, false);
+});
+

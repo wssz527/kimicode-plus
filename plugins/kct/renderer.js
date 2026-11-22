@@ -23,6 +23,20 @@ const STREAM_MAX_WAIT_MS = 3000;
 const TARGET_LANGUAGES = ["zh", "en", "ja", "ko", "es", "fr", "de", "ru"];
 const AUTO = "__auto__";
 const PROVIDERS = ["bing", "google", "custom"];
+const CREDENTIAL = "translator";
+// 自定义服务的本机写法：清单只授权这几个字面目标，其余主机必须走 HTTPS。
+const LOCAL_ENDPOINT_HOSTS = new Set(["127.0.0.1", "[::1]", "localhost"]);
+const PROVIDER_LABELS = { bing: "Bing 翻译", google: "Google 翻译", custom: "自定义服务" };
+const LANGUAGE_LABELS = {
+  zh: "简体中文",
+  en: "English",
+  ja: "日本語",
+  ko: "한국어",
+  es: "Español",
+  fr: "Français",
+  de: "Deutsch",
+  ru: "Русский",
+};
 
 const DEFAULTS = {
   targetLanguage: AUTO,
@@ -37,21 +51,47 @@ export async function activate(ctx) {
   const engine = await createEngine(ctx);
   const style = injectStyles();
   const blocks = new Set();
+  const popover = createSettingsPopover({ ctx, engine, blocks });
 
   function current() {
     return engine.settings;
   }
 
-  async function reload() {
+  async function reload(source) {
     await engine.loadSettings();
-    for (const state of blocks) schedule(state, true);
+    // 每块记录它是用哪一组设置翻出来的；与当前设置不同的块才作废译文。仅切换
+    // 自动翻译或凭据开关时签名不变，已经显示的译文仍然有效，清空它只会让用户
+    // 失去正在读的内容。
+    const signature = translationSignature(engine.settings);
+    for (const state of blocks) {
+      if (state.signature !== signature) {
+        // 与独立版的 resetAll 一致：旧译文属于旧设置，必须作废并按新设置重新
+        // 调度；否则 done 标记会让 maybeRun 直接跳过，切换语言或服务看起来
+        // 毫无效果。state.requested 保留，用户手动发起过的块会继续重译。
+        cancel(state);
+        state.done = false;
+        state.source = "";
+        state.rendered = false;
+        state.skipped = false;
+        state.translatedSource = "";
+        state.translatedPrefix = "";
+        state.preferOriginal = false;
+        state.body.querySelector(".ekdp-kct-translated")?.remove();
+        setView(state, "original");
+        setStatus(state, "ok", "");
+      }
+      schedule(state, false);
+    }
+    // 内联浮层已经持有最新值；它自己的保存不应重建正在操作的控件。
+    if (source !== "inline") popover.refresh();
   }
 
-  function onSettingsChanged() {
-    void reload();
+  function onSettingsChanged(event) {
+    void reload(event?.detail?.source);
   }
-  function onCacheCleared() {
+  function onCacheCleared(event) {
     engine.clearMemoryCache();
+    if (event?.detail?.source !== "inline") popover.refresh();
   }
   window.addEventListener("ekdp-kct:settings", onSettingsChanged);
   window.addEventListener("ekdp-kct:cache", onCacheCleared);
@@ -80,7 +120,16 @@ export async function activate(ctx) {
     toggle.setAttribute("aria-label", "翻译这段思考");
     toggle.setAttribute("aria-pressed", "false");
 
-    bar.append(status, toggle);
+    const settings = document.createElement("button");
+    settings.type = "button";
+    settings.className = "ekdp-kct-btn";
+    settings.textContent = "设置";
+    settings.title = "翻译设置";
+    settings.setAttribute("aria-label", "翻译设置");
+    settings.setAttribute("aria-haspopup", "dialog");
+    settings.setAttribute("aria-expanded", "false");
+
+    bar.append(status, toggle, settings);
     head.after(bar);
 
     const state = {
@@ -104,6 +153,8 @@ export async function activate(ctx) {
       generation: 0,
       timer: 0,
       streamSince: 0,
+      // 译文是用哪一组设置产生的；设置变化后与之比较以决定是否重译。
+      signature: translationSignature(engine.settings),
     };
     blocks.add(state);
     bar.hidden = !info.open;
@@ -123,6 +174,7 @@ export async function activate(ctx) {
       state.requested = true;
       schedule(state, true);
     });
+    settings.addEventListener("click", () => popover.toggle(settings));
 
     schedule(state, false);
 
@@ -130,11 +182,13 @@ export async function activate(ctx) {
       update(next) {
         state.info = next;
         bar.hidden = !next.open;
+        if (!next.open) popover.closeFor(settings);
         schedule(state, false);
       },
       dispose() {
         cancel(state);
         blocks.delete(state);
+        popover.closeFor(settings);
         bar.remove();
         if (state.sourceNode) state.sourceNode.removeAttribute("data-ekdp-kct-hidden");
         const node = state.body.querySelector(".ekdp-kct-translated");
@@ -146,6 +200,7 @@ export async function activate(ctx) {
   ctx.onDispose(() => {
     window.removeEventListener("ekdp-kct:settings", onSettingsChanged);
     window.removeEventListener("ekdp-kct:cache", onCacheCleared);
+    popover.dispose();
     decoration.dispose();
     blocks.clear();
     style.remove();
@@ -240,7 +295,15 @@ export async function activate(ctx) {
       if (!source.trim()) return;
       if (source === state.source && state.done) return;
       if (settings.provider === "custom" && !customEndpoint(settings)) {
-        setStatus(state, "error", "请先设置自定义端点", "在插件设置里填写自定义服务地址");
+        const raw = String(settings.customEndpoint || "").trim();
+        setStatus(
+          state,
+          "error",
+          raw ? "端点地址无效" : "请先设置自定义端点",
+          raw
+            ? "远程端点必须使用 HTTPS；本机地址可用 http://127.0.0.1、http://[::1] 或 http://localhost。"
+            : "展开思考块工具栏的“设置”，填写自定义服务地址。",
+        );
         return;
       }
       await run(state, source);
@@ -299,10 +362,11 @@ export async function activate(ctx) {
       render(state, translated + nowSource.slice(source.length));
       state.done = nowSource === source && !state.info.streaming;
       state.source = source;
+      state.signature = translationSignature(settings);
       setStatus(state, state.done ? "ok" : "loading", state.done ? "" : "后续内容待翻译");
     } catch (error) {
       if (!valid()) return;
-      setStatus(state, "error", "重试", `翻译失败：${messageOf(error)}`);
+      setStatus(state, "error", `重试 · ${errorBrief(error)}`, `翻译失败：${messageOf(error)}`);
     } finally {
       if (state.generation === generation) {
         state.running = false;
@@ -658,7 +722,296 @@ async function createEngine(ctx) {
     return final;
   }
 
-  return { settings, translate, loadSettings, clearMemoryCache };
+  return { settings, translate, loadSettings, clearMemoryCache, cacheCount: () => cache.size };
+}
+
+// ------------------------------------------------------------- 内联设置
+
+// 每个思考块工具栏上的“设置”共用同一个浮层。浮层写入与设置页相同的存储键并
+// 派发 ekdp-kct:settings，因此内联改动会让已展开的思考块按新设置重译，设置页
+// 也能读到同一份值。
+function createSettingsPopover({ ctx, engine, blocks }) {
+  let panel = null;
+  let anchor = null;
+
+  function toggle(button) {
+    if (panel && anchor === button) {
+      close();
+      return;
+    }
+    open(button);
+  }
+
+  function open(button) {
+    close();
+    anchor = button;
+    panel = document.createElement("div");
+    panel.className = "ekdp-kct-panel";
+    panel.dataset.ekdpOwned = "1";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-label", "思考内容翻译设置");
+    anchor.setAttribute("aria-expanded", "true");
+    document.body.appendChild(panel);
+    render();
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+  }
+
+  function close(restoreFocus = false) {
+    if (!panel) return;
+    panel.remove();
+    panel = null;
+    if (anchor?.isConnected) {
+      anchor.setAttribute("aria-expanded", "false");
+      if (restoreFocus) anchor.focus();
+    }
+    anchor = null;
+    window.removeEventListener("pointerdown", onPointerDown, true);
+    window.removeEventListener("keydown", onKeyDown, true);
+    window.removeEventListener("resize", place);
+    window.removeEventListener("scroll", place, true);
+  }
+
+  function closeFor(button) {
+    if (anchor === button) close();
+  }
+
+  function refresh() {
+    if (panel) render();
+  }
+
+  function dispose() {
+    close();
+  }
+
+  function onPointerDown(event) {
+    if (!panel) return;
+    if (panel.contains(event.target) || anchor?.contains(event.target)) return;
+    close();
+  }
+
+  function onKeyDown(event) {
+    if (!panel || event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopPropagation();
+    close(true);
+  }
+
+  function place() {
+    if (!panel) return;
+    if (!anchor?.isConnected) {
+      close();
+      return;
+    }
+    const rect = anchor.getBoundingClientRect();
+    const width = Math.min(320, Math.max(240, window.innerWidth - 16));
+    panel.style.width = `${width}px`;
+    panel.style.visibility = "hidden";
+    const height = panel.offsetHeight;
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+    let top = rect.bottom + 6;
+    if (top + height > window.innerHeight - 8) {
+      top = Math.max(8, rect.top - height - 6);
+    }
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
+    panel.style.visibility = "visible";
+  }
+
+  function render() {
+    if (!panel) return;
+    panel.replaceChildren();
+
+    const heading = document.createElement("div");
+    heading.className = "ekdp-kct-panel-head";
+    const title = document.createElement("strong");
+    title.textContent = "翻译设置";
+    const closeButton = document.createElement("button");
+    closeButton.type = "button";
+    closeButton.className = "ekdp-kct-btn";
+    closeButton.textContent = "关闭";
+    closeButton.addEventListener("click", () => close(true));
+    heading.append(title, closeButton);
+
+    const note = document.createElement("p");
+    note.className = "ekdp-kct-note";
+    note.setAttribute("aria-live", "polite");
+
+    async function apply(patch) {
+      const next = { ...engine.settings, ...patch };
+      try {
+        await ctx.storage.set(SETTINGS_KEY, next);
+        Object.assign(engine.settings, next);
+        window.dispatchEvent(new CustomEvent("ekdp-kct:settings", { detail: { source: "inline" } }));
+      } catch (error) {
+        note.textContent = `保存失败：${messageOf(error)}`;
+      }
+    }
+
+    const language = selectControl(
+      [[AUTO, "跟随界面语言"], ...TARGET_LANGUAGES.map(code => [code, LANGUAGE_LABELS[code] ?? code])],
+      engine.settings.targetLanguage,
+      value => void apply({ targetLanguage: value }),
+    );
+    const provider = selectControl(
+      PROVIDERS.map(value => [value, PROVIDER_LABELS[value]]),
+      engine.settings.provider,
+      value => {
+        void apply({ provider: value }).then(render);
+      },
+    );
+
+    const auto = document.createElement("label");
+    auto.className = "ekdp-kct-check";
+    const autoInput = document.createElement("input");
+    autoInput.type = "checkbox";
+    autoInput.checked = engine.settings.autoTranslate !== false;
+    autoInput.addEventListener("change", () => void apply({ autoTranslate: autoInput.checked }));
+    auto.append(autoInput, document.createTextNode(" 展开后自动翻译"));
+
+    panel.append(heading, field("目标语言", language), field("翻译服务", provider), auto);
+    if (engine.settings.provider === "custom") panel.append(customFields(apply));
+
+    const stats = document.createElement("p");
+    stats.className = "ekdp-kct-note ekdp-kct-stats";
+    const refreshStats = () => {
+      stats.textContent =
+        `${blocks.size} 个思考块 · 缓存 ${engine.cacheCount()} 段 · ` +
+        `${PROVIDER_LABELS[engine.settings.provider] ?? engine.settings.provider}`;
+    };
+    refreshStats();
+
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.className = "ekdp-kct-btn";
+    clear.textContent = "清除翻译缓存";
+    clear.addEventListener("click", async () => {
+      clear.disabled = true;
+      try {
+        const keys = await ctx.storage.list(CACHE_ENTRY_PREFIX);
+        for (const key of keys) await ctx.storage.delete(key);
+        await ctx.storage.delete(CACHE_INDEX_KEY);
+        await ctx.storage.delete("cache.v1");
+        engine.clearMemoryCache();
+        window.dispatchEvent(new CustomEvent("ekdp-kct:cache", { detail: { source: "inline" } }));
+        clear.textContent = "缓存已清除";
+        refreshStats();
+      } catch (error) {
+        stats.textContent = `清除缓存失败：${messageOf(error)}`;
+      } finally {
+        clear.disabled = false;
+      }
+    });
+
+    const tools = document.createElement("div");
+    tools.className = "ekdp-kct-panel-actions";
+    tools.append(clear);
+
+    const hint = document.createElement("p");
+    hint.className = "ekdp-kct-note";
+    hint.textContent =
+      engine.settings.provider === "custom"
+        ? "思考原文会发送到你配置的自定义端点。"
+        : "思考原文会发送到所选公共翻译服务，可能包含代码与会话细节。";
+
+    panel.append(tools, stats, hint, note);
+    place();
+  }
+
+  function customFields(apply) {
+    const wrap = document.createElement("div");
+    wrap.className = "ekdp-kct-custom";
+
+    const endpointInput = document.createElement("input");
+    endpointInput.type = "url";
+    endpointInput.className = "ekdp-kct-input";
+    endpointInput.placeholder = "https://…/v1/chat/completions";
+    endpointInput.value = engine.settings.customEndpoint || "";
+    const endpointNote = document.createElement("p");
+    endpointNote.className = "ekdp-kct-note";
+    endpointNote.textContent = engine.settings.customEndpoint ? "" : "尚未填写端点，翻译会暂停。";
+    endpointInput.addEventListener("change", () => {
+      const raw = endpointInput.value.trim();
+      if (raw && !customEndpoint({ customEndpoint: raw })) {
+        endpointNote.textContent =
+          "远程端点必须使用 HTTPS；本机地址可用 http://127.0.0.1、http://[::1] 或 http://localhost。";
+        return;
+      }
+      endpointNote.textContent = raw ? "" : "尚未填写端点，翻译会暂停。";
+      void apply({ customEndpoint: raw });
+    });
+
+    const modelInput = document.createElement("input");
+    modelInput.type = "text";
+    modelInput.className = "ekdp-kct-input";
+    modelInput.placeholder = "模型名（可选）";
+    modelInput.value = engine.settings.customModel || "";
+    modelInput.addEventListener("change", () => void apply({ customModel: modelInput.value.trim() }));
+
+    const credential = document.createElement("p");
+    credential.className = "ekdp-kct-note";
+    void refreshCredential(credential);
+
+    const openSettings = document.createElement("button");
+    openSettings.type = "button";
+    openSettings.className = "ekdp-kct-btn";
+    openSettings.textContent = "打开插件设置";
+    openSettings.addEventListener("click", () => {
+      if (!ctx.ui.openSettings) {
+        credential.textContent = "当前宿主没有打开设置页的入口，请在插件列表里打开“思考内容翻译”。";
+        return;
+      }
+      void ctx.ui.openSettings().catch(error => {
+        credential.textContent = `无法打开设置页：${messageOf(error)}`;
+      });
+    });
+
+    const endpointField = field("自定义端点（OpenAI 兼容）", endpointInput);
+    endpointField.append(endpointNote);
+    wrap.append(endpointField, field("模型名", modelInput), credential, openSettings);
+    return wrap;
+  }
+
+  async function refreshCredential(node) {
+    try {
+      const result = await ctx.core.request("credentials.list");
+      const entry = Array.isArray(result?.items) ? result.items.find(item => item?.name === CREDENTIAL) : null;
+      node.textContent = entry?.stored
+        ? entry.unlocked
+          ? "密钥已保存，请求时由核心注入。"
+          : "密钥已保存，但凭据库处于锁定状态；解锁后才能请求。"
+        : "尚未保存密钥；多数自定义服务需要密钥。";
+    } catch (error) {
+      node.textContent = `无法读取凭据状态：${messageOf(error)}`;
+    }
+  }
+
+  function field(labelText, control) {
+    const wrap = document.createElement("label");
+    wrap.className = "ekdp-kct-field";
+    const caption = document.createElement("span");
+    caption.textContent = labelText;
+    wrap.append(caption, control);
+    return wrap;
+  }
+
+  function selectControl(options, value, onChange) {
+    const select = document.createElement("select");
+    select.className = "ekdp-kct-input";
+    for (const [optionValue, label] of options) {
+      const option = document.createElement("option");
+      option.value = optionValue;
+      option.textContent = label;
+      select.append(option);
+    }
+    select.value = value;
+    select.addEventListener("change", () => onChange(select.value));
+    return select;
+  }
+
+  return { toggle, closeFor, refresh, dispose };
 }
 
 // --------------------------------------------------------------- 三种服务
@@ -746,11 +1099,11 @@ function customEndpoint(settings) {
   } catch {
     return "";
   }
-  // 主机名可能经 DNS 指向其他地址，只使用清单逐项授权的本机字面 IP。
-  const local = url.hostname === "127.0.0.1" || url.hostname === "[::1]";
-  if (!local) return "";
-  if (url.protocol !== "https:" && url.protocol !== "http:") return "";
-  return url.href;
+  if (url.username || url.password) return "";
+  // 远程端点由清单的 net:https 授权（只允许 TLS）；本机服务用清单列出的字面目标。
+  if (url.protocol === "https:") return url.href;
+  if (url.protocol === "http:" && LOCAL_ENDPOINT_HOSTS.has(url.hostname)) return url.href;
+  return "";
 }
 
 async function request(ctx, url, init) {
@@ -758,7 +1111,12 @@ async function request(ctx, url, init) {
   try {
     response = await ctx.net.fetch(url, init);
   } catch (error) {
-    throw Object.assign(new Error("网络请求失败"), { status: 0, cause: error });
+    // 核心的错误信息说明了拒绝原因（DNS、代理、能力、凭据……），换掉它会让
+    // 用户只能看到“失败”而无法判断该改哪里。
+    throw Object.assign(new Error(messageOf(error) || "网络请求失败"), {
+      status: Number(error?.status) || 0,
+      cause: error,
+    });
   }
   if (response.status < 200 || response.status >= 300) {
     const error = Object.assign(new Error(`HTTP ${response.status}`), { status: response.status });
@@ -949,6 +1307,16 @@ function resolveTarget(settings) {
   return TARGET_LANGUAGES.includes(base) ? base : "en";
 }
 
+// 译文取决于哪个服务、哪种语言，以及自定义端点和模型；自动翻译与凭据开关
+// 只影响是否/如何请求，不改变已显示译文的内容。
+function translationSignature(settings) {
+  const provider = settings.provider;
+  const scope = provider === "custom"
+    ? `${String(settings.customEndpoint || "").trim()}\u0000${String(settings.customModel || "").trim()}`
+    : "";
+  return `${provider}\u0000${resolveTarget(settings)}\u0000${scope}`;
+}
+
 // 缓存键只需稳定且足够分散，不能依赖 crypto.subtle。
 function hashKey(text) {
   let h1 = 0x811c9dc5;
@@ -998,6 +1366,20 @@ function injectStyles() {
 .ekdp-kct-status:empty{display:none}
 .ekdp-kct-status[data-state="error"]{color:var(--color-danger,var(--red,light-dark(#b42318,#f97066)))}
 .ekdp-kct-translated{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
+.ekdp-kct-panel{position:fixed;z-index:2147483000;display:flex;flex-direction:column;gap:10px;box-sizing:border-box;padding:12px 14px;border:1px solid var(--color-line,var(--line,light-dark(rgba(0,0,0,.14),rgba(255,255,255,.16))));border-radius:10px;background:var(--color-surface,var(--surface-raised,light-dark(#fff,#1e1f22)));color:var(--color-text,light-dark(#222,#eee));box-shadow:0 12px 32px light-dark(rgba(15,23,42,.18),rgba(0,0,0,.5));font:12px/1.5 var(--font-ui,sans-serif);text-align:left}
+.ekdp-kct-panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.ekdp-kct-panel-head strong{font-size:13px;font-weight:600}
+.ekdp-kct-field{display:flex;flex-direction:column;gap:4px}
+.ekdp-kct-field>span{color:var(--color-text-secondary,var(--ink-muted,light-dark(#666,#aaa)));font-size:11px}
+.ekdp-kct-input{width:100%;box-sizing:border-box;font:inherit;color:inherit;background:var(--surface-sunken,light-dark(#f3f5f8,#26272b));border:1px solid var(--color-line,var(--line,light-dark(rgba(0,0,0,.14),rgba(255,255,255,.16))));border-radius:6px;padding:4px 6px}
+.ekdp-kct-input:focus-visible{outline:2px solid var(--blue,#4385ef);outline-offset:1px}
+.ekdp-kct-check{display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer}
+.ekdp-kct-check input{margin:0}
+.ekdp-kct-note{margin:0;color:var(--color-text-secondary,var(--ink-muted,light-dark(#666,#aaa)));font-size:11px;line-height:1.5;overflow-wrap:anywhere}
+.ekdp-kct-note:empty{display:none}
+.ekdp-kct-panel-actions{display:flex;align-items:center;gap:8px}
+.ekdp-kct-custom{display:flex;flex-direction:column;gap:10px}
+.ekdp-kct-stats{opacity:.85}
 `;
   document.head.appendChild(style);
   injected = style;
@@ -1007,4 +1389,20 @@ function injectStyles() {
 function messageOf(error) {
   const text = String(error?.message || error || "");
   return text.length > 200 ? text.slice(0, 200) + "…" : text;
+}
+
+// 状态药丸只放得下一句短话；完整原因在 title 里。分类覆盖用户最常遇到的失败：
+// 限流、被拒绝、服务错误、DNS、代理/连接与超时。
+function errorBrief(error) {
+  const status = Number(error?.status) || 0;
+  const text = String(error?.message || error || "").trim();
+  if (status === 429) return "请求过多";
+  if (status === 401 || status === 403) return "无权限或凭据被拒绝";
+  if (status >= 500) return `服务返回 ${status}`;
+  if (status >= 400) return `HTTP ${status}`;
+  if (/无法解析|no such host|lookup|dns/i.test(text)) return "DNS 解析失败";
+  if (/proxy|代理|tunnel|connect/i.test(text)) return "连接失败";
+  if (/超时|timeout|deadline/i.test(text)) return "请求超时";
+  if (!text) return "网络请求失败";
+  return text.length > 24 ? `${text.slice(0, 24)}…` : text;
 }

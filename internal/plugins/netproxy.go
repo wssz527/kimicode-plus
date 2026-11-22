@@ -25,14 +25,18 @@ const (
 
 var proxyHeaderPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
 
-// proxyClient builds a one-shot client pinned to the address the guard just
-// approved. The transport is not shared: a pooled connection belongs to one
-// host's resolution, and reusing it for another host would let a keep-alive
-// socket outlive the check that authorized it.
-func newProxyClient(dial func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Client {
+// proxyFromEnvironment is a variable so tests can drive both egress paths
+// without the process-wide cache inside http.ProxyFromEnvironment: the standard
+// function reads HTTP(S)_PROXY and NO_PROXY once per process.
+var proxyFromEnvironment = http.ProxyFromEnvironment
+
+// proxyClient builds a one-shot client pinned to one egress path: the address
+// the guard just approved, or the proxy the environment configures. The
+// transport is not shared: a pooled connection belongs to one host's resolution,
+// and reusing it for another host would let a keep-alive socket outlive the
+// check that authorized it.
+func newProxyClient(dial func(ctx context.Context, network, addr string) (net.Conn, error), proxyURL *url.URL) *http.Client {
 	transport := &http.Transport{
-		Proxy:                 nil,
-		DialContext:           dial,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          1,
 		MaxIdleConnsPerHost:   1,
@@ -41,6 +45,11 @@ func newProxyClient(dial func(ctx context.Context, network, addr string) (net.Co
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	if proxyURL != nil {
+		transport.Proxy = http.ProxyURL(proxyURL)
+	} else {
+		transport.DialContext = dial
 	}
 	return &http.Client{
 		Transport: transport,
@@ -52,6 +61,32 @@ func newProxyClient(dial func(ctx context.Context, network, addr string) (net.Co
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+// proxyForTarget reports the proxy the environment configures for one target.
+// A loopback target is never proxied: the grant names a service on this machine,
+// and sending that request to a proxy would address a different machine. The
+// proxy itself is reached through the standard dialer because its address comes
+// from the user's own environment, not from the plugin's grant.
+func proxyForTarget(scheme, host, port string) *url.URL {
+	if isLoopbackTarget(host) {
+		return nil
+	}
+	request := &http.Request{URL: &url.URL{Scheme: scheme, Host: net.JoinHostPort(host, port)}}
+	proxyURL, err := proxyFromEnvironment(request)
+	if err != nil || proxyURL == nil {
+		return nil
+	}
+	return proxyURL
+}
+
+func isLoopbackTarget(host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 type proxyRequest struct {
@@ -89,7 +124,7 @@ func (m *Manager) proxy(ctx context.Context, id string, grants Grants, vault *cr
 	if err != nil {
 		return nil, err
 	}
-	if err := grants.AuthorizeNet(action, parsed.Hostname()); err != nil {
+	if err := grants.AuthorizeNetURL(action, parsed); err != nil {
 		return nil, err
 	}
 	method := strings.ToUpper(strings.TrimSpace(request.Method))
@@ -148,10 +183,18 @@ func (m *Manager) proxy(ctx context.Context, id string, grants Grants, vault *cr
 	outbound.Header = headers
 	outbound.Header.Set("Accept-Encoding", "identity")
 
-	// Resolve once, validate every answer, then dial that literal address. The
-	// authorization above checked a name; this check is what makes the name and
-	// the socket agree even if DNS changes between the two.
+	// The broad `net:https` grant carries no host list. A literal address or
+	// `localhost` it did not name gets no loopback/private exception; only a target
+	// the user wrote in a `net:` entry is exempt.
 	host := parsed.Hostname()
+	if !grants.AllowsHost(host) {
+		if isLoopbackTarget(host) {
+			return nil, apiError(http.StatusForbidden, "PLUGIN_NET_HOST_DENIED", "插件网络目标不能是本机或内网地址 "+host)
+		}
+		if literal, ok := canonicalIP(strings.TrimSuffix(host, ".")); ok && isBlockedAddress(net.ParseIP(literal)) {
+			return nil, apiError(http.StatusForbidden, "PLUGIN_NET_HOST_DENIED", "插件网络目标不能是本机或内网地址 "+literal)
+		}
+	}
 	port := parsed.Port()
 	if port == "" {
 		if parsed.Scheme == "https" {
@@ -160,11 +203,29 @@ func (m *Manager) proxy(ctx context.Context, id string, grants Grants, vault *cr
 			port = "80"
 		}
 	}
-	addr, err := resolveApprovedAddr(ctx, m.resolver().LookupIPAddr, host)
-	if err != nil {
-		return nil, err
+
+	// Behind an HTTP(S) proxy the socket goes to the proxy, which owns DNS for
+	// the target. A local answer is still checked when one arrives: a name that
+	// points at the machine or the LAN must not slip past the address guard just
+	// because the user runs a proxy. The lookup is best-effort because proxy-only
+	// networks have no local DNS, so a failure is tolerated. Without a proxy the
+	// answer is the address that gets dialed, so it is authoritative.
+	var client *http.Client
+	if proxyURL := proxyForTarget(parsed.Scheme, host, port); proxyURL != nil {
+		lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		_, err := resolveApprovedAddr(lookupCtx, m.resolver().LookupIPAddr, host)
+		cancel()
+		if err != nil && !isDNSFailure(err) {
+			return nil, err
+		}
+		client = newProxyClient(nil, proxyURL)
+	} else {
+		addr, err := resolveApprovedAddr(ctx, m.resolver().LookupIPAddr, host)
+		if err != nil {
+			return nil, err
+		}
+		client = newProxyClient(guardedDialer(addr, port), nil)
 	}
-	client := newProxyClient(guardedDialer(addr, port))
 	response, err := client.Do(outbound)
 	if err != nil {
 		// The error text can contain the URL; it cannot contain the injected

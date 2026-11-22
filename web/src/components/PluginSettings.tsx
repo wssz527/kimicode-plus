@@ -1,9 +1,9 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { api, ApiError, type KctMigrationResult, type PluginActivity, type PluginPlatformLimitation, type PluginPreview, type PluginRecord, type PluginUpstream } from "../api";
+import { api, ApiError, type KctMigrationResult, type MonitorMigrationResult, type PluginActivity, type PluginPlatformLimitation, type PluginPreview, type PluginRecord, type PluginUpstream } from "../api";
 import { pluginHostBridge, syncPluginHost } from "../plugin-runtime/host";
 import type { NativeHost } from "../native";
 import { Icon } from "./Icon";
-import { ActionButton, Badge, EmptyState, ErrorNotice, Field, InfoNote, Panel, SkeletonRows, StateBadge } from "./ui";
+import { ActionButton, Badge, EmptyState, ErrorNotice, Field, InfoNote, Panel, SkeletonRows, StateBadge, Toggle } from "./ui";
 import { PluginCredentials } from "./PluginCredentials";
 import { requestWindowsReopen } from "./WindowsAttachStatus";
 import { PageError } from "../AppShell";
@@ -159,6 +159,19 @@ function PluginLegalFiles({ plugin }: { plugin: PluginRecord }) {
 /** The bundled KCT adapter, whose enable is gated by the standalone handover. */
 const KCT_PLUGIN_ID = "kimicode-plus.kct";
 
+/** The bundled Monitor panel, gated by the standalone desktop patch handover. */
+const MONITOR_PLUGIN_ID = "kimicode-plus.monitor";
+
+const PLANNER_PLUGIN_ID = "kimicode-plus.planner";
+
+function canQuickToggle(plugin: PluginRecord): boolean {
+  return plugin.state !== "UNINSTALLED" && plugin.state !== "CORRUPT" && Boolean(plugin.compatible || plugin.enabled);
+}
+
+function isMigrationGate(error: unknown): boolean {
+  return error instanceof ApiError && error.code === "PLUGIN_MIGRATION_REQUIRED";
+}
+
 const ACTIVITY_LABELS: Record<string, string> = {
   INSTALL: "安装",
   ENABLE: "启用",
@@ -219,7 +232,7 @@ function PluginFaultNotice({ reason }: { reason: string }) {
       <Icon name="alert" size={18} />
       <div className="notice-copy">
         <strong>{fault.title}</strong>
-        <p>{fault.detail}</p>
+        {fault.detail && fault.detail !== fault.title ? <p>{fault.detail}</p> : null}
         <p className="notice-recovery">增强插件已停用。修正文件或更换增强插件后可以重新启用。</p>
         {fault.code ? (
           <details className="notice-diagnostics">
@@ -278,7 +291,10 @@ function PluginSettingsPanel({ plugin }: { plugin: PluginRecord }) {
   }, [plugin.id]);
 
   return (
-    <Panel title="增强插件设置">
+    <section className="plugin-settings-section" aria-label="增强插件设置">
+      <div className="plugin-section-head">
+        <h3>设置</h3>
+      </div>
       {state === "unavailable" ? (
         <p className="panel-note">增强插件设置只在 Kimi Code 宿主内可用。当前页面没有运行增强插件运行时。</p>
       ) : state === "loading" ? (
@@ -287,7 +303,7 @@ function PluginSettingsPanel({ plugin }: { plugin: PluginRecord }) {
         <ErrorNotice message={message || "增强插件设置页加载失败。"} recovery="停用再启用增强插件后重试；仍然失败时检查增强插件文件是否为最新版本。" />
       ) : null}
       <div className="ekdp-settings-mount" ref={hostRef} hidden={state !== "ready"} />
-    </Panel>
+    </section>
   );
 }
 
@@ -297,7 +313,7 @@ function PluginSettingsPanel({ plugin }: { plugin: PluginRecord }) {
  * still disabled. The panel explains what will be stopped, copies only the two
  * public settings, and keeps the loader untouched until the user confirms.
  */
-function KctMigrationPanel({ show }: { show: boolean }) {
+function KctMigrationPanel({ show, onMigrated }: { show: boolean; onMigrated?: () => void }) {
   const report = useResource("plugins/kct/migration", () => api.plugins.kctMigration(), { enabled: show });
   const action = useAction<KctMigrationResult>();
   const [result, setResult] = useState<KctMigrationResult | null>(null);
@@ -312,6 +328,7 @@ function KctMigrationPanel({ show }: { show: boolean }) {
     if (done) {
       setResult(done);
       report.reload();
+      onMigrated?.();
     }
   }
 
@@ -401,6 +418,116 @@ function KctMigrationPanel({ show }: { show: boolean }) {
   );
 }
 
+/**
+ * The handover from the standalone kimi-code-monitor desktop patch. The patch
+ * injects its own sidebar panel into Kimi Code's `desktop-dist`; enabling the
+ * bundled plugin while it is still in place would mount two panels. The restore
+ * is a core route because the plugin is blocked while the patch exists.
+ */
+function MonitorMigrationPanel({ show, onMigrated }: { show: boolean; onMigrated?: () => void }) {
+  const report = useResource("plugins/monitor/migration", () => api.plugins.monitorMigration(), { enabled: show });
+  const action = useAction<MonitorMigrationResult>();
+  const [result, setResult] = useState<MonitorMigrationResult | null>(null);
+
+  if (!show) return null;
+  const state = result?.report ?? report.data ?? null;
+  const needsConfirmation = Boolean(state?.needsConfirmation);
+  const migrated = Boolean(state?.migrated);
+
+  async function confirm() {
+    const done = await action.run(() => api.plugins.confirmMonitorMigration());
+    if (done) {
+      setResult(done);
+      report.reload();
+      onMigrated?.();
+    }
+  }
+
+  if (report.loading && !state) {
+    return (
+      <Panel title="独立版 Monitor 迁移">
+        <SkeletonRows rows={2} cols={1} />
+      </Panel>
+    );
+  }
+  if (report.error && !state) {
+    return (
+      <Panel title="独立版 Monitor 迁移">
+        <ErrorNotice
+          message={errorMessage(report.error)}
+          recovery="增强插件在确认迁移前不能启用。稍后重试；仍然失败时确认核心服务正在运行。"
+        />
+      </Panel>
+    );
+  }
+  if (!needsConfirmation && !migrated) {
+    return null;
+  }
+
+  return (
+    <Panel title={migrated ? "独立版 Monitor 迁移" : "先卸载独立版 Monitor 补丁"}>
+      {migrated ? (
+        <>
+          <p className="panel-note">
+            {result?.message || "独立版 Kimi Code Monitor 的桌面补丁已卸载"}
+            {state?.migratedAt ? `（${fmtDateTime(state.migratedAt)}）` : ""}。原始的 <code>index.html</code> 已经恢复，
+            <code>kcm/</code> 目录也已删除，现在可以启用这个增强插件。
+          </p>
+          <InfoNote tone="warn">
+            <p>
+              如果旧窗口里已经加载过独立版侧栏面板，请按 <kbd>Cmd+R</kbd>（Windows 为 <kbd>Ctrl+R</kbd>）重新载入 Kimi Code，
+              再启用「Monitor」，避免侧栏同时出现两个面板。
+            </p>
+          </InfoNote>
+        </>
+      ) : (
+        <>
+          <p>
+            检测到独立版 <code>kimi-code-monitor</code> 的桌面补丁仍在 Kimi Code 的 <code>desktop-dist</code> 中：
+            <code>kcm/</code> 仍在，<code>index.html</code> 仍会加载它的 <code>kcm/loader.js</code>。这个增强插件和独立版都会向侧栏
+            注入 Monitor 面板，两套同时存在会看到两个重叠的面板。确认后会还原原始 <code>index.html</code> 并删除 <code>kcm/</code>。
+          </p>
+          <dl className="rail-facts">
+            <div>
+              <dt>桌面目录</dt>
+              <dd className="num">{state?.distDir || "未找到"}</dd>
+            </div>
+            <div>
+              <dt>独立版载荷</dt>
+              <dd className="num">{state?.payloadPresent ? state.payloadDir : "不在了"}</dd>
+            </div>
+            <div>
+              <dt>原始页面备份</dt>
+              <dd className="num">{state?.backupPresent ? state.backupPath : "没有 index.html.bak-kcm，将只清理补丁标记"}</dd>
+            </div>
+          </dl>
+          <InfoNote tone="warn">
+            <p>卸载只还原 Kimi Code 的桌面页面并删除补丁载荷，不会删除独立版自己的数据目录，也不会改动这个增强插件的设置。</p>
+          </InfoNote>
+          <div className="inline-actions">
+            <ActionButton variant="primary" icon="check" onClick={() => void confirm()} busy={action.busy}>
+              停用并卸载独立版 Monitor 补丁
+            </ActionButton>
+            <ActionButton variant="quiet" onClick={report.reload} busy={report.loading}>
+              重新检测
+            </ActionButton>
+          </div>
+          <p className="panel-note">不确认也可以：增强插件保持停用，独立版继续工作，两边不会同时显示。</p>
+        </>
+      )}
+      {action.error ? (
+        <ErrorNotice
+          message={errorMessage(action.error)}
+          recovery="独立版补丁没有被改动。排除原因后可以再次确认；这个操作可以安全重复。"
+          onDismiss={action.clearError}
+        />
+      ) : null}
+      {!migrated && result?.message ? <p className="panel-note">{result.message}</p> : null}
+      {state?.detail ? <p className="panel-note">{state.detail}</p> : null}
+    </Panel>
+  );
+}
+
 const SCHEDULER_PLUGIN_ID = "kimicode-plus.scheduler";
 
 interface SchedulerAttachPromptState {
@@ -446,6 +573,8 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
   const action = useAction<PluginRecord | { id: string; uninstalled: boolean }>();
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [quickBusy, setQuickBusy] = useState<string | null>(null);
+  const [quickError, setQuickError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!flash) return;
@@ -453,7 +582,10 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
     return () => clearTimeout(timer);
   }, [flash]);
 
-  const items = plugins.data?.items ?? [];
+  const items = useMemo(
+    () => (plugins.data?.items ?? []).filter(item => item.id !== PLANNER_PLUGIN_ID),
+    [plugins.data?.items],
+  );
   const current = useMemo(() => items.find(item => item.id === selected) ?? null, [items, selected]);
   const detailActive = Boolean(current);
   const previewPrivileged = preview?.privilegedCapabilities ?? [];
@@ -572,6 +704,13 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
     }
   }
 
+  async function afterStateChange(record: PluginRecord) {
+    await syncHost();
+    setFlash(`「${record.name || record.id}」现在${PLAIN_STATE[record.state] ?? stateLabel(record.state)}。`);
+    plugins.reload();
+    activity.reload();
+  }
+
   async function run(id: string, kind: "enable" | "disable" | "uninstall", options?: { deleteData?: boolean }) {
     if (kind === "uninstall") {
       const done = await action.run(() => api.plugins.uninstall(id, options));
@@ -590,15 +729,44 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
     }
     const result = await action.run(() => (kind === "enable" ? api.plugins.enable(id) : api.plugins.disable(id)));
     if (result && "state" in result) {
-      await syncHost();
-      setFlash(`「${result.name || result.id}」现在${PLAIN_STATE[result.state] ?? stateLabel(result.state)}。`);
-      plugins.reload();
-      activity.reload();
+      await afterStateChange(result);
       if (kind === "enable") {
         await maybePromptSchedulerAutoAttach(result);
       } else if (id === SCHEDULER_PLUGIN_ID) {
         setAutoAttachPrompt(null);
       }
+    }
+  }
+
+  /* The list row cannot host a migration panel, so a gated enable lands the user
+     on the detail page that owns the confirmation. */
+  async function quickToggle(plugin: PluginRecord, next: boolean) {
+    if (quickBusy !== null) return;
+    setQuickError(null);
+    setQuickBusy(plugin.id);
+    try {
+      const record = next ? await api.plugins.enable(plugin.id) : await api.plugins.disable(plugin.id);
+      await afterStateChange(record);
+      if (next && record.state === "BLOCKED") {
+        setFlash(`「${record.name || record.id}」被门禁拦截，已打开详情页查看原因。`);
+        openDetail(plugin.id);
+        return;
+      }
+      if (next) {
+        await maybePromptSchedulerAutoAttach(record);
+      } else if (plugin.id === SCHEDULER_PLUGIN_ID) {
+        setAutoAttachPrompt(null);
+      }
+    } catch (error) {
+      if (isMigrationGate(error)) {
+        setFlash(`「${plugin.name || plugin.id}」需要先完成独立版迁移，已打开详情页。`);
+        openDetail(plugin.id);
+        plugins.reload();
+      } else {
+        setQuickError(errorMessage(error));
+      }
+    } finally {
+      setQuickBusy(null);
     }
   }
 
@@ -813,18 +981,53 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
     const capabilities = current.capabilities ?? [];
     const privileged = current.privilegedCapabilities ?? [];
     const ungranted = (current.declaredCapabilities ?? []).filter(name => !capabilities.includes(name));
+    const hasScheduler = capabilities.includes("schedule:manage")
+      || (current.declaredCapabilities ?? []).includes("schedule:manage");
     return (
       <div className={embedded ? "ekds-plugins ekds-subpage" : "page"} data-ekd-plugin-detail={current.id}>
         <button type="button" className="ekds-back" ref={backRef} onClick={closeDetail}>
           <Icon name="arrowRight" size={14} />返回增强插件
         </button>
+
         <div className="plugins-detail-head">
-          <div className="plugins-detail-title">
-            <h2>{current.name || current.id}</h2>
-            <span className="num">{current.id} · v{current.version}</span>
+          <div className="plugins-detail-identity">
+            <span className="plugin-glyph" aria-hidden="true">
+              <Icon name={current.state === "CORRUPT" || current.state === "FAULTED" ? "alert" : "plugins"} size={18} />
+            </span>
+            <div className="plugins-detail-title">
+              <div className="plugins-detail-title-row">
+                <h2>{current.name || current.id}</h2>
+                <StateBadge state={current.state} tone={stateTone(current.state)} label={PLAIN_STATE[current.state] ?? stateLabel(current.state)} />
+              </div>
+              <span className="num">
+                v{current.version} · {current.source === "BUNDLED" ? "预装" : "本地"} · {current.id}
+              </span>
+            </div>
           </div>
-          <StateBadge state={current.state} tone={stateTone(current.state)} label={PLAIN_STATE[current.state] ?? stateLabel(current.state)} />
+          <div className="plugins-detail-header-actions">
+            {current.enabled ? (
+              <ActionButton icon="power" onClick={() => void run(current.id, "disable")} busy={action.busy || syncing}>
+                停用增强插件
+              </ActionButton>
+            ) : (
+              <ActionButton
+                variant="primary"
+                icon="power"
+                onClick={() => void run(current.id, "enable")}
+                busy={action.busy || syncing}
+                disabled={safeMode}
+              >
+                启用增强插件
+              </ActionButton>
+            )}
+            {!current.enabled && !current.compatible ? (
+              <ActionButton icon="alert" onClick={() => setConfirmForce(true)} busy={action.busy || syncing} disabled={safeMode}>
+                强制启用
+              </ActionButton>
+            ) : null}
+          </div>
         </div>
+        {current.description ? <p className="plugins-detail-desc">{current.description}</p> : null}
 
         {flash ? (
           <div className="save-flash" role="status">
@@ -839,184 +1042,190 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
         ) : null}
 
         {current.error ? <PluginFaultNotice reason={current.error} /> : null}
-
-        <div className="plugins-detail-grid">
-          <Panel title="能力">
-            {current.platformLimitations?.length ? <WindowsPluginReopen host={host} /> : null}
-            {capabilities.length === 0 ? (
-              <p className="panel-note">这个增强插件没有获得任何能力，只能显示自己的界面。</p>
-            ) : (
-              <ul className="capability-list">
-                {capabilities.map(name => {
-                  const label = capabilityLabel(name);
-                  return (
-                    <li key={name}>
-                      <Icon name="check" size={14} />
-                      <div>
-                        <CapabilityTitle name={name} privileged={privileged} />
-                        <p>{label.detail}</p>
-                        <CapabilityPlatformNotes name={name} limitations={current.platformLimitations} />
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-            {ungranted.length > 0 ? (
-              <InfoNote tone="warn">
-                <p>
-                  当前不可用的能力
-                  {ungranted.map((name, index) => (
-                    <span key={name}>{index === 0 ? " · " : "、"}{capabilityLabel(name).title}{privileged.includes(name) ? "（高权限）" : ""}</span>
-                  ))}。
-                </p>
-                {ungranted.map(name => <CapabilityPlatformNotes key={name} name={name} limitations={current.platformLimitations} />)}
-              </InfoNote>
-            ) : null}
-          </Panel>
-
-          <Panel title="信息">
-            {current.description ? <p className="panel-note">{current.description}</p> : null}
-            <dl className="rail-facts">
-              <div><dt>作者</dt><dd>{current.author || "未声明"}</dd></div>
-              {current.apiVersion ? <div><dt>插件 API</dt><dd className="num">v{current.apiVersion}</dd></div> : null}
-              <div>
-                <dt>来源</dt>
-                <dd>{current.source === "BUNDLED" ? (current.official ? "内置预装，完整性已校验" : "预装") : "本地安装"}</dd>
-              </div>
-              <div>
-                <dt>许可证</dt>
-                <dd>{current.license || "未声明"}</dd>
-              </div>
-              <div>
-                <dt>适用宿主</dt>
-                <dd className="num">{(current.hostVersions ?? []).join(", ") || "未声明"}</dd>
-              </div>
-              <div>
-                <dt>版本检验</dt>
-                <dd>{current.compatible ? "通过" : "未在此版本验证"}</dd>
-              </div>
-              {current.updatedAt ? (
-                <div>
-                  <dt>最近变化</dt>
-                  <dd className="num">{fmtDateTime(current.updatedAt)}</dd>
-                </div>
-              ) : null}
-            </dl>
-            <PluginUpstreamInfo upstream={current} />
-            <PluginLegalFiles key={`${current.id}/${current.installedAt ?? ""}`} plugin={current} />
-          </Panel>
-
-          <Panel title="操作">
-            <div className="plugins-detail-actions">
-              {current.enabled ? (
-                <ActionButton icon="power" onClick={() => void run(current.id, "disable")} busy={action.busy || syncing}>
-                  停用增强插件
-                </ActionButton>
-              ) : (
-                <ActionButton
-                  variant="primary"
-                  icon="power"
-                  onClick={() => void run(current.id, "enable")}
-                  busy={action.busy || syncing}
-                  disabled={safeMode}
-                >
-                  启用增强插件
-                </ActionButton>
-              )}
-              {!current.enabled && !current.compatible ? (
-                <ActionButton icon="alert" onClick={() => setConfirmForce(true)} busy={action.busy || syncing} disabled={safeMode}>
-                  强制启用
-                </ActionButton>
-              ) : null}
-              <ActionButton
-                variant="danger"
-                icon="trash"
-                onClick={() => {
-                  const hasScheduler = (current.capabilities ?? []).includes("schedule:manage")
-                    || (current.declaredCapabilities ?? []).includes("schedule:manage");
-                  if (hasScheduler) {
-                    setConfirmUninstall(true);
-                  } else {
-                    void run(current.id, "uninstall");
-                  }
-                }}
-                busy={action.busy || syncing}
-              >
-                卸载
+        {current.platformLimitations?.length ? <WindowsPluginReopen host={host} /> : null}
+        {!current.enabled && !current.compatible ? (
+          <InfoNote tone="warn">
+            <p>这个增强插件没有声明当前宿主版本，默认不会启用。强制启用后它会以未验证状态运行。</p>
+          </InfoNote>
+        ) : null}
+        {confirmForce ? (
+          <div className="plugin-confirm" role="dialog" aria-modal="true" aria-label="确认强制启用">
+            <p>
+              强制启用「{current.name || current.id}」意味着让一个没有在当前宿主版本验证过的增强插件运行。它可能读到你的会话内容。确认继续？
+            </p>
+            <div className="inline-actions">
+              <ActionButton variant="danger" icon="check" onClick={() => void forceEnable(current.id)} busy={action.busy || syncing}>
+                确认强制启用
+              </ActionButton>
+              <ActionButton variant="quiet" onClick={() => setConfirmForce(false)}>
+                取消
               </ActionButton>
             </div>
-            {confirmUninstall ? (
-              <div className="plugin-confirm" role="dialog" aria-modal="true" aria-label="确认卸载增强插件">
-                <p>
-                  卸载「{current.name || current.id}」时，是否同时删除该增强插件创建的定时任务和运行记录？
-                </p>
-                <div className="inline-actions">
-                  <ActionButton variant="danger" icon="trash" onClick={() => void run(current.id, "uninstall", { deleteData: true })} busy={action.busy || syncing}>
-                    卸载并删除任务数据
-                  </ActionButton>
-                  <ActionButton onClick={() => void run(current.id, "uninstall", { deleteData: false })} busy={action.busy || syncing}>
-                    仅卸载，保留任务数据
-                  </ActionButton>
-                  <ActionButton variant="quiet" onClick={() => setConfirmUninstall(false)}>
-                    取消
-                  </ActionButton>
+          </div>
+        ) : null}
+
+        {current.id === KCT_PLUGIN_ID ? (
+          <KctMigrationPanel show={!current.enabled || current.state === "BLOCKED"} onMigrated={() => plugins.reload()} />
+        ) : null}
+        {current.id === MONITOR_PLUGIN_ID ? (
+          <MonitorMigrationPanel show={!current.enabled || current.state === "BLOCKED"} onMigrated={() => plugins.reload()} />
+        ) : null}
+        {current.hasSettings && current.enabled ? <PluginSettingsPanel plugin={current} /> : null}
+        {current.hasSettings && !current.enabled ? (
+          <div className="plugin-settings-disabled">
+            <p className="panel-note">启用增强插件后即可在这里调整配置。</p>
+            <ActionButton
+              variant="primary"
+              icon="power"
+              onClick={() => void run(current.id, "enable")}
+              busy={action.busy || syncing}
+              disabled={safeMode}
+            >
+              立即启用
+            </ActionButton>
+          </div>
+        ) : null}
+
+        <PluginCredentials plugin={current} />
+
+        <div className="plugin-details-stack">
+          <details className="plugin-details-disclosure" open={ungranted.length > 0 || !current.hasSettings}>
+            <summary>
+              <span>权限与能力</span>
+              <span className="num">{capabilities.length} 项{ungranted.length > 0 ? ` · ${ungranted.length} 项未授权` : ""}</span>
+            </summary>
+            <div className="plugin-details-body">
+              {capabilities.length === 0 ? (
+                <p className="panel-note">这个增强插件没有获得任何能力，只能显示自己的界面。</p>
+              ) : (
+                <ul className="capability-list">
+                  {capabilities.map(name => {
+                    const label = capabilityLabel(name);
+                    return (
+                      <li key={name}>
+                        <Icon name="check" size={14} />
+                        <div>
+                          <CapabilityTitle name={name} privileged={privileged} />
+                          <p>{label.detail}</p>
+                          <CapabilityPlatformNotes name={name} limitations={current.platformLimitations} />
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+              {ungranted.length > 0 ? (
+                <InfoNote tone="warn">
+                  <p>
+                    当前不可用的能力
+                    {ungranted.map((name, index) => (
+                      <span key={name}>{index === 0 ? " · " : "、"}{capabilityLabel(name).title}{privileged.includes(name) ? "（高权限）" : ""}</span>
+                    ))}。
+                  </p>
+                  {ungranted.map(name => <CapabilityPlatformNotes key={name} name={name} limitations={current.platformLimitations} />)}
+                </InfoNote>
+              ) : null}
+            </div>
+          </details>
+
+          <details className="plugin-details-disclosure">
+            <summary>
+              <span>插件信息与开源许可</span>
+              <span className="num">{current.license || "未声明"}</span>
+            </summary>
+            <div className="plugin-details-body">
+              <dl className="rail-facts">
+                <div><dt>作者</dt><dd>{current.author || "未声明"}</dd></div>
+                {current.apiVersion ? <div><dt>插件 API</dt><dd className="num">v{current.apiVersion}</dd></div> : null}
+                <div>
+                  <dt>来源</dt>
+                  <dd>{current.source === "BUNDLED" ? (current.official ? "内置预装，完整性已校验" : "预装") : "本地安装"}</dd>
                 </div>
-              </div>
-            ) : null}
-            {!current.enabled && !current.compatible ? (
-              <InfoNote tone="warn">
-                <p>这个增强插件没有声明当前宿主版本，默认不会启用。强制启用后它会以未验证状态运行。</p>
-              </InfoNote>
-            ) : null}
-            {confirmForce ? (
-              <div className="plugin-confirm" role="dialog" aria-modal="true" aria-label="确认强制启用">
-                <p>
-                  强制启用「{current.name || current.id}」意味着让一个没有在当前宿主版本验证过的增强插件运行。它可能读到你的会话内容。确认继续？
-                </p>
-                <div className="inline-actions">
-                  <ActionButton variant="danger" icon="check" onClick={() => void forceEnable(current.id)} busy={action.busy || syncing}>
-                    确认强制启用
-                  </ActionButton>
-                  <ActionButton variant="quiet" onClick={() => setConfirmForce(false)}>
-                    取消
-                  </ActionButton>
+                <div>
+                  <dt>许可证</dt>
+                  <dd>{current.license || "未声明"}</dd>
                 </div>
-              </div>
-            ) : null}
-            <p className="panel-note">卸载会删除增强插件文件和它的私有存储。预装增强插件卸载后不会自动恢复，会以"已卸载"留在列表里，可以从那里恢复。</p>
-          </Panel>
-          <PluginCredentials plugin={current} />
-          {current.hasSettings && current.enabled ? <PluginSettingsPanel plugin={current} /> : null}
-          {current.id === KCT_PLUGIN_ID ? (
-            <KctMigrationPanel show={!current.enabled || current.state === "BLOCKED"} />
-          ) : null}
-          {current.hasSettings && !current.enabled ? (
-            <Panel title="增强插件设置">
-              <p className="panel-note">启用增强插件后可以在这里打开它的设置页。</p>
-            </Panel>
-          ) : null}
+                <div>
+                  <dt>适用宿主</dt>
+                  <dd className="num">{(current.hostVersions ?? []).join(", ") || "未声明"}</dd>
+                </div>
+                <div>
+                  <dt>版本检验</dt>
+                  <dd>{current.compatible ? "通过" : "未在此版本验证"}</dd>
+                </div>
+                {current.updatedAt ? (
+                  <div>
+                    <dt>最近变化</dt>
+                    <dd className="num">{fmtDateTime(current.updatedAt)}</dd>
+                  </div>
+                ) : null}
+              </dl>
+              <PluginUpstreamInfo upstream={current} />
+              <PluginLegalFiles key={`${current.id}/${current.installedAt ?? ""}`} plugin={current} />
+            </div>
+          </details>
+
+          <details className="plugin-details-disclosure">
+            <summary>
+              <span>活动记录</span>
+              <span className="num">{activity.data?.length ?? 0} 条</span>
+            </summary>
+            <div className="plugin-details-body">
+              {activity.loading ? (
+                <SkeletonRows rows={3} cols={3} />
+              ) : activity.error ? (
+                <PageError error={activity.error} />
+              ) : (activity.data ?? []).length === 0 ? (
+                <p className="panel-note">还没有记录。启用、停用和增强插件发起的动作都会记录在这里。</p>
+              ) : (
+                <ul className="activity-list">
+                  {(activity.data ?? []).map((item: PluginActivity) => (
+                    <li key={item.id}>
+                      <span className="num">{fmtDateTime(item.at)}</span>
+                      <Badge tone="neutral">{ACTIVITY_LABELS[item.kind] ?? item.kind}</Badge>
+                      <span>{item.detail}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </details>
         </div>
 
-        <Panel title="活动记录" aside={<span className="num">{activity.data?.length ?? 0}</span>}>
-          {activity.loading ? (
-            <SkeletonRows rows={3} cols={3} />
-          ) : activity.error ? (
-            <PageError error={activity.error} />
-          ) : (activity.data ?? []).length === 0 ? (
-            <p className="panel-note">还没有记录。启用、停用和增强插件发起的动作都会记录在这里。</p>
-          ) : (
-            <ul className="activity-list">
-              {(activity.data ?? []).map((item: PluginActivity) => (
-                <li key={item.id}>
-                  <span className="num">{fmtDateTime(item.at)}</span>
-                  <Badge tone="neutral">{ACTIVITY_LABELS[item.kind] ?? item.kind}</Badge>
-                  <span>{item.detail}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </Panel>
+        <div className="plugin-danger-bar">
+          <p className="panel-note">
+            卸载会删除增强插件文件和私有存储；预装增强插件卸载后仍可从列表中恢复。
+          </p>
+          <ActionButton
+            variant="danger"
+            icon="trash"
+            onClick={() => {
+              if (hasScheduler) setConfirmUninstall(true);
+              else void run(current.id, "uninstall");
+            }}
+            busy={action.busy || syncing}
+          >
+            卸载
+          </ActionButton>
+        </div>
+        {confirmUninstall ? (
+          <div className="plugin-confirm" role="dialog" aria-modal="true" aria-label="确认卸载增强插件">
+            <p>
+              卸载「{current.name || current.id}」时，是否同时删除该增强插件创建的定时任务和运行记录？
+            </p>
+            <div className="inline-actions">
+              <ActionButton variant="danger" icon="trash" onClick={() => void run(current.id, "uninstall", { deleteData: true })} busy={action.busy || syncing}>
+                卸载并删除任务数据
+              </ActionButton>
+              <ActionButton onClick={() => void run(current.id, "uninstall", { deleteData: false })} busy={action.busy || syncing}>
+                仅卸载，保留任务数据
+              </ActionButton>
+              <ActionButton variant="quiet" onClick={() => setConfirmUninstall(false)}>
+                取消
+              </ActionButton>
+            </div>
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -1027,7 +1236,11 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
         <div>
           {/* The settings dialog already prints this title above the section. */}
           {embedded ? null : <h2>增强插件</h2>}
-          <p>增强插件运行在当前桌面界面中，与 KimiCode+ 共享同一运行环境，没有独立的系统沙箱：除当前界面会话内容外，还可能触及本机的增强能力与接口。因此只安装来源完全可信的第三方增强插件。能力清单用于声明与管理插件能调用哪些接口，不能替代你对插件代码的信任审查。</p>
+          <p>
+            {embedded
+              ? "由本机安装与授权的 KimiCode+ 增强插件，与官方插件市场相互独立。点击插件行可查看详情与设置。"
+              : "由本机安装与授权的 KimiCode+ 增强插件，与官方插件市场相互独立。只安装来源完全可信的第三方插件。"}
+          </p>
         </div>
         <div className="plugins-list-actions">
           <ActionButton icon="refresh" onClick={plugins.reload} busy={plugins.loading}>
@@ -1200,6 +1413,8 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
         </Panel>
       ) : null}
 
+      {quickError ? <ErrorNotice message={quickError} onDismiss={() => setQuickError(null)} /> : null}
+
       {plugins.loading ? (
         <SkeletonRows rows={4} cols={4} />
       ) : plugins.error ? (
@@ -1210,33 +1425,55 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
         </EmptyState>
       ) : (
         <ul className="plugin-list">
-          {items.map(plugin => (
-            <li key={plugin.id} className={plugin.enabled ? "plugin" : "plugin muted"}>
-              <button
-                type="button"
-                className="plugin-open"
-                ref={node => {
-                  if (node) rowRefs.current.set(plugin.id, node);
-                  else rowRefs.current.delete(plugin.id);
-                }}
-                onClick={() => openDetail(plugin.id)}
-              >
-                <span className="plugin-glyph" aria-hidden="true">
-                  <Icon name={plugin.state === "CORRUPT" || plugin.state === "FAULTED" ? "alert" : "plugins"} size={17} />
-                </span>
-                <span className="plugin-line">
-                  <strong>{plugin.name || plugin.id}</strong>
-                  <span className="num">
-                    v{plugin.version} · {plugin.source === "BUNDLED" ? "预装" : "本地"}
+          {items.map(plugin => {
+            const name = plugin.name || plugin.id;
+            const summary = plugin.description?.trim();
+            return (
+              <li key={plugin.id} className={plugin.enabled ? "plugin" : "plugin muted"}>
+                <button
+                  type="button"
+                  className="plugin-open"
+                  ref={node => {
+                    if (node) rowRefs.current.set(plugin.id, node);
+                    else rowRefs.current.delete(plugin.id);
+                  }}
+                  onClick={() => openDetail(plugin.id)}
+                >
+                  <span className="plugin-glyph" aria-hidden="true">
+                    <Icon name={plugin.state === "CORRUPT" || plugin.state === "FAULTED" ? "alert" : "plugins"} size={17} />
                   </span>
-                </span>
-                <StateBadge state={plugin.state} tone={stateTone(plugin.state)} label={PLAIN_STATE[plugin.state] ?? stateLabel(plugin.state)} />
-                <span className="plugin-count num">
-                  {plugin.state === "UNINSTALLED" ? "可恢复" : `${(plugin.capabilities ?? []).length} 项能力`}
-                </span>
-              </button>
-            </li>
-          ))}
+                  <span className="plugin-line">
+                    <span className="plugin-meta">
+                      <strong>{name}</strong>
+                      <span className="num">
+                        v{plugin.version} · {plugin.source === "BUNDLED" ? "预装" : "本地"}
+                      </span>
+                      {plugin.hasSettings ? <span className="plugin-tag">可配置</span> : null}
+                    </span>
+                    {summary ? <span className="plugin-desc" title={plugin.description}>{summary}</span> : null}
+                  </span>
+                  <StateBadge state={plugin.state} tone={stateTone(plugin.state)} label={PLAIN_STATE[plugin.state] ?? stateLabel(plugin.state)} />
+                  <span className="plugin-count num">
+                    {plugin.state === "UNINSTALLED" ? "可恢复" : `${(plugin.capabilities ?? []).length} 项能力`}
+                  </span>
+                  <span className="plugin-chevron" aria-hidden="true">
+                    <Icon name="arrowRight" size={13} />
+                  </span>
+                </button>
+                <div className="plugin-row-actions">
+                  {canQuickToggle(plugin) ? (
+                    <Toggle
+                      hideLabel
+                      label={plugin.enabled ? `停用「${name}」` : `启用「${name}」`}
+                      checked={Boolean(plugin.enabled)}
+                      disabled={quickBusy !== null || (!plugin.enabled && safeMode)}
+                      onChange={next => void quickToggle(plugin, next)}
+                    />
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>

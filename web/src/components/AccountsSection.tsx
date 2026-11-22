@@ -10,6 +10,7 @@ import {
   preflightAccountSwitch,
   refreshAccountQuotas,
   renameAccount,
+  resetAccountVault,
   saveCurrentAccount,
   switchAccount,
   type AccountSummary,
@@ -21,10 +22,51 @@ import { errorText } from "./workbench/pieces";
 import { FallbackNotice } from "./OfficialSettingsSections";
 import "../styles/native-settings-surface.css";
 
+/** The two-step confirmation for retiring a vault nobody can unlock any more. */
+function VaultResetPanel({
+  systemManaged,
+  busy,
+  onConfirm,
+  onCancel,
+}: {
+  systemManaged: boolean;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="ekds-acc-confirm" role="group" aria-label="重置凭据库确认" data-ekd-vault-reset="confirm">
+      <strong>确认重置凭据库？</strong>
+      <p className="ekds-note">
+        重置会清空旧凭据库中已加密的账号令牌和插件密钥，
+        {systemManaged
+          ? "并立即建立一个由系统凭据库托管的新库。"
+          : "随后需要设置一个新的加密库密码。"}
+        这不会让你退出当前官方 Kimi 账号，登录状态保持不变；重置后重新点一次「保存当前账号」即可继续使用。
+      </p>
+      <div className="ekds-acc-confirm-actions">
+        <button type="button" className="ekds-btn is-danger" disabled={busy} onClick={onConfirm}>
+          {busy ? "重置中…" : "确认重置凭据库"}
+        </button>
+        <button type="button" className="ekds-btn" disabled={busy} onClick={onCancel}>
+          取消
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function dispatchAccountSwitched() {
   if (typeof window !== "undefined") {
     window.dispatchEvent(new CustomEvent("ekd:account-switched"));
   }
+}
+
+/** Names the store holding the vault key, for the one-line auto-unlock note. */
+function keychainLabel(backend?: string): string {
+  if (backend === "MACOS_KEYCHAIN") return "由 macOS 钥匙串自动解锁";
+  if (backend === "WINDOWS_DPAPI") return "由 Windows DPAPI 自动解锁";
+  return "系统凭据库已自动解锁";
 }
 
 function readActiveOfficialModel(): string | undefined {
@@ -312,6 +354,7 @@ export function AccountsManagerSection({
   const [backupWarning, setBackupWarning] = useState<string | null>(null);
 
   const [vaultPassword, setVaultPassword] = useState("");
+  const [confirmResetVault, setConfirmResetVault] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameText, setRenameText] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -360,6 +403,13 @@ export function AccountsManagerSection({
     return !Number.isFinite(checkedMs) || Date.now() - checkedMs > 60_000;
   });
   const vaultUnlocked = state?.vaultUnlocked === true;
+  // A locked vault on a machine with an OS key store, or one the core already
+  // marked as a password vault, is the old manual kind: the user may not
+  // remember the password and needs the reset path, not just a prompt.
+  const legacyVault = Boolean(state && !state.vaultUnlocked && (state.legacyPasswordVault || state.vaultOsKeychainAvailable));
+  // Only promise automatic handover where a key store can actually take the
+  // password; without one the vault stays manual and must keep saying so.
+  const migratingVault = Boolean(state && !state.vaultUnlocked && state.vaultOsKeychainAvailable);
   const [autoQuotaFetched, setAutoQuotaFetched] = useState(false);
   useEffect(() => {
     if (!vaultUnlocked || !needsAutoQuotaRefresh || autoQuotaFetched) return;
@@ -394,8 +444,31 @@ export function AccountsManagerSection({
     try {
       await features.unlock(vaultPassword);
       setVaultPassword("");
-      setNotice("加密凭据库已解锁。");
+      setNotice(migratingVault ? "凭据库已解锁，以后将由系统凭据库自动托管。" : "加密凭据库已解锁。");
       await load(false);
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleResetVault() {
+    if (busyAction) return;
+    setBusyAction("reset-vault");
+    setError(null);
+    setNotice(null);
+    try {
+      const next = await resetAccountVault(host);
+      // The reset answer is the fresh state, so no extra read is needed.
+      setState(next);
+      setConfirmResetVault(false);
+      setVaultPassword("");
+      setNotice(
+        next.vaultUnlocked
+          ? "已重置并切换为系统自动托管，现在可以直接保存和切换账号。"
+          : "凭据库已重置。请设置一个新的加密库密码后继续保存账号。",
+      );
     } catch (cause) {
       setError(errorText(cause));
     } finally {
@@ -627,6 +700,12 @@ export function AccountsManagerSection({
         </div>
       ) : null}
 
+      {state && state.vaultUnlocked && state.vaultOsKeychain ? (
+        <p className="ekds-note" role="status" data-ekd-vault-os="true">
+          {keychainLabel(state.vaultOsKeychainBackend)}
+        </p>
+      ) : null}
+
       {state && !state.vaultUnlocked ? (
         <form
           className="ekds-group ekds-acc-unlock"
@@ -637,14 +716,20 @@ export function AccountsManagerSection({
         >
           <div className="ekds-row">
             <span className="ekds-row-label">
-              <strong>解锁加密凭据库</strong>
-              <small>账号令牌只加密保存在本地增强核心，渲染界面不会接触明文令牌。输入主密码解锁后即可保存与切换账号。</small>
+              <strong>{legacyVault ? "检测到旧版密码保护的凭据库" : "解锁加密凭据库"}</strong>
+              <small>
+                {legacyVault
+                  ? migratingVault
+                    ? "新版本已支持由系统凭据库自动托管，无需记忆密码。你可以输入原密码解锁一次（解锁后会自动转入系统托管，以后不再询问）；如果忘记了旧密码，可直接重置凭据库并重新保存账号。"
+                    : "这是旧版密码保护的凭据库，需要原密码才能解锁。如果忘记了旧密码，可以重置凭据库并重新保存账号。"
+                  : "账号令牌只加密保存在本地增强核心，渲染界面不会接触明文令牌。输入主密码解锁后即可保存与切换账号。"}
+              </small>
             </span>
             <div className="ekds-acc-unlock-controls">
               <input
                 type="password"
                 className="ekds-input"
-                placeholder="输入加密库密码"
+                placeholder={legacyVault ? "输入原密码" : "输入加密库密码"}
                 autoComplete="current-password"
                 value={vaultPassword}
                 disabled={busyAction !== null}
@@ -655,11 +740,41 @@ export function AccountsManagerSection({
                 className="ekds-btn is-primary"
                 disabled={!vaultPassword.trim() || busyAction !== null}
               >
-                {busyAction === "unlock" ? "解锁中…" : "解锁"}
+                {busyAction === "unlock" ? "解锁中…" : migratingVault ? "解锁并转为自动托管" : "解锁"}
               </button>
             </div>
           </div>
+          {legacyVault ? (
+            <div className="ekds-row">
+              <span className="ekds-row-label">
+                <strong>忘记了旧密码？</strong>
+                <small>
+                  {migratingVault
+                    ? "可以重置凭据库：旧的加密账号令牌与插件密钥会被清空，并立即建立一个由系统托管的新库；当前官方登录不受影响。"
+                    : "可以重置凭据库：旧的加密账号令牌与插件密钥会被清空，随后可设置新的加密库密码；当前官方登录不受影响。"}
+                </small>
+              </span>
+              <button
+                type="button"
+                className="ekds-btn"
+                disabled={busyAction !== null}
+                data-ekd-vault-reset="open"
+                onClick={() => setConfirmResetVault(true)}
+              >
+                忘记密码，重置凭据库
+              </button>
+            </div>
+          ) : null}
         </form>
+      ) : null}
+
+      {state && !state.vaultUnlocked && confirmResetVault ? (
+        <VaultResetPanel
+          systemManaged={migratingVault}
+          busy={busyAction === "reset-vault"}
+          onConfirm={() => void handleResetVault()}
+          onCancel={() => setConfirmResetVault(false)}
+        />
       ) : null}
 
       <div className="ekds-group" role="list" aria-label="已保存的 Kimi Code 账号">

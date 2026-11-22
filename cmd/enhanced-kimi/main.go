@@ -219,6 +219,8 @@ func runCore(updateAPIBaseURL string, updateHTTPClient *http.Client) error {
 		Home: effectiveKimiHome, CWD: cwd, DataDir: instance.Dir, Executable: executable,
 		Profile: *hostProfile, CoreURL: "http://" + listener.Addr().String(), PairingToken: guard.PairingToken(),
 		UpdateAPIBaseURL: updateAPIBaseURL, UpdateHTTPClient: updateHTTPClient,
+		EnableOSKeyStore:      os.Getenv("EKD_DISABLE_OS_KEYCHAIN") != "1",
+		EnableAutoUpdateCheck: os.Getenv("EKD_DISABLE_AUTO_UPDATE_CHECK") != "1",
 		RestartState: func() updater.RestartState {
 			return restartStateForCore(instance.Dir, listener.Addr().(*net.TCPAddr).Port, *hostProfile, *allowDaily)
 		},

@@ -1,7 +1,7 @@
 {
   "id": "kimicode-plus.kct",
   "name": "思考内容翻译",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "apiVersion": 1,
   "description": "为思考内容提供内嵌翻译：展开思考块后按段落翻译，代码块与链接保持原样，可随时切回原文。移植自独立版 kimi-cot-translate。",
   "author": "KimiCode+",
@@ -14,8 +14,10 @@
     "storage",
     "net:edge.microsoft.com",
     "net:translate.googleapis.com",
+    "net:https",
     "net:127.0.0.1",
     "net:::1",
+    "net:localhost",
     "credentials:translator"
   ],
   "upstream": {

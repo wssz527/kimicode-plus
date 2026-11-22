@@ -81,12 +81,13 @@ func TestNativeActionPermissionsFollowIntent(t *testing.T) {
 		"automation.get": "core:read", "automation.set": "settings:write",
 		"recovery.get": "core:read", "recovery.set": "settings:write", "recovery.watch": "tasks:write",
 		"recovery.check": "tasks:write", "planner.get": "chat:read", "planner.send": "chat:write",
-		"update.status": "update:read", "update.check": "update:write", "update.apply": "update:write",
+		"update.status": "update:read", "update.check": "update:write", "update.apply": "update:write", "update.autoCheck": "update:write",
 		"accounts.list": "credentials:read", "accounts.switchPreflight": "credentials:read",
 		"accounts.saveCurrent": "credentials:write", "accounts.beginAdd": "credentials:write",
 		"accounts.completeAdd": "credentials:write", "accounts.rename": "credentials:write",
 		"accounts.delete": "credentials:write", "accounts.refreshQuotas": "credentials:write",
 		"accounts.switch": "credentials:write", "accounts.cancelPending": "credentials:write",
+		"accounts.resetVault": "credentials:write",
 		"session.send": "tasks:write", "session.create": "tasks:write", "session.abort": "tasks:write",
 		"session.reply": "tasks:write", "handoff": "tasks:write",
 	} {
@@ -187,8 +188,12 @@ func TestPluginRuntimeRoutesCountAsPluginTraffic(t *testing.T) {
 		// The KCT handover is driven by the plugin page, so it has to be plugin
 		// traffic as well. Classified as core traffic, the confirm button answered
 		// 403 to the only client that can press it.
-		"/enhance/v1/kct/migration":         "plugins:read",
-		"/enhance/v1/kct/migration/confirm": "plugins:write",
+		"/enhance/v1/kct/migration":             "plugins:read",
+		"/enhance/v1/kct/migration/confirm":     "plugins:write",
+		"/enhance/v1/plugins/monitor/migration": "plugins:read",
+		"/enhance/v1/plugins/monitor/migration/confirm": "plugins:write",
+		"/enhance/v1/credentials/reset":         "credentials:write",
+		"/enhance/v1/update/auto-check":         "update:write",
 	}
 	for path, expected := range cases {
 		method := http.MethodGet

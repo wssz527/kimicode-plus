@@ -178,6 +178,13 @@ export function CacheSettings({ host }: { host: NativeHost }) {
     return () => { alive = false; };
   }, [host, range]);
 
+  // A model that stops appearing in the observation list must not leave the
+  // select showing a stale (or blank) option.
+  useEffect(() => {
+    if (!retentionModel) return;
+    if (!retention?.byModel?.some(item => item.model === retentionModel)) setRetentionModel("");
+  }, [retention, retentionModel]);
+
   useEffect(() => host.subscribe<CachePolicySettings>("automation", event => {
     // A background event refreshes the persisted policy, but never while the user has
     // an edit or write in flight.
@@ -223,6 +230,11 @@ export function CacheSettings({ host }: { host: NativeHost }) {
   const openCoverage = idleKeepAliveCoverageMinutes(openTTL, idleKeepAlive.defaultCount);
   const modelRetention = retention?.byModel?.find(item => item.model === retentionModel);
   const retentionBuckets = modelRetention?.idleBuckets ?? retention?.idleBuckets;
+  const historyPoints = history?.points ?? [];
+  const peakTokens = historyPoints.reduce(
+    (max, point) => Math.max(max, point.totals.inputOther + point.totals.inputCacheRead + point.totals.inputCacheCreation),
+    0,
+  );
 
   return <div className="eks">
     {error ? <ErrorNotice title="缓存数据暂时不可用" message={error} recovery="可以继续使用官方客户端；修正后重新打开本页。" /> : null}
@@ -453,7 +465,9 @@ export function CacheSettings({ host }: { host: NativeHost }) {
           <small>统计模型</small>
           <select value={modelRetention?.model ?? ""} onChange={event => setRetentionModel(event.target.value)}>
             <option value="">全部模型</option>
-            {retention.byModel.map(item => <option key={item.model} value={item.model}>{item.model}</option>)}
+            {retention.byModel.map(item => <option key={item.model} value={item.model}>
+              {item.model}{typeof item.samples === "number" && item.samples > 0 ? `（${item.samples} 次）` : ""}
+            </option>)}
           </select>
         </label> : null}
         {retentionBuckets?.length ? <div className="eks-retention">
@@ -533,11 +547,16 @@ export function CacheSettings({ host }: { host: NativeHost }) {
       {history?.points?.length
         ? <div className="eks-spark" aria-label={`${history.range} 输入 token 分布`}>
           {history.points.map(point => {
-            const peak = Math.max(...history.points.map(candidate => candidate.totals.inputOther + candidate.totals.inputCacheRead + candidate.totals.inputCacheCreation));
             const total = point.totals.inputOther + point.totals.inputCacheRead + point.totals.inputCacheCreation;
-            const height = peak > 0 ? Math.max(2, Math.round((total / peak) * 100)) : 0;
-            return <span key={point.bucket} className="eks-spark-bar" style={{ height: `${height}%` }}
-              title={`${point.bucket}：命中 ${tokenLabel(point.totals.inputCacheRead)} · 未命中 ${tokenLabel(point.totals.inputOther)}`} />;
+            const empty = total === 0;
+            return <span
+              key={point.bucket}
+              className={`eks-spark-bar${empty ? " is-empty" : ""}`}
+              style={{ height: empty ? "2px" : `${Math.max(2, Math.round((total / peakTokens) * 100))}%` }}
+              title={empty
+                ? `${point.bucket}：无记录`
+                : `${point.bucket}：命中 ${tokenLabel(point.totals.inputCacheRead)} · 未命中 ${tokenLabel(point.totals.inputOther)}`}
+            />;
           })}
         </div>
         : <p className="eks-empty">这个区间还没有记录。</p>}

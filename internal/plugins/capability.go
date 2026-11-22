@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -24,6 +25,13 @@ const (
 	CapStorage       = "storage"
 	capNetPrefix     = "net:"
 	capCredentialPre = "credentials:"
+
+	// CapNetHTTPS is the broad network grant: any host, but only over TLS. It
+	// exists for plugins whose remote service is chosen by the user after install
+	// (an OpenAI-compatible endpoint), so the host cannot be listed in the
+	// manifest. The address guard in netguard.go still refuses loopback, private
+	// and metadata answers, and a literal address receives no exception.
+	CapNetHTTPS = "net:https"
 
 	// API v2 capabilities require verified installed content. Local installs
 	// additionally require explicit consent to the privilege.
@@ -80,7 +88,7 @@ func (g Grants) hasPrivileged() bool {
 // carry a parameter behind a documented prefix.
 var fixedCapabilities = append([]string{
 	CapMetricsRead, CapSessionsRead, CapSessionsSend, CapConfigRead, CapConfigWrite,
-	CapUISidebar, CapUISettings, CapUIThinking, CapUIMessage, CapStorage,
+	CapUISidebar, CapUISettings, CapUIThinking, CapUIMessage, CapStorage, CapNetHTTPS,
 }, privilegedCapabilities...)
 
 var (
@@ -405,12 +413,22 @@ func (g Grants) Authorize(action string) error {
 	return nil
 }
 
-// AuthorizeNet checks the host allowlist for a proxied request.
-func (g Grants) AuthorizeNet(action, host string) error {
-	if !g.AllowsHost(host) {
-		return capabilityDenied(action, capNetPrefix+host)
+// AuthorizeNetURL checks the host allowlist for a proxied request. The broad
+// `net:https` declaration admits any host, but only over TLS: a user who chose a
+// remote OpenAI-compatible endpoint approved an encrypted destination, not
+// cleartext access to every host.
+func (g Grants) AuthorizeNetURL(action string, parsed *url.URL) error {
+	if parsed != nil && g.AllowsHost(parsed.Hostname()) {
+		return nil
 	}
-	return nil
+	if parsed != nil && parsed.Scheme == "https" && g.Has(CapNetHTTPS) {
+		return nil
+	}
+	host := ""
+	if parsed != nil {
+		host = parsed.Hostname()
+	}
+	return capabilityDenied(action, capNetPrefix+host)
 }
 
 // AuthorizeCredential checks that a plugin declared the credential it wants

@@ -7,8 +7,8 @@ import { useEmbeddedNavigation } from "./routes";
 import { normalizeColorScheme, rewriteAssetURLs } from "./lib/embed";
 import { createCoreTransport, createEventChannel, createNativeHost, HostScopeContext, type DemoHost, type NativeHost, type HostScopeValue } from "./native";
 import { AuthProvider } from "./auth";
-import { SettingsWindow } from "./components/SettingsSurface";
-import { AccountSettingsSection, LabSettingsSection } from "./components/OfficialSettingsSections";
+import { SettingsWindow, CacheSettingsSurface } from "./components/SettingsSurface";
+import { AccountSettingsSection, LabSettingsSection, PluginsSettingsSection } from "./components/OfficialSettingsSections";
 import { AccountSwitchModal } from "./components/AccountsSection";
 import { SessionKeepAliveMenu } from "./components/SessionKeepAliveMenu";
 import { NativeSettings } from "./components/NativeSettings";
@@ -27,6 +27,7 @@ export {
   detectSidebarMode,
   evaluateDOMContracts,
   findAccountMenuAnchor,
+  findChatHeaderTail,
   findOfficialSettingsPanel,
   findOfficialSettingsSection,
   findOfficialSettingsTab,
@@ -126,6 +127,45 @@ function acquireNavigation(): () => void {
   };
 }
 
+/**
+ * Resolve the theme onto the surface root. A Shadow DOM surface that kept
+ * "system" would apply the light `--paper` fallback for the frame before the
+ * host stylesheet resolves it, which reads as a white flash inside a dark host.
+ * The media query is resolved here and watched, so the surface is dark from the
+ * first paint; `dispose()` removes the listener and the observer.
+ */
+function watchColorScheme(
+  container: HTMLElement,
+  document: Document,
+  explicit: string | undefined,
+): () => void {
+  const query = typeof window.matchMedia === "function"
+    ? window.matchMedia("(prefers-color-scheme: dark)")
+    : null;
+  const syncTheme = () => {
+    const scheme = normalizeColorScheme(
+      explicit ?? document.documentElement.dataset.colorScheme ?? document.documentElement.dataset.theme,
+    );
+    container.dataset.colorScheme = scheme === "system"
+      ? (query?.matches === true ? "dark" : "light")
+      : scheme;
+  };
+  syncTheme();
+  const onChange = () => syncTheme();
+  if (query) {
+    if (typeof query.addEventListener === "function") query.addEventListener("change", onChange);
+    else query.addListener?.(onChange);
+  }
+  const observer = new MutationObserver(syncTheme);
+  observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-color-scheme", "data-theme"] });
+  return () => {
+    observer.disconnect();
+    if (!query) return;
+    if (typeof query.removeEventListener === "function") query.removeEventListener("change", onChange);
+    else query.removeListener?.(onChange);
+  };
+}
+
 export function mountEnhancement(element: HTMLElement, options: MountOptions): EnhancementHandle {
   const embed = options.embed === true;
   mounts.get(element)?.unmount();
@@ -134,12 +174,7 @@ export function mountEnhancement(element: HTMLElement, options: MountOptions): E
   const styles = createStyles(options);
   const container = document.createElement("div");
   container.className = `ekd-root ekd-mount${embed ? " is-embedded" : ""}`;
-  const syncTheme = () => {
-    container.dataset.colorScheme = normalizeColorScheme(options.colorScheme ?? document.documentElement.dataset.colorScheme);
-  };
-  syncTheme();
-  const observer = new MutationObserver(syncTheme);
-  observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-color-scheme"] });
+  const releaseTheme = watchColorScheme(container, document, options.colorScheme);
   const priorEmbeddedAttr = element.getAttribute("data-ekd-embedded");
   if (embed) element.dataset.ekdEmbedded = "true";
   shadow.append(styles, container);
@@ -162,7 +197,7 @@ export function mountEnhancement(element: HTMLElement, options: MountOptions): E
     unmount: () => {
       if (!mounted) return;
       mounted = false;
-      observer.disconnect();
+      releaseTheme();
       if (mounts.get(element) === handle) mounts.delete(element);
       try {
         root.unmount();
@@ -186,6 +221,8 @@ export function mountEnhancement(element: HTMLElement, options: MountOptions): E
 export type SurfaceName =
   | "sessions"
   | "settings"
+  | "settings-cache"
+  | "settings-plugins"
   | "settings-account"
   | "settings-agent-permissions"
   | "settings-agent-subagent"
@@ -206,7 +243,7 @@ export interface SurfaceMountOptions {
   onCloseModal?: () => void;
 }
 
-const SETTINGS_PERMISSIONS = ["core:read", "settings:write", "models:read", "usage:read", "usage:write", "plugins:read", "plugins:write", "credentials:read", "credentials:write"];
+const SETTINGS_PERMISSIONS = ["core:read", "settings:write", "models:read", "usage:read", "usage:write", "plugins:read", "plugins:write", "credentials:read", "credentials:write", "update:read", "update:write"];
 
 export function mountSurface(element: HTMLElement, surface: SurfaceName, options: SurfaceMountOptions): EnhancementHandle {
   mounts.get(element)?.unmount();
@@ -215,10 +252,7 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
   const styles = createStyles(options);
   const container = document.createElement("div");
   container.className = `ekd-root ekd-surface ekd-surface-${surface}`;
-  const syncTheme = () => { container.dataset.colorScheme = normalizeColorScheme(options.colorScheme ?? element.ownerDocument.documentElement.dataset.colorScheme); };
-  syncTheme();
-  const observer = new MutationObserver(syncTheme);
-  observer.observe(element.ownerDocument.documentElement, { attributes: true, attributeFilter: ["data-color-scheme"] });
+  const releaseTheme = watchColorScheme(container, element.ownerDocument, options.colorScheme);
   shadow.append(styles, container);
   const needsSettingsTransport = surface === "settings" || surface.startsWith("settings-") || surface === "account-switch-modal";
   const releaseTransport = needsSettingsTransport
@@ -228,6 +262,10 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
   const wrap = (children: React.ReactNode) => <HostScopeProvider host={options.host}>{children}</HostScopeProvider>;
   if (surface === "sessions") {
     root.render(wrap(<SessionGrid host={options.host} initialExtraIds={options.initialExtraIds ?? []} onNativeRestore={options.onNativeRestore ?? (() => options.host.close())} />));
+  } else if (surface === "settings-cache") {
+    root.render(wrap(<CacheSettingsSurface host={options.host} />));
+  } else if (surface === "settings-plugins") {
+    root.render(wrap(<PluginsSettingsSection host={options.host} />));
   } else if (surface === "settings-account") {
     root.render(wrap(<AccountSettingsSection host={options.host} />));
   } else if (surface === "settings-agent-permissions") {
@@ -249,7 +287,7 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
     unmount: () => {
       if (!mounted) return;
       mounted = false;
-      observer.disconnect();
+      releaseTheme();
       root.unmount();
       container.remove();
       styles.remove();

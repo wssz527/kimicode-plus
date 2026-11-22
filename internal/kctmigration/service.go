@@ -320,7 +320,7 @@ func (s *Service) disableLoader(ctx context.Context, plist string) (stopped, dis
 		return false, true, nil
 	}
 	if loaded {
-		if _, runErr := s.launchctl(ctx, "bootout", s.domain()); runErr != nil && !isMissingJob(runErr) {
+		if _, runErr := s.launchctl(ctx, "bootout", s.domain()+"/"+Label); runErr != nil && !isMissingJob(runErr) {
 			return false, false, fmt.Errorf("停用独立版后台加载器失败：%w", runErr)
 		} else if runErr == nil {
 			stopped = true
@@ -393,11 +393,24 @@ func (s *Service) domain() string {
 }
 
 func (s *Service) launchctl(ctx context.Context, args ...string) ([]byte, error) {
+	if len(args) > 0 && args[0] == "bootout" {
+		// `launchctl bootout gui/<uid>` ends the whole GUI session; only the KCT
+		// job inside that domain may ever be addressed from here.
+		target := s.domain() + "/" + Label
+		if len(args) != 2 || args[1] != target || !strings.Contains(args[1], "/"+Label) {
+			return nil, fmt.Errorf("%w：需要 %s，拒绝 %s", errUnsafeBootout, target, strings.Join(args, " "))
+		}
+	}
 	if s.sys.Run == nil {
 		return nil, errors.New("launchctl 不可用")
 	}
 	return s.sys.Run(ctx, args...)
 }
+
+// errUnsafeBootout is the refusal a bootout gets when it does not name the
+// exact KCT job. It is a sentinel so a test can prove the refusal happened
+// before launchctl was invoked.
+var errUnsafeBootout = errors.New("拒绝执行未指定 KCT 服务目标的 bootout")
 
 func isMissingJob(err error) bool {
 	text := strings.ToLower(err.Error())

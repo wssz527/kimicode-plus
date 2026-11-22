@@ -67,6 +67,52 @@ func sampleUsage(other, output, read, creation int) map[string]int {
 	return map[string]int{"inputOther": other, "output": output, "inputCacheRead": read, "inputCacheCreation": creation}
 }
 
+// modelSteps builds one usage.record/step.end pair per gap, each gap measured from
+// the previous step, so a fixture can place a model's steps at exact idle intervals.
+func modelSteps(prefix, model string, usage map[string]int, start time.Time, gaps ...time.Duration) []string {
+	lines := []string{}
+	at := start
+	for index, gap := range gaps {
+		at = at.Add(gap)
+		lines = append(lines,
+			plainLine(usageRecord(model, usage, "turn", at)),
+			plainLine(stepEnd(fmt.Sprintf("%s-%d", prefix, index), "0", index+1, usage, 500, 1200, "end_turn", at)))
+	}
+	return lines
+}
+
+// writeBareSession creates a session with state.json but no agent records, which is
+// enough for discover and for the session/live upserts of a scan.
+func writeBareSession(t *testing.T, home, id string) {
+	t.Helper()
+	dir := filepath.Join(home, "sessions", "wd_test", id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := fmt.Sprintf(`{"id":%q,"cwd":"/tmp/synthetic","createdAt":%d,"updatedAt":%d}`, id, time.Now().Add(-time.Hour).UnixMilli(), time.Now().UnixMilli())
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func countRows(t *testing.T, store *Store, table, sessionID string) int {
+	t.Helper()
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE session_id=?`, sessionID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func retentionModel(retention Retention, model string) (ModelRetention, bool) {
+	for _, item := range retention.ByModel {
+		if item.Model == model {
+			return item, true
+		}
+	}
+	return ModelRetention{}, false
+}
+
 // TestIncrementalAppend reads the same file three times and asserts each scan only
 // picks up the newly appended step.
 func TestIncrementalAppend(t *testing.T) {
@@ -277,6 +323,146 @@ func TestScanIntervalFloor(t *testing.T) {
 	}
 }
 
+// TestScanPrunesDeletedSessions keeps the database from serving sessions the user
+// deleted: a complete scan is the proof that a session no longer exists on disk.
+func TestScanPrunesDeletedSessions(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	start := now.Add(-time.Hour)
+	usage := sampleUsage(1000, 80, 600, 0)
+	writeWire(t, home, "session_keep", "main",
+		modelSteps("keep", "synthetic/kept", usage, start, time.Minute, time.Minute, time.Minute)...)
+	writeWire(t, home, "session_gone", "main",
+		modelSteps("gone", "synthetic/doomed", usage, start, time.Minute, time.Minute, time.Minute)...)
+	store := newTestStore(t, home)
+	ctx := context.Background()
+	if _, err := store.Scan(ctx, now, true); err != nil {
+		t.Fatal(err)
+	}
+	retention, err := store.Retention(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := retentionModel(retention, "synthetic/doomed"); !exists {
+		t.Fatalf("fixture precondition: synthetic/doomed missing from byModel: %+v", retention.ByModel)
+	}
+
+	if err = os.RemoveAll(filepath.Join(home, "sessions", "wd_test", "session_gone")); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.Scan(ctx, now.Add(time.Minute), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BudgetLimited || result.Sessions != 1 {
+		t.Fatalf("scan result = %+v, want the single remaining session without a budget limit", result)
+	}
+	for _, table := range []string{"cache_steps", "cache_sessions", "cache_live"} {
+		if count := countRows(t, store, table, "session_gone"); count != 0 {
+			t.Fatalf("%s still holds %d rows for the deleted session", table, count)
+		}
+	}
+	if count := countRows(t, store, "cache_steps", "session_keep"); count != 3 {
+		t.Fatalf("kept steps = %d, want 3", count)
+	}
+	if count := countRows(t, store, "cache_sessions", "session_keep"); count != 1 {
+		t.Fatalf("kept session rows = %d, want 1", count)
+	}
+	store.mu.Lock()
+	paths := make([]string, 0, len(store.files))
+	for path := range store.files {
+		paths = append(paths, path)
+	}
+	store.mu.Unlock()
+	for _, path := range paths {
+		if strings.Contains(path, "session_gone") {
+			t.Fatalf("stale reader left in the store: %s", path)
+		}
+	}
+	retention, err = store.Retention(ctx, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := retentionModel(retention, "synthetic/doomed"); exists {
+		t.Fatalf("deleted session still contributes a model to byModel: %+v", retention.ByModel)
+	}
+	if _, exists := retentionModel(retention, "synthetic/kept"); !exists {
+		t.Fatalf("kept session disappeared from byModel: %+v", retention.ByModel)
+	}
+}
+
+// TestScanKeepsRowsWhenBudgetLimited pins the guard: a truncated discovery pass must
+// never be read as "every session outside the window was deleted".
+func TestScanKeepsRowsWhenBudgetLimited(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	start := now.Add(-time.Hour)
+	usage := sampleUsage(1000, 80, 600, 0)
+	writeWire(t, home, "session_keep", "main",
+		modelSteps("keep", "synthetic/kept", usage, start, time.Minute, time.Minute)...)
+	writeWire(t, home, "session_gone", "main",
+		modelSteps("gone", "synthetic/doomed", usage, start, time.Minute, time.Minute)...)
+	store := newTestStore(t, home)
+	ctx := context.Background()
+	if _, err := store.Scan(ctx, now, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(home, "sessions", "wd_test", "session_gone")); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < scanSessionBudget; index++ {
+		writeBareSession(t, home, fmt.Sprintf("session_bare_%03d", index))
+	}
+	result, err := store.Scan(ctx, now.Add(time.Minute), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.BudgetLimited {
+		t.Fatalf("scan result = %+v, want a budget-limited pass over %d sessions", result, scanSessionBudget+1)
+	}
+	for _, want := range []struct {
+		table string
+		count int
+	}{
+		{"cache_steps", 2},
+		{"cache_sessions", 1},
+		{"cache_live", 1},
+	} {
+		if count := countRows(t, store, want.table, "session_gone"); count != want.count {
+			t.Fatalf("%s pruned rows for a session outside the budget: %d, want %d", want.table, count, want.count)
+		}
+	}
+}
+
+// TestScanKeepsRowsWhenSessionsRootIsMissing covers the misconfigured-home case: a
+// home without a sessions directory is not evidence that every session was deleted.
+func TestScanKeepsRowsWhenSessionsRootIsMissing(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	usage := sampleUsage(1000, 80, 600, 0)
+	writeWire(t, home, "session_keep", "main",
+		modelSteps("keep", "synthetic/kept", usage, now.Add(-time.Hour), time.Minute, time.Minute)...)
+	store := newTestStore(t, home)
+	ctx := context.Background()
+	if _, err := store.Scan(ctx, now, true); err != nil {
+		t.Fatal(err)
+	}
+
+	store.SetHome(filepath.Join(home, "missing"))
+	result, err := store.Scan(ctx, now.Add(time.Minute), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Sessions != 0 {
+		t.Fatalf("scan of a home without sessions = %+v, want no sessions", result)
+	}
+	for _, table := range []string{"cache_steps", "cache_sessions", "cache_live"} {
+		if count := countRows(t, store, table, "session_keep"); count == 0 {
+			t.Fatalf("%s lost the session of the previous home", table)
+		}
+	}
+}
+
 // TestModelPairingAndUnknown covers the pairing rules: usageScope=session is
 // ignored, an unmatched step stays UNKNOWN, and a usage-empty error step is not
 // stored at all.
@@ -474,14 +660,19 @@ func TestRetentionBuckets(t *testing.T) {
 	if first.Samples != 2 || first.HitRate == nil || first.Reported != Reported {
 		t.Fatalf("0-2 bucket = %+v", first)
 	}
-	if len(retention.ByModel) != 2 || retention.ByModel[0].Model != "synthetic/b" || retention.ByModel[1].Model != "synthetic/r" {
+	// synthetic/b has a single transition and never reports cache fields, so the
+	// per-model list leaves it out; the overall buckets must still count its sample.
+	if len(retention.ByModel) != 1 || retention.ByModel[0].Model != "synthetic/r" {
 		t.Fatalf("unexpected retention models: %+v", retention.ByModel)
 	}
-	if buckets := retention.ByModel[0].IdleBuckets; buckets[0].Samples != 0 || buckets[1].Samples != 1 || buckets[1].Reported != NotReported {
-		t.Fatalf("switching models must not count as that model's retention sample: %+v", buckets)
-	}
-	if buckets := retention.ByModel[1].IdleBuckets; buckets[0].Samples != 1 || buckets[0].HitRate == nil || *buckets[0].HitRate != 0.6 {
+	if buckets := retention.ByModel[0].IdleBuckets; buckets[0].Samples != 1 || buckets[0].HitRate == nil || *buckets[0].HitRate != 0.6 || buckets[1].Samples != 0 {
 		t.Fatalf("other model polluted same-model samples: %+v", buckets)
+	}
+	if model := retention.ByModel[0]; model.Samples != 2 || model.LastSeen == nil || !model.LastSeen.Equal(start.Add(21*time.Minute)) {
+		t.Fatalf("model summary = %+v, want 2 samples last seen at %v", model, start.Add(21*time.Minute))
+	}
+	if bucket := byLabel["2–5 分钟"]; bucket.Samples != 1 || bucket.Reported != NotReported || bucket.HitRate != nil {
+		t.Fatalf("overall 2-5 bucket = %+v, want the unreported model-switch sample counted", bucket)
 	}
 	if got := *first.HitRate; got < 0.5999 || got > 0.6001 {
 		t.Fatalf("0-2 hit rate = %.4f, want 0.6", got)
@@ -492,6 +683,99 @@ func TestRetentionBuckets(t *testing.T) {
 	}
 	if buckets := byLabel["30 分钟以上"]; buckets.Samples != 0 || buckets.HitRate != nil {
 		t.Fatalf("30m+ bucket = %+v, want empty", buckets)
+	}
+}
+
+// TestRetentionByModelFiltersAndSorts pins what the per-model picker shows: models
+// that never reported cache fields and models with too few transitions are dropped,
+// and the rest is ordered by recent activity and sample count instead of by name.
+func TestRetentionByModelFiltersAndSorts(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	hit := sampleUsage(400, 90, 600, 0)
+	miss := sampleUsage(900, 90, 0, 0)
+
+	writeWire(t, home, "session_recent_big", "main",
+		modelSteps("big", "synthetic/recent-big", hit, now.Add(-3*24*time.Hour), time.Minute, time.Minute, time.Minute, time.Minute)...)
+	writeWire(t, home, "session_recent_small", "main",
+		modelSteps("small", "synthetic/recent-small", hit, now.Add(-2*24*time.Hour), time.Minute, time.Minute, time.Minute)...)
+	// The first transition belongs to synthetic/other, so it must not become one of
+	// synthetic/recent-equal's samples.
+	equalStart := now.Add(-4 * 24 * time.Hour)
+	equalLines := modelSteps("other", "synthetic/other", hit, equalStart, time.Minute)
+	equalLines = append(equalLines, modelSteps("equal", "synthetic/recent-equal", hit, equalStart.Add(time.Minute), time.Minute, time.Minute, time.Minute)...)
+	writeWire(t, home, "session_recent_equal", "main", equalLines...)
+	writeWire(t, home, "session_silent", "main",
+		modelSteps("silent", "synthetic/silent", miss, now.Add(-24*time.Hour), time.Minute, time.Minute, time.Minute, time.Minute)...)
+	writeWire(t, home, "session_one_hit", "main",
+		modelSteps("one", "synthetic/one-hit", hit, now.Add(-24*time.Hour), time.Minute, time.Minute)...)
+	writeWire(t, home, "session_old_big", "main",
+		modelSteps("old", "synthetic/old-big", hit, now.Add(-20*24*time.Hour), time.Minute, time.Minute, time.Minute, time.Minute, time.Minute)...)
+
+	store := newTestStore(t, home)
+	ctx := context.Background()
+	if _, err := store.Scan(ctx, now, true); err != nil {
+		t.Fatal(err)
+	}
+	retention, err := store.Retention(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	byName := map[string]ModelRetention{}
+	for _, model := range retention.ByModel {
+		byName[model.Model] = model
+	}
+	// synthetic/silent has 3 samples but never reports cache fields; synthetic/one-hit
+	// reports but has a single sample; synthetic/other never produced a transition.
+	for _, absent := range []string{"synthetic/silent", "synthetic/one-hit", "synthetic/other"} {
+		if _, exists := byName[absent]; exists {
+			t.Fatalf("%s must not appear in byModel: %+v", absent, retention.ByModel)
+		}
+	}
+	wantOrder := []string{
+		"synthetic/recent-big",   // 3 samples, active 3 days ago
+		"synthetic/recent-small", // 2 samples, active 2 days ago
+		"synthetic/recent-equal", // 2 samples, active 4 days ago
+		"synthetic/old-big",      // 4 samples but inactive for 20 days
+	}
+	if len(retention.ByModel) != len(wantOrder) {
+		t.Fatalf("byModel = %+v, want %v", retention.ByModel, wantOrder)
+	}
+	for index, model := range wantOrder {
+		if retention.ByModel[index].Model != model {
+			t.Fatalf("byModel[%d] = %s, want %s (order: %+v)", index, retention.ByModel[index].Model, model, retention.ByModel)
+		}
+	}
+	for model, want := range map[string]int{
+		"synthetic/recent-big":   3,
+		"synthetic/recent-small": 2,
+		"synthetic/recent-equal": 2,
+		"synthetic/old-big":      4,
+	} {
+		if got := byName[model].Samples; got != want {
+			t.Fatalf("%s samples = %d, want %d", model, got, want)
+		}
+	}
+	for model, want := range map[string]time.Time{
+		"synthetic/recent-big":   now.Add(-3 * 24 * time.Hour).Add(4 * time.Minute),
+		"synthetic/recent-small": now.Add(-2 * 24 * time.Hour).Add(3 * time.Minute),
+		"synthetic/recent-equal": now.Add(-4 * 24 * time.Hour).Add(4 * time.Minute),
+		"synthetic/old-big":      now.Add(-20 * 24 * time.Hour).Add(5 * time.Minute),
+	} {
+		lastSeen := byName[model].LastSeen
+		if lastSeen == nil || !lastSeen.Equal(want) {
+			t.Fatalf("%s lastSeen = %v, want %v", model, lastSeen, want)
+		}
+	}
+	// The overall buckets keep every main-agent transition, including the models that
+	// were filtered out of the per-model list.
+	samples := 0
+	for _, bucket := range retention.IdleBuckets {
+		samples += bucket.Samples
+	}
+	if samples != 16 {
+		t.Fatalf("overall retention samples = %d, want 16 across all models", samples)
 	}
 }
 

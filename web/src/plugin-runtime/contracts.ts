@@ -1,6 +1,13 @@
 export type ContractProbeStatus = "available" | "disabled" | "untested";
 
-export type OfficialSettingsTabKey = "general" | "account" | "agent" | "providers" | "lab" | "archived";
+export type OfficialSettingsTabKey =
+  | "general"
+  | "account"
+  | "agent"
+  | "providers"
+  | "plugins"
+  | "lab"
+  | "archived";
 
 export interface DOMContractProbe {
   id: string;
@@ -46,6 +53,7 @@ const OFFICIAL_KEY_FALLBACKS: Record<string, readonly string[]> = {
   "settings.tabs.account": ["账户", "Account"],
   "settings.tabs.agent": ["智能体与会话", "Agent & Sessions"],
   "settings.tabs.providers": ["模型供应商", "Model Providers"],
+  "settings.tabs.plugins": ["插件", "Plugins"],
   "settings.tabs.lab": ["实验室", "Lab"],
   "settings.tabs.archived": ["已归档的会话", "已归档", "Archived Sessions", "Archived"],
   "settings.agentDefaults": ["Agent 默认值", "Agent Defaults", "智能体默认值"],
@@ -60,8 +68,11 @@ const TAB_PROBE_META: Record<
   account: { id: "dom.settings_account", label: "官方「账户」设置页内容区", title: "账户" },
   agent: { id: "dom.settings_agent", label: "官方「智能体与会话」设置页内容区", title: "智能体与会话" },
   providers: { id: "dom.settings_providers", label: "官方「模型供应商」设置页与模型行", title: "模型供应商" },
+  plugins: { id: "dom.settings_plugins", label: "官方「插件」设置页内容区", title: "插件" },
   lab: { id: "dom.settings_lab", label: "官方「实验室」设置页内容区", title: "实验室" },
 };
+
+const PROBED_SETTINGS_TABS = ["account", "agent", "providers", "plugins", "lab"] as const;
 
 export function createDOMContractState(): DOMContractState {
   return { seen: {}, disabledReasons: {} };
@@ -267,6 +278,12 @@ export function findSettingsDialogParts(document: Document): SettingsDialogParts
   return { dialog, tabList, body, officialTabs };
 }
 
+export function findChatHeaderTail(document: Document): Element | null {
+  const nested = document.querySelector("header.chat-header .ch-tail") ?? document.querySelector(".ch .ch-tail");
+  if (nested) return nested;
+  return document.querySelector(".ch-tail");
+}
+
 export function findOfficialSettingsTab(document: Document, key: OfficialSettingsTabKey): Element | null {
   const parts = findSettingsDialogParts(document);
   if (!parts) return null;
@@ -337,6 +354,9 @@ export function findOfficialSettingsPanel(document: Document, key: Exclude<Offic
   if (key === "providers") {
     return firstVisibleCandidate(parts.body, [".pf", ".panel-sections", ".panel"]);
   }
+  if (key === "plugins") {
+    return firstVisibleCandidate(parts.body, [".plugins-panel", ".panel", ".panel-sections", ".sec"]);
+  }
   return firstVisibleCandidate(parts.body, [".panel", ".panel-sections", ".sec"]);
 }
 
@@ -380,6 +400,7 @@ export interface SettingsFallbackState<T extends SettingsProbeSummary = Settings
   account: T | null;
   agent: T | null;
   lab: T | null;
+  plugins: T | null;
 }
 
 export function resolveSettingsFallbacks<T extends SettingsProbeSummary>(
@@ -393,6 +414,7 @@ export function resolveSettingsFallbacks<T extends SettingsProbeSummary>(
     account: findDisabled("dom.settings_account"),
     agent: findDisabled("dom.settings_agent"),
     lab: findDisabled("dom.settings_lab"),
+    plugins: findDisabled("dom.settings_plugins"),
   };
 }
 
@@ -494,7 +516,7 @@ export function evaluateDOMContracts(document: Document, previous?: DOMContractS
       push("dom.settings_dialog", "设置弹层与标签栏", "disabled", reason);
     }
 
-    for (const key of ["account", "agent", "providers", "lab"] as const) {
+    for (const key of PROBED_SETTINGS_TABS) {
       const meta = TAB_PROBE_META[key];
       if (!settings.tabList || !settings.body) {
         const reason = `设置弹层容器缺失，无法定位「${meta.title}」页`;
@@ -557,7 +579,7 @@ export function evaluateDOMContracts(document: Document, previous?: DOMContractS
       push("dom.settings_dialog", "设置弹层与标签栏", "disabled", reason);
     }
 
-    for (const key of ["account", "agent", "providers", "lab"] as const) {
+    for (const key of PROBED_SETTINGS_TABS) {
       const meta = TAB_PROBE_META[key];
       if (state.seen[meta.id]) {
         push(meta.id, meta.label, "available", undefined, "已通过检测，当前设置弹层未打开");

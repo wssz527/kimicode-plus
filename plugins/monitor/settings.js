@@ -5,22 +5,151 @@
 var CONFIG_KEY = "kimi-statusbar.config";
 var MINI_KEY = "kimi-statusbar.mini";
 var RANGE_LABEL = { day: "24 小时", week: "7 天", month: "30 天" };
+var DEFAULT_WIDGET_CONFIG = {
+  version: 3,
+  modules: {
+    header: { show: "hidden", span: 2, stat: "balance", dataLink: "subscription" },
+    input: { show: "full", span: 1 },
+    cache: { show: "full", span: 1 },
+    output: { show: "full", span: 1 },
+    speed: { show: "full", span: 1 },
+    duration: { show: "hidden", span: 2 },
+    quota5h: { show: "mini", span: 1, pace: true, resetFormat: "countdown" },
+    quotaWeek: { show: "mini", span: 1, pace: true, resetFormat: "countdown" },
+    usageChart: { show: "hidden", span: 2, chartRange: "week" },
+    pet: { show: "mini", span: 2, stat: "daily", sidebarTidy: false, ballLink: "subscription" },
+    agents: { show: "hidden", span: 2, hiddenAgents: [] },
+    external: { show: "full", span: 2, hiddenAccounts: [] }
+  },
+  orderFull: ["external", "output", "cache", "input", "speed"],
+  orderMini: ["pet", "quota5h", "quotaWeek"],
+  orderHidden: ["header", "duration", "agents", "usageChart"]
+};
 var STYLE = `
-.ekdp-mon-settings { display: flex; flex-direction: column; gap: 18px; padding: 4px 2px 18px; color: var(--color-text, #eee); font-size: 13px; }
-.ekdp-mon-settings h3 { margin: 0; font-size: 14px; font-weight: 600; }
-.ekdp-mon-settings p { margin: 0; color: var(--color-text-secondary, #999); line-height: 1.6; }
-.ekdp-mon-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 12px; border: 1px solid var(--color-border, #333); border-radius: 8px; }
-.ekdp-mon-row-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.ekdp-mon-row-text strong { font-weight: 500; }
-.ekdp-mon-seg { display: inline-flex; gap: 2px; padding: 2px; border-radius: 7px; background: var(--color-fill, #1e1e1e); }
-.ekdp-mon-seg button { padding: 4px 10px; border: 0; border-radius: 5px; background: transparent; color: inherit; font: inherit; cursor: pointer; }
-.ekdp-mon-seg button[aria-pressed="true"] { background: var(--color-selected, #333); }
-.ekdp-mon-switch { width: 38px; height: 22px; padding: 0; border: 0; border-radius: 11px; background: var(--color-fill, #333); cursor: pointer; position: relative; }
-.ekdp-mon-switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform .15s; }
-.ekdp-mon-switch[aria-pressed="true"] { background: var(--color-accent, #1783ff); }
-.ekdp-mon-switch[aria-pressed="true"]::after { transform: translateX(16px); }
-.ekdp-mon-note { font-size: 12px; color: var(--color-text-secondary, #999); }
-.ekdp-mon-error { font-size: 12px; color: var(--color-danger, #e5534b); }
+.ekdp-mon-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  color: var(--ekds-text, var(--color-text, inherit));
+  font: 13px/1.55 var(--font-ui, system-ui, sans-serif);
+}
+.ekdp-mon-intro {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--ekds-muted, var(--color-text-muted, var(--color-text-secondary, light-dark(#5c6370, #a3aab8))));
+}
+.ekdp-mon-group {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: var(--ekds-hairline, 1px solid var(--color-line, rgba(128, 128, 128, 0.22)));
+  border-radius: var(--ekds-radius, 12px);
+  background: var(--ekds-surface, var(--color-surface, light-dark(#f8f9fb, rgba(255, 255, 255, 0.04))));
+}
+.ekdp-mon-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  border-top: var(--ekds-hairline, 1px solid var(--color-line, rgba(128, 128, 128, 0.2)));
+}
+.ekdp-mon-row:first-child { border-top: 0; }
+.ekdp-mon-row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.ekdp-mon-row-text strong {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ekds-text, var(--color-text, inherit));
+}
+.ekdp-mon-seg {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+  padding: 3px;
+  border: var(--ekds-hairline, 1px solid var(--color-line, rgba(128, 128, 128, 0.22)));
+  border-radius: 8px;
+  background: var(--ekds-bg, var(--color-bg, light-dark(#eef0f4, rgba(0, 0, 0, 0.26))));
+}
+.ekdp-mon-seg button {
+  height: 26px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ekds-muted, var(--color-text-muted, var(--color-text-secondary, light-dark(#5c6370, #a3aab8))));
+  font: 500 12px/1 var(--font-ui, system-ui, sans-serif);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 120ms ease, color 120ms ease;
+}
+.ekdp-mon-seg button:hover {
+  color: var(--ekds-text, var(--color-text, inherit));
+}
+.ekdp-mon-seg button[aria-pressed="true"] {
+  background: var(--ekds-surface, var(--color-surface-raised, light-dark(#ffffff, rgba(255, 255, 255, 0.14))));
+  color: var(--ekds-text, var(--color-text, inherit));
+  box-shadow: 0 1px 2px light-dark(rgba(15, 23, 42, 0.08), rgba(0, 0, 0, 0.35));
+}
+.ekdp-mon-switch {
+  flex: none;
+  width: 36px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--ekds-line, rgba(128, 128, 128, 0.3)) 85%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ekds-muted, #888) 26%, transparent);
+  cursor: pointer;
+  position: relative;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+.ekdp-mon-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: transform 140ms ease;
+}
+.ekdp-mon-switch[aria-pressed="true"] {
+  border-color: transparent;
+  background: var(--ekds-accent, var(--color-accent, #2563eb));
+}
+.ekdp-mon-switch[aria-pressed="true"]::after {
+  transform: translateX(16px);
+}
+.ekdp-mon-switch:focus-visible,
+.ekdp-mon-seg button:focus-visible {
+  outline: none;
+  box-shadow: var(--ekds-ring, 0 0 0 2px var(--color-accent, #2563eb));
+}
+.ekdp-mon-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ekds-muted, var(--color-text-muted, var(--color-text-secondary, light-dark(#5c6370, #a3aab8))));
+}
+.ekdp-mon-ok {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--success, #27865a);
+}
+.ekdp-mon-error {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-danger, var(--danger, #c64b52));
+}
 `;
 function node(tag, className, text) {
   const element = document.createElement(tag);
@@ -28,19 +157,27 @@ function node(tag, className, text) {
   if (text != null) element.textContent = text;
   return element;
 }
+function hydrateConfig(raw) {
+  const base = structuredClone(DEFAULT_WIDGET_CONFIG);
+  if (!raw || typeof raw !== "object") return base;
+  const next = structuredClone(raw);
+  next.modules = next.modules && typeof next.modules === "object" ? next.modules : {};
+  next.modules.usageChart = { ...base.modules.usageChart, ...next.modules.usageChart || {} };
+  next.modules.pet = { ...base.modules.pet, ...next.modules.pet || {} };
+  return next;
+}
 function renderSettings(ctx, element) {
   const style = document.createElement("style");
   style.textContent = STYLE;
   element.append(style);
   const wrap = node("div", "ekdp-mon-settings");
-  wrap.append(node("h3", "", "Monitor 侧栏面板"));
-  wrap.append(node("p", "", "面板数据来自本机缓存指标与核心的余额读取，不读取会话正文，也不保存任何供应商密钥。"));
   const status = node("p", "ekdp-mon-note", "");
   let config = null;
   let miniEnabled = "0";
+  let loaded = false;
   let disposed = false;
-  function report(text, isError) {
-    status.className = isError ? "ekdp-mon-error" : "ekdp-mon-note";
+  function report(text, tone) {
+    status.className = tone === "error" ? "ekdp-mon-error" : tone === "ok" ? "ekdp-mon-ok" : "ekdp-mon-note";
     status.textContent = text;
   }
   async function saveConfig(mutate) {
@@ -50,7 +187,7 @@ function renderSettings(ctx, element) {
     try {
       await ctx.storage.set(CONFIG_KEY, next);
     } catch (error) {
-      report(`保存失败，仍在使用上次保存的设置：${error?.message || error}`, true);
+      report(`保存失败，仍在使用上次保存的设置：${error?.message || error}`, "error");
       return;
     }
     if (disposed) return;
@@ -59,7 +196,7 @@ function renderSettings(ctx, element) {
       detail: { key: CONFIG_KEY, value: next }
     }));
     render();
-    report("已保存", false);
+    report("已保存", "ok");
   }
   function rangeRow() {
     const row = node("div", "ekdp-mon-row");
@@ -90,13 +227,15 @@ function renderSettings(ctx, element) {
     const toggle = node("button", "ekdp-mon-switch");
     toggle.type = "button";
     toggle.setAttribute("role", "switch");
+    toggle.setAttribute("aria-label", "迷你模式");
     toggle.setAttribute("aria-pressed", String(miniEnabled === "1"));
+    toggle.setAttribute("aria-checked", String(miniEnabled === "1"));
     toggle.addEventListener("click", async () => {
       const next = miniEnabled === "1" ? "0" : "1";
       try {
         await ctx.storage.set(MINI_KEY, next);
       } catch (error) {
-        report(`保存失败，仍在使用上次保存的设置：${error?.message || error}`, true);
+        report(`保存失败，仍在使用上次保存的设置：${error?.message || error}`, "error");
         return;
       }
       if (disposed) return;
@@ -105,7 +244,8 @@ function renderSettings(ctx, element) {
         detail: { key: MINI_KEY, value: next }
       }));
       toggle.setAttribute("aria-pressed", String(next === "1"));
-      report("已保存", false);
+      toggle.setAttribute("aria-checked", String(next === "1"));
+      report("已保存", "ok");
     });
     row.append(text, toggle);
     return row;
@@ -118,7 +258,10 @@ function renderSettings(ctx, element) {
     const toggle = node("button", "ekdp-mon-switch");
     toggle.type = "button";
     toggle.setAttribute("role", "switch");
-    toggle.setAttribute("aria-pressed", String(config?.modules?.pet?.sidebarTidy === true));
+    toggle.setAttribute("aria-label", "侧栏整理");
+    const checked = config?.modules?.pet?.sidebarTidy === true;
+    toggle.setAttribute("aria-pressed", String(checked));
+    toggle.setAttribute("aria-checked", String(checked));
     toggle.addEventListener("click", () => {
       void saveConfig((next) => {
         next.modules.pet.sidebarTidy = next.modules.pet.sidebarTidy !== true;
@@ -129,13 +272,17 @@ function renderSettings(ctx, element) {
   }
   function render() {
     wrap.replaceChildren();
-    wrap.append(node("h3", "", "Monitor 侧栏面板"));
-    wrap.append(node("p", "", "面板数据来自本机缓存指标与核心的余额读取，不读取会话正文，也不保存任何供应商密钥。"));
-    if (!config) {
+    wrap.append(node("p", "ekdp-mon-intro", "面板数据来自本机缓存指标与核心余额读取，不读取会话正文，也不保存任何供应商密钥。"));
+    if (!loaded) {
       wrap.append(node("p", "ekdp-mon-note", "正在读取已保存的设置…"));
       return;
     }
-    wrap.append(rangeRow(), miniRow(), tidyRow(), status);
+    if (config) {
+      const group = node("div", "ekdp-mon-group");
+      group.append(rangeRow(), miniRow(), tidyRow());
+      wrap.append(group);
+    }
+    wrap.append(status);
   }
   element.append(wrap);
   render();
@@ -143,16 +290,17 @@ function renderSettings(ctx, element) {
     try {
       const stored = await ctx.storage.get(CONFIG_KEY);
       if (disposed) return;
-      if (stored && typeof stored === "object") config = stored;
-      else config = null;
+      config = hydrateConfig(stored);
       const mini = await ctx.storage.get(MINI_KEY);
       if (!disposed) miniEnabled = mini === "1" ? "1" : "0";
+      loaded = true;
+      if (!disposed) render();
     } catch (error) {
-      if (!disposed) report(`读取设置失败：${error?.message || error}`, true);
-    }
-    if (!disposed) {
-      if (config) render();
-      else report("面板还没有运行过，先在侧栏打开一次 Monitor 再回来设置。", true);
+      if (disposed) return;
+      loaded = true;
+      config = null;
+      report(`读取设置失败：${error?.message || error}`, "error");
+      render();
     }
   })();
   return () => {

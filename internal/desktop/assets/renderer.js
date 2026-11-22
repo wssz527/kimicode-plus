@@ -123,13 +123,25 @@ async function installNativeRenderer(options) {
     settingsDialog: null,
     settingsList: null,
     settingsBody: null,
-    settingsButton: null,
+    settingsTabs: new Map(),
     settingsHost: null,
     settingsHandle: null,
-    settingsActive: false,
+    settingsActiveTab: null,
     settingsRelease: null,
     settingsObserver: null,
+    updateStatus: null,
+    updatePill: null,
+    updatePopover: null,
+    updateOutside: null,
+    updateKeydown: null,
+    updatePillDigest: '',
+    unsubscribeUpdate: null,
     officialSections: new Map(),
+    officialPluginsTabActive: false,
+    officialPluginsPanel: null,
+    officialPluginsSeg: null,
+    officialPluginsTabBtn: null,
+    officialPluginsSegClick: null,
     accountsCache: null,
     accountsFetchedAt: 0,
     accountsFetchPromise: null,
@@ -303,6 +315,42 @@ async function installNativeRenderer(options) {
     const host = makeHost(closeSessions);
     state.sessionHandle = mount(element, 'sessions', host, { initialExtraIds: extraIds, onNativeRestore: closeSessions });
   }
+  function clearOfficialPluginsTab(resetActive = true) {
+    if (state.officialPluginsSeg && state.officialPluginsSegClick) {
+      state.officialPluginsSeg.removeEventListener('click', state.officialPluginsSegClick, true);
+    }
+    if (state.officialPluginsSeg) {
+      state.officialPluginsSeg.removeAttribute('data-ekd-plugins-active');
+    }
+    if (state.officialPluginsPanel) {
+      state.officialPluginsPanel.classList.remove('ekd-plugins-active');
+      state.officialPluginsPanel.removeAttribute('data-ekd-plugins-segmented');
+    }
+    state.officialPluginsTabBtn?.remove();
+    state.officialPluginsPanel = null;
+    state.officialPluginsSeg = null;
+    state.officialPluginsTabBtn = null;
+    state.officialPluginsSegClick = null;
+    if (resetActive) state.officialPluginsTabActive = false;
+  }
+  function applyOfficialPluginsTabState(panel, seg, btn) {
+    const active = state.officialPluginsTabActive === true;
+    if (panel) {
+      if (panel.dataset.ekdPluginsSegmented !== 'true') panel.dataset.ekdPluginsSegmented = 'true';
+      if (panel.classList.contains('ekd-plugins-active') !== active) {
+        panel.classList.toggle('ekd-plugins-active', active);
+      }
+    }
+    if (seg) {
+      const hasAttr = seg.getAttribute('data-ekd-plugins-active') === 'true';
+      if (active && !hasAttr) seg.setAttribute('data-ekd-plugins-active', 'true');
+      else if (!active && hasAttr) seg.removeAttribute('data-ekd-plugins-active');
+    }
+    if (btn) {
+      if (btn.classList.contains('is-on') !== active) btn.classList.toggle('is-on', active);
+      if (btn.getAttribute('aria-selected') !== String(active)) btn.setAttribute('aria-selected', String(active));
+    }
+  }
   function unmountOfficialSection(key) {
     const entry = state.officialSections.get(key);
     if (!entry) return;
@@ -311,8 +359,9 @@ async function installNativeRenderer(options) {
     entry.hostEl.remove();
   }
   function unmountAllOfficialSections() {
+    clearOfficialPluginsTab(true);
     for (const key of [...state.officialSections.keys()]) unmountOfficialSection(key);
-    for (const stale of document.querySelectorAll('[data-ekd-official-section]')) stale.remove();
+    for (const stale of document.querySelectorAll('[data-ekd-official-section], [data-ekd-plugins-tab]')) stale.remove();
   }
   function placeOfficialSection(panel, key, surface, placement) {
     let entry = state.officialSections.get(key);
@@ -346,7 +395,7 @@ async function installNativeRenderer(options) {
     return entry;
   }
   function syncOfficialSettingsSections(evaluation) {
-    if (!state.settingsDialog || state.settingsActive || evaluation.byId['dom.settings_dialog']?.status === 'disabled') {
+    if (!state.settingsDialog || state.settingsActiveTab || evaluation.byId['dom.settings_dialog']?.status === 'disabled') {
       unmountAllOfficialSections();
       return;
     }
@@ -389,6 +438,67 @@ async function installNativeRenderer(options) {
         desired.add('lab');
         placeOfficialSection(labPanel, 'lab', 'settings-lab', { kind: 'append' });
       }
+    }
+    if (evaluation.byId['dom.settings_plugins']?.status !== 'disabled') {
+      const pluginsPanel = module.findOfficialSettingsPanel(document, 'plugins');
+      if (pluginsPanel) {
+        const officialDetailOpen = Boolean(pluginsPanel.querySelector('.plugin-details'));
+        const seg = officialDetailOpen
+          ? null
+          : pluginsPanel.querySelector('.pp-toolbar [role="tablist"], .pp-toolbar .ui-seg');
+        const officialBtn = seg
+          ? seg.querySelector('button[role="tab"]:not([data-ekd-plugins-tab]), .ui-seg__item:not([data-ekd-plugins-tab])')
+          : null;
+        if (officialDetailOpen) {
+          clearOfficialPluginsTab(true);
+        } else if (seg && officialBtn) {
+          if (state.officialPluginsSeg !== seg || !state.officialPluginsTabBtn?.isConnected) {
+            clearOfficialPluginsTab(false);
+            const btn = officialBtn.cloneNode(false);
+            btn.classList.remove('is-on');
+            btn.removeAttribute('disabled');
+            btn.dataset.ekdPluginsTab = 'true';
+            btn.setAttribute('role', 'tab');
+            btn.setAttribute('aria-selected', String(state.officialPluginsTabActive));
+            btn.textContent = 'KimiCode+';
+            btn.addEventListener('click', event => {
+              event.preventDefault();
+              event.stopPropagation();
+              state.officialPluginsTabActive = true;
+              applyOfficialPluginsTabState(pluginsPanel, seg, btn);
+              ensure();
+            });
+            seg.append(btn);
+            const onSegClick = event => {
+              const clicked = event.target?.closest?.('button[role="tab"], .ui-seg__item');
+              if (!clicked || clicked.hasAttribute('data-ekd-plugins-tab')) return;
+              if (state.officialPluginsTabActive) {
+                state.officialPluginsTabActive = false;
+                applyOfficialPluginsTabState(pluginsPanel, seg, btn);
+                setTimeout(() => ensure(), 20);
+              }
+            };
+            seg.addEventListener('click', onSegClick, true);
+            state.officialPluginsPanel = pluginsPanel;
+            state.officialPluginsSeg = seg;
+            state.officialPluginsTabBtn = btn;
+            state.officialPluginsSegClick = onSegClick;
+          }
+          applyOfficialPluginsTabState(pluginsPanel, seg, state.officialPluginsTabBtn);
+          if (state.officialPluginsTabActive) {
+            desired.add('plugins');
+            placeOfficialSection(pluginsPanel, 'plugins', 'settings-plugins', { kind: 'append' });
+          }
+        } else {
+          clearOfficialPluginsTab(true);
+          desired.add('plugins');
+          placeOfficialSection(pluginsPanel, 'plugins', 'settings-plugins', { kind: 'append' });
+        }
+      } else {
+        clearOfficialPluginsTab(true);
+      }
+    } else {
+      clearOfficialPluginsTab(true);
     }
     for (const key of [...state.officialSections.keys()]) {
       if (!desired.has(key)) unmountOfficialSection(key);
@@ -789,7 +899,7 @@ async function installNativeRenderer(options) {
       const relevant = records.some(record => {
         const target = record.target;
         if (!(target instanceof Element)) return true;
-        return !target.closest('[data-ekd-official-section], .ekd-settings-mount, [data-ekd-settings-tab]');
+        return !target.closest('[data-ekd-official-section], .ekd-settings-mount, [data-ekd-settings-tab], [data-ekd-plugins-tab]');
       });
       if (relevant) ensure();
     });
@@ -801,37 +911,49 @@ async function installNativeRenderer(options) {
     });
   }
   function deactivateSettings() {
-    state.settingsActive = false;
+    state.settingsActiveTab = null;
     unmountHandle(state.settingsHandle);
     state.settingsHandle = null;
     state.settingsHost?.remove();
     state.settingsHost = null;
     state.settingsRelease?.();
     state.settingsRelease = null;
-    state.settingsButton?.classList.remove('on');
-    state.settingsButton?.setAttribute('aria-selected', 'false');
+    for (const button of state.settingsTabs.values()) {
+      button.classList.remove('on');
+      button.setAttribute('aria-selected', 'false');
+    }
   }
   function detachSettings() {
     state.settingsObserver?.disconnect();
     state.settingsObserver = null;
     unmountAllOfficialSections();
-    state.settingsButton?.remove();
+    for (const button of state.settingsTabs.values()) button.remove();
+    state.settingsTabs.clear();
     state.settingsDialog = null;
     state.settingsList = null;
     state.settingsBody = null;
-    state.settingsButton = null;
   }
   function markSettingsActive() {
     for (const tab of state.settingsList?.querySelectorAll('button.tab[role="tab"]') || []) {
-      const selected = tab === state.settingsButton;
+      const selected = typeof state.settingsActiveTab === 'string' && tab === state.settingsTabs.get(state.settingsActiveTab);
+      // `ensure()` is driven by DOM mutations, so only write when the state
+      // differs; rewriting the same class would schedule another sync.
+      if (tab.classList.contains('on') === selected && tab.getAttribute('aria-selected') === String(selected)) continue;
       tab.classList.toggle('on', selected);
       tab.setAttribute('aria-selected', String(selected));
     }
   }
-  function activateSettings() {
-    if (!state.settingsBody || state.settingsActive) return;
+  async function activateSettings(kind = 'kimicode-plus') {
+    if (!state.settingsBody) return;
+    if (state.settingsActiveTab === kind && state.settingsHandle) return;
     unmountAllOfficialSections();
-    state.settingsActive = true;
+    unmountHandle(state.settingsHandle);
+    state.settingsHandle = null;
+    state.settingsHost?.remove();
+    state.settingsHost = null;
+    state.settingsRelease?.();
+    state.settingsRelease = null;
+    state.settingsActiveTab = kind;
     markSettingsActive();
     state.settingsRelease = contain(state.settingsBody, 'settings');
     const element = document.createElement('div');
@@ -839,7 +961,7 @@ async function installNativeRenderer(options) {
     state.settingsBody.append(element);
     state.settingsHost = element;
     const host = makeHost(() => deactivateSettings());
-    state.settingsHandle = mount(element, 'settings', host);
+    state.settingsHandle = mount(element, kind === 'cache' ? 'settings-cache' : 'settings', host);
   }
   async function openSettings(tab) {
     if (!module.findSettingsDialogParts(document)) {
@@ -847,27 +969,30 @@ async function installNativeRenderer(options) {
       if (!button) throw new Error('官方设置入口未就绪');
       button.click();
     }
-    const officialTabs = new Set(['general', 'account', 'agent', 'providers', 'lab', 'archived']);
-    const wantOfficial = typeof tab === 'string' && officialTabs.has(tab);
+    const officialTabs = new Set(['general', 'account', 'agent', 'providers', 'plugins', 'lab', 'archived']);
+    const targetOfficialTab = tab === 'plugins-ekd' ? 'plugins' : tab;
+    const wantOfficial = typeof targetOfficialTab === 'string' && officialTabs.has(targetOfficialTab);
     const findOfficialTab = key => module.findOfficialSettingsTab(document, key);
+    const ready = () => Boolean(state.settingsBody) && state.settingsTabs.size > 0;
     const deadline = Date.now() + 10000;
-    while (!state.settingsBody || !state.settingsButton || (wantOfficial && !findOfficialTab(tab))) {
+    while (!ready() || (wantOfficial && !findOfficialTab(targetOfficialTab))) {
       syncSettingsTab();
-      if (state.settingsBody && state.settingsButton && (!wantOfficial || findOfficialTab(tab))) break;
+      if (ready() && (!wantOfficial || findOfficialTab(targetOfficialTab))) break;
       if (Date.now() >= deadline) throw new Error('官方设置对话框契约未就绪');
       await new Promise(resolve => setTimeout(resolve, 50));
     }
     if (wantOfficial) {
-      if (state.settingsActive) deactivateSettings();
-      const targetTab = findOfficialTab(tab);
-      if (!targetTab) throw new Error(`官方「${tab}」标签未找到`);
+      if (state.settingsActiveTab) deactivateSettings();
+      if (tab === 'plugins-ekd') state.officialPluginsTabActive = true;
+      const targetTab = findOfficialTab(targetOfficialTab);
+      if (!targetTab) throw new Error(`官方「${targetOfficialTab}」标签未找到`);
       targetTab.click();
       targetTab.classList.add('on');
       targetTab.setAttribute('aria-selected', 'true');
       setTimeout(() => ensure(), 40);
       return;
     }
-    await activateSettings();
+    await activateSettings(tab === 'cache' ? 'cache' : 'kimicode-plus');
   }
   function syncSettingsTab() {
     const parts = module.findSettingsDialogParts(document);
@@ -893,45 +1018,387 @@ async function installNativeRenderer(options) {
       attachSettingsObserver(dialog);
     }
     if (state.settingsList !== list) {
-      state.settingsButton?.remove();
-      state.settingsButton = null;
+      for (const button of state.settingsTabs.values()) button.remove();
+      state.settingsTabs.clear();
       state.settingsList = list;
     }
     if (state.settingsBody !== body) {
       state.settingsRelease?.();
       state.settingsBody = body;
-      if (state.settingsActive && state.settingsHost) {
+      if (state.settingsActiveTab && state.settingsHost) {
         state.settingsRelease = contain(body, 'settings');
         body.append(state.settingsHost);
       }
     }
-    if (state.settingsActive) {
+    if (state.settingsActiveTab) {
       body.setAttribute('data-ekd-containment', 'settings');
       if (state.settingsHost && state.settingsHost.parentElement !== body) body.append(state.settingsHost);
     }
-    if (state.settingsButton?.isConnected) {
-      if (state.settingsActive) markSettingsActive();
+    const injected = [...state.settingsTabs.values()];
+    if (injected.length === 2 && injected.every(button => button.isConnected)) {
+      if (state.settingsActiveTab) markSettingsActive();
       return;
     }
     const nativeTab = parts.officialTabs[0];
     if (!nativeTab) return;
-    const button = nativeTab.cloneNode(true);
-    button.classList.remove('on');
-    button.setAttribute('aria-selected', 'false');
-    button.dataset.ekdSettingsTab = '';
-    const label = button.querySelector('span');
-    if (label) label.textContent = 'KimiCode+';
-    else button.textContent = 'KimiCode+';
+    for (const button of injected) button.remove();
+    state.settingsTabs.clear();
+    const archived = module.findOfficialSettingsTab(document, 'archived');
+    const makeTab = (kind, label, paintIcon) => {
+      const button = nativeTab.cloneNode(true);
+      button.classList.remove('on');
+      button.setAttribute('aria-selected', 'false');
+      button.dataset.ekdSettingsTab = '';
+      button.setAttribute('data-ekd-settings-tab', kind);
+      const span = button.querySelector('span');
+      if (span) span.textContent = label;
+      else button.textContent = label;
+      button.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        void activateSettings(kind);
+      });
+      paintIcon(button);
+      state.settingsTabs.set(kind, button);
+      list.insertBefore(button, archived || null);
+      return button;
+    };
+    makeTab('cache', '缓存与用量', replaceCacheIcon);
+    makeTab('kimicode-plus', 'KimiCode+', replaceIcon);
+    if (state.settingsActiveTab) markSettingsActive();
+  }
+  const UPDATE_DISMISS_KEY = 'ekd:update-dismissed';
+  const UPDATE_VISIBLE_STATES = new Set(['available', 'downloading', 'verifying', 'restarting', 'rolled_back']);
+  const UPDATE_ICON = '<svg class="upd-pill-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"></path><path d="m7 10 5 5 5-5"></path><path d="M5 20h14"></path></svg>';
+  function readUpdateDismissed() {
+    try { return window.sessionStorage.getItem(UPDATE_DISMISS_KEY) || ''; } catch { return ''; }
+  }
+  function writeUpdateDismissed(version) {
+    try {
+      if (version) window.sessionStorage.setItem(UPDATE_DISMISS_KEY, version);
+      else window.sessionStorage.removeItem(UPDATE_DISMISS_KEY);
+    } catch {
+      // Session storage can be unavailable; dismissal is best effort.
+    }
+  }
+  function updatePercent(status) {
+    const total = Number(status?.totalBytes) || 0;
+    if (!total) return 0;
+    const done = Math.max(0, Number(status?.downloadedBytes) || 0);
+    return Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+  }
+  function updatePillLabel(status) {
+    switch (status?.state) {
+      case 'available': return '有新版本';
+      case 'downloading': return `更新中 ${updatePercent(status)}%`;
+      case 'verifying': return '正在更新…';
+      case 'restarting': return '正在重启…';
+      case 'rolled_back': return '更新已回滚';
+      default: return '有新版本';
+    }
+  }
+  function updatePillVisible(status) {
+    if (!status || !UPDATE_VISIBLE_STATES.has(status.state)) return false;
+    if (status.state !== 'available') return true;
+    const dismissed = readUpdateDismissed();
+    return !(dismissed && status.latestVersion && dismissed === status.latestVersion);
+  }
+  function closeUpdatePopover() {
+    if (state.updateOutside) {
+      document.removeEventListener('pointerdown', state.updateOutside, true);
+      state.updateOutside = null;
+    }
+    if (state.updateKeydown) {
+      document.removeEventListener('keydown', state.updateKeydown, true);
+      state.updateKeydown = null;
+    }
+    window.removeEventListener('resize', positionUpdatePopover);
+    state.updatePopover?.remove();
+    state.updatePopover = null;
+  }
+  function positionUpdatePopover() {
+    const popover = state.updatePopover;
+    const pill = state.updatePill;
+    if (!popover || !pill) return;
+    const rect = pill.getBoundingClientRect();
+    const width = Math.min(348, Math.max(272, window.innerWidth - 24));
+    popover.style.width = `${width}px`;
+    const height = popover.offsetHeight || 300;
+    let left = Math.min(rect.right - width, window.innerWidth - width - 12);
+    if (left < 12) left = 12;
+    let top = rect.bottom + 8;
+    if (top + height > window.innerHeight - 12) top = Math.max(12, rect.top - height - 8);
+    popover.style.left = `${Math.round(left)}px`;
+    popover.style.top = `${Math.round(Math.max(12, top))}px`;
+  }
+  function appendUpdateAction(node, text, className, onClick) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = className;
+    button.textContent = text;
     button.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
-      void activateSettings();
+      onClick();
     });
-    const archived = module.findOfficialSettingsTab(document, 'archived');
-    list.insertBefore(button, archived || null);
-    replaceIcon(button);
-    state.settingsButton = button;
-    if (state.settingsActive) markSettingsActive();
+    node.append(button);
+    return button;
+  }
+  function appendReleaseNotes(container, raw) {
+    const lines = String(raw || '').split(/\r?\n/);
+    let list = null;
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) {
+        list = null;
+        continue;
+      }
+      const bullet = /^[-*•]\s+(.+)$/.exec(line);
+      if (bullet) {
+        if (!list) {
+          list = document.createElement('ul');
+          list.className = 'ekd-upd-list';
+          container.append(list);
+        }
+        const li = document.createElement('li');
+        li.textContent = bullet[1];
+        list.append(li);
+        continue;
+      }
+      list = null;
+      const heading = /^#{1,4}\s+(.+)$/.exec(line);
+      if (heading) {
+        const h = document.createElement('h5');
+        h.className = 'ekd-upd-h';
+        h.textContent = heading[1];
+        container.append(h);
+        continue;
+      }
+      const p = document.createElement('p');
+      p.className = 'ekd-upd-p';
+      p.textContent = line;
+      container.append(p);
+    }
+  }
+  function paintUpdatePopover() {
+    const popover = state.updatePopover;
+    const status = state.updateStatus;
+    if (!popover) return;
+    popover.replaceChildren();
+    if (!status) return;
+    const head = document.createElement('div');
+    head.className = 'ekd-upd-head';
+    const title = document.createElement('strong');
+    title.className = 'ekd-upd-title';
+    title.textContent = status.state === 'available'
+      ? `发现新版本 v${status.latestVersion || ''}`
+      : `KimiCode+ ${updatePillLabel(status)}`;
+    const meta = document.createElement('span');
+    meta.className = 'ekd-upd-meta';
+    meta.textContent = status.currentVersion ? `KimiCode+ · 当前 v${status.currentVersion}` : 'KimiCode+';
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'ekd-upd-close';
+    close.setAttribute('aria-label', '关闭更新提示');
+    close.textContent = '×';
+    close.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      closeUpdatePopover();
+    });
+    const heading = document.createElement('div');
+    heading.className = 'ekd-upd-heading';
+    heading.append(title, meta);
+    head.append(heading, close);
+
+    const body = document.createElement('div');
+    body.className = 'ekd-upd-body';
+    const message = status.error || status.note || status.cannotApplyReason || '';
+    if (status.state === 'downloading') {
+      const percent = updatePercent(status);
+      const bar = document.createElement('div');
+      bar.className = 'ekd-upd-bar';
+      const fill = document.createElement('span');
+      fill.style.width = `${percent}%`;
+      bar.append(fill);
+      body.append(bar);
+      const progress = document.createElement('p');
+      progress.className = 'ekd-upd-message';
+      progress.textContent = `正在下载更新… ${percent}%`;
+      body.append(progress);
+    } else if (message) {
+      const note = document.createElement('p');
+      note.className = 'ekd-upd-message';
+      note.textContent = message;
+      body.append(note);
+    }
+    if (status.releaseNotes) {
+      const notes = document.createElement('div');
+      notes.className = 'ekd-upd-notes';
+      const notesTitle = document.createElement('h4');
+      notesTitle.className = 'ekd-upd-notes-title';
+      notesTitle.textContent = '更新内容';
+      const notesBody = document.createElement('div');
+      notesBody.className = 'ekd-upd-notes-body';
+      appendReleaseNotes(notesBody, status.releaseNotes);
+      notes.append(notesTitle, notesBody);
+      body.append(notes);
+    }
+
+    const foot = document.createElement('div');
+    foot.className = 'ekd-upd-foot';
+    const links = document.createElement('div');
+    links.className = 'ekd-upd-links';
+    const releaseUrl = typeof status.releaseUrl === 'string' ? status.releaseUrl : '';
+    if (/^https:\/\//i.test(releaseUrl)) {
+      appendUpdateAction(links, '查看发布页', 'ekd-upd-link', () => {
+        void transport.request('host.openBrowser', { url: releaseUrl, mode: 'exec' }).catch(() => {});
+      });
+    }
+    appendUpdateAction(links, '更新设置', 'ekd-upd-link', () => {
+      closeUpdatePopover();
+      void openSettings('kimicode-plus').catch(() => {});
+    });
+    const actions = document.createElement('div');
+    actions.className = 'ekd-upd-actions';
+    if (status.state === 'available' && status.latestVersion) {
+      appendUpdateAction(actions, '忽略此版本', 'ekd-upd-secondary', () => {
+        writeUpdateDismissed(status.latestVersion);
+        closeUpdatePopover();
+        syncUpdatePill();
+      });
+    }
+    if (status.state === 'available' && status.canApply) {
+      const applyButton = appendUpdateAction(actions, '下载并更新', 'ekd-upd-primary', () => {
+        if (applyButton.disabled) return;
+        applyButton.disabled = true;
+        body.querySelector('.ekd-upd-message.is-error')?.remove();
+        void transport.request('update.apply')
+          .then(next => { if (next && typeof next === 'object') applyUpdateStatus(next); })
+          .catch(error => {
+            applyButton.disabled = false;
+            const text = document.createElement('p');
+            text.className = 'ekd-upd-message is-error';
+            text.textContent = error?.message || '更新启动失败';
+            body.append(text);
+          });
+      });
+    }
+    if (links.childElementCount > 0) foot.append(links);
+    if (actions.childElementCount > 0) foot.append(actions);
+    popover.append(head, body);
+    if (foot.childElementCount > 0) popover.append(foot);
+  }
+  function openUpdatePopover() {
+    if (state.updatePopover || !state.updatePill || state.removed) return;
+    const popover = document.createElement('div');
+    popover.className = 'ekd-upd-pop';
+    popover.dataset.ekdUpdatePopover = 'true';
+    popover.setAttribute('role', 'dialog');
+    popover.setAttribute('aria-label', 'KimiCode+ 更新');
+    document.body.append(popover);
+    state.updatePopover = popover;
+    paintUpdatePopover();
+    positionUpdatePopover();
+    state.updateOutside = event => {
+      const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+      if (path.includes(popover) || path.includes(state.updatePill)) return;
+      closeUpdatePopover();
+    };
+    state.updateKeydown = event => {
+      if (event.key === 'Escape') closeUpdatePopover();
+    };
+    document.addEventListener('pointerdown', state.updateOutside, true);
+    document.addEventListener('keydown', state.updateKeydown, true);
+    window.addEventListener('resize', positionUpdatePopover);
+  }
+  function syncUpdatePill() {
+    const status = state.updateStatus;
+    if (state.removed || !status) {
+      if (!state.updatePill && !state.updatePopover) return;
+      closeUpdatePopover();
+      state.updatePill?.remove();
+      state.updatePill = null;
+      state.updatePillDigest = '';
+      return;
+    }
+    const tail = updatePillVisible(status) ? module.findChatHeaderTail(document) : null;
+    if (!tail) {
+      if (!state.updatePill && !state.updatePopover) return;
+      closeUpdatePopover();
+      state.updatePill?.remove();
+      state.updatePill = null;
+      state.updatePillDigest = '';
+      return;
+    }
+    // `ensure()` runs on every DOM mutation, and rewriting the pill's children
+    // here would post another mutation. Only touch the DOM when the rendered
+    // state actually changed.
+    const digest = [
+      status.state,
+      updatePillLabel(status),
+      status.latestVersion || '',
+      status.canApply ? '1' : '0',
+      status.error || status.note || status.cannotApplyReason || '',
+    ].join('|');
+    if (state.updatePill?.parentElement === tail && digest === state.updatePillDigest) return;
+    state.updatePillDigest = digest;
+    if (!state.updatePill) {
+      const pill = document.createElement('button');
+      pill.type = 'button';
+      pill.className = 'upd-pill';
+      pill.dataset.ekdUpdatePill = 'true';
+      pill.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (state.updatePopover) closeUpdatePopover();
+        else openUpdatePopover();
+      });
+      state.updatePill = pill;
+    }
+    const pill = state.updatePill;
+    if (pill.parentElement !== tail) tail.append(pill);
+    const label = updatePillLabel(status);
+    pill.dataset.state = status.state;
+    pill.setAttribute('aria-label', `KimiCode+ ${label}`);
+    pill.title = status.state === 'available'
+      ? `KimiCode+ v${status.latestVersion || ''} 可用，点击查看更新`
+      : label;
+    pill.replaceChildren();
+    const icon = document.createElement('span');
+    icon.className = 'upd-pill-icon-wrap';
+    icon.innerHTML = UPDATE_ICON;
+    const text = document.createElement('span');
+    text.className = 'upd-pill-text';
+    text.textContent = label;
+    pill.append(icon, text);
+    if (state.updatePopover) {
+      paintUpdatePopover();
+      positionUpdatePopover();
+    }
+  }
+  function applyUpdateStatus(status) {
+    if (state.removed) return;
+    if (!status || typeof status !== 'object' || typeof status.state !== 'string') {
+      // A read that answers with an envelope instead of a status must not wipe a
+      // pill the last real status produced.
+      if (status === null) {
+        state.updateStatus = null;
+        syncUpdatePill();
+      }
+      return;
+    }
+    state.updateStatus = status;
+    syncUpdatePill();
+  }
+  function disposeUpdateSurface() {
+    state.unsubscribeUpdate?.();
+    state.unsubscribeUpdate = null;
+    closeUpdatePopover();
+    state.updatePill?.remove();
+    state.updatePill = null;
+    state.updatePillDigest = '';
+    state.updateStatus = null;
   }
   async function pickSession(exclude = []) {
     if (state.picker) { state.picker.close(); state.picker.remove(); }
@@ -1060,9 +1527,19 @@ async function installNativeRenderer(options) {
        panel sits below the dialog and cannot be reached by wheel, keyboard or
        scripted scrolling. flex:1 1 auto covers a flex body, max-height:100% covers
        a block body; both resolve against the body's definite height. */
-    .ekd-settings-mount{display:block;width:100%;min-width:0;min-height:0;flex:1 1 auto;max-height:100%;box-sizing:border-box;overflow-y:auto;overscroll-behavior:contain}
+    .ekd-settings-mount{display:block;width:100%;min-width:0;min-height:0;flex:1 1 auto;max-height:100%;box-sizing:border-box;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--color-text-faint,#888) 38%,transparent) transparent}
+    .ekd-settings-mount::-webkit-scrollbar{width:6px;height:6px}
+    .ekd-settings-mount::-webkit-scrollbar-track{background:transparent}
+    .ekd-settings-mount::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--color-text-faint,#888) 34%,transparent);border-radius:9999px}
+    .ekd-settings-mount::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,var(--color-text-faint,#888) 52%,transparent)}
+    .ekd-settings-mount::-webkit-scrollbar-corner{background:transparent}
     .ekd-official-section{display:block;width:100%;min-width:0;box-sizing:border-box;padding:var(--space-4,16px) 0}
-    .panel>.ekd-official-section:first-child{padding-top:0}
+    .panel>.ekd-official-section:first-child,.plugins-panel>.ekd-official-section[data-ekd-official-section="plugins"]{padding-top:0}
+    .plugins-panel[data-ekd-plugins-segmented="true"]:not(.ekd-plugins-active)>[data-ekd-official-section="plugins"]{display:none!important}
+    .plugins-panel.ekd-plugins-active>:not(.pp-panel-title):not(.pp-toolbar):not([data-ekd-official-section="plugins"]){display:none!important}
+    .plugins-panel.ekd-plugins-active .pp-tools{visibility:hidden;pointer-events:none}
+    .ui-seg[data-ekd-plugins-active="true"] .ui-seg__item:not([data-ekd-plugins-tab]){background:transparent!important;box-shadow:none!important;color:var(--color-text-muted,var(--color-text-faint,inherit))!important}
+    .ui-seg[data-ekd-plugins-active="true"] .ui-seg__indicator{opacity:0!important;pointer-events:none}
     .ekd-native-entry{position:relative}
     .ekd-session-picker{width:min(520px,calc(100vw - 40px));max-height:min(680px,calc(100vh - 60px));padding:0;border:1px solid var(--color-line,#8884);border-radius:8px;background:var(--color-bg,#121212);color:var(--color-text,#eee);font:13px/1.5 var(--font-ui,system-ui);box-shadow:0 16px 50px rgba(0,0,0,.24)}
     .ekd-session-picker::backdrop{background:rgba(0,0,0,.36)}
@@ -1097,14 +1574,56 @@ async function installNativeRenderer(options) {
     .ekd-keepalive-status.is-warn{color:var(--color-warning,var(--warning,#b4761f))}
     .ekd-keepalive-status.is-error{color:var(--color-danger,var(--danger,#c64b52))}
     .ekd-keepalive-popover{position:fixed;z-index:2147483000}
+    .ch-tail .upd-pill{display:inline-flex;align-items:center;gap:4px;height:24px;padding:0 9px;border:0;border-radius:9999px;font:500 11.5px/1 var(--font-ui,system-ui);white-space:nowrap;cursor:pointer;background:var(--color-warning,#d9822b);color:var(--color-text-on-accent,#fff);transition:filter 120ms ease;-webkit-app-region:no-drag}
+    .ch-tail .upd-pill:hover{filter:brightness(1.08)}
+    .ch-tail .upd-pill:focus-visible{outline:none;box-shadow:var(--p-focus-ring,0 0 0 2px color-mix(in srgb,var(--color-accent,#5b8def) 55%,transparent))}
+    .ch-tail .upd-pill[data-state="downloading"],.ch-tail .upd-pill[data-state="verifying"],.ch-tail .upd-pill[data-state="restarting"]{background:var(--color-accent,#5b8def);color:var(--color-text-on-accent,#fff)}
+    .ch-tail .upd-pill[data-state="rolled_back"]{background:var(--color-danger,#c64b52);color:var(--color-text-on-accent,#fff)}
+    .ch-tail .upd-pill .upd-pill-icon-wrap{display:inline-flex;flex:none;align-items:center;justify-content:center}
+    .ch-tail .upd-pill .upd-pill-icon{flex:none;color:currentColor}
+    .ch-tail .upd-pill .upd-pill-text{font-variant-numeric:tabular-nums}
+    .ekd-upd-pop{position:fixed;z-index:2147483000;box-sizing:border-box;padding:16px;border:1px solid var(--color-line,rgba(128,128,128,.24));border-radius:14px;background:var(--color-surface-raised,var(--color-surface,var(--color-bg,light-dark(#fff,#222))));color:var(--color-text,light-dark(#1a1c20,#eee));font:12.5px/1.5 var(--font-ui,system-ui);box-shadow:0 16px 44px light-dark(rgba(15,23,42,.14),rgba(0,0,0,.42))}
+    .ekd-upd-head{display:flex;align-items:flex-start;gap:10px}
+    .ekd-upd-heading{display:flex;flex:1;min-width:0;flex-direction:column;gap:2px}
+    .ekd-upd-title{font-size:13.5px;font-weight:600;color:var(--color-text,light-dark(#1a1c20,#eee))}
+    .ekd-upd-meta{font-size:11.5px;color:var(--color-text-faint,light-dark(#6b7280,#8e8e93))}
+    .ekd-upd-close{flex:none;width:24px;height:24px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--color-text-muted,var(--color-text-secondary,light-dark(#5c6370,#aaa)));font:16px/1 var(--font-ui,system-ui);cursor:pointer}
+    .ekd-upd-close:hover{background:var(--color-hover,rgba(128,128,128,.16));color:var(--color-text,light-dark(#1a1c20,#eee))}
+    .ekd-upd-body{display:flex;flex-direction:column;gap:10px;margin-top:10px}
+    .ekd-upd-message{margin:0;font-size:12px;color:var(--color-text-muted,var(--color-text-secondary,light-dark(#5c6370,#aaa)));word-break:break-word}
+    .ekd-upd-message.is-error{color:var(--color-danger,#c64b52)}
+    .ekd-upd-bar{height:4px;border-radius:9999px;background:color-mix(in srgb,var(--color-text-faint,#888) 22%,transparent);overflow:hidden}
+    .ekd-upd-bar>span{display:block;height:100%;border-radius:9999px;background:var(--color-accent,#5b8def);transition:width 200ms ease}
+    .ekd-upd-notes{margin:0;padding-top:10px;border-top:1px solid var(--color-line,rgba(128,128,128,.24))}
+    .ekd-upd-notes-title{margin:0 0 6px;font-size:11.5px;font-weight:500;color:var(--color-text-faint,light-dark(#6b7280,#8e8e93))}
+    .ekd-upd-notes-body{margin:0;max-height:min(280px,38vh);overflow-y:auto;font:12px/1.6 var(--font-ui,system-ui);color:var(--color-text,light-dark(#1a1c20,#eee));scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--color-text-faint,#888) 38%,transparent) transparent}
+    .ekd-upd-notes-body::-webkit-scrollbar{width:6px}
+    .ekd-upd-notes-body::-webkit-scrollbar-track{background:transparent}
+    .ekd-upd-notes-body::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--color-text-faint,#888) 34%,transparent);border-radius:9999px}
+    .ekd-upd-list{margin:0;padding-left:16px;display:flex;flex-direction:column;gap:4px}
+    .ekd-upd-list li{margin:0}
+    .ekd-upd-h{margin:8px 0 4px;font-size:12px;font-weight:600;color:var(--color-text,light-dark(#1a1c20,#eee))}
+    .ekd-upd-h:first-child{margin-top:0}
+    .ekd-upd-p{margin:0 0 6px}
+    .ekd-upd-p:last-child{margin-bottom:0}
+    .ekd-upd-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:14px;padding-top:12px;border-top:1px solid var(--color-line,rgba(128,128,128,.2))}
+    .ekd-upd-links{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+    .ekd-upd-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-left:auto}
+    .ekd-upd-secondary{height:30px;padding:0 10px;border:1px solid var(--color-line,rgba(128,128,128,.28));border-radius:8px;background:transparent;color:var(--color-text,light-dark(#1a1c20,#eee));font:500 12px/1 var(--font-ui,system-ui);cursor:pointer;white-space:nowrap}
+    .ekd-upd-secondary:hover{background:var(--color-hover,rgba(128,128,128,.12))}
+    .ekd-upd-primary{height:30px;padding:0 12px;border:0;border-radius:8px;background:var(--color-accent,#2563eb);color:var(--color-text-on-accent,#fff);font:500 12px/1 var(--font-ui,system-ui);cursor:pointer;white-space:nowrap}
+    .ekd-upd-primary:hover{filter:brightness(1.08)}
+    .ekd-upd-primary:disabled{opacity:.6;cursor:default}
+    .ekd-upd-link{padding:0;border:0;background:transparent;color:var(--color-text-muted,var(--color-text-secondary,light-dark(#5c6370,#aaa)));font:11.5px/1.4 var(--font-ui,system-ui);cursor:pointer}
+    .ekd-upd-link:hover{color:var(--color-text,light-dark(#1a1c20,#eee));text-decoration:underline}
     .ekd-toast-stack{position:fixed;right:18px;bottom:18px;z-index:2147483001;display:flex;flex-direction:column;gap:8px;max-width:360px}
-    .ekd-toast{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border-radius:12px;border:1px solid var(--color-line,rgba(128,128,128,.28));background:var(--color-surface-raised,#222);color:var(--color-text,#eee);box-shadow:0 8px 24px rgba(0,0,0,.22);font:12.5px/1.45 var(--font-ui,system-ui)}
+    .ekd-toast{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border-radius:12px;border:1px solid var(--color-line,rgba(128,128,128,.28));background:var(--color-surface-raised,var(--color-surface,light-dark(#fff,#222)));color:var(--color-text,light-dark(#1a1c20,#eee));box-shadow:0 8px 24px light-dark(rgba(15,23,42,.12),rgba(0,0,0,.28));font:12.5px/1.45 var(--font-ui,system-ui)}
     .ekd-toast.is-warning{border-color:color-mix(in srgb,var(--color-warning,#b4761f) 45%,var(--color-line,#8884))}
     .ekd-toast.is-error{border-color:color-mix(in srgb,var(--color-danger,#c64b52) 45%,var(--color-line,#8884))}
     .ekd-toast-body{flex:1;min-width:0}
     .ekd-toast-body strong{display:block;font-weight:600;margin-bottom:2px}
-    .ekd-toast-body p{margin:0;color:var(--color-text-secondary,#aaa)}
-    .ekd-toast-close{flex:none;border:0;background:transparent;color:var(--color-text-secondary,#aaa);font-size:16px;line-height:1;cursor:pointer;padding:0 2px}
+    .ekd-toast-body p{margin:0;color:var(--color-text-muted,var(--color-text-secondary,light-dark(#5c6370,#aaa)))}
+    .ekd-toast-close{flex:none;border:0;background:transparent;color:var(--color-text-muted,var(--color-text-secondary,light-dark(#5c6370,#aaa)));font-size:16px;line-height:1;cursor:pointer;padding:0 2px}
     @media(prefers-reduced-motion:reduce){.ekd-session-picker{scroll-behavior:auto}}
   `;
   document.head.append(nativeStyle);
@@ -1120,7 +1639,8 @@ async function installNativeRenderer(options) {
     },
   });
   const SETTINGS_ICON = 'm12 3 2.5 5 5.5 1-4 4 .8 5.5L12 16l-4.8 2.5L8 13 4 9l5.5-1L12 3Z';
-  function replaceIcon(button) {
+  const CACHE_ICON = 'M4 19V5 M4 19h16 M8 16v-4 M12 16V8 M16 16v-6';
+  function paintIcon(button, path) {
     const existing = button.querySelector('svg');
     if (!existing) return;
     existing.setAttribute('viewBox', '0 0 24 24');
@@ -1129,7 +1649,13 @@ async function installNativeRenderer(options) {
     existing.setAttribute('stroke-width', '1.6');
     existing.setAttribute('stroke-linecap', 'round');
     existing.setAttribute('stroke-linejoin', 'round');
-    existing.innerHTML = '<path d="' + SETTINGS_ICON + '"></path>';
+    existing.innerHTML = '<path d="' + path + '"></path>';
+  }
+  function replaceIcon(button) {
+    paintIcon(button, SETTINGS_ICON);
+  }
+  function replaceCacheIcon(button) {
+    paintIcon(button, CACHE_ICON);
   }
   // The built-in same-screen entry is the only entry this file still owns. Plugin
   // entries arrive as definitions from their own code, so disabling a plugin
@@ -1278,6 +1804,7 @@ async function installNativeRenderer(options) {
     }
     syncAccountMenu(evaluation);
     syncSessionInfoKeepAlive();
+    syncUpdatePill();
     if (!gates.rightPanel) {
       if (state.activePluginPanel) deactivatePluginPanel(state.activePluginPanel, false);
       for (const entry of state.pluginPanels.values()) {
@@ -1336,13 +1863,14 @@ async function installNativeRenderer(options) {
     state.unsubscribeSchedule?.();
     state.unsubscribeFeatures?.();
     state.unsubscribePlugins?.();
+    disposeUpdateSurface();
     state.restoreNotifyCompletion?.();
     state.restoreNotifyCompletion = null;
     window.removeEventListener('ekd:config-saved', onConfigSaved);
     window.removeEventListener('ekd:account-switched', onAccountSwitched);
     closeAccountSwitchModal();
     closeKeepAliveMenu();
-    for (const node of document.querySelectorAll('[data-ekd-account-menu],[data-ekd-keepalive-row],[data-ekd-keepalive-wrap],[data-ekd-toast-stack]')) node.remove();
+    for (const node of document.querySelectorAll('[data-ekd-account-menu],[data-ekd-keepalive-row],[data-ekd-keepalive-wrap],[data-ekd-toast-stack],[data-ekd-update-pill],[data-ekd-update-popover],[data-ekd-plugins-tab]')) node.remove();
     document.removeEventListener('visibilitychange', pluginRefresh);
     window.removeEventListener('focus', pluginRefresh);
     for (const release of [...state.pluginReleases.values()]) release();
@@ -1400,18 +1928,19 @@ async function installNativeRenderer(options) {
     }
   };
   const settingsTabClick = event => {
-    const tab = event.target.closest('.settings-tab-list button.tab[role="tab"]');
-    if (tab && tab !== state.settingsButton) {
-      if (state.settingsActive) {
-        deactivateSettings();
-        tab.classList.add('on');
-        tab.setAttribute('aria-selected', 'true');
-      }
+    const clicked = event.target.closest('.settings-tab-list button.tab[role="tab"]');
+    const tab = clicked && !clicked.hasAttribute('data-ekd-settings-tab') ? clicked : null;
+    if (tab) {
+      // An official tab always wins: the custom mount owns the body only while
+      // one of its own tabs is selected.
+      if (state.settingsActiveTab) deactivateSettings();
+      tab.classList.add('on');
+      tab.setAttribute('aria-selected', 'true');
       setTimeout(() => ensure(), 40);
     }
   };
   const settingsScroll = event => {
-    if (!state.settingsActive || event.target !== state.settingsBody) return;
+    if (!state.settingsActiveTab || event.target !== state.settingsBody) return;
     const body = state.settingsBody;
     body.classList.add('scrolling');
     clearTimeout(state.settingsScrollTimer);
@@ -1445,6 +1974,13 @@ async function installNativeRenderer(options) {
   await refreshFeatures();
   if (state.removed) return { status: 'removed', surface: 'host', domRevision: 1 };
   state.unsubscribeFeatures = makeHost(() => {}).subscribe('features', value => applyFeatures(value, false));
+  if (options.surface === 'host') {
+    // The update indicator lives in the chat header, so only the official window
+    // subscribes. The first read seeds the pill without waiting for a status
+    // change event; a failed read just leaves the pill hidden.
+    state.unsubscribeUpdate = makeHost(() => {}).subscribe('update', applyUpdateStatus);
+    void transport.request('update.status').then(applyUpdateStatus).catch(() => {});
+  }
   let watchChain = Promise.resolve();
   function syncActiveSessionWatch(targetId) {
     watchChain = watchChain.then(async () => {

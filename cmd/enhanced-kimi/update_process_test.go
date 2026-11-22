@@ -241,7 +241,8 @@ func TestCoreUpdateProcesses(t *testing.T) {
 			// The resident copy must not inherit the download directory as its
 			// working directory, so the managed scenario starts in the data dir.
 			cmd.Env = append(os.Environ(), restartChildCert+"="+string(certificate), restartChildAPI+"="+releases.URL,
-				restartChildDir+"="+workDir, "EKD_UPDATE_REPO=f3/test-release")
+				restartChildDir+"="+workDir, "EKD_UPDATE_REPO=f3/test-release",
+				"EKD_DISABLE_OS_KEYCHAIN=1", "EKD_DISABLE_AUTO_UPDATE_CHECK=1")
 			if managed {
 				// The restarted resident copy must run from the data directory, not
 				// from the download folder the user may delete.

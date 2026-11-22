@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -128,9 +129,16 @@ type Retention struct {
 	Note        string            `json:"note"`
 }
 
+// ModelRetention is one row of Retention.ByModel. Models that never reported cache
+// fields, and models with too few transitions to describe a cache lifetime, are
+// left out: a picker row that only ever says 未上报 is noise, not a choice.
 type ModelRetention struct {
 	Model       string            `json:"model"`
 	IdleBuckets []RetentionBucket `json:"idleBuckets"`
+	// Samples is the number of retention transitions attributed to the model.
+	Samples int `json:"samples,omitempty"`
+	// LastSeen is the model's newest main-agent step; it ranks recent models first.
+	LastSeen *time.Time `json:"lastSeen,omitempty"`
 }
 
 // retentionBounds are the idle gap buckets from the plan.
@@ -148,6 +156,23 @@ var retentionBounds = []struct {
 
 type rowTotals struct {
 	steps, read, creation, other, output int64
+}
+
+// minModelRetentionSamples keeps one-off models out of the per-model list: a single
+// transition describes one session's timing, not how long the model's cache lives.
+const minModelRetentionSamples = 2
+
+// modelRecentWindow ranks models used within it above models that stopped being
+// used weeks ago, so the picker opens on the models the user is working with.
+const modelRecentWindow = 14 * 24 * time.Hour
+
+// modelRetentionAggregate is the per-model state Retention folds while it walks the
+// steps: the bucket totals plus what the picker needs to filter and rank the model.
+type modelRetentionAggregate struct {
+	buckets  []rowTotals
+	samples  int
+	reported bool
+	lastSeen time.Time
 }
 
 func (r rowTotals) totals() Totals {
@@ -558,7 +583,7 @@ func (s *Store) Retention(ctx context.Context, now time.Time) (Retention, error)
 		return Retention{}, err
 	}
 	aggregates := make([]rowTotals, len(retentionBounds))
-	byModel := make(map[string][]rowTotals)
+	byModel := make(map[string]*modelRetentionAggregate)
 	rows, err := s.db.QueryContext(ctx, `SELECT session_id,time,model,input_cache_read,input_cache_creation,input_other FROM cache_steps WHERE agent='main' ORDER BY session_id,time ASC`)
 	if err != nil {
 		return Retention{}, err
@@ -576,6 +601,17 @@ func (s *Store) Retention(ctx context.Context, now time.Time) (Retention, error)
 		if parsed.IsZero() {
 			continue
 		}
+		var aggregate *modelRetentionAggregate
+		if model != "" && model != ModelUnknown {
+			aggregate = byModel[model]
+			if aggregate == nil {
+				aggregate = &modelRetentionAggregate{buckets: make([]rowTotals, len(retentionBounds))}
+				byModel[model] = aggregate
+			}
+			if parsed.After(aggregate.lastSeen) {
+				aggregate.lastSeen = parsed
+			}
+		}
 		if previousSession == sessionID && !previousTime.IsZero() {
 			gap := parsed.Sub(previousTime).Milliseconds()
 			for index, bound := range retentionBounds {
@@ -583,11 +619,14 @@ func (s *Store) Retention(ctx context.Context, now time.Time) (Retention, error)
 					continue
 				}
 				addRetentionSample(&aggregates[index], read, creation, other)
-				if model != "" && model != ModelUnknown && model == previousModel {
-					if byModel[model] == nil {
-						byModel[model] = make([]rowTotals, len(retentionBounds))
+				if aggregate != nil && model == previousModel {
+					addRetentionSample(&aggregate.buckets[index], read, creation, other)
+					aggregate.samples++
+					// Only a sample with real cache activity proves the provider reports
+					// cache fields for this model; otherwise every bucket says 未上报.
+					if read > 0 || creation > 0 {
+						aggregate.reported = true
 					}
-					addRetentionSample(&byModel[model][index], read, creation, other)
 				}
 				break
 			}
@@ -598,14 +637,38 @@ func (s *Store) Retention(ctx context.Context, now time.Time) (Retention, error)
 		return Retention{}, err
 	}
 	models := make([]ModelRetention, 0, len(byModel))
-	for model, totals := range byModel {
-		models = append(models, ModelRetention{Model: model, IdleBuckets: retentionBuckets(totals)})
+	for model, aggregate := range byModel {
+		if aggregate.samples < minModelRetentionSamples || !aggregate.reported {
+			continue
+		}
+		lastSeen := aggregate.lastSeen
+		models = append(models, ModelRetention{
+			Model:       model,
+			IdleBuckets: retentionBuckets(aggregate.buckets),
+			Samples:     aggregate.samples,
+			LastSeen:    &lastSeen,
+		})
 	}
-	sort.Slice(models, func(i, j int) bool { return models[i].Model < models[j].Model })
+	// Recently used models come first, then the ones with more samples, then the
+	// newer last step; the name tie-break keeps the list deterministic.
+	cutoff := now.Add(-modelRecentWindow)
+	sort.Slice(models, func(i, j int) bool {
+		recentI, recentJ := models[i].LastSeen.After(cutoff), models[j].LastSeen.After(cutoff)
+		if recentI != recentJ {
+			return recentI
+		}
+		if models[i].Samples != models[j].Samples {
+			return models[i].Samples > models[j].Samples
+		}
+		if !models[i].LastSeen.Equal(*models[j].LastSeen) {
+			return models[i].LastSeen.After(*models[j].LastSeen)
+		}
+		return models[i].Model < models[j].Model
+	})
 	return Retention{
 		IdleBuckets: retentionBuckets(aggregates),
 		ByModel:     models,
-		Note:        "按主代理两次请求的间隔统计缓存读取比例。分模型统计只计入同一会话连续使用同一模型的请求。",
+		Note:        fmt.Sprintf("按主代理两次请求的间隔统计缓存读取比例；总体包含全部主代理样本。分模型只计入同一会话连续使用同一已知模型的请求，且只列出至少 %d 个样本、上报过缓存数据的模型，最近 %d 天活跃的模型排在前面。", minModelRetentionSamples, int(modelRecentWindow/(24*time.Hour))),
 	}, nil
 }
 

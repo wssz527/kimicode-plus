@@ -270,12 +270,14 @@ export function Toggle({
   label,
   disabled,
   hint,
+  hideLabel,
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
   label: string;
   disabled?: boolean;
   hint?: string;
+  hideLabel?: boolean;
 }) {
   return (
     <label className={`toggle ${disabled ? "is-disabled" : ""}`}>
@@ -290,10 +292,12 @@ export function Toggle({
       <span className="toggle-track" aria-hidden="true">
         <span className="toggle-knob" />
       </span>
-      <span className="toggle-copy">
-        <span className="toggle-label">{label}</span>
-        {hint ? <span className="toggle-hint">{hint}</span> : null}
-      </span>
+      {hideLabel ? null : (
+        <span className="toggle-copy">
+          <span className="toggle-label">{label}</span>
+          {hint ? <span className="toggle-hint">{hint}</span> : null}
+        </span>
+      )}
     </label>
   );
 }
