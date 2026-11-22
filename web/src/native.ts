@@ -774,6 +774,7 @@ export interface AccountSwitchPreflight {
   target: AccountSummary;
   vaultUnlocked: boolean;
   canSwitch: boolean;
+  canForceSwitch?: boolean;
   requiresLogin: boolean;
   busySessions: AccountBusySession[];
   warnings: string[];
@@ -847,8 +848,16 @@ export function preflightAccountSwitch(host: NativeHost, id: string, activeModel
   return host.request<AccountSwitchPreflight>("accounts.switchPreflight", activeModel ? { id, activeModel } : { id });
 }
 
-export function switchAccount(host: NativeHost, id: string, waitUntilIdle = false): Promise<AccountSwitchResult> {
-  return host.request<AccountSwitchResult>("accounts.switch", waitUntilIdle ? { id, waitUntilIdle: true } : { id });
+export function switchAccount(
+  host: NativeHost,
+  id: string,
+  waitUntilIdle = false,
+  force = false,
+): Promise<AccountSwitchResult> {
+  const payload: { id: string; waitUntilIdle?: boolean; force?: boolean } = { id };
+  if (force) payload.force = true;
+  else if (waitUntilIdle) payload.waitUntilIdle = true;
+  return host.request<AccountSwitchResult>("accounts.switch", payload);
 }
 
 export function cancelPendingAccountSwitch(host: NativeHost): Promise<{ cancelled: boolean }> {

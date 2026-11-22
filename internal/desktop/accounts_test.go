@@ -1122,3 +1122,128 @@ func TestAccountSwitchRollsBackOnResnapshotFailure(t *testing.T) {
 		t.Fatalf("recovery backup still present after resnapshot rollback: %v", err)
 	}
 }
+
+func TestAccountSwitchIgnoresStaleOpenBackgroundWhenKAPReportsIdle(t *testing.T) {
+	ctx := context.Background()
+	service, fake, _ := newAccountTestService(t)
+	_, accB := saveTwoTestAccounts(t, service, fake)
+
+	store, err := service.cacheStore()
+	if err != nil {
+		t.Fatalf("cacheStore: %v", err)
+	}
+	if _, err := service.db.ExecContext(ctx, `INSERT INTO cache_live(session_id,open_background,blocked,last_user_prompt,updated_at) VALUES('sess-1',2,0,'',?) ON CONFLICT(session_id) DO UPDATE SET open_background=2`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("seed stale cache_live: %v", err)
+	}
+	_ = store
+
+	// Modern KAP explicitly reports activity="idle": stale open_background on disk must not block switching.
+	fake.mu.Lock()
+	fake.sessions[0]["activity"] = "idle"
+	fake.sessions[0]["busy"] = false
+	fake.sessions[0]["main_turn_active"] = false
+	fake.sessions[0]["pending_interaction"] = "none"
+	fake.mu.Unlock()
+
+	prePayload, _ := json.Marshal(map[string]any{"id": accB.ID})
+	preRaw, err := service.Action(ctx, "accounts.switchPreflight", prePayload)
+	if err != nil {
+		t.Fatalf("switchPreflight(idle): %v", err)
+	}
+	pre := preRaw.(AccountSwitchPreflight)
+	if len(pre.BusySessions) != 0 || !pre.CanSwitch || !pre.CanForceSwitch {
+		t.Fatalf("expected idle session to ignore stale open_background, got %+v", pre)
+	}
+
+	// When KAP explicitly reports activity="background", preflight should report background subagent running.
+	fake.mu.Lock()
+	fake.sessions[0]["activity"] = "background"
+	fake.mu.Unlock()
+	preRaw, err = service.Action(ctx, "accounts.switchPreflight", prePayload)
+	if err != nil {
+		t.Fatalf("switchPreflight(background): %v", err)
+	}
+	pre = preRaw.(AccountSwitchPreflight)
+	if len(pre.BusySessions) != 1 || pre.BusySessions[0].Reason != "有后台子代理正在运行" || pre.CanSwitch || !pre.CanForceSwitch {
+		t.Fatalf("unexpected preflight for background activity: %+v", pre)
+	}
+
+	// Switch succeeds cleanly once KAP reports idle again without needing force.
+	fake.mu.Lock()
+	fake.sessions[0]["activity"] = "idle"
+	fake.mu.Unlock()
+	swPayload, _ := json.Marshal(map[string]any{"id": accB.ID})
+	swRaw, err := service.Action(ctx, "accounts.switch", swPayload)
+	if err != nil {
+		t.Fatalf("accounts.switch when idle with stale cache_live: %v", err)
+	}
+	sw := swRaw.(AccountSwitchResult)
+	if !sw.Switched || fake.readDiskToken(t).AccessToken != "tok-acc-b-secret-1" {
+		t.Fatalf("expected clean switch to B, got %+v", sw)
+	}
+}
+
+func TestAccountSwitchForceWhileBusySucceedsAndCancelsPending(t *testing.T) {
+	ctx := context.Background()
+	service, fake, _ := newAccountTestService(t)
+	_, accB := saveTwoTestAccounts(t, service, fake)
+
+	fake.mu.Lock()
+	fake.sessions[0]["activity"] = "turn"
+	fake.sessions[0]["busy"] = true
+	fake.sessions[0]["main_turn_active"] = true
+	fake.mu.Unlock()
+
+	prePayload, _ := json.Marshal(map[string]any{"id": accB.ID})
+	preRaw, err := service.Action(ctx, "accounts.switchPreflight", prePayload)
+	if err != nil {
+		t.Fatalf("switchPreflight: %v", err)
+	}
+	pre := preRaw.(AccountSwitchPreflight)
+	if pre.CanSwitch || !pre.CanForceSwitch || len(pre.BusySessions) != 1 {
+		t.Fatalf("expected CanSwitch=false CanForceSwitch=true BusySessions=1, got %+v", pre)
+	}
+
+	// Default switch without force still pauses with ACCOUNT_SWITCH_BUSY.
+	defaultPayload, _ := json.Marshal(map[string]any{"id": accB.ID})
+	_, err = service.Action(ctx, "accounts.switch", defaultPayload)
+	var nativeErr *NativeError
+	if !errors.As(err, &nativeErr) || nativeErr.Code != "ACCOUNT_SWITCH_BUSY" {
+		t.Fatalf("expected ACCOUNT_SWITCH_BUSY without force, got %v", err)
+	}
+
+	// Queue a pending switch, then force-switch immediately and ensure the queue is cleared.
+	queuePayload, _ := json.Marshal(map[string]any{"id": accB.ID, "waitUntilIdle": true})
+	if _, err := service.Action(ctx, "accounts.switch", queuePayload); err != nil {
+		t.Fatalf("queue waitUntilIdle: %v", err)
+	}
+	forcePayload, _ := json.Marshal(map[string]any{"id": accB.ID, "force": true})
+	swRaw, err := service.Action(ctx, "accounts.switch", forcePayload)
+	if err != nil {
+		t.Fatalf("force switch while busy: %v", err)
+	}
+	sw := swRaw.(AccountSwitchResult)
+	if !sw.Switched || sw.Queued {
+		t.Fatalf("expected immediate switched result, got %+v", sw)
+	}
+	if got := fake.readDiskToken(t).AccessToken; got != "tok-acc-b-secret-1" {
+		t.Fatalf("expected disk token switched to B, got %s", got)
+	}
+	foundForceWarning := false
+	for _, w := range sw.Warnings {
+		if strings.Contains(w, "强制切换") {
+			foundForceWarning = true
+			break
+		}
+	}
+	if !foundForceWarning {
+		t.Fatalf("expected forced switch warning in %+v", sw.Warnings)
+	}
+	stateRaw, err := service.Action(ctx, "accounts.list", nil)
+	if err != nil {
+		t.Fatalf("accounts.list: %v", err)
+	}
+	if state := stateRaw.(AccountsState); state.PendingSwitch != nil {
+		t.Fatalf("expected pendingSwitch cleared after force switch, got %+v", state.PendingSwitch)
+	}
+}

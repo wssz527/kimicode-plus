@@ -933,18 +933,36 @@
 
 .ekds-acc-busy-box ul {
   margin: 0;
-  padding-left: 18px;
+  padding-left: 0;
+  list-style: none;
+  max-height: 150px;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 5px;
 }
 
 .ekds-acc-busy-box li {
   color: var(--ekds-text);
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ekds-acc-busy-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ekds-acc-busy-box li small {
-  margin-left: 6px;
+  flex: none;
+  margin-left: 0;
+  white-space: nowrap;
   color: var(--ekds-muted);
 }
 

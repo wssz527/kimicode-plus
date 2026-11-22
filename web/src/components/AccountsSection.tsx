@@ -115,22 +115,27 @@ function AccountAvatar({ name, avatar }: { name: string; avatar?: string }) {
 export function AccountSwitchConfirmPanel({
   preflight,
   busy,
+  busyKind,
   error,
   onConfirm,
+  onForceConfirm,
   onWaitUntilIdle,
   onRelogin,
   onCancel,
 }: {
   preflight: AccountSwitchPreflight;
   busy: boolean;
+  busyKind?: "confirm" | "force" | "wait" | null;
   error: string | null;
   onConfirm: () => void;
+  onForceConfirm: () => void;
   onWaitUntilIdle: () => void;
   onRelogin: () => void;
   onCancel: () => void;
 }) {
   const target = preflight.target;
   const hasBusy = preflight.busySessions.length > 0;
+  const canForce = preflight.canForceSwitch ?? (preflight.vaultUnlocked && !preflight.requiresLogin && !target.current);
 
   return (
     <div className="ekds-acc-confirm" role="dialog" aria-label={`切换到 ${target.label}`} data-ekd-account-confirm="true">
@@ -156,16 +161,18 @@ export function AccountSwitchConfirmPanel({
 
       {hasBusy ? (
         <div className="ekds-acc-busy-box">
-          <strong>以下会话尚未空闲，已拒绝立即切换：</strong>
+          <strong>以下会话仍在运行中：</strong>
           <ul>
             {preflight.busySessions.map((session) => (
               <li key={session.id}>
-                <span>{session.title}</span>
+                <span className="ekds-acc-busy-title" title={session.title}>{session.title}</span>
                 <small>{session.reason}</small>
               </li>
             ))}
           </ul>
-          <p className="ekds-note">你可以等待它们完成后自动切换，或取消本次操作。</p>
+          <p className="ekds-note">
+            建议等它们完成后自动切换；也可以仍然立即切换，运行中的会话后续请求将改用新账号（首次不会命中缓存）。
+          </p>
         </div>
       ) : null}
 
@@ -188,14 +195,25 @@ export function AccountSwitchConfirmPanel({
             重新登录
           </button>
         ) : hasBusy ? (
-          <button
-            type="button"
-            className="ekds-btn is-primary"
-            disabled={busy || !preflight.vaultUnlocked}
-            onClick={onWaitUntilIdle}
-          >
-            {busy ? "正在排队…" : "等完成后自动切换"}
-          </button>
+          <>
+            <button
+              type="button"
+              className="ekds-btn"
+              data-ekd-account-force-switch="true"
+              disabled={busy || !canForce}
+              onClick={onForceConfirm}
+            >
+              {busy && busyKind === "force" ? "正在切换…" : "仍然立即切换"}
+            </button>
+            <button
+              type="button"
+              className="ekds-btn is-primary"
+              disabled={busy || !canForce}
+              onClick={onWaitUntilIdle}
+            >
+              {busy && busyKind === "wait" ? "正在排队…" : "等完成后自动切换"}
+            </button>
+          </>
         ) : (
           <button
             type="button"
@@ -203,7 +221,7 @@ export function AccountSwitchConfirmPanel({
             disabled={busy || !preflight.canSwitch}
             onClick={onConfirm}
           >
-            {busy ? "正在切换…" : "确认切换"}
+            {busy && busyKind !== "wait" ? "正在切换…" : "确认切换"}
           </button>
         )}
       </div>
@@ -226,7 +244,8 @@ export function AccountSwitchModal({
 }) {
   const [preflight, setPreflight] = useState<AccountSwitchPreflight | null>(null);
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
+  const [busyKind, setBusyKind] = useState<"confirm" | "force" | "wait" | null>(null);
+  const busy = busyKind !== null;
   const [error, setError] = useState<string | null>(null);
   const [backupWarning, setBackupWarning] = useState<string | null>(null);
 
@@ -257,12 +276,12 @@ export function AccountSwitchModal({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [busy, onClose]);
 
-  async function runSwitch(waitUntilIdle: boolean) {
+  async function runSwitch(waitUntilIdle: boolean, force = false) {
     if (busy) return;
-    setBusy(true);
+    setBusyKind(force ? "force" : waitUntilIdle ? "wait" : "confirm");
     setError(null);
     try {
-      const result = await switchAccount(host, targetId, waitUntilIdle);
+      const result = await switchAccount(host, targetId, waitUntilIdle, force);
       if (result.switched) {
         dispatchAccountSwitched();
         if (result.backupCleanupWarning) {
@@ -274,12 +293,12 @@ export function AccountSwitchModal({
     } catch (cause) {
       setError(errorText(cause));
     } finally {
-      setBusy(false);
+      setBusyKind(null);
     }
   }
 
   async function runRelogin() {
-    setBusy(true);
+    setBusyKind("confirm");
     try {
       await beginAddAccount(host, targetId);
       await host.openSettings("account").catch(() => {});
@@ -287,7 +306,7 @@ export function AccountSwitchModal({
     } catch (cause) {
       setError(errorText(cause));
     } finally {
-      setBusy(false);
+      setBusyKind(null);
     }
   }
 
@@ -314,8 +333,10 @@ export function AccountSwitchModal({
           <AccountSwitchConfirmPanel
             preflight={preflight}
             busy={busy}
+            busyKind={busyKind}
             error={error}
             onConfirm={() => void runSwitch(false)}
+            onForceConfirm={() => void runSwitch(false, true)}
             onWaitUntilIdle={() => void runSwitch(true)}
             onRelogin={() => void runRelogin()}
             onCancel={onClose}
@@ -559,12 +580,12 @@ export function AccountsManagerSection({
     }
   }
 
-  async function handleConfirmSwitch(waitUntilIdle: boolean) {
+  async function handleConfirmSwitch(waitUntilIdle: boolean, force = false) {
     if (!preflight || busyAction) return;
-    setBusyAction("switch");
+    setBusyAction(force ? "switch:force" : waitUntilIdle ? "switch:wait" : "switch:confirm");
     setSwitchError(null);
     try {
-      const res = await switchAccount(host, preflight.target.id, waitUntilIdle);
+      const res = await switchAccount(host, preflight.target.id, waitUntilIdle, force);
       setPreflight(null);
       if (res.queued && res.pendingSwitch) {
         setNotice(`已加入等待队列：待运行中的会话空闲后将自动切换到「${res.pendingSwitch.targetLabel}」。`);
@@ -576,6 +597,26 @@ export function AccountsManagerSection({
       await load(false);
     } catch (cause) {
       setSwitchError(errorText(cause));
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleForceSwitchPending(targetId: string) {
+    if (busyAction) return;
+    setBusyAction("force-pending");
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await switchAccount(host, targetId, false, true);
+      if (res.switched && res.account) {
+        dispatchAccountSwitched();
+        setNotice(`已立即切换到账号「${res.account.label}」，现有 ${res.sessionsCount ?? 0} 个会话均保持完整。`);
+        setBackupWarning(res.backupCleanupWarning || null);
+      }
+      await load(false);
+    } catch (cause) {
+      setError(errorText(cause));
     } finally {
       setBusyAction(null);
     }
@@ -660,14 +701,25 @@ export function AccountsManagerSection({
           <span>
             正在等待 {state.pendingSwitch.busySessionIds.length || 1} 个会话空闲，完成后将自动切换到「{state.pendingSwitch.targetLabel}」。
           </span>
-          <button
-            type="button"
-            className="ekds-btn"
-            disabled={busyAction !== null}
-            onClick={() => void handleCancelPending()}
-          >
-            取消等待
-          </button>
+          <div className="ekds-acc-banner-actions">
+            <button
+              type="button"
+              className="ekds-btn is-primary"
+              data-ekd-account-force-pending="true"
+              disabled={busyAction !== null}
+              onClick={() => void handleForceSwitchPending(state.pendingSwitch!.targetId)}
+            >
+              {busyAction === "force-pending" ? "切换中…" : "立即切换"}
+            </button>
+            <button
+              type="button"
+              className="ekds-btn"
+              disabled={busyAction !== null}
+              onClick={() => void handleCancelPending()}
+            >
+              取消等待
+            </button>
+          </div>
         </div>
       ) : null}
 
@@ -928,9 +980,11 @@ export function AccountsManagerSection({
       {preflight ? (
         <AccountSwitchConfirmPanel
           preflight={preflight}
-          busy={busyAction === "switch"}
+          busy={busyAction !== null && busyAction.startsWith("switch:")}
+          busyKind={busyAction === "switch:force" ? "force" : busyAction === "switch:wait" ? "wait" : busyAction === "switch:confirm" ? "confirm" : null}
           error={switchError}
           onConfirm={() => void handleConfirmSwitch(false)}
+          onForceConfirm={() => void handleConfirmSwitch(false, true)}
           onWaitUntilIdle={() => void handleConfirmSwitch(true)}
           onRelogin={() => void handleBeginAdd(preflight.target.id)}
           onCancel={() => {

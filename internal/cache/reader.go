@@ -147,7 +147,9 @@ type wireLine struct {
 
 	// turn.prompt
 	Origin *struct {
-		Kind string `json:"kind"`
+		Kind   string `json:"kind"`
+		TaskID string `json:"taskId"`
+		Status string `json:"status"`
 	} `json:"origin"`
 
 	// subagent.spawned / subagent.completed. This is the authoritative open/close pair
@@ -156,6 +158,7 @@ type wireLine struct {
 	SubagentID      string `json:"subagentId"`
 	RunInBackground bool   `json:"runInBackground"`
 	SubagentName    string `json:"subagentName"`
+	TaskID          string `json:"taskId"`
 }
 
 // pendingUsage is one usage.record waiting for its step.end.
@@ -174,6 +177,9 @@ type parser struct {
 	// Background agent bookkeeping. Keyed by taskId; the open set is what makes
 	// keepalive decide "a background subagent is still running".
 	tasks map[string]taskState
+	// taskAgents maps a spawned background taskId to its subagentId so terminal
+	// notifications that only carry taskId can clear backgroundSubagents too.
+	taskAgents map[string]string
 	// OpenTasks is the number of detached agent tasks started and not yet
 	// terminated as of the last parsed line.
 	openTasks int
@@ -194,10 +200,16 @@ type parser struct {
 type taskState struct {
 	kind     string
 	detached bool
+	agentID  string
 }
 
 func newParser(agent string) *parser {
-	return &parser{agent: agent, tasks: map[string]taskState{}, backgroundSubagents: map[string]bool{}}
+	return &parser{
+		agent:               agent,
+		tasks:               map[string]taskState{},
+		taskAgents:          map[string]string{},
+		backgroundSubagents: map[string]bool{},
+	}
 }
 
 func (p *parser) consume(line []byte) error {
@@ -280,6 +292,13 @@ func (p *parser) consume(line []byte) error {
 			return nil
 		}
 		p.backgroundSubagents[wire.SubagentID] = true
+		if wire.TaskID != "" {
+			p.taskAgents[wire.TaskID] = wire.SubagentID
+			if existing, ok := p.tasks[wire.TaskID]; ok && existing.agentID == "" {
+				existing.agentID = wire.SubagentID
+				p.tasks[wire.TaskID] = existing
+			}
+		}
 	case "subagent.completed":
 		if wire.SubagentID == "" {
 			return nil
@@ -289,39 +308,93 @@ func (p *parser) consume(line []byte) error {
 		if wire.Info == nil || wire.Info.TaskID == "" {
 			return nil
 		}
-		p.tasks[wire.Info.TaskID] = taskState{kind: wire.Info.Kind, detached: wire.Info.Detached}
+		agentID := wire.Info.AgentID
+		if agentID == "" {
+			agentID = p.taskAgents[wire.Info.TaskID]
+		}
+		prev, existed := p.tasks[wire.Info.TaskID]
+		wasOpenAgent := existed && prev.kind == "agent" && prev.detached
+		p.tasks[wire.Info.TaskID] = taskState{kind: wire.Info.Kind, detached: wire.Info.Detached, agentID: agentID}
 		if wire.Info.Kind == "agent" && wire.Info.Detached {
-			p.openTasks++
-			if wire.Info.AgentID != "" {
-				p.backgroundSubagents[wire.Info.AgentID] = true
+			if !wasOpenAgent {
+				p.openTasks++
+			}
+			if agentID != "" {
+				p.taskAgents[wire.Info.TaskID] = agentID
+				p.backgroundSubagents[agentID] = true
 			}
 		}
 	case "task.terminated":
 		if wire.Info == nil {
 			return nil
 		}
-		previous, ok := p.tasks[wire.Info.TaskID]
-		if ok {
-			delete(p.tasks, wire.Info.TaskID)
-			if previous.kind == "agent" && previous.detached && p.openTasks > 0 {
-				p.openTasks--
-			}
-			if wire.Info.AgentID != "" {
-				delete(p.backgroundSubagents, wire.Info.AgentID)
-			}
-		}
+		p.closeTask(wire.Info.TaskID, wire.Info.AgentID)
 		p.blocked = false
+		p.pendingBlockingCalls = 0
 	case "task.waitDelivered":
 		// NOT a blocking-start marker. Verified against a real record: the sequence is
 		// WaitFor tool.call -> tool.result -> task.waitDelivered -> tool.result ->
 		// llm.request. waitDelivered fires when the wait FINISHES and its result is
 		// delivered, so treating it as "blocking started" inverts the meaning.
 	case "turn.prompt":
-		if wire.Origin != nil && wire.Origin.Kind == "user" {
+		if wire.Origin == nil {
+			return nil
+		}
+		switch wire.Origin.Kind {
+		case "user":
 			p.lastUserPrompt = wire.Time
+		case "task":
+			if isTerminalTaskStatus(wire.Origin.Status) {
+				p.closeTask(wire.Origin.TaskID, "")
+				if strings.EqualFold(strings.TrimSpace(wire.Origin.Status), "lost") {
+					p.blocked = false
+					p.pendingBlockingCalls = 0
+				}
+			}
 		}
 	}
 	return nil
+}
+
+func (p *parser) closeTask(taskID, agentID string) {
+	if taskID != "" {
+		if previous, ok := p.tasks[taskID]; ok {
+			delete(p.tasks, taskID)
+			if previous.kind == "agent" && previous.detached && p.openTasks > 0 {
+				p.openTasks--
+			}
+			if agentID == "" {
+				agentID = previous.agentID
+			}
+		}
+		if mapped, ok := p.taskAgents[taskID]; ok {
+			delete(p.taskAgents, taskID)
+			if agentID == "" {
+				agentID = mapped
+			}
+		}
+	}
+	if agentID != "" && !p.hasOpenTaskForAgent(agentID) {
+		delete(p.backgroundSubagents, agentID)
+	}
+}
+
+func (p *parser) hasOpenTaskForAgent(agentID string) bool {
+	for _, state := range p.tasks {
+		if state.kind == "agent" && state.detached && state.agentID == agentID {
+			return true
+		}
+	}
+	return false
+}
+
+func isTerminalTaskStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed", "failed", "killed", "lost", "timed_out", "cancelled", "canceled", "aborted", "error":
+		return true
+	default:
+		return false
+	}
 }
 
 // blockingTools are the tools whose call keeps the main agent from producing another

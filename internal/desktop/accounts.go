@@ -110,6 +110,7 @@ type AccountSwitchPreflight struct {
 	Target         AccountSummary       `json:"target"`
 	VaultUnlocked  bool                 `json:"vaultUnlocked"`
 	CanSwitch      bool                 `json:"canSwitch"`
+	CanForceSwitch bool                 `json:"canForceSwitch"`
 	RequiresLogin  bool                 `json:"requiresLogin"`
 	BusySessions   []AccountBusySession `json:"busySessions"`
 	Warnings       []string             `json:"warnings"`
@@ -1096,7 +1097,12 @@ func (s *NativeService) findBusySessions(ctx context.Context) ([]AccountBusySess
 	busy := []AccountBusySession{}
 	for _, session := range sessions {
 		reasons := []string{}
-		if session.Busy || session.MainTurnActive {
+		status := strings.ToLower(strings.TrimSpace(session.Status))
+		if session.MainTurnActive {
+			reasons = append(reasons, "正在运行回合")
+		} else if status == "background" {
+			reasons = append(reasons, "有后台子代理正在运行")
+		} else if session.Busy {
 			reasons = append(reasons, "正在运行回合")
 		}
 		if session.PendingInteraction != "" && session.PendingInteraction != "none" {
@@ -1105,7 +1111,10 @@ func (s *NativeService) findBusySessions(ctx context.Context) ([]AccountBusySess
 		if snap, ok := s.automationSnapshot(session.ID); ok && snap.approvals > 0 {
 			reasons = append(reasons, "有待批准操作")
 		}
-		if s.openBackground(ctx, session.ID) > 0 {
+		// Trust an explicit live "idle" activity from the official server over the
+		// offline wire.jsonl counter: after a client exit or restart, a lost
+		// background task may not have a task.terminated record on disk yet.
+		if status != "idle" && status != "background" && s.openBackground(ctx, session.ID) > 0 {
 			reasons = append(reasons, "有后台子代理尚未返回")
 		}
 		if len(reasons) > 0 {
@@ -1288,11 +1297,13 @@ func (s *NativeService) accountsSwitchPreflight(ctx context.Context, input map[s
 	}
 
 	summary := s.accountRowToSummary(ctx, row, currentUserID)
-	canSwitch := unlocked && !requiresLogin && len(busySessions) == 0 && !summary.Current
+	canForceSwitch := unlocked && !requiresLogin && !summary.Current
+	canSwitch := canForceSwitch && len(busySessions) == 0
 	return AccountSwitchPreflight{
 		Target:         summary,
 		VaultUnlocked:  unlocked,
 		CanSwitch:      canSwitch,
+		CanForceSwitch: canForceSwitch,
 		RequiresLogin:  requiresLogin,
 		BusySessions:   busySessions,
 		Warnings:       warnings,
@@ -1331,14 +1342,15 @@ func (s *NativeService) accountsSwitch(ctx context.Context, input map[string]any
 		return AccountSwitchResult{}, errors.New("缺少目标账号 ID")
 	}
 	waitUntilIdle, _ := input["waitUntilIdle"].(bool)
+	force, _ := input["force"].(bool)
 	expectedPID := intInput(input, "expectedPid", 0)
 	if expectedPID <= 0 {
 		expectedPID = s.currentHostPID()
 	}
-	return s.executeAccountSwitch(ctx, targetID, waitUntilIdle, expectedPID)
+	return s.executeAccountSwitch(ctx, targetID, waitUntilIdle, force, expectedPID)
 }
 
-func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID string, waitUntilIdle bool, expectedPID int) (AccountSwitchResult, error) {
+func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID string, waitUntilIdle, force bool, expectedPID int) (AccountSwitchResult, error) {
 	s.switchMu.Lock()
 	defer s.switchMu.Unlock()
 
@@ -1380,25 +1392,30 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 	if err != nil {
 		return AccountSwitchResult{}, fmt.Errorf("切换前检查会话状态失败：%w", err)
 	}
+	forcedWhileBusy := false
 	if len(busySessions) > 0 {
-		names := make([]string, 0, len(busySessions))
-		ids := make([]string, 0, len(busySessions))
-		for _, item := range busySessions {
-			names = append(names, fmt.Sprintf("「%s」（%s）", item.Title, item.Reason))
-			ids = append(ids, item.ID)
-		}
-		if waitUntilIdle {
-			queued := s.queuePendingAccountSwitch(targetRow, ids, expectedPID)
-			return AccountSwitchResult{
-				Switched:      false,
-				Queued:        true,
-				PendingSwitch: &queued,
-				RefreshAuth:   false,
-			}, nil
-		}
-		return AccountSwitchResult{}, &NativeError{
-			Code:    "ACCOUNT_SWITCH_BUSY",
-			Message: "以下会话尚未空闲，已拒绝切换：" + strings.Join(names, "、"),
+		if force {
+			forcedWhileBusy = true
+		} else {
+			names := make([]string, 0, len(busySessions))
+			ids := make([]string, 0, len(busySessions))
+			for _, item := range busySessions {
+				names = append(names, fmt.Sprintf("「%s」（%s）", item.Title, item.Reason))
+				ids = append(ids, item.ID)
+			}
+			if waitUntilIdle {
+				queued := s.queuePendingAccountSwitch(targetRow, ids, expectedPID)
+				return AccountSwitchResult{
+					Switched:      false,
+					Queued:        true,
+					PendingSwitch: &queued,
+					RefreshAuth:   false,
+				}, nil
+			}
+			return AccountSwitchResult{}, &NativeError{
+				Code:    "ACCOUNT_SWITCH_BUSY",
+				Message: "以下会话仍在运行，默认已暂停切换（可选择等待空闲或强制立即切换）：" + strings.Join(names, "、"),
+			}
 		}
 	}
 
@@ -1640,6 +1657,9 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 	}
 
 	warnings := []string{"切换后各会话的第一次请求不会命中提示词缓存（缓存按账号计算）。"}
+	if forcedWhileBusy {
+		warnings = append(warnings, fmt.Sprintf("本次在 %d 个会话运行期间强制切换了账号，这些会话的后续请求将改用新账号。", len(busySessions)))
+	}
 	// Capture refreshed disk token if official Ee.ensureFresh() rotated it during /oauth/userinfo.
 	if refreshedBytes, readErr := os.ReadFile(targetCredPath); readErr == nil {
 		if fields, parseErr := parseRawTokenFields(refreshedBytes); parseErr == nil && !tokenIsRevokedOrEmpty(fields) {
@@ -1741,7 +1761,7 @@ func (s *NativeService) queuePendingAccountSwitch(target accountRow, busyIDs []s
 				}
 				checkCancel()
 				execCtx, execCancel := context.WithTimeout(s.ctx, 20*time.Second)
-				result, switchErr := s.executeAccountSwitch(execCtx, target.ID, false, expectedPID)
+				result, switchErr := s.executeAccountSwitch(execCtx, target.ID, false, false, expectedPID)
 				execCancel()
 				if switchErr != nil {
 					var native *NativeError

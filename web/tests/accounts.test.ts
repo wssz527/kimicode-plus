@@ -32,11 +32,13 @@ test("account action wrappers send exact action names and payloads", async () =>
   await listAccounts(host, true);
   await preflightAccountSwitch(host, "acc_1", "managed:kimi-code/k2.8");
   await switchAccount(host, "acc_1", true);
+  await switchAccount(host, "acc_1", false, true);
 
   assert.deepEqual(calls, [
     { action: "accounts.list", payload: { refreshQuota: true } },
     { action: "accounts.switchPreflight", payload: { id: "acc_1", activeModel: "managed:kimi-code/k2.8" } },
     { action: "accounts.switch", payload: { id: "acc_1", waitUntilIdle: true } },
+    { action: "accounts.switch", payload: { id: "acc_1", force: true } },
   ]);
 });
 
@@ -110,4 +112,14 @@ test("a forgotten legacy vault password can be reset in two steps and says what 
   // The copy must be honest about the destructive part and the untouched login.
   assert.ok(section.includes("不会让你退出当前官方"), "the copy does not say the official login survives");
   assert.ok(section.includes("state.legacyPasswordVault || state.vaultOsKeychainAvailable"), "both legacy markers should offer the reset");
+});
+
+test("busy sessions warn without deadlocking and offer both wait and force switch", () => {
+  const section = readFileSync("src/components/AccountsSection.tsx", "utf8");
+  assert.equal(section.includes("已拒绝立即切换"), false, "copy should warn instead of hard-refusing");
+  assert.ok(section.includes("以下会话仍在运行中"), "busy session warning heading missing");
+  assert.ok(section.includes("仍然立即切换"), "force switch button missing in confirm dialog");
+  assert.ok(section.includes("等完成后自动切换"), "wait-until-idle option should remain available");
+  assert.ok(section.includes('data-ekd-account-force-switch="true"'), "force switch hook missing");
+  assert.ok(section.includes('data-ekd-account-force-pending="true"'), "pending banner immediate switch hook missing");
 });

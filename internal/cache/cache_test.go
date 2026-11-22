@@ -1388,3 +1388,99 @@ func TestDiscoverRanksActiveWireAboveStaleAgentsDirMtime(t *testing.T) {
 		t.Fatalf("active session dropped outside budget: cache_steps = %d, want 1", got)
 	}
 }
+
+func TestLostBackgroundTaskClearsOpenBackground(t *testing.T) {
+	home := t.TempDir()
+	base := time.Now().Add(-10 * time.Minute).UTC().Truncate(time.Millisecond)
+	usage := sampleUsage(400, 80, 200, 0)
+
+	spawned := fmt.Sprintf(`{"type":"subagent.spawned","subagentId":"agent-89","subagentName":"coder","runInBackground":true,"taskId":"agent-w3d32bm2","time":%d}`+"\n", base.UnixMilli())
+	started := fmt.Sprintf(`{"type":"task.started","agentId":"main","info":{"taskId":"agent-w3d32bm2","status":"running","detached":true,"kind":"agent","agentId":"agent-89","startedAt":%d},"time":%d}`+"\n", base.UnixMilli(), base.UnixMilli())
+	waitCall := fmt.Sprintf(`{"type":"context.append_loop_event","agentId":"main","event":{"type":"tool.call","name":"WaitFor","toolCallId":"call-wait-lost","uuid":"tc-lost"},"time":%d}`+"\n", base.Add(time.Second).UnixMilli())
+	userPrompt := fmt.Sprintf(`{"type":"turn.prompt","agentId":"main","origin":{"kind":"user"},"time":%d}`+"\n", base.Add(2*time.Second).UnixMilli())
+
+	wirePath := writeWire(t, home, "session_lost_bg", "main",
+		plainLine(usageRecord("synthetic/model", usage, "turn", base)),
+		plainLine(stepEnd("uuid-lost-1", "0", 1, usage, 300, 900, "end_turn", base)),
+		spawned, started, waitCall, userPrompt)
+
+	store := newTestStore(t, home)
+	ctx := context.Background()
+	if _, err := store.Scan(ctx, base.Add(time.Minute), true); err != nil {
+		t.Fatal(err)
+	}
+	signals, err := store.Live(ctx, "session_lost_bg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signals.OpenBackground != 1 || !signals.Blocked {
+		t.Fatalf("before lost notification: open=%d blocked=%v, want 1/true", signals.OpenBackground, signals.Blocked)
+	}
+
+	// Official client restarts and emits a task.lost turn.prompt without task.terminated or subagent.completed.
+	lostPrompt := fmt.Sprintf(`{"type":"turn.prompt","agentId":"main","origin":{"kind":"task","taskId":"agent-w3d32bm2","status":"lost","notificationId":"task:agent-w3d32bm2:lost"},"time":%d}`+"\n", base.Add(2*time.Minute).UnixMilli())
+	f, err := os.OpenFile(wirePath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(lostPrompt); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+
+	if _, err := store.Scan(ctx, base.Add(3*time.Minute), true); err != nil {
+		t.Fatal(err)
+	}
+	signals, err = store.Live(ctx, "session_lost_bg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signals.OpenBackground != 0 || signals.Blocked {
+		t.Fatalf("after task.lost notification: open=%d blocked=%v, want 0/false", signals.OpenBackground, signals.Blocked)
+	}
+
+	// Resuming the same agentId with a new taskId tracks open=1 and clears back to 0 on termination.
+	resumedSpawn := fmt.Sprintf(`{"type":"subagent.spawned","subagentId":"agent-89","subagentName":"coder","runInBackground":true,"taskId":"agent-lx4pr04j","time":%d}`+"\n", base.Add(4*time.Minute).UnixMilli())
+	resumedStart := fmt.Sprintf(`{"type":"task.started","agentId":"main","info":{"taskId":"agent-lx4pr04j","status":"running","detached":true,"kind":"agent","agentId":"agent-89","startedAt":%d},"time":%d}`+"\n", base.Add(4*time.Minute).UnixMilli(), base.Add(4*time.Minute).UnixMilli())
+	f, err = os.OpenFile(wirePath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(resumedSpawn + resumedStart); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+	if _, err := store.Scan(ctx, base.Add(5*time.Minute), true); err != nil {
+		t.Fatal(err)
+	}
+	signals, err = store.Live(ctx, "session_lost_bg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signals.OpenBackground != 1 {
+		t.Fatalf("after resuming agent-89: open=%d, want 1", signals.OpenBackground)
+	}
+
+	resumedTerm := fmt.Sprintf(`{"type":"task.terminated","agentId":"main","info":{"taskId":"agent-lx4pr04j","status":"completed","detached":true,"kind":"agent","agentId":"agent-89","endedAt":%d},"time":%d}`+"\n", base.Add(6*time.Minute).UnixMilli(), base.Add(6*time.Minute).UnixMilli())
+	f, err = os.OpenFile(wirePath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(resumedTerm); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+	if _, err := store.Scan(ctx, base.Add(7*time.Minute), true); err != nil {
+		t.Fatal(err)
+	}
+	signals, err = store.Live(ctx, "session_lost_bg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signals.OpenBackground != 0 {
+		t.Fatalf("after resumed task terminated: open=%d, want 0", signals.OpenBackground)
+	}
+}
