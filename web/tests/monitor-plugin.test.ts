@@ -292,6 +292,169 @@ test("historical cache.turns snapshots are marked as replays so idle turns do no
   const stepHelper = /function stepEvent\([\s\S]*?\n\}/.exec(source)?.[0] ?? "";
   assert.ok(stepHelper, "stepEvent helper is present in bundle");
   assert.match(stepHelper, /kcmReplay:\s*true/);
+  assert.match(stepHelper, /kcmSkipDaily:\s*true/);
+});
+
+test("host localStorage shim scopes only monitor keys and passes official keys through to native storage", async () => {
+  const hostMap = new Map<string, string>([
+    ["kimi-locale", "en"],
+    ["kimi-web.input-history", "initial"],
+  ]);
+  const nativeStorage = {
+    getItem: (k: string) => (hostMap.has(k) ? hostMap.get(k)! : null),
+    setItem: (k: string, v: string) => { hostMap.set(k, String(v)); },
+    removeItem: (k: string) => { hostMap.delete(k); },
+    key: (i: number) => ([...hostMap.keys()][i] ?? null),
+    get length() { return hostMap.size; },
+    clear: () => { hostMap.clear(); },
+  };
+  const prevDesc = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", {
+    value: nativeStorage,
+    configurable: true,
+    writable: true,
+  });
+
+  const origRive = runtime.rive;
+  const origGetById = runtime.document.getElementById;
+  const origCreateElement = runtime.document.createElement;
+  const regionStub = stubElement();
+  const widgetStub = { ...stubElement(), querySelector: () => regionStub };
+  runtime.document.getElementById = (id: string) => (id === "ksb-widget" ? widgetStub : null);
+  runtime.document.createElement = () => {
+    const node = stubElement();
+    node.querySelector = () => regionStub;
+    return node;
+  };
+  runtime.rive = {
+    RuntimeLoader: { setWasmUrl() {}, setWasmFallbackUrl() {} },
+    Fit: { Contain: "contain" },
+    Alignment: { Center: "center" },
+    Rive: class { cleanup() {} stop() {} play() {} startRendering() {} stopRendering() {} },
+  };
+
+  const pluginStore = new Map<string, unknown>([
+    ["kimi-statusbar.mini", "0"],
+    ["kimi-web.input-history", "legacy-polluted-entry"],
+    ["kimi-active-workspace", "wm_legacy"],
+  ]);
+  const writtenKeys: string[] = [];
+  const deletedKeys: string[] = [];
+  const disposers: Array<() => void> = [];
+  const mod = await import(moduleUrl);
+  try {
+    await mod.activate({
+      log() {},
+      storage: {
+        list: async () => [...pluginStore.keys()],
+        get: async (k: string) => pluginStore.get(k),
+        set: async (k: string, v: unknown) => { writtenKeys.push(k); pluginStore.set(k, v); },
+        delete: async (k: string) => { deletedKeys.push(k); pluginStore.delete(k); },
+      },
+      core: { request: async () => null },
+      events: { on: () => ({ dispose() {} }) },
+      ui: {
+        mount(_slot: string, fn: (el: any) => () => void) {
+          const el = stubElement();
+          const unmount = fn(el);
+          return { dispose: unmount };
+        },
+      },
+      onDispose(fn: () => void) { disposers.push(fn); },
+      activeSessionId: () => "sess-live",
+    });
+
+    assert.equal(runtime.localStorage.getItem("kimi-locale"), "en");
+    const bigPayload = "x".repeat(40_000);
+    runtime.localStorage.setItem("kimi-web.input-history", bigPayload);
+    runtime.localStorage.setItem("kimi-statusbar.mini", "1");
+    runtime.__kcm?.push({
+      v: 1,
+      type: "event",
+      sessionId: "sess-live",
+      event: {
+        type: "turn.step.completed",
+        session_id: "sess-live",
+        agent_id: "main",
+        seq: 1,
+        kcmReplay: true,
+        kcmSkipDaily: true,
+        payload: {
+          stepId: "step-skip-daily",
+          model: "m1",
+          usage: { inputOther: 500, inputCacheRead: 1000, inputCacheCreation: 0, output: 80 },
+        },
+      },
+    });
+    await new Promise((r) => setTimeout(r, 60));
+
+    assert.equal(hostMap.get("kimi-web.input-history"), bigPayload, "official keys write straight to native storage");
+    assert.ok(!writtenKeys.includes("kimi-web.input-history"), "official keys never write into ctx.storage");
+    assert.ok(writtenKeys.includes("kimi-statusbar.mini"), "monitor keys persist through ctx.storage");
+    assert.ok(!writtenKeys.includes("kcm.daily.v2"), "kcmSkipDaily replay must not accumulate into kcm.daily.v2");
+    assert.ok(deletedKeys.includes("kimi-web.input-history"), "legacy polluted host keys are pruned from ctx.storage");
+    assert.ok(deletedKeys.includes("kimi-active-workspace"), "legacy polluted workspace key is pruned from ctx.storage");
+  } finally {
+    for (const fn of disposers.reverse()) fn();
+    runtime.rive = origRive;
+    runtime.document.getElementById = origGetById;
+    runtime.document.createElement = origCreateElement;
+    if (prevDesc) Object.defineProperty(globalThis, "localStorage", prevDesc);
+    else delete runtime.localStorage;
+  }
+});
+
+test("replayed cache.turns do not accumulate into kcm.daily.v2 and 30d history is authoritative", async () => {
+  const dsSource = readFileSync("../plugins/monitor-src/src/datasource.js", "utf8");
+  const dsUrl = `data:text/javascript;base64,${Buffer.from(dsSource).toString("base64")}`;
+  const { startDatasource } = await import(dsUrl);
+
+  const now = new Date();
+  const pad = (v: number) => String(v).padStart(2, "0");
+  const localToday = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  const utcHourBucket = `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}-${pad(now.getUTCDate())}T${pad(now.getUTCHours())}:00`;
+
+  const pushed: any[] = [];
+  const ctx = {
+    log() {},
+    core: {
+      request: async (action: string, params?: any) => {
+        if (action === "cache.history" && params?.range === "24h") {
+          return {
+            range: "24h",
+            unit: "hour",
+            points: [{ bucket: utcHourBucket, totals: { inputOther: 120, inputCacheRead: 280, inputCacheCreation: 0, output: 60 } }],
+          };
+        }
+        if (action === "cache.history" && params?.range === "30d") {
+          return {
+            range: "30d",
+            unit: "day",
+            points: [{ bucket: "2026-11-20", totals: { inputOther: 100, inputCacheRead: 200, inputCacheCreation: 0, output: 50 } }],
+          };
+        }
+        if (action === "cache.turns") {
+          return [{ stepId: "s-hist", agent: "main", model: "m1", inputOther: 500, inputCacheRead: 1000, inputCacheCreation: 0, output: 80, decodeMs: 400 }];
+        }
+        return null;
+      },
+    },
+    events: { on: () => ({ dispose() {} }) },
+  };
+  const ds = startDatasource(ctx, (msg: any) => pushed.push(msg), () => "sess-replay", () => false);
+  try {
+    await ds.start();
+    const dailyMsg = pushed.find((m) => m.type === "usageDaily");
+    assert.equal(dailyMsg?.authoritative, true, "30d cache.history marks daily buckets authoritative");
+    assert.equal(dailyMsg?.daily?.["2026-11-20"]?.input, 300);
+    assert.equal(dailyMsg?.daily?.[localToday]?.input, 400, "local-today bucket is derived from 24h UTC hours");
+    assert.equal(dailyMsg?.daily?.[localToday]?.output, 60);
+    const stepMsg = pushed.find((m) => m.type === "event" && m.event?.type === "turn.step.completed");
+    assert.equal(stepMsg?.event?.kcmReplay, true);
+    assert.equal(stepMsg?.event?.kcmSkipDaily, true);
+  } finally {
+    ds.dispose();
+  }
 });
 
 test("datasource skips cache.sessions seeding and schedules cooldown follow-up after turn.ended", async () => {

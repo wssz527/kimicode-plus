@@ -166,7 +166,7 @@ function rememberStep(key) {
   }
 }
 
-function handleStepCompleted(payload, agentId) {
+function handleStepCompleted(payload, agentId, { skipDailyAccumulate = false } = {}) {
   const key = stepEventKey(payload, agentId);
   if (key && completedStepIds.has(key)) return;
   const usage = normalizeUsage(payload.usage || payload.token_usage);
@@ -176,7 +176,7 @@ function handleStepCompleted(payload, agentId) {
   panel.metrics.cacheCreationTokens += usage.cacheCreationTokens;
 
   // 按天自积累（补丁模式无看门狗时长期统计的兜底，详见 accumulate.js）
-  noteStepUsage(usage, agentId !== 'main');
+  if (!skipDailyAccumulate) noteStepUsage(usage, agentId !== 'main');
 
   // 落进「代理 × 模型」：事件自带模型名就用它（主代理中途换过模型时各归各行），
   // 不带就记到该代理的当前模型；代理合计同步累加，两者不会各记一份
@@ -237,7 +237,7 @@ function handleEvent(message) {
           pushStepSample(payload, replayAgent);
         }
       } else if ((!hasSeq || seq > lastUsageSeq) && !completedStepIds.has(stepEventKey(payload, replayAgent))) {
-        handleStepCompleted(payload, replayAgent);
+        handleStepCompleted(payload, replayAgent, { skipDailyAccumulate: message.kcmSkipDaily === true });
       }
       if (hasSeq) lastUsageSeq = Math.max(lastUsageSeq, seq);
     } else if (message.type === 'turn.ended' || message.type === 'turn.completed') {
@@ -384,10 +384,16 @@ function handleQuota(msg) {
 // 看门狗文件（wire.jsonl 全量扫描）的原始日数据：与页内积累分开存，
 // 每次合并都是「文件 ∪ 积累」按天取大（accumulate.js）
 let lastFileDaily = {};
+let authoritativeDaily = false;
 
 function handleUsageDaily(msg) {
-  lastFileDaily = msg.daily && typeof msg.daily === 'object' ? msg.daily : {};
-  panel.usageHourlyCache = msg.hourly && typeof msg.hourly === 'object' ? msg.hourly : {};
+  if (msg.daily && typeof msg.daily === 'object') {
+    lastFileDaily = msg.daily;
+    authoritativeDaily = msg.authoritative === true;
+  }
+  if (msg.hourly && typeof msg.hourly === 'object') {
+    panel.usageHourlyCache = msg.hourly;
+  }
   // 按会话（代理 × 模型）汇总：切会话时的本地底数。技能重扫后文件内容变化，
   // 下一轮轮询就会把新汇总推上来
   panel.cliSessionSummary = msg.sessions && typeof msg.sessions === 'object' ? msg.sessions : {};
@@ -438,7 +444,7 @@ function applySessionSeed(sid, { agentsOnly = false } = {}) {
 
 /** 合并「文件 + 页内积累」重绘长期统计；补丁模式无文件时纯靠页内积累 */
 export function refreshDailyChart() {
-  const merged = mergeDaily(lastFileDaily);
+  const merged = authoritativeDaily ? { ...lastFileDaily } : mergeDaily(lastFileDaily);
   panel.usageDailyCache = merged;
   if (Object.keys(merged).length > 0) panel.cliUsageConnected = true;
   renderChart();
@@ -728,6 +734,8 @@ export function disposeBridge() {
   completedStepIds.clear();
   panelSessionCache.clear();
   lastUsageSeq = 0;
+  lastFileDaily = {};
+  authoritativeDaily = false;
   currentSessionId = DEFAULT_SESSION_ID;
   try {
     delete globalThis.__kcm;

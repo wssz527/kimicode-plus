@@ -165,7 +165,7 @@ func (s *Store) Scan(ctx context.Context, now time.Time, force bool) (ScanResult
 	if home == "" {
 		return ScanResult{}, nil
 	}
-	sessions, err := discover(home)
+	sessions, incomplete, err := discover(home)
 	if err != nil {
 		return ScanResult{}, err
 	}
@@ -182,9 +182,10 @@ func (s *Store) Scan(ctx context.Context, now time.Time, force bool) (ScanResult
 	if err = s.prune(ctx); err != nil {
 		return result, err
 	}
-	// A budget-limited pass only saw part of the sessions directory, so it cannot
-	// prove any session outside the window was deleted.
-	if !result.BudgetLimited {
+	// A budget-limited or partial pass (such as a broken symlink to an unmounted
+	// volume) only saw part of the sessions tree, so it cannot prove unseen sessions
+	// were deleted.
+	if !result.BudgetLimited && !incomplete {
 		if err = s.pruneMissing(ctx, home, sessions); err != nil {
 			return result, err
 		}
@@ -209,7 +210,7 @@ func (s *Store) scanSession(ctx context.Context, session sessionDir, now time.Ti
 	lastUserPrompt := int64(0)
 	agentCount := 0
 	for _, agent := range session.Agents {
-		path := session.Dir + "/agents/" + agent + "/wire.jsonl"
+		path := filepath.Join(session.Dir, "agents", agent, "wire.jsonl")
 		state := s.fileStateFor(path, agent)
 		read, restarted, err := readIncremental(path, state)
 		if err != nil {
@@ -377,7 +378,7 @@ func (s *Store) forgetStaleFiles(sessions []sessionDir) {
 	live := make(map[string]bool)
 	for _, session := range sessions {
 		for _, agent := range session.Agents {
-			live[session.Dir+"/agents/"+agent+"/wire.jsonl"] = true
+			live[filepath.Join(session.Dir, "agents", agent, "wire.jsonl")] = true
 		}
 	}
 	s.mu.Lock()

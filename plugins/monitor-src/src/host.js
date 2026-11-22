@@ -23,18 +23,24 @@ const memory = new Map();
 const pendingWrites = new Map();
 let bridge = null;
 
+function isPluginStorageKey(key) {
+  const name = String(key);
+  return name.startsWith("kimi-statusbar.") || name.startsWith("kcm.");
+}
+
 function schedule(key) {
-  if (!bridge || pendingWrites.has(key)) return;
+  const name = String(key);
+  if (!bridge || !isPluginStorageKey(name) || pendingWrites.has(name)) return;
   const ctx = bridge;
   const timer = setTimeout(() => {
-    pendingWrites.delete(key);
-    const value = memory.get(key);
-    const write = value === undefined ? ctx.storage.delete(key) : ctx.storage.set(key, value);
+    pendingWrites.delete(name);
+    const value = memory.get(name);
+    const write = value === undefined ? ctx.storage.delete(name) : ctx.storage.set(name, value);
     void Promise.resolve(write).catch((error) => {
       ctx.log("warn", `面板配置写入失败：${error?.message || error}`);
     });
   }, 30);
-  pendingWrites.set(key, timer);
+  pendingWrites.set(name, timer);
 }
 
 function readValue(key) {
@@ -54,6 +60,11 @@ export async function bindStorage(ctx) {
     return;
   }
   for (const key of keys) {
+    if (!isPluginStorageKey(key)) {
+      // 清理旧版全局劫持意外写入的非插件键，避免插件存储膨胀
+      void Promise.resolve(ctx.storage.delete(key)).catch(() => {});
+      continue;
+    }
     try {
       const value = await ctx.storage.get(key);
       if (value !== undefined) memory.set(key, value);
@@ -134,39 +145,137 @@ const chromeShim = {
   }
 };
 
-const localStorageShim = {
+let nativeLocalStorage = null;
+
+function readNativeLocalStorage() {
+  try {
+    if (!nativeLocalStorage) return null;
+    if ("value" in nativeLocalStorage) return nativeLocalStorage.value || null;
+    if (typeof nativeLocalStorage.get === "function") return nativeLocalStorage.get.call(globalThis) || null;
+  } catch (error) {
+    return null;
+  }
+  return null;
+}
+
+const localStorageTarget = {
   getItem: (key) => {
-    const value = readValue(String(key));
-    return value === undefined ? null : String(value);
+    const name = String(key);
+    if (isPluginStorageKey(name)) {
+      const value = readValue(name);
+      return value === undefined ? null : String(value);
+    }
+    const native = readNativeLocalStorage();
+    return native ? native.getItem(name) : null;
   },
   setItem: (key, value) => {
-    memory.set(String(key), String(value));
-    schedule(String(key));
+    const name = String(key);
+    const str = String(value);
+    if (isPluginStorageKey(name)) {
+      memory.set(name, str);
+      schedule(name);
+      return;
+    }
+    const native = readNativeLocalStorage();
+    if (native) native.setItem(name, str);
   },
   removeItem: (key) => {
-    memory.delete(String(key));
-    schedule(String(key));
+    const name = String(key);
+    if (isPluginStorageKey(name)) {
+      memory.delete(name);
+      schedule(name);
+      return;
+    }
+    const native = readNativeLocalStorage();
+    if (native) native.removeItem(name);
   },
   key: (index) => {
+    const native = readNativeLocalStorage();
+    if (native) return native.key(index);
     const keys = [...memory.keys()];
     return index >= 0 && index < keys.length ? keys[index] : null;
   },
   get length() {
-    return memory.size;
+    const native = readNativeLocalStorage();
+    return native ? native.length : memory.size;
   },
   clear: () => {
-    for (const key of [...memory.keys()]) {
-      memory.delete(key);
-      schedule(key);
-    }
+    const native = readNativeLocalStorage();
+    if (native) native.clear();
   }
 };
 
-const nativeLocalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+const localStorageShim = new Proxy(localStorageTarget, {
+  get(target, prop, receiver) {
+    if (prop in target) {
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+    if (typeof prop === "string") {
+      if (isPluginStorageKey(prop)) {
+        const value = readValue(prop);
+        return value === undefined ? undefined : String(value);
+      }
+      const native = readNativeLocalStorage();
+      if (native) {
+        const value = Reflect.get(native, prop);
+        return typeof value === "function" ? value.bind(native) : value;
+      }
+    }
+    return undefined;
+  },
+  set(target, prop, value) {
+    if (typeof prop === "string") {
+      if (isPluginStorageKey(prop)) {
+        memory.set(prop, String(value));
+        schedule(prop);
+        return true;
+      }
+      const native = readNativeLocalStorage();
+      if (native) {
+        native.setItem(prop, String(value));
+        return true;
+      }
+    }
+    return false;
+  },
+  deleteProperty(target, prop) {
+    if (typeof prop === "string") {
+      if (isPluginStorageKey(prop)) {
+        memory.delete(prop);
+        schedule(prop);
+        return true;
+      }
+      const native = readNativeLocalStorage();
+      if (native) {
+        native.removeItem(prop);
+        return true;
+      }
+    }
+    return false;
+  },
+  ownKeys() {
+    const native = readNativeLocalStorage();
+    return native ? Reflect.ownKeys(native) : [...memory.keys()];
+  },
+  getOwnPropertyDescriptor(target, prop) {
+    if (prop in target) return Reflect.getOwnPropertyDescriptor(target, prop);
+    const native = readNativeLocalStorage();
+    if (native && typeof prop === "string") {
+      const value = native.getItem(prop);
+      if (value !== null) return { value, writable: true, enumerable: true, configurable: true };
+    }
+    return undefined;
+  }
+});
 
 function installHost() {
   globalThis.chrome = chromeShim;
   try {
+    const current = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+    if (!current || current.value !== localStorageShim) {
+      nativeLocalStorage = current || null;
+    }
     Object.defineProperty(globalThis, "localStorage", {
       value: localStorageShim,
       configurable: true,
@@ -182,8 +291,10 @@ installHost();
 
 /** 同步来自同窗口其他视图（如设置页）写入的 storage 键值。 */
 export function syncStorageKey(key, value) {
-  if (value === undefined) memory.delete(String(key));
-  else memory.set(String(key), value);
+  const name = String(key);
+  if (!isPluginStorageKey(name)) return;
+  if (value === undefined) memory.delete(name);
+  else memory.set(name, value);
 }
 
 /** 停用插件时恢复宿主原状，并把内存里未落盘的键写出去。 */
@@ -191,12 +302,14 @@ export function disposeHost() {
   for (const timer of pendingWrites.values()) clearTimeout(timer);
   if (bridge) {
     for (const [key, value] of memory) {
+      if (!isPluginStorageKey(key)) continue;
       void Promise.resolve(bridge.storage.set(key, value)).catch(() => {});
     }
   }
   pendingWrites.clear();
   if (nativeLocalStorage) Object.defineProperty(globalThis, "localStorage", nativeLocalStorage);
   else delete globalThis.localStorage;
+  nativeLocalStorage = null;
   delete globalThis.chrome;
   bridge = null;
 }

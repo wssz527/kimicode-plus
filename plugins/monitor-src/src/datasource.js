@@ -40,9 +40,10 @@ function stepEvent(step, sessionId, seq) {
       session_id: sessionId,
       agent_id: step?.agent || "main",
       seq,
-      // cache.turns 读取的是已落盘的历史 step 快照，标成重放只补计数与折线，
-      // 不会触发 bridge 把空闲面板切进「思考中」。
+      // cache.turns 读取的是已落盘的历史 step 快照，标成重放只补本会话计数与折线，
+      // 不会触发 bridge 把空闲面板切进「思考中」，也不重复累加到 kcm.daily.v2。
       kcmReplay: true,
+      kcmSkipDaily: true,
       payload: {
         stepId: step?.stepId || "",
         model: step?.model || "",
@@ -302,15 +303,27 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
       }
     }
     if (history24h || history30d) {
-      const daily = history30d ? bucketsFromHistory(history30d).daily : {};
-      const hourly = history24h ? bucketsFromHistory(history24h).hourly : {};
-      send({
+      const msg = {
         v: 1,
         type: "usageDaily",
-        daily,
-        hourly,
         connected: true
-      });
+      };
+      const h24 = history24h ? bucketsFromHistory(history24h) : null;
+      if (history30d) {
+        const daily = bucketsFromHistory(history30d).daily;
+        if (h24) {
+          const now = new Date();
+          const pad = (value) => String(value).padStart(2, "0");
+          const localToday = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+          if (h24.daily[localToday]) daily[localToday] = h24.daily[localToday];
+        }
+        msg.daily = daily;
+        msg.authoritative = true;
+      }
+      if (h24) {
+        msg.hourly = h24.hourly;
+      }
+      send(msg);
     }
     if (sessionId && sessionId !== "panel") {
       enterSession(sessionId, activeTurnSession === sessionId, Array.isArray(turns) ? turns.at(-1)?.at || "" : "");

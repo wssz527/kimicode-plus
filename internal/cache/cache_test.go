@@ -1241,3 +1241,150 @@ func TestScanSkippedWaitsForInFlightScan(t *testing.T) {
 		t.Fatalf("second scan result = %+v, want Skipped=true", res)
 	}
 }
+
+func TestDiscoverFollowsSymlinksAndDeduplicatesAliases(t *testing.T) {
+	home := t.TempDir()
+	externalRoot := t.TempDir()
+	externalBucket := filepath.Join(externalRoot, "wm_external")
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	usage := sampleUsage(1200, 150, 900, 0)
+
+	agentDir := filepath.Join(externalBucket, "session_symlinked", "agents", "main")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wire := plainLine(usageRecord("synthetic/ext", usage, "turn", now)) +
+		plainLine(stepEnd("uuid-ext-1", "0", 1, usage, 300, 900, "end_turn", now))
+	if err := os.WriteFile(filepath.Join(agentDir, "wire.jsonl"), []byte(wire), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := fmt.Sprintf(`{"id":"session_symlinked","cwd":"/Volumes/External/project","createdAt":%d,"updatedAt":%d}`, now.Add(-time.Hour).UnixMilli(), now.UnixMilli())
+	if err := os.WriteFile(filepath.Join(externalBucket, "session_symlinked", "state.json"), []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionsRoot := filepath.Join(home, "sessions")
+	if err := os.MkdirAll(sessionsRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(externalBucket, filepath.Join(sessionsRoot, "wm_external")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(externalBucket, filepath.Join(sessionsRoot, "wd_alias")); err != nil {
+		t.Fatal(err)
+	}
+
+	store := newTestStore(t, home)
+	ctx := context.Background()
+	res, err := store.Scan(ctx, now.Add(time.Minute), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Sessions != 1 || res.Files != 1 || res.Steps != 1 {
+		t.Fatalf("scan result = %+v, want 1 deduplicated session / 1 file / 1 step", res)
+	}
+	if got := countRows(t, store, "cache_steps", "session_symlinked"); got != 1 {
+		t.Fatalf("cache_steps = %d, want 1", got)
+	}
+	store.mu.Lock()
+	fileCount := len(store.files)
+	store.mu.Unlock()
+	if fileCount != 1 {
+		t.Fatalf("store.files count = %d, want 1 deduplicated reader", fileCount)
+	}
+}
+
+func TestScanSkipsPruneMissingWhenSymlinkBucketIsBroken(t *testing.T) {
+	home := t.TempDir()
+	externalRoot := t.TempDir()
+	externalBucket := filepath.Join(externalRoot, "wm_mount")
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	usage := sampleUsage(500, 90, 400, 0)
+
+	agentDir := filepath.Join(externalBucket, "session_mounted", "agents", "main")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wire := plainLine(usageRecord("synthetic/mount", usage, "turn", now)) +
+		plainLine(stepEnd("uuid-mnt-1", "0", 1, usage, 200, 600, "end_turn", now))
+	if err := os.WriteFile(filepath.Join(agentDir, "wire.jsonl"), []byte(wire), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := fmt.Sprintf(`{"id":"session_mounted","cwd":"/Volumes/External/p","createdAt":%d,"updatedAt":%d}`, now.Add(-time.Hour).UnixMilli(), now.UnixMilli())
+	if err := os.WriteFile(filepath.Join(externalBucket, "session_mounted", "state.json"), []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionsRoot := filepath.Join(home, "sessions")
+	if err := os.MkdirAll(sessionsRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(externalBucket, filepath.Join(sessionsRoot, "wm_mount")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	store := newTestStore(t, home)
+	ctx := context.Background()
+	if _, err := store.Scan(ctx, now, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, store, "cache_steps", "session_mounted"); got != 1 {
+		t.Fatalf("initial cache_steps = %d, want 1", got)
+	}
+
+	// Simulate the external volume being temporarily unmounted so the symlink dangles.
+	if err := os.RemoveAll(externalBucket); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Scan(ctx, now.Add(time.Minute), true); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, store, "cache_steps", "session_mounted"); got != 1 {
+		t.Fatalf("cache_steps after broken symlink = %d, want 1 preserved", got)
+	}
+	if got := countRows(t, store, "cache_sessions", "session_mounted"); got != 1 {
+		t.Fatalf("cache_sessions after broken symlink = %d, want 1 preserved", got)
+	}
+}
+
+func TestDiscoverRanksActiveWireAboveStaleAgentsDirMtime(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Second)
+	usage := sampleUsage(300, 60, 200, 0)
+
+	activeWire := writeWire(t, home, "session_active_long", "main",
+		plainLine(usageRecord("synthetic/active", usage, "turn", now)),
+		plainLine(stepEnd("uuid-act-1", "0", 1, usage, 200, 700, "end_turn", now)),
+	)
+	oldTime := now.Add(-48 * time.Hour)
+	agentsDir := filepath.Join(home, "sessions", "wd_test", "session_active_long", "agents")
+	statePath := filepath.Join(home, "sessions", "wd_test", "session_active_long", "state.json")
+	if err := os.WriteFile(statePath, []byte(fmt.Sprintf(`{"id":"session_active_long","createdAt":%d,"updatedAt":%d}`, oldTime.UnixMilli(), oldTime.UnixMilli())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(statePath, oldTime, oldTime)
+	_ = os.Chtimes(agentsDir, oldTime, oldTime)
+	freshTime := now.Add(2 * time.Second)
+	if err := os.Chtimes(activeWire, freshTime, freshTime); err != nil {
+		t.Fatal(err)
+	}
+
+	for index := 0; index < scanSessionBudget; index++ {
+		id := fmt.Sprintf("session_bare_%03d", index)
+		writeBareSession(t, home, id)
+		midTime := now.Add(-time.Hour)
+		_ = os.Chtimes(filepath.Join(home, "sessions", "wd_test", id, "state.json"), midTime, midTime)
+	}
+
+	store := newTestStore(t, home)
+	res, err := store.Scan(context.Background(), freshTime, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.BudgetLimited {
+		t.Fatalf("expected budget-limited scan, got %+v", res)
+	}
+	if got := countRows(t, store, "cache_steps", "session_active_long"); got != 1 {
+		t.Fatalf("active session dropped outside budget: cache_steps = %d, want 1", got)
+	}
+}

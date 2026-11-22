@@ -9968,18 +9968,23 @@ var ASSETS = define_MONITOR_ASSETS_default;
 var memory = /* @__PURE__ */ new Map();
 var pendingWrites = /* @__PURE__ */ new Map();
 var bridge = null;
+function isPluginStorageKey(key) {
+  const name = String(key);
+  return name.startsWith("kimi-statusbar.") || name.startsWith("kcm.");
+}
 function schedule(key) {
-  if (!bridge || pendingWrites.has(key)) return;
+  const name = String(key);
+  if (!bridge || !isPluginStorageKey(name) || pendingWrites.has(name)) return;
   const ctx = bridge;
   const timer = setTimeout(() => {
-    pendingWrites.delete(key);
-    const value = memory.get(key);
-    const write = value === void 0 ? ctx.storage.delete(key) : ctx.storage.set(key, value);
+    pendingWrites.delete(name);
+    const value = memory.get(name);
+    const write = value === void 0 ? ctx.storage.delete(name) : ctx.storage.set(name, value);
     void Promise.resolve(write).catch((error) => {
       ctx.log("warn", `面板配置写入失败：${error?.message || error}`);
     });
   }, 30);
-  pendingWrites.set(key, timer);
+  pendingWrites.set(name, timer);
 }
 function readValue(key) {
   return memory.has(key) ? memory.get(key) : void 0;
@@ -9996,6 +10001,11 @@ async function bindStorage(ctx) {
     return;
   }
   for (const key of keys) {
+    if (!isPluginStorageKey(key)) {
+      void Promise.resolve(ctx.storage.delete(key)).catch(() => {
+      });
+      continue;
+    }
     try {
       const value = await ctx.storage.get(key);
       if (value !== void 0) memory.set(key, value);
@@ -10065,37 +10075,133 @@ var chromeShim = {
     onChanged: noopListenerHub
   }
 };
-var localStorageShim = {
+var nativeLocalStorage = null;
+function readNativeLocalStorage() {
+  try {
+    if (!nativeLocalStorage) return null;
+    if ("value" in nativeLocalStorage) return nativeLocalStorage.value || null;
+    if (typeof nativeLocalStorage.get === "function") return nativeLocalStorage.get.call(globalThis) || null;
+  } catch (error) {
+    return null;
+  }
+  return null;
+}
+var localStorageTarget = {
   getItem: (key) => {
-    const value = readValue(String(key));
-    return value === void 0 ? null : String(value);
+    const name = String(key);
+    if (isPluginStorageKey(name)) {
+      const value = readValue(name);
+      return value === void 0 ? null : String(value);
+    }
+    const native = readNativeLocalStorage();
+    return native ? native.getItem(name) : null;
   },
   setItem: (key, value) => {
-    memory.set(String(key), String(value));
-    schedule(String(key));
+    const name = String(key);
+    const str = String(value);
+    if (isPluginStorageKey(name)) {
+      memory.set(name, str);
+      schedule(name);
+      return;
+    }
+    const native = readNativeLocalStorage();
+    if (native) native.setItem(name, str);
   },
   removeItem: (key) => {
-    memory.delete(String(key));
-    schedule(String(key));
+    const name = String(key);
+    if (isPluginStorageKey(name)) {
+      memory.delete(name);
+      schedule(name);
+      return;
+    }
+    const native = readNativeLocalStorage();
+    if (native) native.removeItem(name);
   },
   key: (index) => {
+    const native = readNativeLocalStorage();
+    if (native) return native.key(index);
     const keys = [...memory.keys()];
     return index >= 0 && index < keys.length ? keys[index] : null;
   },
   get length() {
-    return memory.size;
+    const native = readNativeLocalStorage();
+    return native ? native.length : memory.size;
   },
   clear: () => {
-    for (const key of [...memory.keys()]) {
-      memory.delete(key);
-      schedule(key);
-    }
+    const native = readNativeLocalStorage();
+    if (native) native.clear();
   }
 };
-var nativeLocalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+var localStorageShim = new Proxy(localStorageTarget, {
+  get(target, prop, receiver) {
+    if (prop in target) {
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+    if (typeof prop === "string") {
+      if (isPluginStorageKey(prop)) {
+        const value = readValue(prop);
+        return value === void 0 ? void 0 : String(value);
+      }
+      const native = readNativeLocalStorage();
+      if (native) {
+        const value = Reflect.get(native, prop);
+        return typeof value === "function" ? value.bind(native) : value;
+      }
+    }
+    return void 0;
+  },
+  set(target, prop, value) {
+    if (typeof prop === "string") {
+      if (isPluginStorageKey(prop)) {
+        memory.set(prop, String(value));
+        schedule(prop);
+        return true;
+      }
+      const native = readNativeLocalStorage();
+      if (native) {
+        native.setItem(prop, String(value));
+        return true;
+      }
+    }
+    return false;
+  },
+  deleteProperty(target, prop) {
+    if (typeof prop === "string") {
+      if (isPluginStorageKey(prop)) {
+        memory.delete(prop);
+        schedule(prop);
+        return true;
+      }
+      const native = readNativeLocalStorage();
+      if (native) {
+        native.removeItem(prop);
+        return true;
+      }
+    }
+    return false;
+  },
+  ownKeys() {
+    const native = readNativeLocalStorage();
+    return native ? Reflect.ownKeys(native) : [...memory.keys()];
+  },
+  getOwnPropertyDescriptor(target, prop) {
+    if (prop in target) return Reflect.getOwnPropertyDescriptor(target, prop);
+    const native = readNativeLocalStorage();
+    if (native && typeof prop === "string") {
+      const value = native.getItem(prop);
+      if (value !== null) return { value, writable: true, enumerable: true, configurable: true };
+    }
+    return void 0;
+  }
+});
 function installHost() {
   globalThis.chrome = chromeShim;
   try {
+    const current = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+    if (!current || current.value !== localStorageShim) {
+      nativeLocalStorage = current || null;
+    }
     Object.defineProperty(globalThis, "localStorage", {
       value: localStorageShim,
       configurable: true,
@@ -10106,13 +10212,16 @@ function installHost() {
 }
 installHost();
 function syncStorageKey(key, value) {
-  if (value === void 0) memory.delete(String(key));
-  else memory.set(String(key), value);
+  const name = String(key);
+  if (!isPluginStorageKey(name)) return;
+  if (value === void 0) memory.delete(name);
+  else memory.set(name, value);
 }
 function disposeHost() {
   for (const timer of pendingWrites.values()) clearTimeout(timer);
   if (bridge) {
     for (const [key, value] of memory) {
+      if (!isPluginStorageKey(key)) continue;
       void Promise.resolve(bridge.storage.set(key, value)).catch(() => {
       });
     }
@@ -10120,6 +10229,7 @@ function disposeHost() {
   pendingWrites.clear();
   if (nativeLocalStorage) Object.defineProperty(globalThis, "localStorage", nativeLocalStorage);
   else delete globalThis.localStorage;
+  nativeLocalStorage = null;
   delete globalThis.chrome;
   bridge = null;
 }
@@ -13131,7 +13241,7 @@ function rememberStep(key) {
     completedStepIds.delete(completedStepIds.values().next().value);
   }
 }
-function handleStepCompleted(payload, agentId) {
+function handleStepCompleted(payload, agentId, { skipDailyAccumulate = false } = {}) {
   const key = stepEventKey(payload, agentId);
   if (key && completedStepIds.has(key)) return;
   const usage = normalizeUsage(payload.usage || payload.token_usage);
@@ -13139,7 +13249,7 @@ function handleStepCompleted(payload, agentId) {
   panel.metrics.outputTokens += usage.outputTokens;
   panel.metrics.cacheReadTokens += usage.cacheReadTokens;
   panel.metrics.cacheCreationTokens += usage.cacheCreationTokens;
-  noteStepUsage(usage, agentId !== "main");
+  if (!skipDailyAccumulate) noteStepUsage(usage, agentId !== "main");
   noteAgentUsage(agentId, payload.model || payload.modelAlias, usage);
   pushStepSample(payload, agentId);
   rememberStep(key);
@@ -13180,7 +13290,7 @@ function handleEvent(message) {
           pushStepSample(payload, replayAgent);
         }
       } else if ((!hasSeq || seq > lastUsageSeq) && !completedStepIds.has(stepEventKey(payload, replayAgent))) {
-        handleStepCompleted(payload, replayAgent);
+        handleStepCompleted(payload, replayAgent, { skipDailyAccumulate: message.kcmSkipDaily === true });
       }
       if (hasSeq) lastUsageSeq = Math.max(lastUsageSeq, seq);
     } else if (message.type === "turn.ended" || message.type === "turn.completed") {
@@ -13306,9 +13416,15 @@ function handleQuota(msg) {
   }
 }
 var lastFileDaily = {};
+var authoritativeDaily = false;
 function handleUsageDaily(msg) {
-  lastFileDaily = msg.daily && typeof msg.daily === "object" ? msg.daily : {};
-  panel.usageHourlyCache = msg.hourly && typeof msg.hourly === "object" ? msg.hourly : {};
+  if (msg.daily && typeof msg.daily === "object") {
+    lastFileDaily = msg.daily;
+    authoritativeDaily = msg.authoritative === true;
+  }
+  if (msg.hourly && typeof msg.hourly === "object") {
+    panel.usageHourlyCache = msg.hourly;
+  }
   panel.cliSessionSummary = msg.sessions && typeof msg.sessions === "object" ? msg.sessions : {};
   panel.secondaryModelName = typeof msg.secondaryModel === "string" ? msg.secondaryModel : "";
   panel.cliUsageConnected = msg.connected !== false;
@@ -13345,7 +13461,7 @@ function applySessionSeed(sid, { agentsOnly = false } = {}) {
   return true;
 }
 function refreshDailyChart() {
-  const merged = mergeDaily(lastFileDaily);
+  const merged = authoritativeDaily ? { ...lastFileDaily } : mergeDaily(lastFileDaily);
   panel.usageDailyCache = merged;
   if (Object.keys(merged).length > 0) panel.cliUsageConnected = true;
   renderChart();
@@ -13567,6 +13683,8 @@ function disposeBridge() {
   completedStepIds.clear();
   panelSessionCache.clear();
   lastUsageSeq = 0;
+  lastFileDaily = {};
+  authoritativeDaily = false;
   currentSessionId = DEFAULT_SESSION_ID;
   try {
     delete globalThis.__kcm;
@@ -13596,9 +13714,10 @@ function stepEvent(step, sessionId, seq) {
       session_id: sessionId,
       agent_id: step?.agent || "main",
       seq,
-      // cache.turns 读取的是已落盘的历史 step 快照，标成重放只补计数与折线，
-      // 不会触发 bridge 把空闲面板切进「思考中」。
+      // cache.turns 读取的是已落盘的历史 step 快照，标成重放只补本会话计数与折线，
+      // 不会触发 bridge 把空闲面板切进「思考中」，也不重复累加到 kcm.daily.v2。
       kcmReplay: true,
+      kcmSkipDaily: true,
       payload: {
         stepId: step?.stepId || "",
         model: step?.model || "",
@@ -13820,15 +13939,27 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
       }
     }
     if (history24h || history30d) {
-      const daily = history30d ? bucketsFromHistory(history30d).daily : {};
-      const hourly = history24h ? bucketsFromHistory(history24h).hourly : {};
-      send({
+      const msg = {
         v: 1,
         type: "usageDaily",
-        daily,
-        hourly,
         connected: true
-      });
+      };
+      const h24 = history24h ? bucketsFromHistory(history24h) : null;
+      if (history30d) {
+        const daily = bucketsFromHistory(history30d).daily;
+        if (h24) {
+          const now = /* @__PURE__ */ new Date();
+          const pad = (value) => String(value).padStart(2, "0");
+          const localToday = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+          if (h24.daily[localToday]) daily[localToday] = h24.daily[localToday];
+        }
+        msg.daily = daily;
+        msg.authoritative = true;
+      }
+      if (h24) {
+        msg.hourly = h24.hourly;
+      }
+      send(msg);
     }
     if (sessionId && sessionId !== "panel") {
       enterSession(sessionId, activeTurnSession === sessionId, Array.isArray(turns) ? turns.at(-1)?.at || "" : "");

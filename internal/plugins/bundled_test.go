@@ -217,9 +217,9 @@ func TestBundledUpgradeRefreshesFilesPreservesStorageAndKeepsOfficialV2Grants(t 
 	if oldPlannerManifest == string(bundled["kimicode-plus.planner"]["plugin.json"]) {
 		t.Fatal("expected planner bundled version to be 1.0.5")
 	}
-	oldMonitorManifest := strings.Replace(string(bundled["kimicode-plus.monitor"]["plugin.json"]), `"version": "1.1.0"`, `"version": "1.0.1"`, 1)
+	oldMonitorManifest := strings.Replace(string(bundled["kimicode-plus.monitor"]["plugin.json"]), `"version": "1.1.1"`, `"version": "1.0.1"`, 1)
 	if oldMonitorManifest == string(bundled["kimicode-plus.monitor"]["plugin.json"]) {
-		t.Fatal("expected monitor bundled version to be 1.1.0")
+		t.Fatal("expected monitor bundled version to be 1.1.1")
 	}
 
 	legacySet := map[string]map[string][]byte{
@@ -292,8 +292,12 @@ func TestBundledUpgradeRefreshesFilesPreservesStorageAndKeepsOfficialV2Grants(t 
 	}
 
 	monitorItem, ok := cur.Get("kimicode-plus.monitor")
-	if !ok || !monitorItem.Official || monitorItem.Version != "1.1.0" {
-		t.Fatalf("monitor = %+v (ok=%v), want official v1.1.0", monitorItem, ok)
+	if !ok || !monitorItem.Official || monitorItem.Version != "1.1.1" {
+		t.Fatalf("monitor = %+v (ok=%v), want official v1.1.1", monitorItem, ok)
+	}
+	monitorSettings, readErr := os.ReadFile(filepath.Join(root, "plugins", "kimicode-plus.monitor", "settings.js"))
+	if readErr != nil || string(monitorSettings) != string(bundled["kimicode-plus.monitor"]["settings.js"]) {
+		t.Fatalf("monitor settings.js on disk was not updated to bundled bytes (err=%v)", readErr)
 	}
 
 	storedSite, found, err := cur.PluginStorage(ctx, "kimicode-plus.planner", "lastSite")

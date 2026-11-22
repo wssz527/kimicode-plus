@@ -500,33 +500,88 @@ type sessionDir struct {
 	ModTime time.Time
 }
 
+func isDirectory(path string, entry os.DirEntry) (isDir bool, brokenSymlink bool) {
+	if entry.IsDir() {
+		return true, false
+	}
+	mode := entry.Type()
+	if mode&os.ModeSymlink == 0 && mode != 0 {
+		return false, false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, mode&os.ModeSymlink != 0
+	}
+	return info.IsDir(), false
+}
+
+func canonicalDir(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil && resolved != "" {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(path)
+}
+
+func newerTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
 // discover walks <home>/sessions/<bucket>/<session_id>/ and returns sessions
 // newest-modified first, so a bounded scan covers the sessions a user is
-// actually looking at.
-func discover(home string) ([]sessionDir, error) {
+// actually looking at. It follows directory symlinks, deduplicates aliases
+// pointing to the same target, and reports incomplete=true when any symlinked
+// or unreadable bucket could not be traversed (for example an unmounted volume)
+// so callers do not prune cached history on partial visibility.
+func discover(home string) ([]sessionDir, bool, error) {
 	root := filepath.Join(home, "sessions")
 	buckets, err := os.ReadDir(root)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, false, nil
 		}
-		return nil, err
+		return nil, false, err
 	}
 	found := []sessionDir{}
+	seenBuckets := map[string]bool{}
+	seenSessions := map[string]int{}
+	incomplete := false
 	for _, bucket := range buckets {
-		if !bucket.IsDir() {
+		bucketPath := filepath.Join(root, bucket.Name())
+		isDir, broken := isDirectory(bucketPath, bucket)
+		if broken {
+			incomplete = true
 			continue
 		}
-		bucketPath := filepath.Join(root, bucket.Name())
-		sessions, readErr := os.ReadDir(bucketPath)
+		if !isDir {
+			continue
+		}
+		realBucket := canonicalDir(bucketPath)
+		if seenBuckets[realBucket] {
+			continue
+		}
+		seenBuckets[realBucket] = true
+		sessions, readErr := os.ReadDir(realBucket)
 		if readErr != nil {
+			incomplete = true
 			continue
 		}
 		for _, session := range sessions {
-			if !session.IsDir() || !strings.HasPrefix(session.Name(), "session_") {
+			if !strings.HasPrefix(session.Name(), "session_") {
 				continue
 			}
-			dir := filepath.Join(bucketPath, session.Name())
+			sessionPath := filepath.Join(realBucket, session.Name())
+			sessionIsDir, sessionBroken := isDirectory(sessionPath, session)
+			if sessionBroken {
+				incomplete = true
+				continue
+			}
+			if !sessionIsDir {
+				continue
+			}
+			dir := canonicalDir(sessionPath)
 			meta, metaErr := readSessionMeta(filepath.Join(dir, "state.json"))
 			if metaErr != nil && !os.IsNotExist(metaErr) {
 				continue
@@ -534,22 +589,38 @@ func discover(home string) ([]sessionDir, error) {
 			if meta.ID == "" {
 				meta.ID = session.Name()
 			}
+			agentsDir := filepath.Join(dir, "agents")
 			agents := []string{}
-			if entries, agentErr := os.ReadDir(filepath.Join(dir, "agents")); agentErr == nil {
+			modTime := millis(meta.UpdatedAt)
+			if info, statErr := os.Stat(filepath.Join(dir, "state.json")); statErr == nil {
+				modTime = newerTime(modTime, info.ModTime())
+			}
+			if info, statErr := os.Stat(agentsDir); statErr == nil {
+				modTime = newerTime(modTime, info.ModTime())
+			}
+			if entries, agentErr := os.ReadDir(agentsDir); agentErr == nil {
 				for _, entry := range entries {
-					if entry.IsDir() {
-						agents = append(agents, entry.Name())
+					agentPath := filepath.Join(agentsDir, entry.Name())
+					agentIsDir, _ := isDirectory(agentPath, entry)
+					if !agentIsDir {
+						continue
+					}
+					agents = append(agents, entry.Name())
+					if info, statErr := os.Stat(filepath.Join(agentPath, "wire.jsonl")); statErr == nil {
+						modTime = newerTime(modTime, info.ModTime())
 					}
 				}
 			}
 			sort.Strings(agents)
-			modTime := time.Time{}
-			if info, statErr := os.Stat(filepath.Join(dir, "agents")); statErr == nil {
-				modTime = info.ModTime()
-			} else if info, statErr := os.Stat(filepath.Join(dir, "state.json")); statErr == nil {
-				modTime = info.ModTime()
+			candidate := sessionDir{ID: meta.ID, Dir: dir, Meta: meta, Agents: agents, ModTime: modTime}
+			if existingIndex, exists := seenSessions[meta.ID]; exists {
+				if candidate.ModTime.After(found[existingIndex].ModTime) {
+					found[existingIndex] = candidate
+				}
+				continue
 			}
-			found = append(found, sessionDir{ID: meta.ID, Dir: dir, Meta: meta, Agents: agents, ModTime: modTime})
+			seenSessions[meta.ID] = len(found)
+			found = append(found, candidate)
 		}
 	}
 	sort.Slice(found, func(i, j int) bool {
@@ -558,5 +629,5 @@ func discover(home string) ([]sessionDir, error) {
 		}
 		return found[i].ModTime.After(found[j].ModTime)
 	})
-	return found, nil
+	return found, incomplete, nil
 }
