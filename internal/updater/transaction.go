@@ -16,14 +16,15 @@ const (
 	transactionName       = "transaction.json"
 	activeTransactionName = "active-tx.json"
 
-	phasePrepared    = "prepared"
-	phaseBackedUp    = "backed_up"
-	phaseReplaced    = "replaced"
-	phaseVerifying   = "verifying"
-	phaseRollingBack = "rolling_back"
-	phaseCommitted   = "committed"
-	phaseRolledBack  = "rolled_back"
-	phaseFailed      = "failed"
+	phasePrepared      = "prepared"
+	phaseBackedUp      = "backed_up"
+	phaseReplaced      = "replaced"
+	phaseVerifying     = "verifying"
+	phaseRollingBack   = "rolling_back"
+	phaseFilesRestored = "files_restored"
+	phaseCommitted     = "committed"
+	phaseRolledBack    = "rolled_back"
+	phaseFailed        = "failed"
 )
 
 // updateTransaction records what one update is doing and where its independent
@@ -185,7 +186,7 @@ func databaseFile(name string) bool {
 func restoreDatabases(dataDir, backupDir string) error {
 	entries, err := os.ReadDir(backupDir)
 	if errors.Is(err, os.ErrNotExist) {
-		return errors.New("数据库备份目录不存在")
+		return fmt.Errorf("数据库备份目录不存在：%w", err)
 	}
 	if err != nil {
 		return err

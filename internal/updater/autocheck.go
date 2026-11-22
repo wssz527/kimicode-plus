@@ -137,7 +137,7 @@ func (m *Manager) autoCheckAllowed(force bool) bool {
 		return false
 	}
 	switch status.State {
-	case Checking, Available, Downloading, Verifying, Restarting, Updated:
+	case Checking, Available, Downloading, Verifying, Restarting:
 		return false
 	}
 	m.mu.RLock()

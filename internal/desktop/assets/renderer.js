@@ -35,7 +35,8 @@ async function installNativeRenderer(options) {
         body: nativeStringify({ protocol: 1, id, action, payload }),
       });
       body = await response.json().catch(() => null);
-      const refused = !response.ok || (body?.error && bridgeRejectedBeforeDispatch(body.error.code));
+      const code = body?.error?.code || (!response.ok ? `HTTP_${response.status}` : '');
+      const refused = (!response.ok || body?.error) && bridgeRejectedBeforeDispatch(code);
       if (!refused || attempt === 1) break;
       // A rotated bridge key or a rebinding window is visible for a few hundred
       // milliseconds. One retry rides that out instead of surfacing an error
@@ -138,6 +139,7 @@ async function installNativeRenderer(options) {
     unsubscribeUpdate: null,
     officialSections: new Map(),
     officialPluginsTabActive: false,
+    officialPluginsTabPending: false,
     officialPluginsPanel: null,
     officialPluginsSeg: null,
     officialPluginsTabBtn: null,
@@ -449,6 +451,10 @@ async function installNativeRenderer(options) {
         const officialBtn = seg
           ? seg.querySelector('button[role="tab"]:not([data-ekd-plugins-tab]), .ui-seg__item:not([data-ekd-plugins-tab])')
           : null;
+        if (seg && officialBtn && state.officialPluginsTabPending) {
+          state.officialPluginsTabActive = true;
+          state.officialPluginsTabPending = false;
+        }
         if (officialDetailOpen) {
           clearOfficialPluginsTab(true);
         } else if (seg && officialBtn) {
@@ -924,6 +930,7 @@ async function installNativeRenderer(options) {
     }
   }
   function detachSettings() {
+    state.officialPluginsTabPending = false;
     state.settingsObserver?.disconnect();
     state.settingsObserver = null;
     unmountAllOfficialSections();
@@ -964,6 +971,7 @@ async function installNativeRenderer(options) {
     state.settingsHandle = mount(element, kind === 'cache' ? 'settings-cache' : 'settings', host);
   }
   async function openSettings(tab) {
+    state.officialPluginsTabPending = tab === 'plugins-ekd';
     if (!module.findSettingsDialogParts(document)) {
       const button = document.querySelector('button.side-footer-settings');
       if (!button) throw new Error('官方设置入口未就绪');
@@ -983,7 +991,6 @@ async function installNativeRenderer(options) {
     }
     if (wantOfficial) {
       if (state.settingsActiveTab) deactivateSettings();
-      if (tab === 'plugins-ekd') state.officialPluginsTabActive = true;
       const targetTab = findOfficialTab(targetOfficialTab);
       if (!targetTab) throw new Error(`官方「${targetOfficialTab}」标签未找到`);
       targetTab.click();

@@ -374,6 +374,48 @@ func TestConfirmStripsLoaderFromBackup(t *testing.T) {
 	}
 }
 
+func TestConfirmNeverOverwritesCleanCurrentIndexWithStaleBackup(t *testing.T) {
+	f := newFake(t)
+	current := "<html><head><script src=\"/assets/new-release.js\"></script></head></html>"
+	if err := os.WriteFile(f.indexPath(), []byte(current), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.backupPath(), []byte(originalIndex), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := f.service(t).Confirm(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RestoredIndex {
+		t.Fatal("a clean current page was reported as restored")
+	}
+	if got := f.read(t, f.indexPath()); got != current {
+		t.Fatalf("stale backup replaced the current release: %q", got)
+	}
+	if f.exists(f.backupPath()) {
+		t.Fatal("stale backup was not cleaned up")
+	}
+}
+
+func TestConfirmUsesCurrentIndexWhenBackupIsFromAnotherRelease(t *testing.T) {
+	f := newFake(t)
+	current := "<html><head><script src=\"/assets/new-release.js\"></script></head></html>"
+	patched := injectLoader(t, current, "new")
+	if err := os.WriteFile(f.indexPath(), []byte(patched), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.backupPath(), []byte(originalIndex), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service(t).Confirm(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.read(t, f.indexPath()); got != current {
+		t.Fatalf("cross-release backup replaced current content: %q", got)
+	}
+}
+
 func TestConfirmIsIdempotent(t *testing.T) {
 	f := newFake(t)
 	f.patch(t, true, true)

@@ -98,12 +98,12 @@ type AccountsState struct {
 	VaultOSKeychainBackend   string                `json:"vaultOsKeychainBackend,omitempty"`
 	LegacyPasswordVault      bool                  `json:"legacyPasswordVault"`
 	SignedIn                 bool                  `json:"signedIn"`
-	CurrentAccountID string                `json:"currentAccountId,omitempty"`
-	CurrentProfile   *AccountProfile       `json:"currentProfile,omitempty"`
-	Accounts         []AccountSummary      `json:"accounts"`
-	PendingSwitch    *AccountPendingSwitch `json:"pendingSwitch,omitempty"`
-	AddFlow          *AccountAddFlow       `json:"addFlow,omitempty"`
-	CLIRunning       bool                  `json:"cliRunning"`
+	CurrentAccountID         string                `json:"currentAccountId,omitempty"`
+	CurrentProfile           *AccountProfile       `json:"currentProfile,omitempty"`
+	Accounts                 []AccountSummary      `json:"accounts"`
+	PendingSwitch            *AccountPendingSwitch `json:"pendingSwitch,omitempty"`
+	AddFlow                  *AccountAddFlow       `json:"addFlow,omitempty"`
+	CLIRunning               bool                  `json:"cliRunning"`
 }
 
 type AccountSwitchPreflight struct {
@@ -181,6 +181,9 @@ func (s *NativeService) UseVault(vault *credentials.Vault) {
 		s.accountVault = vault.KimiAccountStore()
 	}
 	s.mu.Unlock()
+	if vault != nil {
+		vault.UseOnReset(s.resetAccountMetadata)
+	}
 }
 
 func (s *NativeService) currentVault() *credentials.Vault {
@@ -707,6 +710,18 @@ func (s *NativeService) accountsList(ctx context.Context, input map[string]any) 
 	}, nil
 }
 
+func (s *NativeService) resetAccountMetadata(ctx context.Context) error {
+	s.accountsCancelPending()
+	s.accountMu.Lock()
+	s.addFlow = nil
+	s.accountMu.Unlock()
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM kimi_accounts`); err != nil {
+		return err
+	}
+	s.bus.Publish("accounts", map[string]any{"type": "vault.reset"})
+	return nil
+}
+
 func (s *NativeService) accountsResetVault(ctx context.Context, input map[string]any) (AccountsState, error) {
 	confirm, _ := input["confirm"].(bool)
 	if !confirm {
@@ -716,17 +731,9 @@ func (s *NativeService) accountsResetVault(ctx context.Context, input map[string
 	if rawVault == nil {
 		return AccountsState{}, errors.New("加密凭据库不可用")
 	}
-	s.accountsCancelPending()
-	s.accountMu.Lock()
-	s.addFlow = nil
-	s.accountMu.Unlock()
 	if err := rawVault.Reset(ctx); err != nil {
 		return AccountsState{}, err
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM kimi_accounts`); err != nil {
-		return AccountsState{}, err
-	}
-	s.bus.Publish("accounts", map[string]any{"type": "vault.reset"})
 	return s.accountsList(ctx, nil)
 }
 
@@ -1576,12 +1583,18 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 				oauthObj[key] = value
 			}
 		}
+		updatedProvider["baseUrl"] = firstNonEmpty(targetSecret.BaseURL, targetRow.BaseURL, defaultManagedBaseURL)
+		delete(updatedProvider, "base_url")
 		oauthObj["key"] = "oauth/" + sanitizeOAuthKey(targetOAuthKey)
 		if _, ok := oauthObj["storage"]; !ok {
 			oauthObj["storage"] = "file"
 		}
+		delete(oauthObj, "host")
+		delete(oauthObj, "oauth_host")
 		if h := firstNonEmpty(targetSecret.OAuthHost, targetRow.OAuthHost); h != "" {
 			oauthObj["oauthHost"] = h
+		} else {
+			delete(oauthObj, "oauthHost")
 		}
 		updatedProvider["oauth"] = oauthObj
 		// An error response can arrive after the configuration change was applied.

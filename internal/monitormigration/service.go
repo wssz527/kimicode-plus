@@ -350,32 +350,38 @@ func (s *Service) Confirm(ctx context.Context) (Result, error) {
 func (s *Service) restoreIndex(distDir string) (bool, error) {
 	indexPath := filepath.Join(distDir, indexName)
 	backupPath := filepath.Join(distDir, backupName)
-	backup, err := s.sys.ReadFile(backupPath)
-	switch {
-	case err == nil:
-		if writeErr := s.writeIndex(indexPath, stripLoaderScript(backup)); writeErr != nil {
-			return false, writeErr
+	current, readErr := s.sys.ReadFile(indexPath)
+	if readErr == nil && !bytes.Contains(current, []byte(loaderPath)) {
+		if err := s.sys.Remove(backupPath); err != nil && !os.IsNotExist(err) {
+			return false, fmt.Errorf("无法删除残留备份 %s：%w", backupPath, err)
 		}
+		return false, nil
+	}
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return false, fmt.Errorf("无法读取 %s：%w", indexPath, readErr)
+	}
+
+	backup, backupErr := s.sys.ReadFile(backupPath)
+	if backupErr != nil && !os.IsNotExist(backupErr) {
+		return false, fmt.Errorf("无法读取备份 %s：%w", backupPath, backupErr)
+	}
+	if os.IsNotExist(readErr) && os.IsNotExist(backupErr) {
+		return false, nil
+	}
+	restored := stripLoaderScript(current)
+	if backupErr == nil {
+		fromBackup := stripLoaderScript(backup)
+		if os.IsNotExist(readErr) || bytes.Equal(restored, fromBackup) {
+			restored = fromBackup
+		}
+	}
+	if writeErr := s.writeIndex(indexPath, restored); writeErr != nil {
+		return false, writeErr
+	}
+	if backupErr == nil {
 		if removeErr := s.sys.Remove(backupPath); removeErr != nil {
 			return true, fmt.Errorf("无法删除备份 %s：%w", backupPath, removeErr)
 		}
-		return true, nil
-	case !os.IsNotExist(err):
-		return false, fmt.Errorf("无法读取备份 %s：%w", backupPath, err)
-	}
-
-	current, readErr := s.sys.ReadFile(indexPath)
-	if readErr != nil {
-		if os.IsNotExist(readErr) {
-			return false, nil
-		}
-		return false, fmt.Errorf("无法读取 %s：%w", indexPath, readErr)
-	}
-	if !bytes.Contains(current, []byte(loaderPath)) {
-		return false, nil
-	}
-	if writeErr := s.writeIndex(indexPath, stripLoaderScript(current)); writeErr != nil {
-		return false, writeErr
 	}
 	return true, nil
 }
@@ -416,7 +422,7 @@ func stripLoaderScript(index []byte) []byte {
 		if strings.TrimSpace(cleaned) == "" {
 			continue
 		}
-		if len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+		if len(out) > 0 && (strings.Contains(strings.ToLower(cleaned), "</head>") || strings.TrimSpace(out[len(out)-1]) == "") {
 			out[len(out)-1] += strings.TrimLeft(cleaned, " \t")
 			continue
 		}

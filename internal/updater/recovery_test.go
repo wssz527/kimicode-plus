@@ -45,6 +45,9 @@ func TestInterruptedTransactionRestoresDatabasesAndBinary(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dataDir, "enhancement.db-wal")); !os.IsNotExist(err) {
 		t.Fatal("candidate journal survived the recovery")
 	}
+	if !strings.Contains(recovery.detail, phaseReplaced) || strings.Contains(recovery.detail, "rolled_back 阶段") {
+		t.Fatalf("recovery reported the rewritten phase instead of the interrupted phase: %q", recovery.detail)
+	}
 	if active := readActiveTransaction(dataDir); active != nil {
 		t.Fatalf("recovered transaction still blocks new updates: %+v", active)
 	}
@@ -144,6 +147,34 @@ func TestInterruptedCommittedTransactionReportsUpdated(t *testing.T) {
 	}
 }
 
+func TestInterruptedTransactionWithMissingDatabaseBackupDoesNotLoop(t *testing.T) {
+	dataDir := t.TempDir()
+	executable := filepath.Join(t.TempDir(), "enhanced-kimi")
+	writeTestFile(t, executable, "previous", 0o755)
+	writeTestFile(t, filepath.Join(dataDir, "enhancement.db"), "candidate schema", 0o600)
+	tx := newTestTransaction(t, dataDir, executable)
+	if err := updateFile(executable, tx.BackupPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(tx.DBBackupDir); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, executable, "candidate", 0o755)
+	if err := tx.setPhase(phaseReplaced); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := recoverInterruptedTransaction(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovery.state != Failed || !strings.Contains(recovery.detail, "数据库备份目录不存在") {
+		t.Fatalf("missing backup was not reported: %+v", recovery)
+	}
+	if active := readActiveTransaction(dataDir); active != nil || hasRecoverableActiveTransaction(dataDir) {
+		t.Fatalf("missing backup left a permanent recovery loop: %+v", active)
+	}
+}
+
 func TestPreservedFailedTransactionAutoRecoversOnNextAcquire(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "core")
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -189,5 +220,26 @@ func TestPreservedFailedTransactionAutoRecoversOnNextAcquire(t *testing.T) {
 	}
 	if active := readActiveTransaction(dataDir); active != nil {
 		t.Fatalf("active-tx was not cleared after auto-recovery: %+v", active)
+	}
+}
+
+func TestFilesRestoredFailureNeverRestoresDatabaseAgain(t *testing.T) {
+	dataDir := t.TempDir()
+	executable := filepath.Join(t.TempDir(), "enhanced-kimi")
+	writeTestFile(t, executable, "previous", 0o755)
+	writeTestFile(t, filepath.Join(dataDir, "enhancement.db"), "new user data", 0o600)
+	tx := newTestTransaction(t, dataDir, executable)
+	if err := tx.setPhase(phaseFilesRestored); err != nil {
+		t.Fatal(err)
+	}
+	if hasRecoverableActiveTransaction(dataDir) {
+		t.Fatal("a completed file rollback remained recoverable")
+	}
+	recovery, err := recoverInterruptedTransaction(dataDir)
+	if err != nil || recovery.state != Failed {
+		t.Fatalf("files-restored recovery = %+v, %v", recovery, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(dataDir, "enhancement.db")); err != nil || string(data) != "new user data" {
+		t.Fatalf("new user data was overwritten: %q, %v", data, err)
 	}
 }

@@ -230,7 +230,59 @@ func TestLaunchdHandoverHealthyUpdateDoesNotSelfRollback(t *testing.T) {
 	}
 }
 
+func TestStopLaunchdCoreWaitsForCapturedProcessExit(t *testing.T) {
+	previousRunner, previousAlive := launchdRunner, launchdProcessAlive
+	t.Cleanup(func() {
+		launchdRunner, launchdProcessAlive = previousRunner, previousAlive
+	})
+	fake := &fakeLaunchdHandover{activePID: 4321}
+	launchdRunner = fake
+	released := make(chan struct{})
+	observed := make(chan struct{}, 1)
+	launchdProcessAlive = func(pid int) bool {
+		if pid != 4321 {
+			t.Fatalf("unexpected pid: %d", pid)
+		}
+		observed <- struct{}{}
+		select {
+		case <-released:
+			return false
+		default:
+			return true
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- (supervisorJob{LaunchdLabel: launchdDefaultLabel}).stopLaunchdCore() }()
+	select {
+	case <-observed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not check the captured process")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("stop returned while the captured process was alive: %v", err)
+	default:
+	}
+	close(released)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not finish after process exit")
+	}
+}
+
 func TestLaunchdHandoverUnhealthyCandidateRollsBackBinaryAndDB(t *testing.T) {
+	testLaunchdHandoverRollback(t, true)
+}
+
+func TestLaunchdRollbackWithUnhealthyRestoredCoreDoesNotPreserveActiveTransaction(t *testing.T) {
+	testLaunchdHandoverRollback(t, false)
+}
+
+func testLaunchdHandoverRollback(t *testing.T, restoredHealthy bool) {
 	prevRunner := launchdRunner
 	prevTimeout := coreTimeout
 	coreTimeout = 1500 * time.Millisecond
@@ -259,10 +311,15 @@ func TestLaunchdHandoverUnhealthyCandidateRollsBackBinaryAndDB(t *testing.T) {
 					{"id": "plugins", "state": "FAULTED", "message": "schema migration failed"},
 				}, true
 			}
-			return "0.2.0", []map[string]any{
+			oldModules := []map[string]any{
 				{"id": "registry", "state": "READY"},
 				{"id": "plugins", "state": "READY"},
-			}, false
+			}
+			if !restoredHealthy {
+				oldModules[1]["state"] = "FAULTED"
+				oldModules[1]["message"] = "old core health check failed"
+			}
+			return "0.2.0", oldModules, false
 		},
 	}
 	t.Cleanup(fake.cleanup)
@@ -302,8 +359,12 @@ func TestLaunchdHandoverUnhealthyCandidateRollsBackBinaryAndDB(t *testing.T) {
 		t.Fatalf("replaceAndRestart failed: %v", err)
 	}
 	res := readResult(dataDir)
-	if res.State != RolledBack {
-		t.Fatalf("unhealthy launchd handover state = %+v, want RolledBack", res.UpdateResult)
+	wantState, wantBootouts := RolledBack, 1
+	if !restoredHealthy {
+		wantState, wantBootouts = Failed, 2
+	}
+	if res.State != wantState {
+		t.Fatalf("launchd rollback state = %+v, want %s (restoredHealthy=%t)", res.UpdateResult, wantState, restoredHealthy)
 	}
 	if bin, err := os.ReadFile(executable); err != nil || string(bin) != "old-binary-v0.2.0" {
 		t.Fatalf("binary was not restored after launchd rollback: %q, %v", bin, err)
@@ -319,7 +380,7 @@ func TestLaunchdHandoverUnhealthyCandidateRollsBackBinaryAndDB(t *testing.T) {
 	}
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	if fake.kickstarts != 2 || fake.bootouts != 1 {
-		t.Fatalf("kickstarts=%d bootouts=%d, want 2/1", fake.kickstarts, fake.bootouts)
+	if fake.kickstarts != 2 || fake.bootouts != wantBootouts {
+		t.Fatalf("kickstarts=%d bootouts=%d, want 2/%d", fake.kickstarts, fake.bootouts, wantBootouts)
 	}
 }

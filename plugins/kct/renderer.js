@@ -963,7 +963,7 @@ function createSettingsPopover({ ctx, engine, blocks }) {
         credential.textContent = "当前宿主没有打开设置页的入口，请在插件列表里打开“思考内容翻译”。";
         return;
       }
-      void ctx.ui.openSettings().catch(error => {
+      void ctx.ui.openSettings("plugins-ekd").catch(error => {
         credential.textContent = `无法打开设置页：${messageOf(error)}`;
       });
     });

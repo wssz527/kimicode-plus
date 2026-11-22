@@ -446,7 +446,8 @@ func (job supervisorJob) rollback(tx *updateTransaction, gate *startupGate, rece
 	} else {
 		problems = append(problems, "旧核心备份缺失或已损坏")
 	}
-	if len(problems) == 0 {
+	filesRestored := len(problems) == 0
+	if filesRestored {
 		var old *runningCore
 		var err error
 		if job.LaunchdLabel != "" {
@@ -461,7 +462,11 @@ func (job supervisorJob) rollback(tx *updateTransaction, gate *startupGate, rece
 				err = job.waitForHealth(old, job.PreviousVersion)
 			}
 			if err != nil {
-				err = errors.Join(err, old.stop())
+				if old != nil {
+					err = errors.Join(err, old.stop())
+				} else if job.LaunchdLabel != "" {
+					err = errors.Join(err, job.stopLaunchdCore())
+				}
 			}
 		}
 		if err != nil {
@@ -476,9 +481,16 @@ func (job supervisorJob) rollback(tx *updateTransaction, gate *startupGate, rece
 		_ = tx.setPhase(phaseRolledBack)
 		return job.cleanUpTransaction(tx, receipt, RolledBack, reason, nil)
 	}
-	_ = tx.setPhase(phaseFailed)
+	if filesRestored {
+		_ = tx.setPhase(phaseFilesRestored)
+	} else {
+		_ = tx.setPhase(phaseFailed)
+	}
 	reason := fmt.Sprintf("更新失败（%v）；%s；备份保留在 %s", cause, strings.Join(problems, "；"), tx.dir)
-	if !backupOK {
+	// A restored old core may keep writing after a health-check failure. Clearing
+	// the active transaction prevents a later restart from restoring the stale
+	// database snapshot over those new writes.
+	if filesRestored || !backupOK {
 		_ = clearActiveTransaction(job.DataDir)
 	}
 	return receipt.finish(job.DataDir, Failed, reason)

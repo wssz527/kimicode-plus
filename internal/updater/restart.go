@@ -207,6 +207,9 @@ func recoverInterruptedTransaction(dataDir string) (interruptedRecovery, error) 
 	case phaseCommitted:
 		_ = clearActiveTransaction(dataDir)
 		return interruptedRecovery{state: Updated}, nil
+	case phaseFilesRestored:
+		_ = clearActiveTransaction(dataDir)
+		return interruptedRecovery{state: Failed, detail: "更新回滚已还原数据库与核心文件，但旧核心未恢复健康；不会重复还原旧备份"}, nil
 	case phaseReplaced, phaseVerifying, phaseRollingBack, phaseFailed:
 	default:
 		_ = clearActiveTransaction(dataDir)
@@ -239,9 +242,10 @@ func recoverInterruptedTransaction(dataDir string) (interruptedRecovery, error) 
 		}
 		return interruptedRecovery{state: Failed, detail: fmt.Sprintf("更新在 %s 阶段中断（正在运行的核心为%s版本）；%s；备份保留在 %s", tx.Phase, runningLabel(runningCandidate), strings.Join(problems, "；"), tx.dir)}, nil
 	}
+	interruptedPhase := tx.Phase
 	_ = tx.setPhase(phaseRolledBack)
 	_ = clearActiveTransaction(dataDir)
-	detail := fmt.Sprintf("更新在 %s 阶段被中断，已还原数据库与核心文件", tx.Phase)
+	detail := fmt.Sprintf("更新在 %s 阶段被中断，已还原数据库与核心文件", interruptedPhase)
 	if runningCandidate {
 		detail += "；当前进程是已回滚的新版核心，即将退出以便旧版启动"
 	}

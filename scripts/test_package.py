@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the build-manifest gate in scripts/package.py.
+"""Tests for release packaging and update metadata in scripts/package.py.
 
 Every case runs in a temporary directory: the real dist/ is never read or
 written, because a packaging test must not be able to publish anything.
@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ('darwin-arm64', 'darwin-amd64', 'windows-amd64')
@@ -96,6 +97,21 @@ class PackageManifestGateTest(unittest.TestCase):
             self.assertTrue(archive.is_file(), archive.name)
         published = json.loads((release / 'manifest.json').read_text(encoding='utf-8'))
         self.assertEqual([entry['version'] for entry in published], [self.harness.version] * len(TARGETS))
+
+    def test_release_metadata_is_written_to_every_manifest_entry(self):
+        self.harness.write_manifest()
+        with mock.patch.dict(os.environ, {
+            'RELEASE_PUBLISHED_AT': '2026-11-22T08:00:00Z',
+            'RELEASE_NOTES': '修复更新检查\n\n保留 SHA-256 校验',
+        }):
+            result = self.harness.run('--version', self.harness.version)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        published = json.loads(
+            (self.harness.root / 'dist' / 'release' / 'manifest.json').read_text(encoding='utf-8')
+        )
+        for entry in published:
+            self.assertEqual(entry['publishedAt'], '2026-11-22T08:00:00Z')
+            self.assertEqual(entry['releaseNotes'], '修复更新检查\n\n保留 SHA-256 校验')
 
     def test_missing_manifest_is_refused_with_a_rebuild_hint(self):
         result = self.harness.run('--version', self.harness.version)

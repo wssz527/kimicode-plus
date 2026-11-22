@@ -170,6 +170,8 @@ def main():
 
     release = dist / 'release'
     release.mkdir(exist_ok=True)
+    published_at = os.environ.get('RELEASE_PUBLISHED_AT', '').strip()
+    release_notes = os.environ.get('RELEASE_NOTES', '').strip()
     manifest = []
     for target, binary in zip(TARGETS, binaries):
         extension = 'zip' if target.startswith('windows') else 'tar.gz'
@@ -182,7 +184,7 @@ def main():
             ('RUN.txt', run_instructions(version, target, binary.name), 0o644),
         ]
         write_archive(archive, entries)
-        manifest.append({
+        entry = {
             'version': version,
             'target': target,
             'binaryName': binary.name,
@@ -191,7 +193,12 @@ def main():
             'packageBytes': archive.stat().st_size,
             'unpackedBytes': sum(len(data) for _, data, _ in entries),
             'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
-        })
+        }
+        if published_at:
+            entry['publishedAt'] = published_at
+        if release_notes:
+            entry['releaseNotes'] = release_notes
+        manifest.append(entry)
     manifest_json = json.dumps(manifest, indent=2)
     (release / 'manifest.json').write_text(manifest_json + '\n', encoding='utf-8')
     (release / 'SHA256SUMS').write_text(''.join(f'{entry["sha256"]}  {entry["archive"]}\n' for entry in manifest), encoding='utf-8')

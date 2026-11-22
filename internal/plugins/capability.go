@@ -422,6 +422,10 @@ func (g Grants) AuthorizeNetURL(action string, parsed *url.URL) error {
 		return nil
 	}
 	if parsed != nil && parsed.Scheme == "https" && g.Has(CapNetHTTPS) {
+		host := strings.TrimSuffix(parsed.Hostname(), ".")
+		if _, err := parseNetHost(host); err != nil {
+			return apiError(403, "PLUGIN_NET_HOST_DENIED", "插件网络目标主机名无效 "+host)
+		}
 		return nil
 	}
 	host := ""

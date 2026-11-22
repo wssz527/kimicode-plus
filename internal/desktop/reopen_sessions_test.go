@@ -21,6 +21,7 @@ func TestReopenSessionActivity(t *testing.T) {
 	}{
 		{"empty", `{"items":[],"has_more":false}`, true, false},
 		{"legacy idle", `{"items":[{"id":"s","busy":false,"main_turn_active":false,"pending_interaction":"none"}],"has_more":false}`, true, false},
+		{"null activity uses legacy fields", `{"items":[{"id":"s","activity":null,"busy":false,"main_turn_active":false,"pending_interaction":"none"}],"has_more":false}`, true, false},
 		{"legacy busy", `{"items":[{"id":"s","busy":true,"main_turn_active":false,"pending_interaction":"none"}],"has_more":false}`, false, true},
 		{"legacy turn", `{"items":[{"id":"s","busy":false,"main_turn_active":true,"pending_interaction":"none"}],"has_more":false}`, false, true},
 		{"legacy approval", `{"items":[{"id":"s","busy":false,"main_turn_active":false,"pending_interaction":"approval"}],"has_more":false}`, false, true},

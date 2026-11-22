@@ -41,6 +41,9 @@ const CAPABILITY_LABELS: Record<string, { title: string; detail: string }> = {
 };
 
 function capabilityLabel(name: string): { title: string; detail: string } {
+  if (name === "net:https") {
+    return { title: "访问任意公网 HTTPS 服务", detail: "经核心代理访问用户配置的公网 HTTPS 地址；仅限加密连接，仍拦截本机与内网地址。" };
+  }
   if (name.startsWith("net:")) {
     const host = name.slice(4);
     if (host === "localhost" || host === "127.0.0.1" || host === "::1") {

@@ -3,6 +3,7 @@
 package updater
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -211,16 +213,45 @@ func defaultLaunchdBootout(label string) error { return launchdRunner.bootout(la
 
 func defaultLaunchdServicePID(label string) (int, error) { return launchdRunner.servicePID(label) }
 
-// stopLaunchdCore terminates the job's current process and waits until launchd
-// reports the job idle, so restored files cannot be replaced mid-startup. The
+var launchdProcessAlive = func(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func runtimeCorePID(dataDir string) int {
+	data, err := os.ReadFile(filepath.Join(dataDir, "runtime.json"))
+	if err != nil {
+		return 0
+	}
+	var runtime struct {
+		PID int `json:"pid"`
+	}
+	if json.Unmarshal(data, &runtime) != nil || runtime.PID <= 0 {
+		return 0
+	}
+	return runtime.PID
+}
+
+// stopLaunchdCore terminates the job's current process and waits for both the
+// launchd job and the captured process to disappear, so restored files cannot be
+// replaced while the old candidate is still closing its databases. The
 // job is unloaded as well: with KeepAlive=true launchd would otherwise start the
 // unhealthy candidate again while the previous release is being restored. The
 // plist stays installed, so the later kickstart reloads the same definition.
 func (job supervisorJob) stopLaunchdCore() error {
+	pid, err := job.launchdServicePID()
+	if err != nil || pid <= 0 {
+		pid = runtimeCorePID(job.DataDir)
+	}
 	_ = job.launchdKill("SIGTERM")
 	_ = job.launchdBootout()
 	for deadline := time.Now().Add(launchdStopTimeout); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
-		if pid, err := job.launchdServicePID(); err != nil || pid <= 0 {
+		servicePID, serviceErr := job.launchdServicePID()
+		processStopped := pid <= 0 || !launchdProcessAlive(pid)
+		if (serviceErr != nil || servicePID <= 0) && processStopped {
 			return nil
 		}
 	}

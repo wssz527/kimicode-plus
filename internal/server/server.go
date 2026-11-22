@@ -34,7 +34,7 @@ import (
 	bundledPlugins "enhancedkimi/plugins"
 )
 
-var Version = "0.2.2"
+var Version = "0.2.3"
 
 type Module struct {
 	ID      string `json:"id"`
@@ -42,15 +42,15 @@ type Module struct {
 	Message string `json:"message,omitempty"`
 }
 type NativeOptions struct {
-	Home             string
-	CWD              string
-	DataDir          string
-	Executable       string
-	Profile          string
-	CoreURL          string
-	PairingToken     string
-	RestartState     func() updater.RestartState
-	RequestRestart   func()
+	Home                  string
+	CWD                   string
+	DataDir               string
+	Executable            string
+	Profile               string
+	CoreURL               string
+	PairingToken          string
+	RestartState          func() updater.RestartState
+	RequestRestart        func()
 	UpdateAPIBaseURL      string
 	UpdateHTTPClient      *http.Client
 	VaultKeyStore         credentials.OSKeyStore
@@ -59,24 +59,24 @@ type NativeOptions struct {
 }
 
 type App struct {
-	Handler       http.Handler
-	Settings      *config.Store
-	modules       []Module
-	pluginClose   func() error
-	pluginSafe    func()
-	pluginManager *plugins.Manager
-	adapter       *desktop.Mock
-	native        *desktop.NativeService
-	updater       *updater.Manager
-	started       time.Time
-	gateway       *gateway.Gateway
-	planner       *chat.PlannerService
-	scheduler     *scheduler.Engine
+	Handler          http.Handler
+	Settings         *config.Store
+	modules          []Module
+	pluginClose      func() error
+	pluginSafe       func()
+	pluginManager    *plugins.Manager
+	adapter          *desktop.Mock
+	native           *desktop.NativeService
+	updater          *updater.Manager
+	started          time.Time
+	gateway          *gateway.Gateway
+	planner          *chat.PlannerService
+	scheduler        *scheduler.Engine
 	kctMigration     *kctmigration.Service
 	monitorMigration *monitormigration.Service
 	winBridge        *windowsBridge
-	gatewayErr    string
-	gatewayBase   string
+	gatewayErr       string
+	gatewayBase      string
 }
 
 // New builds the core without the local gateway. A build that wants /v1 uses

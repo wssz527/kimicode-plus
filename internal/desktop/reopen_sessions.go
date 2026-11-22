@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -34,7 +35,8 @@ type reopenSessionsPage struct {
 // parseReopenActivity normalizes both the 1.4.2 string activity and the older
 // object form. The boolean reports whether an activity field was present.
 func parseReopenActivity(raw json.RawMessage) (string, bool, error) {
-	if len(raw) == 0 {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return "", false, nil
 	}
 	var activity string

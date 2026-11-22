@@ -205,8 +205,8 @@ export function PluginCredentials({ plugin }: { plugin: PluginRecord }) {
           <div className="plugin-credential-form" role="group" aria-label="重置凭据库确认">
             <p className="plugin-credential-detail">
               {osKeychainAvailable
-                ? "重置会清空旧凭据库中已加密的全部凭据，并立即建立一个由系统凭据库托管、已解锁的新库。已保存的凭据值无法恢复，需要重新填写。"
-                : "重置会清空旧凭据库中已加密的全部凭据，随后需要设置一个新的解锁口令。已保存的凭据值无法恢复，需要重新填写。"}
+                ? "重置会清空旧凭据库中已加密的全部插件凭据和 Kimi 账号令牌，并删除已保存的账号记录；当前官方登录不会被退出。随后会立即建立一个由系统凭据库托管、已解锁的新库，已保存的内容需要重新填写。"
+                : "重置会清空旧凭据库中已加密的全部插件凭据和 Kimi 账号令牌，并删除已保存的账号记录；当前官方登录不会被退出。随后需要设置一个新的解锁口令，已保存的内容需要重新填写。"}
             </p>
             <div className="inline-actions">
               <ActionButton variant="danger" icon="check" busy={resetAction.busy} onClick={() => void reset()}>

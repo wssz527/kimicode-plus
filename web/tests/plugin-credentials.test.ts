@@ -119,7 +119,8 @@ test("a forgotten legacy vault password can be reset from the credential panel",
   assert.ok(panel.includes("忘记旧密码？重置凭据库"), "the reset entry is missing");
   assert.ok(panel.includes("确认重置凭据库"), "the second confirmation step is missing");
   assert.ok(panel.includes("vault.reload()"), "a successful reset must reload the vault state");
-  assert.ok(panel.includes("已保存的凭据值无法恢复"), "the copy does not say the stored values are lost");
+  assert.ok(panel.includes("已保存的内容需要重新填写"), "the copy does not say the stored values are lost");
+  assert.ok(panel.includes("Kimi 账号令牌"), "the copy omits account token deletion");
   // The reset is only offered where a password vault actually exists.
   assert.ok(panel.includes("legacyPasswordVault || osKeychainAvailable"), "the reset is offered without a legacy vault");
 });

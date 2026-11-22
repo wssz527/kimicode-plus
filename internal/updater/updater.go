@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	defaultRepo = "wssz527/kimicode-plus"
-	defaultAPI  = "https://api.github.com"
+	defaultRepo     = "wssz527/kimicode-plus"
+	defaultAPI      = "https://api.github.com"
+	defaultReleases = "https://github.com"
 
 	Idle        = "idle"
 	Checking    = "checking"
@@ -53,6 +54,7 @@ type Options struct {
 	Launchd               LaunchdOptions
 	HealthyModules        func() []string
 	APIBaseURL            string
+	ReleaseBaseURL        string
 	AllowInsecureHTTP     bool
 	AllowTemporaryExe     bool
 	GOOS                  string
@@ -110,20 +112,31 @@ type release struct {
 	Assets      []asset `json:"assets"`
 }
 
+type releaseManifestEntry struct {
+	Version      string `json:"version"`
+	Target       string `json:"target"`
+	Archive      string `json:"archive"`
+	PackageBytes int64  `json:"packageBytes"`
+	PublishedAt  string `json:"publishedAt"`
+	ReleaseNotes string `json:"releaseNotes"`
+}
+
 type Manager struct {
-	options   Options
-	current   version
-	repo      string
-	api       string
-	client    http.Client
-	configErr error
-	ctx       context.Context
-	cancel    context.CancelFunc
-	operation sync.Mutex
-	mu        sync.RWMutex
-	status    Status
-	archive   asset
-	checksums asset
+	options     Options
+	current     version
+	repo        string
+	api         string
+	releaseBase string
+	manifest    bool
+	client      http.Client
+	configErr   error
+	ctx         context.Context
+	cancel      context.CancelFunc
+	operation   sync.Mutex
+	mu          sync.RWMutex
+	status      Status
+	archive     asset
+	checksums   asset
 
 	statusWake       chan struct{}
 	publishedState   string
@@ -178,23 +191,31 @@ func New(options Options) *Manager {
 	if m.api == "" {
 		m.api = os.Getenv("EKD_UPDATE_API_BASE")
 	}
+	m.manifest = m.api == "" || options.ReleaseBaseURL != ""
 	if m.api == "" {
 		m.api = defaultAPI
 	}
 	m.api = strings.TrimRight(m.api, "/")
+	m.releaseBase = strings.TrimRight(options.ReleaseBaseURL, "/")
+	if m.releaseBase == "" {
+		m.releaseBase = defaultReleases
+	}
 	apiURL, urlErr := url.Parse(m.api)
+	releaseURL, releaseErr := url.Parse(m.releaseBase)
 	current, validVersion := parseVersion(options.CurrentVersion)
 	m.current = current
 	switch {
 	case !repoPattern.MatchString(m.repo) || strings.HasSuffix(m.repo, "/.") || strings.HasSuffix(m.repo, "/.."):
 		m.configErr = errors.New("EKD_UPDATE_REPO 必须使用有效的 owner/repo 格式")
-	case urlErr != nil || !m.validURL(apiURL) || apiURL.RawQuery != "" || apiURL.ForceQuery:
+	case m.manifest && (releaseErr != nil || !m.validURL(releaseURL) || releaseURL.RawQuery != "" || releaseURL.ForceQuery):
+		m.configErr = errors.New("更新 Release 地址必须是有效的 HTTPS 地址")
+	case !m.manifest && (urlErr != nil || !m.validURL(apiURL) || apiURL.RawQuery != "" || apiURL.ForceQuery):
 		m.configErr = errors.New("更新 API 地址必须是有效的 HTTPS 地址")
 	case !validVersion:
 		m.configErr = errors.New("当前核心版本号无效，无法比较发布版本")
 	}
 	if m.configErr == nil {
-		m.status.ReleaseURL = "https://github.com/" + m.repo + "/releases"
+		m.status.ReleaseURL = m.releaseBase + "/" + m.repo + "/releases"
 	} else {
 		m.status.State, m.status.Error = Failed, m.configErr.Error()
 	}
@@ -327,7 +348,7 @@ func (m *Manager) checkInternal(ctx context.Context, silent bool) (response Stat
 	previous := m.status
 	m.mu.RUnlock()
 	previousArchive, previousChecksums := m.archive, m.checksums
-	status := Status{State: Checking, CurrentVersion: strings.TrimPrefix(m.options.CurrentVersion, "v"), ReleaseURL: "https://github.com/" + m.repo + "/releases"}
+	status := Status{State: Checking, CurrentVersion: strings.TrimPrefix(m.options.CurrentVersion, "v"), ReleaseURL: m.releaseBase + "/" + m.repo + "/releases"}
 	m.archive, m.checksums = asset{}, asset{}
 	m.commit(status)
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -390,7 +411,13 @@ func (m *Manager) checkInternal(ctx context.Context, silent bool) (response Stat
 }
 
 func (m *Manager) latest(ctx context.Context) (*release, error) {
-	res, err := m.get(ctx, m.api+"/repos/"+m.repo+"/releases/latest", "application/vnd.github+json")
+	address := m.api + "/repos/" + m.repo + "/releases/latest"
+	accept := "application/vnd.github+json"
+	if m.manifest {
+		address = m.releaseBase + "/" + m.repo + "/releases/latest/download/manifest.json"
+		accept = "application/json"
+	}
+	res, err := m.get(ctx, address, accept)
 	if err != nil {
 		return nil, fmt.Errorf("无法连接更新服务：%w", err)
 	}
@@ -411,11 +438,49 @@ func (m *Manager) latest(ctx context.Context) (*release, error) {
 	if err != nil {
 		return nil, errors.New("无法读取发布信息或发布信息超过大小限制")
 	}
+	if m.manifest {
+		return m.releaseFromManifest(body)
+	}
 	var latest release
 	if err = json.Unmarshal(body, &latest); err != nil {
 		return nil, errors.New("更新服务返回了无效的发布信息")
 	}
 	return &latest, nil
+}
+
+func (m *Manager) releaseFromManifest(body []byte) (*release, error) {
+	var entries []releaseManifestEntry
+	if err := json.Unmarshal(body, &entries); err != nil || len(entries) == 0 {
+		return nil, errors.New("更新服务返回了无效的发布清单")
+	}
+	version := strings.TrimPrefix(entries[0].Version, "v")
+	if version == "" {
+		return nil, errors.New("更新服务返回了无效的发布清单")
+	}
+	base := m.releaseBase + "/" + m.repo + "/releases"
+	latest := &release{
+		Tag:         "v" + version,
+		PublishedAt: entries[0].PublishedAt,
+		URL:         base + "/tag/" + url.PathEscape("v"+version),
+		Notes:       entries[0].ReleaseNotes,
+	}
+	for _, entry := range entries {
+		if strings.TrimPrefix(entry.Version, "v") != version || entry.PackageBytes < 0 {
+			return nil, errors.New("发布清单包含不一致的版本或无效的包大小")
+		}
+		if entry.Archive != "" {
+			latest.Assets = append(latest.Assets, asset{
+				Name: entry.Archive,
+				URL:  base + "/download/" + url.PathEscape(latest.Tag) + "/" + url.PathEscape(entry.Archive),
+				Size: entry.PackageBytes,
+			})
+		}
+	}
+	latest.Assets = append(latest.Assets, asset{
+		Name: "SHA256SUMS",
+		URL:  base + "/download/" + url.PathEscape(latest.Tag) + "/SHA256SUMS",
+	})
+	return latest, nil
 }
 
 func (m *Manager) get(ctx context.Context, address, accept string) (*http.Response, error) {

@@ -107,7 +107,7 @@ async function installNativeBootstrap(options) {
     if (response.status !== 401 || !options.runtimePath || state.cleaned) return response;
     const failure = await response.clone().json().catch(() => null);
     if (failure?.error?.code !== 'TOKEN_EXPIRED') return response;
-    await refreshCoreSession().catch(error => { console.warn('[EKD] reactive core session renewal failed:', error?.message || String(error)); });
+    if (coreToken === originalToken) await refreshCoreSession().catch(error => { console.warn('[EKD] reactive core session renewal failed:', error?.message || String(error)); });
     if (state.cleaned || coreToken === originalToken) return response;
     await response.body?.cancel();
     // Exactly one retry: a renewed token that is still refused is a real

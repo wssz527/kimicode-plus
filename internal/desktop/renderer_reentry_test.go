@@ -1,6 +1,9 @@
 package desktop
 
 import (
+	"encoding/json"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -51,6 +54,75 @@ func TestRendererCleanupAllowsReentrantInstall(t *testing.T) {
 	} {
 		if !strings.Contains(source, wanted) {
 			t.Fatalf("renderer reentrant cleanup guard is missing: %s", wanted)
+		}
+	}
+}
+
+func TestBridgeRetriesOnlyPreDispatchRefusals(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed; the renderer bridge probe needs it")
+	}
+	source, err := filepath.Abs("assets/renderer.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := `
+const fs = require('node:fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const start = source.indexOf('async function installNativeRenderer(options) {');
+const end = source.indexOf('  const transport = {', start);
+if (start < 0 || end < 0) throw new Error('bridge source not found');
+const prefix = source.slice(start, end) + '\n return bridgeRequest;\n}\nreturn installNativeRenderer;';
+async function run(responses) {
+  let calls = 0;
+  const window = { fetch: async (_url, init) => {
+    const request = JSON.parse(init.body);
+    const item = responses[Math.min(calls++, responses.length - 1)];
+    const body = item.status === 200
+      ? { protocol: 1, id: request.id, result: { ok: true } }
+      : item.code ? { error: { code: item.code, message: 'refused' } } : null;
+    return { status: item.status, ok: item.status === 200, json: async () => body };
+  } };
+  const install = new Function('window', prefix)(window);
+  const request = await install({ endpoint: 'http://bridge', bridgeKey: 'bridge-key', transport: 'windows-cdp-loopback' });
+  try {
+    const result = await request('update.apply', {});
+    return { calls, ok: result.ok === true };
+  } catch (error) {
+    return { calls, error: error.code };
+  }
+}
+(async () => {
+  const results = {
+    expired: await run([{ status: 401, code: 'BRIDGE_SESSION_EXPIRED' }, { status: 200 }]),
+    oversized: await run([{ status: 413, code: 'RPC_TOO_LARGE' }, { status: 200 }]),
+    refused: await run([{ status: 403, code: 'RPC_DENIED' }, { status: 200 }]),
+    httpFailure: await run([{ status: 500 }, { status: 200 }]),
+  };
+  process.stdout.write(JSON.stringify(results));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+`
+	output, err := exec.Command(node, "-e", script, source).Output()
+	if err != nil {
+		t.Fatalf("renderer bridge probe failed: %v\n%s", err, output)
+	}
+	var results map[string]struct {
+		Calls int    `json:"calls"`
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(output, &results); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"expired", "oversized"} {
+		if result := results[name]; result.Calls != 1 || result.OK || result.Error == "" {
+			t.Fatalf("%s semantic failure was retried: %+v", name, result)
+		}
+	}
+	for _, name := range []string{"refused", "httpFailure"} {
+		if result := results[name]; result.Calls != 2 || !result.OK {
+			t.Fatalf("%s pre-dispatch refusal was not retried once: %+v", name, result)
 		}
 	}
 }

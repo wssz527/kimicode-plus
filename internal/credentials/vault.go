@@ -29,6 +29,7 @@ type Vault struct {
 	mu        sync.Mutex
 	key       []byte
 	keyStore  OSKeyStore
+	onReset   func(context.Context) error
 	osManaged bool
 }
 
@@ -144,6 +145,12 @@ func (v *Vault) UseKeyStore(store OSKeyStore) {
 	v.keyStore = store
 }
 
+func (v *Vault) UseOnReset(callback func(context.Context) error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.onReset = callback
+}
+
 func (v *Vault) metaExistsLocked(ctx context.Context) (bool, error) {
 	var one int
 	err := v.db.QueryRowContext(ctx, `SELECT 1 FROM vault_meta WHERE id=1`).Scan(&one)
@@ -204,7 +211,7 @@ func (v *Vault) AutoUnlock(ctx context.Context) error {
 // Reset discards every stored secret and starts a fresh key, which is the only
 // recovery path for a forgotten manual password. With an OS key store the new
 // vault is unlocked again in the same call.
-func (v *Vault) Reset(ctx context.Context) error {
+func (v *Vault) Reset(ctx context.Context) (err error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	tx, err := v.db.BeginTx(ctx, nil)
@@ -225,6 +232,13 @@ func (v *Vault) Reset(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	// Once encrypted rows are gone, dependent account records must not survive
+	// even if recreating the OS-managed key later fails.
+	defer func() {
+		if v.onReset != nil {
+			err = errors.Join(err, v.onReset(ctx))
+		}
+	}()
 	clear(v.key)
 	v.key = nil
 	v.osManaged = false

@@ -72,6 +72,11 @@ test("enhanced plugins keep the 增强插件 name and now mount into the officia
   assert.ok(renderer.includes("settings-agent-permissions"));
   assert.ok(renderer.includes("settings-agent-subagent"));
   assert.ok(renderer.includes("settings-lab"));
+  assert.ok(renderer.includes("officialPluginsTabPending"), "plugins-ekd navigation must survive the official panel transition");
+  const kct = source("../plugins/kct/renderer.js");
+  assert.ok(kct.includes('ctx.ui.openSettings("plugins-ekd")'), "KCT settings must open the enhanced section in the official plugins tab");
+  assert.ok(pluginSettings.includes('name === "net:https"'), "the broad HTTPS grant needs accurate consent copy");
+  assert.ok(pluginSettings.includes("访问任意公网 HTTPS 服务"));
 });
 
 test("resolveSettingsFallbacks activates only disabled official tab probes and keeps KimiCode+ fallback copy", () => {

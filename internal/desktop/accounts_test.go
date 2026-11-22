@@ -27,6 +27,9 @@ type fakeAccountKAP struct {
 	models            map[string]any
 	hasManaged        bool
 	oauthKey          string
+	baseURL           string
+	oauthHost         string
+	legacyHost        string
 	failModels        bool
 	failUser          int
 	wrongUID          string
@@ -46,6 +49,7 @@ func newFakeAccountKAP(t *testing.T) *fakeAccountKAP {
 		tokens:     map[string]AccountProfile{},
 		hasManaged: true,
 		oauthKey:   defaultManagedOAuthKey,
+		baseURL:    defaultManagedBaseURL,
 		sessions: []map[string]any{
 			{"id": "sess-1", "title": "主会话", "updated_at": time.Now().UTC().Format(time.RFC3339Nano), "busy": false, "main_turn_active": false, "pending_interaction": "none"},
 			{"id": "sess-2", "title": "辅助会话", "updated_at": time.Now().UTC().Format(time.RFC3339Nano), "busy": false, "main_turn_active": false, "pending_interaction": "none"},
@@ -148,14 +152,22 @@ func (f *fakeAccountKAP) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		providers := map[string]any{}
 		if f.hasManaged {
+			oauth := map[string]any{
+				"storage": "file",
+				"key":     "oauth/" + sanitizeOAuthKey(f.oauthKey),
+			}
+			if f.oauthHost != "" {
+				oauth["oauthHost"] = f.oauthHost
+			}
+			if f.legacyHost != "" {
+				oauth["host"] = f.legacyHost
+				oauth["oauth_host"] = f.legacyHost
+			}
 			providers["managed:kimi-code"] = map[string]any{
 				"type":    "kimi",
-				"baseUrl": "https://api.kimi.com/coding/v1",
+				"baseUrl": f.baseURL,
 				"apiKey":  "",
-				"oauth": map[string]any{
-					"storage": "file",
-					"key":     "oauth/" + sanitizeOAuthKey(f.oauthKey),
-				},
+				"oauth":   oauth,
 			}
 		}
 		writeNativeTestEnvelope(w, map[string]any{
@@ -176,9 +188,17 @@ func (f *fakeAccountKAP) handle(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 				} else if provider, ok := val.(map[string]any); ok {
+					if baseURL, present := provider["baseUrl"].(string); present {
+						f.baseURL = baseURL
+					}
 					if oauth, ok := provider["oauth"].(map[string]any); ok {
 						if key, ok := oauth["key"].(string); ok && strings.TrimSpace(key) != "" {
 							f.oauthKey = sanitizeOAuthKey(key)
+						}
+						f.oauthHost, _ = oauth["oauthHost"].(string)
+						f.legacyHost, _ = oauth["host"].(string)
+						if f.legacyHost == "" {
+							f.legacyHost, _ = oauth["oauth_host"].(string)
 						}
 					}
 				}
@@ -876,6 +896,30 @@ func TestAccountSwitchKeepsOAuthKeysIsolated(t *testing.T) {
 			service, fake, vault := newAccountTestService(t)
 			accA := saveAccountUnderOAuthKey(t, service, fake, "account-a", "tok-a-v1", "ref-a-v1", "主号A")
 			accB := saveAccountUnderOAuthKey(t, service, fake, "account-b", "tok-b-v1", "ref-b-v1", "备号B")
+			if _, err := service.db.Exec(`UPDATE kimi_accounts SET base_url=?,oauth_host=? WHERE id=?`, "https://old.example/v1", "https://old-oauth.example", accA.ID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.db.Exec(`UPDATE kimi_accounts SET base_url=?,oauth_host='' WHERE id=?`, "https://target.example/v1", accB.ID); err != nil {
+				t.Fatal(err)
+			}
+			var targetSecret storedKimiAccountSecret
+			if err := json.Unmarshal(savedAccountSecret(t, ctx, vault, accB.ID), &targetSecret); err != nil {
+				t.Fatal(err)
+			}
+			targetSecret.BaseURL = "https://target.example/v1"
+			targetSecret.OAuthHost = ""
+			targetSecretJSON, err := json.Marshal(targetSecret)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := vault.KimiAccountStore().Put(ctx, accountVaultRef(accB.ID), targetSecretJSON); err != nil {
+				t.Fatal(err)
+			}
+			fake.mu.Lock()
+			fake.baseURL = "https://old.example/v1"
+			fake.oauthHost = "https://old-oauth.example"
+			fake.legacyHost = "https://old-oauth.example"
+			fake.mu.Unlock()
 
 			// The target path already holds a resolvable token for another account.
 			fake.mu.Lock()
@@ -929,8 +973,8 @@ func TestAccountSwitchKeepsOAuthKeysIsolated(t *testing.T) {
 				if after, err := os.ReadFile(fake.credPathFor("account-a")); err != nil || !bytes.Equal(after, currentBytes) {
 					t.Fatalf("current credential file changed during rollback: %v", err)
 				}
-				if key, _, _, exists, cfgErr := service.readManagedProviderConfig(ctx); cfgErr != nil || !exists || key != "account-a" {
-					t.Fatalf("provider oauth key after rollback = %q (exists=%t, err=%v)", key, exists, cfgErr)
+				if key, host, baseURL, exists, cfgErr := service.readManagedProviderConfig(ctx); cfgErr != nil || !exists || key != "account-a" || host != "https://old-oauth.example" || baseURL != "https://old.example/v1" {
+					t.Fatalf("provider config after rollback = key %q host %q base %q (exists=%t, err=%v)", key, host, baseURL, exists, cfgErr)
 				}
 				if _, err := os.Lstat(fake.credPathFor("account-b") + ".ekd-bak"); !errors.Is(err, os.ErrNotExist) {
 					t.Fatalf("recovery backup still present after complete rollback: %v", err)
@@ -954,13 +998,39 @@ func TestAccountSwitchKeepsOAuthKeysIsolated(t *testing.T) {
 			if got := fake.readDiskTokenFor(t, "account-b").AccessToken; got != "tok-b-v1" {
 				t.Fatalf("target file token = %q, want tok-b-v1", got)
 			}
-			if key, _, _, exists, cfgErr := service.readManagedProviderConfig(ctx); cfgErr != nil || !exists || key != "account-b" {
-				t.Fatalf("provider oauth key after switch = %q (exists=%t, err=%v)", key, exists, cfgErr)
+			if key, host, baseURL, exists, cfgErr := service.readManagedProviderConfig(ctx); cfgErr != nil || !exists || key != "account-b" || host != "" || baseURL != "https://target.example/v1" {
+				t.Fatalf("provider config after switch = key %q host %q base %q (exists=%t, err=%v)", key, host, baseURL, exists, cfgErr)
+			}
+			if fake.legacyHost != "" {
+				t.Fatalf("legacy OAuth host survived the switch: %q", fake.legacyHost)
 			}
 			if _, err := os.Lstat(fake.credPathFor("account-b") + ".ekd-bak"); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("recovery backup still present after successful switch: %v", err)
 			}
 		})
+	}
+}
+
+func TestDirectVaultResetClearsAccountRecordsAndPendingFlows(t *testing.T) {
+	service, fake, vault := newAccountTestService(t)
+	saveTwoTestAccounts(t, service, fake)
+	service.accountMu.Lock()
+	service.addFlow = &AccountAddFlow{Active: true}
+	service.pendingSwitch = &pendingSwitchState{cancel: func() {}}
+	service.accountMu.Unlock()
+	if err := vault.Reset(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state, err := service.accountsList(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Accounts) != 0 || state.PendingSwitch != nil || state.AddFlow != nil {
+		t.Fatalf("direct vault reset left stale account state: %+v", state)
+	}
+	var count int
+	if err := service.db.QueryRow(`SELECT COUNT(*) FROM kimi_accounts`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("account metadata count=%d err=%v", count, err)
 	}
 }
 

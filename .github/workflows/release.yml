@@ -71,6 +71,16 @@ jobs:
               print(f'version={version}', file=output)
               print(f'prerelease={"true" if prerelease else "false"}', file=output)
           PY
+      - name: Verify release packaging
+        run: python3 scripts/test_package.py
+      - name: Prepare release metadata
+        run: |
+          echo "RELEASE_PUBLISHED_AT=$(git log -1 --format=%cI)" >> "$GITHUB_ENV"
+          {
+            echo 'RELEASE_NOTES<<__EKD_RELEASE_NOTES__'
+            git log -1 --format=%B
+            echo '__EKD_RELEASE_NOTES__'
+          } >> "$GITHUB_ENV"
       - name: Refuse to overwrite an existing release
         env:
           GH_TOKEN: ${{ github.token }}

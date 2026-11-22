@@ -163,8 +163,15 @@ function makeCore(state) {
       const token = String(request.headers.authorization || '').replace('Bearer ', '');
       state.requestTokens.push(token);
       if (state.expiredTokens.has(token)) {
-        response.statusCode = 401;
-        response.end(JSON.stringify({ error: { code: 'TOKEN_EXPIRED', message: '增强核心会话凭据已失效或过期，正在重新连接' } }));
+        const reply = () => {
+          response.statusCode = 401;
+          response.end(JSON.stringify({ error: { code: 'TOKEN_EXPIRED', message: '增强核心会话凭据已失效或过期，正在重新连接' } }));
+        };
+        if (state.holdExpired) {
+          state.holdExpired(reply);
+          return;
+        }
+        reply();
         return;
       }
       if (state.forbidden) {
@@ -423,6 +430,40 @@ async function scenarioReopenAfterWindowClosed() {
   return findings;
 }
 
+async function scenarioConcurrentRenewal() {
+  const host = fakeContents('app://renderer/index.html');
+  const electron = makeElectron(host);
+  const expiredReplies = [];
+  const state = {
+    pairingTokens: [], requestTokens: [], expiredTokens: new Set(),
+    holdExpired: reply => { expiredReplies.push(reply); },
+    mint: (() => {
+      let count = 0;
+      return () => (++count === 1
+        ? { token: '{{SECRET_2j9mctzq}}', expiresAt: new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString() }
+        : { token: 'planner-token-123456', expiresAt: new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString() });
+    })(),
+  };
+  const core = makeCore(state);
+  const port = await listen(core);
+  const coreURL = 'http://127.0.0.1:' + port;
+  writeRuntime(coreURL, PAIRING_ONE);
+  const { state: world } = await install(coreURL, PAIRING_ONE, host, electron);
+  state.expiredTokens.add('{{SECRET_2j9mctzq}}');
+  const calls = [bridge(world, host, 'attach.status', {}), bridge(world, host, 'accounts.list', {})];
+  for (let i = 0; i < 200 && expiredReplies.length < 2; i += 1) await settle(1);
+  if (expiredReplies.length !== 2) throw new Error('two requests did not use the expired token');
+  expiredReplies[0]();
+  for (let i = 0; i < 200 && (state.pairingTokens.length < 2 || !state.requestTokens.includes('planner-token-123456')); i += 1) await settle(1);
+  if (state.pairingTokens.length !== 2) throw new Error('first request did not renew');
+  expiredReplies[1]();
+  const results = await Promise.all(calls);
+  const findings = { ok: results.every(result => result.ok === true), pairCalls: state.pairingTokens.length, requestTokens: state.requestTokens };
+  await world.cleanup();
+  core.close();
+  return findings;
+}
+
 async function main() {
   return {
     renewAfterExpiry: await scenarioRenewAfterExpiry(),
@@ -430,6 +471,7 @@ async function main() {
     permissionDenied: await scenarioPermissionDeniedDoesNotRenew(),
     sameCore: await scenarioSameCoreRenewsSilently(),
     restartedCore: await scenarioRestartedCoreRebinds(),
+    concurrentRenewal: await scenarioConcurrentRenewal(),
     reopen: await scenarioReopenAfterWindowClosed(),
     fatal: '',
   };
@@ -487,6 +529,11 @@ type renewalFindings struct {
 		WindowsInState      int      `json:"windowsInState"`
 		RequestTokens       []string `json:"requestTokens"`
 	} `json:"restartedCore"`
+	ConcurrentRenewal struct {
+		OK            bool     `json:"ok"`
+		PairCalls     int      `json:"pairCalls"`
+		RequestTokens []string `json:"requestTokens"`
+	} `json:"concurrentRenewal"`
 	Reopen struct {
 		Before  int `json:"before"`
 		AfterCl struct {
@@ -580,6 +627,9 @@ func TestBootstrapRenewsSessionsAndRebindsWindows(t *testing.T) {
 		t.Fatalf("a restarted core must drop windows bound to the old session: %#v", run.RestartedCore)
 	}
 
+	if run.ConcurrentRenewal.PairCalls != 2 || !run.ConcurrentRenewal.OK || len(run.ConcurrentRenewal.RequestTokens) != 4 {
+		t.Fatalf("a staggered 401 triggered another renewal instead of reusing the new token: %#v", run.ConcurrentRenewal)
+	}
 	if run.Reopen.Before != 1 {
 		t.Fatalf("the initial bind did not happen once: %#v", run.Reopen)
 	}

@@ -107,6 +107,7 @@ type fakeRelease struct {
 	assets       []asset
 	get          atomic.Int32
 	packageGet   atomic.Int32
+	checksumGet  atomic.Int32
 	servePackage http.HandlerFunc
 }
 
@@ -142,6 +143,40 @@ func serveRelease(t *testing.T, releaseData *fakeRelease) *httptest.Server {
 			} else {
 				_, _ = w.Write(releaseData.archive)
 			}
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func serveManifestRelease(t *testing.T, releaseData *fakeRelease) *httptest.Server {
+	t.Helper()
+	t.Setenv("EKD_UPDATE_REPO", "test-owner/test-repo")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		base := "/test-owner/test-repo/releases"
+		switch r.URL.Path {
+		case base + "/latest/download/manifest.json":
+			releaseData.get.Add(1)
+			if r.Method != http.MethodGet || r.Header.Get("Accept") != "application/json" || r.UserAgent() != "KimiCodePlus/0.2.0" {
+				t.Errorf("unexpected manifest request: %s %v", r.Method, r.Header)
+			}
+			if releaseData.status != 0 {
+				w.WriteHeader(releaseData.status)
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]releaseManifestEntry{{
+				Version: strings.TrimPrefix(releaseData.tag, "v"), Target: "darwin-amd64", Archive: releaseData.name,
+				PackageBytes: int64(len(releaseData.archive)), PublishedAt: fixedTime.Format(time.RFC3339), ReleaseNotes: "## Changes\nUpdated from manifest",
+			}})
+		case base + "/download/" + releaseData.tag + "/SHA256SUMS":
+			releaseData.checksumGet.Add(1)
+			_, _ = w.Write([]byte(releaseData.sums))
+		case base + "/download/" + releaseData.tag + "/" + releaseData.name:
+			releaseData.packageGet.Add(1)
+			_, _ = w.Write(releaseData.archive)
 		default:
 			t.Errorf("unexpected request: %s", r.URL.Path)
 			http.NotFound(w, r)
@@ -200,6 +235,45 @@ func TestCheckRelease(t *testing.T) {
 				t.Fatalf("missing metadata: %+v", s)
 			}
 		})
+	}
+}
+
+func TestManifestReleaseCheckAndApply(t *testing.T) {
+	r := darwinRelease(t, "\xcf\xfa\xed\xfe updated from manifest")
+	server := serveManifestRelease(t, r)
+	options := testOptions(t, server.URL, "darwin")
+	options.APIBaseURL = ""
+	options.ReleaseBaseURL = server.URL
+	restarted := false
+	options.RequestRestart = func() { restarted = true }
+	options.launchSupervisor = func(_, _ string) error { return nil }
+	m := New(options)
+	defer m.Close()
+	status, err := m.Check(t.Context())
+	if err != nil || status.State != Available || !status.CanApply || status.LatestVersion != "0.3.0" ||
+		status.ReleaseNotes != "## Changes\nUpdated from manifest" || status.PublishedAt != fixedTime.Format(time.RFC3339) {
+		t.Fatalf("manifest check: %+v, %v", status, err)
+	}
+	status, err = m.Apply(t.Context())
+	if err != nil || status.State != Restarting || !restarted || status.DownloadedBytes != int64(len(r.archive)) {
+		t.Fatalf("manifest apply: %+v, %v", status, err)
+	}
+	if r.get.Load() != 1 || r.checksumGet.Load() != 1 || r.packageGet.Load() != 1 {
+		t.Fatalf("unexpected manifest traffic: checks=%d checksums=%d packages=%d", r.get.Load(), r.checksumGet.Load(), r.packageGet.Load())
+	}
+}
+
+func TestManifestReleaseValidation(t *testing.T) {
+	m := New(Options{CurrentVersion: "0.2.0"})
+	defer m.Close()
+	for _, body := range []string{
+		`{}`, `[]`,
+		`[{"version":"0.3.0","archive":"one"},{"version":"0.3.1","archive":"two"}]`,
+		`[{"version":"0.3.0","archive":"one","packageBytes":-1}]`,
+	} {
+		if _, err := m.releaseFromManifest([]byte(body)); err == nil {
+			t.Fatalf("invalid manifest accepted: %s", body)
+		}
 	}
 }
 

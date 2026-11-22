@@ -587,6 +587,13 @@ func TestProxyBroadGrantRefusesBlockedLiterals(t *testing.T) {
 		"https://LOCALHOST./v1",
 		"https://169.254.169.254/latest/meta-data",
 		"https://10.0.0.5/admin",
+		"https://127.1/",
+		"https://0x7f000001/",
+		"https://2130706433/",
+		"https://2852039166/latest/meta-data",
+		"https://0177.0.0.1/",
+		"https://[fe80::1%25en0]/",
+		"https://metadata/",
 	} {
 		params := json.RawMessage(`{"url":"` + target + `"}`)
 		_, err := manager.proxy(context.Background(), "test.sample", grants, noVault(), "net.fetch", request, params)

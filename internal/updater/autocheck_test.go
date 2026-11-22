@@ -277,6 +277,35 @@ func TestSilentAutoCheckFailureKeepsCalmStatus(t *testing.T) {
 	})
 }
 
+func TestAutoCheckAfterSuccessfulUpdate(t *testing.T) {
+	var attempts atomic.Int32
+	server := updateFeed(t, nil, &attempts, "v0.2.0")
+	options := autoCheckOptions(t)
+	options.APIBaseURL = server.URL
+	options.AllowInsecureHTTP = true
+	options.AutoCheckInitialDelay = time.Millisecond
+	options.AutoCheckInterval = time.Hour
+	if err := os.MkdirAll(filepath.Join(options.DataDir, "updates"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(options.DataDir, "updates", "result.json"), []byte(`{"state":"updated","targetVersion":"0.2.0","previousVersion":"0.1.9"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(options)
+	defer manager.Close()
+	if manager.Status().State != Updated {
+		t.Fatal("test did not restore the successful update receipt")
+	}
+	manager.StartAutoCheck()
+	deadline := time.Now().Add(5 * time.Second)
+	for attempts.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a persisted successful update permanently blocked auto check")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestAutoCheckRespectsSafeMode(t *testing.T) {
 	t.Setenv("EKD_UPDATE_REPO", "test-owner/test-repo")
 	var hits atomic.Int32
