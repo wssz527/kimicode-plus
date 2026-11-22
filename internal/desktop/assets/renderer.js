@@ -1,5 +1,28 @@
 async function installNativeRenderer(options) {
-  if (window.__ekdNativeUI) await window.__ekdNativeUI.remove();
+  const freeze = Object.freeze;
+  const installCtrl = (window.__ekdNativeInstall ??= { seq: 0, chain: Promise.resolve() });
+  const mySeq = ++installCtrl.seq;
+  const isStale = () => installCtrl.seq !== mySeq;
+  const prevUI = window.__ekdNativeUI;
+  let activeRemove = null;
+  let publishedUI = null;
+  let publishedPlugins = null;
+  let publishedBrowserNav = null;
+  const prevRemove = prevUI && typeof prevUI.remove === 'function'
+    ? Promise.resolve().then(() => prevUI.remove()).catch(() => {})
+    : Promise.resolve();
+  const teardownDone = installCtrl.chain.then(() => prevRemove);
+  installCtrl.chain = teardownDone.catch(() => {});
+  const pendingUI = freeze({
+    remove: async () => {
+      if (installCtrl.seq === mySeq) installCtrl.seq += 1;
+      await teardownDone;
+      if (typeof activeRemove === 'function') await activeRemove();
+    },
+  });
+  window.__ekdNativeUI = pendingUI;
+  await teardownDone;
+  if (isStale()) return { status: 'removed', surface: options.surface || 'host', domRevision: 1 };
   // Third-party plugins share this page and can replace globals. Pin the
   // primitives the host depends on before any enhancement or plugin module
   // runs: a plugin that patches window.fetch could otherwise read the
@@ -7,7 +30,6 @@ async function installNativeRenderer(options) {
   const nativeFetch = window.fetch.bind(window);
   const nativeStringify = JSON.stringify;
   const nativeParse = JSON.parse;
-  const freeze = Object.freeze;
   const windowsLoopback = options.transport === 'windows-cdp-loopback';
   // A bridge 401/403 means the host-side channel was rebound or its key rotated,
   // not that the official Kimi account lost its credentials. Keep the two apart
@@ -100,7 +122,17 @@ async function installNativeRenderer(options) {
     },
   };
   const moduleURL = URL.createObjectURL(new Blob([options.moduleSource], { type: 'text/javascript' }));
-  const module = await import(moduleURL);
+  let module;
+  try {
+    module = await import(moduleURL);
+  } catch (error) {
+    URL.revokeObjectURL(moduleURL);
+    throw error;
+  }
+  if (isStale()) {
+    URL.revokeObjectURL(moduleURL);
+    return { status: 'removed', surface: options.surface || 'host', domRevision: 1 };
+  }
   // One poll loop for the whole renderer. Every surface shares it, so three open
   // panels no longer run three overlapping events.poll requests.
   const channel = module.createEventChannel(transport);
@@ -1049,6 +1081,7 @@ async function installNativeRenderer(options) {
     const nativeTab = parts.officialTabs[0];
     if (!nativeTab) return;
     for (const button of injected) button.remove();
+    for (const stale of list.querySelectorAll('[data-ekd-settings-tab]')) stale.remove();
     state.settingsTabs.clear();
     const archived = module.findOfficialSettingsTab(document, 'archived');
     const makeTab = (kind, label, paintIcon) => {
@@ -1836,14 +1869,39 @@ async function installNativeRenderer(options) {
     if (state.sessionContainer) state.sessionContainer.setAttribute('data-ekd-containment', 'sessions');
     scheduleContractReport(evaluation.probes, firstEvaluation || Boolean(module.findSettingsDialogParts(document)));
   }
+  const legacyZombieTimers = [];
+  function reclaimLegacyZombie() {
+    if (state.removed || isStale() || !publishedUI) return;
+    const current = window.__ekdNativeUI;
+    if (!current || current === publishedUI || current === pendingUI) return;
+    window.__ekdNativeUI = publishedUI;
+    if (typeof current.remove === 'function') {
+      void Promise.resolve()
+        .then(() => current.remove())
+        .catch(() => {})
+        .finally(() => {
+          if (!state.removed && !isStale()) {
+            if (window.__ekdNativeUI !== publishedUI) window.__ekdNativeUI = publishedUI;
+            if (publishedPlugins && window.__ekdPlugins !== publishedPlugins) window.__ekdPlugins = publishedPlugins;
+            if (publishedBrowserNav && window.__ekdPluginBrowserNavigated !== publishedBrowserNav) window.__ekdPluginBrowserNavigated = publishedBrowserNav;
+            queueMicrotask(() => { if (!state.removed && !isStale()) ensure(); });
+          }
+        });
+    }
+  }
   function ensure() {
-    if (state.removed) return;
+    if (state.removed || isStale()) {
+      state.observer?.disconnect();
+      state.settingsObserver?.disconnect();
+      return;
+    }
+    reclaimLegacyZombie();
     state.observer?.disconnect();
     state.settingsObserver?.disconnect();
     try {
       syncNativeEntries();
     } finally {
-      if (!state.removed) {
+      if (!state.removed && !isStale()) {
         state.observer?.observe(document.body, { childList: true, subtree: true });
         if (state.settingsDialog?.isConnected && state.settingsObserver) {
           state.settingsObserver.observe(state.settingsDialog, {
@@ -1856,9 +1914,11 @@ async function installNativeRenderer(options) {
       }
     }
   }
-  state.remove = async () => {
+  let removePromise = null;
+  state.remove = () => (removePromise ??= (async () => {
     if (state.removed) return;
     state.removed = true;
+    while (legacyZombieTimers.length > 0) clearTimeout(legacyZombieTimers.pop());
     state.observer?.disconnect();
     state.settingsObserver?.disconnect();
     state.settingsObserver = null;
@@ -1871,13 +1931,14 @@ async function installNativeRenderer(options) {
     state.unsubscribeFeatures?.();
     state.unsubscribePlugins?.();
     disposeUpdateSurface();
+    state.channel?.close();
     state.restoreNotifyCompletion?.();
     state.restoreNotifyCompletion = null;
     window.removeEventListener('ekd:config-saved', onConfigSaved);
     window.removeEventListener('ekd:account-switched', onAccountSwitched);
     closeAccountSwitchModal();
     closeKeepAliveMenu();
-    for (const node of document.querySelectorAll('[data-ekd-account-menu],[data-ekd-keepalive-row],[data-ekd-keepalive-wrap],[data-ekd-toast-stack],[data-ekd-update-pill],[data-ekd-update-popover],[data-ekd-plugins-tab]')) node.remove();
+    for (const node of document.querySelectorAll('[data-ekd-account-menu],[data-ekd-keepalive-row],[data-ekd-keepalive-wrap],[data-ekd-toast-stack],[data-ekd-update-pill],[data-ekd-update-popover],[data-ekd-plugins-tab],[data-ekd-settings-tab],[data-ekd-official-section],[data-ekd-account-modal],[data-ekd-keepalive-popover]')) node.remove();
     document.removeEventListener('visibilitychange', pluginRefresh);
     window.removeEventListener('focus', pluginRefresh);
     for (const release of [...state.pluginReleases.values()]) release();
@@ -1890,11 +1951,10 @@ async function installNativeRenderer(options) {
     for (const release of [...state.pluginSettings.values()]) release.dispose();
     state.pluginSettings.clear();
     state.browserNavListeners.clear();
-    delete window.__ekdPluginBrowserNavigated;
-    await unwatchActiveSession();
+    if (window.__ekdPluginBrowserNavigated === publishedBrowserNav) delete window.__ekdPluginBrowserNavigated;
     state.plugins?.dispose();
     state.plugins = null;
-    delete window.__ekdPlugins;
+    if (window.__ekdPlugins === publishedPlugins) delete window.__ekdPlugins;
     document.removeEventListener('click', nativeTabClick, true);
     document.removeEventListener('click', sidebarResetClick, true);
     document.removeEventListener('click', settingsTabClick, true);
@@ -1916,8 +1976,14 @@ async function installNativeRenderer(options) {
     state.providerEnhance = null;
     nativeStyle.remove();
     URL.revokeObjectURL(moduleURL);
-    delete window.__ekdNativeUI;
-  };
+    if (window.__ekdNativeUI === publishedUI || window.__ekdNativeUI === pendingUI) delete window.__ekdNativeUI;
+    await Promise.race([unwatchActiveSession(), new Promise(resolve => setTimeout(resolve, 250))]);
+  })());
+  activeRemove = state.remove;
+  if (isStale()) {
+    await state.remove();
+    return { status: 'removed', surface: options.surface || 'host', domRevision: 1 };
+  }
   const nativeTabClick = event => {
     const clickedNative = event.target.closest('.ptb-tab:not([data-ekdp-plugin-panel])')
       || event.target.closest('.sit-link:not([data-ekd-entry]), .pt-body .pl button.ui-menu-item:not([data-ekd-entry])');
@@ -1980,6 +2046,11 @@ async function installNativeRenderer(options) {
   publishNativeUI();
   await refreshFeatures();
   if (state.removed) return { status: 'removed', surface: 'host', domRevision: 1 };
+  if (isStale()) {
+    await state.remove();
+    return { status: 'removed', surface: 'host', domRevision: 1 };
+  }
+  legacyZombieTimers.push(setTimeout(reclaimLegacyZombie, 300), setTimeout(reclaimLegacyZombie, 1000));
   state.unsubscribeFeatures = makeHost(() => {}).subscribe('features', value => applyFeatures(value, false));
   if (options.surface === 'host') {
     // The update indicator lives in the chat header, so only the official window
@@ -2464,7 +2535,10 @@ async function installNativeRenderer(options) {
   function publishNativeUI() {
     const ui = {
       mainBridgeCore: options.coreURL || '',
-      remove: () => state.remove(),
+      remove: () => {
+        if (installCtrl.seq === mySeq) installCtrl.seq += 1;
+        return state.remove();
+      },
       mountSessions: extraIds => mountSessions(extraIds),
       pickSession: exclude => pickSession(exclude),
       openOfficial: id => openOfficial(id),
@@ -2484,6 +2558,7 @@ async function installNativeRenderer(options) {
     // the published entry points from being replaced or extended in place; the
     // private closure stays out of reach either way.
     if (freeze) freeze(ui);
+    publishedUI = ui;
     window.__ekdNativeUI = ui;
     return ui;
   }
@@ -2502,7 +2577,7 @@ async function installNativeRenderer(options) {
     unregister: (pluginId, name) => transport.request('plugin.command.unregister', { token: pluginToken(pluginId), name }),
     invoke: (pluginId, name, args) => transport.request('plugin.command.invoke', { token: pluginToken(pluginId), name, args }),
   };
-  window.__ekdPluginBrowserNavigated = payload => {
+  publishedBrowserNav = payload => {
     if (!payload || typeof payload.pluginId !== 'string' || typeof payload.viewId !== 'string' || typeof payload.url !== 'string') return;
     const listeners = state.browserNavListeners.get(payload.pluginId + ':' + payload.viewId);
     if (!listeners) return;
@@ -2510,6 +2585,7 @@ async function installNativeRenderer(options) {
       try { listener(payload.url); } catch {}
     }
   };
+  window.__ekdPluginBrowserNavigated = publishedBrowserNav;
   const pluginBrowserHost = {
     open: (pluginId, viewId, url) => transport.request("browser.view.open", { token: pluginToken(pluginId), viewId, url }),
     navigate: (pluginId, viewId, url) => transport.request("browser.view.navigate", { token: pluginToken(pluginId), viewId, url }),
@@ -2656,7 +2732,7 @@ async function installNativeRenderer(options) {
   }
 
   async function syncPlugins() {
-    if (state.removed) return;
+    if (state.removed || isStale()) return;
     // Concurrent triggers (a settings action plus a feature change) must not run
     // two reconciliations against the same maps.
     if (syncPromise) {
@@ -2667,7 +2743,7 @@ async function installNativeRenderer(options) {
       do {
         syncPending = false;
         await reconcilePlugins();
-      } while (syncPending);
+      } while (syncPending && !state.removed && !isStale());
     })();
     try {
       await syncPromise;
@@ -2677,6 +2753,7 @@ async function installNativeRenderer(options) {
   }
 
   async function reconcilePlugins() {
+    if (state.removed || isStale()) return;
     const current = activeSession();
     if (current && state.watchedSession !== current) void syncActiveSessionWatch(current);
     let list;
@@ -2686,7 +2763,7 @@ async function installNativeRenderer(options) {
       console.warn('plugin list unavailable', error?.message || error);
       return;
     }
-    if (state.removed) return;
+    if (state.removed || isStale()) return;
     const items = list?.items || [];
     state.pluginList = items;
     const enabled = items.filter(plugin => plugin.enabled && (options.surface !== 'plugin' || plugin.id === options.pluginId));
@@ -2728,21 +2805,30 @@ async function installNativeRenderer(options) {
       }
     }
     for (const plugin of enabled) {
+      if (state.removed || isStale() || !state.plugins) return;
       if (state.pluginReleases.has(plugin.id)) continue;
       try {
         const token = plugin.token || (await corePost('/plugins/' + encodeURIComponent(plugin.id) + '/token'))?.token;
+        if (state.removed || isStale() || !state.plugins) return;
         if (!token) continue;
         state.pluginTokens.set(plugin.id, token);
         const entry = await loadPluginAsset(plugin.id, module.pluginEntryPath(plugin.entry?.renderer || 'renderer.js'));
-        await state.plugins.activate(entry, {
+        if (state.removed || isStale() || !state.plugins) return;
+        const runtime = state.plugins;
+        await runtime.activate(entry, {
           id: plugin.id,
           version: plugin.version,
           apiVersion: plugin.apiVersion,
           granted: plugin.capabilities || [],
           token,
         });
-        state.pluginReleases.set(plugin.id, () => state.plugins.deactivate(plugin.id));
+        if (state.removed || isStale() || state.plugins !== runtime) {
+          runtime.deactivate(plugin.id);
+          return;
+        }
+        state.pluginReleases.set(plugin.id, () => runtime.deactivate(plugin.id));
       } catch (error) {
+        if (state.removed || isStale()) return;
         // One plugin failing to activate must not stop the others. The plugin
         // that failed is stopped by the core with the reason recorded.
         noteActivationFault(plugin.id, error);
@@ -2769,12 +2855,13 @@ async function installNativeRenderer(options) {
       if (state.pluginSettings.get(id) === release) state.pluginSettings.delete(id);
     };
   }
-  window.__ekdPlugins = {
+  publishedPlugins = {
     sync: syncPlugins,
     mountSettings: mountPluginSettings,
     invokeCommand: target => state.plugins?.invokeLocal(target),
     list: () => state.pluginList || [],
   };
+  window.__ekdPlugins = publishedPlugins;
 
   state.syncPlugins = syncPlugins;
   state.mountPluginSettings = mountPluginSettings;

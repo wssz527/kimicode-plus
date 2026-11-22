@@ -113,9 +113,9 @@ func TestResolveAttachCredentialsPrefersLiveRuntime(t *testing.T) {
 		t.Fatalf("missing runtime.json did not fall back: %s %s", gotURL, gotToken)
 	}
 
-	writeRuntime := func(rawURL, token string) {
+	writeRuntime := func(rawURL, token, version string) {
 		t.Helper()
-		payload, err := json.Marshal(map[string]any{"url": rawURL, "pairingToken": token})
+		payload, err := json.Marshal(map[string]any{"url": rawURL, "pairingToken": token, "version": version})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -124,17 +124,17 @@ func TestResolveAttachCredentialsPrefersLiveRuntime(t *testing.T) {
 		}
 	}
 
-	writeRuntime(server.URL, liveToken)
-	if gotURL, gotToken := resolveAttachCredentials(ctx, dir, staleURL, staleToken); gotURL != server.URL || gotToken != liveToken {
-		t.Fatalf("live runtime.json was not preferred: got (%s, %s), want (%s, %s)", gotURL, gotToken, server.URL, liveToken)
+	writeRuntime(server.URL, liveToken, "0.2.7")
+	if gotURL, gotToken, gotVersion := resolveAttachRuntime(ctx, dir, staleURL, staleToken); gotURL != server.URL || gotToken != liveToken || gotVersion != "0.2.7" {
+		t.Fatalf("live runtime.json was not preferred: got (%s, %s, %s), want (%s, %s, 0.2.7)", gotURL, gotToken, gotVersion, server.URL, liveToken)
 	}
 
-	writeRuntime("https://remote.example", liveToken)
+	writeRuntime("https://remote.example", liveToken, "0.2.7")
 	if gotURL, gotToken := resolveAttachCredentials(ctx, dir, staleURL, staleToken); gotURL != staleURL || gotToken != staleToken {
 		t.Fatalf("non-loopback runtime.json was accepted: %s", gotURL)
 	}
 
-	writeRuntime(server.URL, strings.Repeat("x", 48))
+	writeRuntime(server.URL, strings.Repeat("x", 48), "0.2.7")
 	if gotURL, gotToken := resolveAttachCredentials(ctx, dir, staleURL, staleToken); gotURL != staleURL || gotToken != staleToken {
 		t.Fatalf("unauthorized runtime.json did not fall back: %s", gotURL)
 	}

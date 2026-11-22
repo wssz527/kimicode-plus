@@ -183,12 +183,16 @@ func attachWindowsMain(ctx context.Context, opts WindowsCDPAttachOptions, dataDi
 	if opts.Profile != "" && opts.AppVersionOverride != "" {
 		appVersion = opts.AppVersionOverride
 	}
-	config, err := json.Marshal(map[string]any{
+	configMap := map[string]any{
 		"coreURL": opts.CoreURL, "pairingToken": opts.PairingToken, "runtimePath": runtimePath,
 		"windowsMainBridge": true,
 		"expectedApp":       identity.AppVersion, "expectedElectron": identity.Electron, "reportedApp": appVersion,
 		"moduleSource": string(module), "cssSource": string(css), "rendererSource": rendererBundle,
-	})
+	}
+	if opts.CoreVersion != "" {
+		configMap["coreVersion"] = opts.CoreVersion
+	}
+	config, err := json.Marshal(configMap)
 	if err != nil {
 		return nil, err
 	}

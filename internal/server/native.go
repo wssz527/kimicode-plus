@@ -22,7 +22,7 @@ func newNativeIntegration(db *sql.DB, options NativeOptions, safe func() bool) (
 	}
 	service.UseAttach(desktop.AttachConfig{
 		DataDir: options.DataDir, KimiHome: options.Home, Profile: options.Profile,
-		CoreURL: options.CoreURL, PairingToken: options.PairingToken, Executable: options.Executable,
+		CoreURL: options.CoreURL, PairingToken: options.PairingToken, CoreVersion: Version, Executable: options.Executable,
 	})
 	return service, nil
 }

@@ -16,6 +16,7 @@ import (
 
 	"enhancedkimi/internal/desktop"
 	"enhancedkimi/internal/platform"
+	"enhancedkimi/internal/server"
 )
 
 // attachOptions is the argument set launchd runs. It mirrors the flags the
@@ -117,7 +118,7 @@ func runAttach(args []string) error {
 	if err := validateAttachCredentials(options.coreURL, options.pairingToken); err != nil {
 		return err
 	}
-	coreURL, pairingToken := resolveAttachCredentials(ctx, options.dataDir, options.coreURL, options.pairingToken)
+	coreURL, pairingToken, coreVersion := resolveAttachRuntime(ctx, options.dataDir, options.coreURL, options.pairingToken)
 	if coreURL == "" {
 		wait, stop := context.WithTimeout(ctx, 6*time.Second)
 		defer stop()
@@ -127,16 +128,19 @@ func runAttach(args []string) error {
 			select {
 			case <-wait.Done():
 			case <-ticker.C:
-				coreURL, pairingToken = resolveAttachCredentials(wait, options.dataDir, "", "")
+				coreURL, pairingToken, coreVersion = resolveAttachRuntime(wait, options.dataDir, "", "")
 			}
 		}
 		if coreURL == "" {
 			return errors.New("增强核心尚未就绪，待核心启动后重试接入")
 		}
 	}
+	if coreVersion == "" {
+		coreVersion = server.Version
+	}
 	result, attachErr := desktop.AttachOnce(ctx, desktop.AttachOptions{
 		DataDir: options.dataDir, KimiExecutable: options.kimiExe, DebugPort: options.debugPort,
-		Profile: options.profile, CoreURL: coreURL, PairingToken: pairingToken,
+		Profile: options.profile, CoreURL: coreURL, PairingToken: pairingToken, CoreVersion: coreVersion,
 		AllowDailyInstance: options.allowDailyInstance,
 		AppVersionOverride: options.appVersionOverride,
 		SkipCurrent:        options.background,
@@ -155,33 +159,40 @@ func runAttach(args []string) error {
 }
 
 func resolveAttachCredentials(ctx context.Context, dataDir, fallbackURL, fallbackToken string) (string, string) {
+	url, token, _ := resolveAttachRuntime(ctx, dataDir, fallbackURL, fallbackToken)
+	return url, token
+}
+
+func resolveAttachRuntime(ctx context.Context, dataDir, fallbackURL, fallbackToken string) (string, string, string) {
 	if dataDir == "" {
-		return fallbackURL, fallbackToken
+		return fallbackURL, fallbackToken, ""
 	}
 	data, err := os.ReadFile(filepath.Join(dataDir, "runtime.json"))
 	if err != nil {
-		return fallbackURL, fallbackToken
+		return fallbackURL, fallbackToken, ""
 	}
 	var runtimeInfo struct {
 		URL          string `json:"url"`
 		PairingToken string `json:"pairingToken"`
+		Version      string `json:"version"`
 	}
 	if json.Unmarshal(data, &runtimeInfo) != nil {
-		return fallbackURL, fallbackToken
+		return fallbackURL, fallbackToken, ""
 	}
 	liveURL := strings.TrimRight(strings.TrimSpace(runtimeInfo.URL), "/")
 	liveToken := strings.TrimSpace(runtimeInfo.PairingToken)
+	liveVersion := strings.TrimSpace(runtimeInfo.Version)
 	if !isLoopbackHTTPURL(liveURL) || len(liveToken) < desktop.AttachTokenMinLength {
-		return fallbackURL, fallbackToken
+		return fallbackURL, fallbackToken, ""
 	}
 	if liveURL == strings.TrimRight(strings.TrimSpace(fallbackURL), "/") && liveToken == strings.TrimSpace(fallbackToken) {
-		return fallbackURL, fallbackToken
+		return fallbackURL, fallbackToken, liveVersion
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, liveURL+"/enhance/v1/health", nil)
 	if err != nil {
-		return fallbackURL, fallbackToken
+		return fallbackURL, fallbackToken, ""
 	}
 	req.Header.Set("Authorization", "Bearer "+liveToken)
 	client := &http.Client{
@@ -192,13 +203,13 @@ func resolveAttachCredentials(ctx context.Context, dataDir, fallbackURL, fallbac
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fallbackURL, fallbackToken
+		return fallbackURL, fallbackToken, ""
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fallbackURL, fallbackToken
+		return fallbackURL, fallbackToken, ""
 	}
-	return liveURL, liveToken
+	return liveURL, liveToken, liveVersion
 }
 
 func isLoopbackHTTPURL(raw string) bool {

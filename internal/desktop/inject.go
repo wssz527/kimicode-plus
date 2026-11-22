@@ -55,7 +55,10 @@ type AttachOptions struct {
 	// contract acceptance (e.g. simulating an unknown future version "1.9.9").
 	// It is ignored whenever Profile is empty.
 	AppVersionOverride string
-	SkipCurrent        bool
+	// CoreVersion names the version of the enhancement core performing this attach
+	// so bootstrap.js can distinguish a same-version core restart from an upgrade.
+	CoreVersion string
+	SkipCurrent bool
 }
 
 type AttachResult struct {
@@ -98,6 +101,9 @@ func bootstrapConfig(options AttachOptions, expectedApp, reportedApp, electron, 
 		"expectedApp": expectedApp, "expectedElectron": electron,
 		"reportedApp":  reportedApp,
 		"moduleSource": moduleSource, "cssSource": cssSource, "rendererSource": rendererBundle,
+	}
+	if options.CoreVersion != "" {
+		config["coreVersion"] = options.CoreVersion
 	}
 	if options.DataDir != "" {
 		runtimePath, err := filepath.Abs(filepath.Join(options.DataDir, "runtime.json"))
@@ -162,6 +168,13 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (result *Att
 	if err != nil {
 		return nil, err
 	}
+	gate, err := acquireHostAttachLock(ctx, options.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	if gate != nil {
+		defer gate.Close()
+	}
 	key := darwinAttachKey(info, options)
 	if options.SkipCurrent {
 		if state := ReadAttachState(options.DataDir); state["status"] == "installed" && state["attachKey"] == key {
@@ -194,6 +207,10 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (result *Att
 		if closeErr := cdp.Close(closeCtx); closeErr != nil {
 			result = nil
 			retErr = errors.Join(retErr, fmt.Errorf("未能确认关闭宿主临时调试端口，请正常退出并重新打开 Kimi Code：%w", closeErr))
+		} else if succeeded && retErr == nil && result != nil && options.DataDir != "" {
+			// Persist the attachKey before releasing host-attach.lock so a queued
+			// background attach sees the current state and skips redundant injection.
+			_ = RecordAttach(options.DataDir, result)
 		}
 	}()
 	raw, err := cdp.Evaluate(attachCtx, `(()=>{const req=typeof require==='function'?require:process.mainModule.require.bind(process.mainModule);return{pid:process.pid,type:process.type,appVersion:req('electron').app.getVersion(),electron:process.versions.electron}})()`)

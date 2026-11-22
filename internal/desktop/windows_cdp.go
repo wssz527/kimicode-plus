@@ -44,6 +44,7 @@ type WindowsCDPAttachOptions struct {
 	HostStarted        string
 	CoreURL            string
 	PairingToken       string
+	CoreVersion        string
 	Profile            string
 	Daily              bool
 	AppVersionOverride string

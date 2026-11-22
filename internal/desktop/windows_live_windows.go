@@ -8,12 +8,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
-
-	"github.com/gofrs/flock"
 )
 
 func attachRunningWindowsMain(ctx context.Context, options AttachOptions, proc WindowsProcessInfo) (result *AttachResult, attachErr error) {
@@ -24,14 +21,17 @@ func attachRunningWindowsMain(ctx context.Context, options AttachOptions, proc W
 	if options.DataDir == "" {
 		return nil, errors.New("运行中接入需要增强数据目录")
 	}
-	gate := flock.New(filepath.Join(options.DataDir, "host-attach.lock"))
-	defer gate.Close()
-	ok, err := gate.TryLock()
+	gate, err := acquireHostAttachLock(ctx, options.DataDir)
 	if err != nil {
 		return nil, err
 	}
-	if !ok {
-		return nil, errors.New("KimiCode+ 正在接入，请稍后重试")
+	if gate != nil {
+		defer gate.Close()
+	}
+	if options.SkipCurrent {
+		if windowsCurrentAttachStateForDir(options.DataDir, proc, ReadAttachState(options.DataDir), false, currentCorePID(options.DataDir)) == "attached" {
+			return nil, nil
+		}
 	}
 	if !windowsInspectorClosed(InspectorPort) {
 		return nil, errors.New("本机临时调试端口已被占用，请关闭其他调试会话后重试")
@@ -80,7 +80,7 @@ func attachRunningWindowsMain(ctx context.Context, options AttachOptions, proc W
 		}
 	}
 	attached, err := attachWindowsMain(ctx, WindowsCDPAttachOptions{
-		HostPID: proc.PID, CoreURL: options.CoreURL, PairingToken: options.PairingToken,
+		HostPID: proc.PID, CoreURL: options.CoreURL, PairingToken: options.PairingToken, CoreVersion: options.CoreVersion,
 		Profile: options.Profile, Daily: options.Profile == "", AppVersionOverride: options.AppVersionOverride,
 	}, options.DataDir, InspectorPort, verify)
 	if err != nil {
@@ -89,6 +89,7 @@ func attachRunningWindowsMain(ctx context.Context, options AttachOptions, proc W
 	portClosed = true
 	if attached != nil {
 		attached.hostStarted = proc.Started
+		_ = recordWindowsAttachInstalled(options.DataDir, proc, attached)
 	}
 	return attached, nil
 }

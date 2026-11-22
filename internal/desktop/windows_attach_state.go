@@ -356,7 +356,7 @@ func runWindowsBackgroundAttachStep(ctx context.Context, cfg AttachConfig, retri
 		return
 	}
 	result, err := deps.attach(ctx, AttachOptions{
-		DataDir: cfg.DataDir, CoreURL: cfg.CoreURL, PairingToken: cfg.PairingToken, Profile: cfg.Profile,
+		DataDir: cfg.DataDir, CoreURL: cfg.CoreURL, PairingToken: cfg.PairingToken, CoreVersion: cfg.CoreVersion, Profile: cfg.Profile,
 		AllowDailyInstance: cfg.Profile == "",
 	})
 	if err == nil && result != nil {

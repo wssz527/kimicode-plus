@@ -259,7 +259,7 @@ func runCore(updateAPIBaseURL string, updateHTTPClient *http.Client) error {
 	hostError := ""
 	if resume.Reattach || (!*resident && (*hostProfile != "" || *allowDaily)) {
 		attachCtx, attachCancel := context.WithTimeout(attachParent, 90*time.Second)
-		options := desktop.AttachOptions{DataDir: instance.Dir, Profile: *hostProfile, CoreURL: base, PairingToken: guard.PairingToken(), AllowDailyInstance: *allowDaily || resume.ReattachDaily}
+		options := desktop.AttachOptions{DataDir: instance.Dir, Profile: *hostProfile, CoreURL: base, PairingToken: guard.PairingToken(), CoreVersion: server.Version, AllowDailyInstance: *allowDaily || resume.ReattachDaily, SkipCurrent: resume.Reattach}
 		if resume.Reattach {
 			hostResult, err = desktop.AttachOnce(attachCtx, options)
 		} else {

@@ -646,3 +646,298 @@ func TestBootstrapRenewsSessionsAndRebindsWindows(t *testing.T) {
 		t.Fatalf("app listeners were not installed and removed cleanly: %#v", run.Reopen)
 	}
 }
+
+const upgradeRebindProbe = `
+const fs = require('node:fs');
+const http = require('node:http');
+const Module = require('node:module');
+const path = require('node:path');
+
+const source = fs.readFileSync(path.resolve(process.argv[2]), 'utf8');
+const runtimePath = path.resolve(process.argv[3]);
+const PAIRING_ONE = 'a'.repeat(48);
+const PAIRING_TWO = 'b'.repeat(48);
+const PAIRING_THREE = 'c'.repeat(48);
+process.versions.electron = '99.0.0';
+
+let currentElectron = null;
+const originalLoad = Module._load;
+Module._load = function (request) {
+  if (request === 'electron') return currentElectron;
+  return originalLoad.apply(this, arguments);
+};
+globalThis.require = require;
+
+function listen(server) {
+  return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+}
+
+function makeContents(delayMs) {
+  let inFlight = 0;
+  let maxConcurrent = 0;
+  const page = {
+    id: 701,
+    url: 'app://renderer/index.html',
+    destroyed: false,
+    renderers: [],
+    removeCalls: 0,
+    listeners: new Map(),
+    onceListeners: new Map(),
+    getURL() { return page.url; },
+    isDestroyed() { return page.destroyed; },
+    on(event, handler) { page.listeners.set(event, handler); return page; },
+    once(event, handler) { page.onceListeners.set(event, handler); return page; },
+    removeListener(event) { page.listeners.delete(event); page.onceListeners.delete(event); return page; },
+    setWindowOpenHandler() {},
+    async executeJavaScript(expression) {
+      if (expression.includes('__ekdNativeUI?.remove')) {
+        page.removeCalls += 1;
+        return null;
+      }
+      if (expression.includes('UPGRADE_RENDERER')) {
+        inFlight += 1;
+        if (inFlight > maxConcurrent) maxConcurrent = inFlight;
+        try {
+          if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+          const start = expression.indexOf(')(');
+          page.renderers.push(JSON.parse(expression.slice(start + 2, -1)));
+          return { status: 'installed' };
+        } finally {
+          inFlight -= 1;
+        }
+      }
+      return null;
+    },
+    get maxConcurrent() { return maxConcurrent; },
+  };
+  return page;
+}
+
+function makeElectron(hostContents) {
+  const electron = {
+    app: { getVersion: () => '9.9.9', on() { return this; }, once() { return this; }, removeListener() { return this; } },
+    session: { fromPartition: () => ({}) },
+    dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+    shell: { async openExternal() {} },
+    BrowserWindow: Object.assign(function () {}, { fromWebContents: () => null }),
+    WebContentsView: class {},
+    ipcMain: { prependListener() {}, on() {}, removeListener() {} },
+    webContents: {
+      fromId(id) { return id === hostContents.id ? hostContents : null; },
+      getAllWebContents() { return [hostContents]; },
+    },
+  };
+  currentElectron = electron;
+  return electron;
+}
+
+function makeCore(state) {
+  return http.createServer((request, response) => {
+    let body = '';
+    request.on('data', chunk => { body += chunk; });
+    request.on('end', () => {
+      response.setHeader('Content-Type', 'application/json');
+      if (request.url === '/enhance/v1/pair') {
+        const pairing = JSON.parse(body || '{}').pairingToken;
+        state.pairCalls += 1;
+        const reply = () => {
+          const token = 'tok-' + state.pairCalls + '-' + pairing.slice(0, 4);
+          response.end(JSON.stringify({ sessionToken: token, expiresAt: new Date(Date.now() + 3600_000).toISOString() }));
+        };
+        if (state.pairDelayMs > 0) setTimeout(reply, state.pairDelayMs);
+        else reply();
+        return;
+      }
+      const token = String(request.headers.authorization || '').replace('Bearer ', '');
+      if (state.expired.has(token)) {
+        response.statusCode = 401;
+        response.end(JSON.stringify({ error: { code: 'TOKEN_EXPIRED', message: 'expired' } }));
+        return;
+      }
+      response.end(JSON.stringify({ value: { ok: true } }));
+    });
+  });
+}
+
+async function bridgeCall(state, contents) {
+  const ch = state.channels.get(contents.id);
+  const response = await fetch(state.endpoint + '/ekd/native/v1', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: ch.expectedOrigin, 'x-ekd-bridge': ch.key },
+    body: JSON.stringify({ protocol: 1, id: 'call-1', action: 'core.fetch', payload: { path: '/enhance/v1/health', method: 'GET' } }),
+  });
+  return response.json();
+}
+
+const runBootstrap = new Function('return (' + source + ')')();
+function bootOptions(coreURL, pairingToken, coreVersion, upgradeRebindDelayMs) {
+  return {
+    expectedApp: '9.9.9',
+    expectedElectron: process.versions.electron,
+    coreURL,
+    pairingToken,
+    coreVersion,
+    upgradeRebindDelayMs,
+    runtimePath,
+    rendererSource: 'async function UPGRADE_RENDERER(options) { return { status: "installed" }; }',
+    cssSource: '',
+    moduleSource: '',
+  };
+}
+
+(async () => {
+  const out = {};
+
+  // Scenario A: cross-version upgrade defers stale rebind, and new bootstrap cancels it cleanly.
+  {
+    const coreState = { pairCalls: 0, pairDelayMs: 0, expired: new Set(['tok-1-aaaa']) };
+    const core = makeCore(coreState);
+    const port = await listen(core);
+    const coreURL = 'http://127.0.0.1:' + port;
+    const host = makeContents(15);
+    makeElectron(host);
+    fs.writeFileSync(runtimePath, JSON.stringify({ url: coreURL, pairingToken: PAIRING_ONE, version: '0.2.6' }), 'utf8');
+    await runBootstrap(bootOptions(coreURL, PAIRING_ONE, '0.2.6', 250));
+    const oldState = globalThis.__ekdNative;
+
+    fs.writeFileSync(runtimePath, JSON.stringify({ url: coreURL, pairingToken: PAIRING_TWO, version: '0.2.7' }), 'utf8');
+    const renewed = await bridgeCall(oldState, host);
+    await new Promise(resolve => setTimeout(resolve, 60));
+    const bindingsBeforeTakeover = host.renderers.length;
+
+    const takeover = await runBootstrap(bootOptions(coreURL, PAIRING_TWO, '0.2.7', 250));
+    await new Promise(resolve => setTimeout(resolve, 320));
+    out.deferredAndCancelled = {
+      renewedOK: Boolean(renewed?.result?.status === 200),
+      bindingsBeforeTakeover,
+      bindingsAfterWait: host.renderers.length,
+      takeoverStatus: takeover.status,
+      oldCleaned: Boolean(oldState.cleaned),
+      maxConcurrent: host.maxConcurrent,
+    };
+    await globalThis.__ekdNative.cleanup();
+    await new Promise(resolve => core.close(resolve));
+  }
+
+  // Scenario B: cross-version upgrade without external reattach falls back after delay.
+  {
+    const coreState = { pairCalls: 0, pairDelayMs: 0, expired: new Set(['tok-1-aaaa']) };
+    const core = makeCore(coreState);
+    const port = await listen(core);
+    const coreURL = 'http://127.0.0.1:' + port;
+    const host = makeContents(10);
+    makeElectron(host);
+    fs.writeFileSync(runtimePath, JSON.stringify({ url: coreURL, pairingToken: PAIRING_ONE, version: '0.2.6' }), 'utf8');
+    await runBootstrap(bootOptions(coreURL, PAIRING_ONE, '0.2.6', 80));
+    const oldState = globalThis.__ekdNative;
+
+    fs.writeFileSync(runtimePath, JSON.stringify({ url: coreURL, pairingToken: PAIRING_TWO, version: '0.2.7' }), 'utf8');
+    await bridgeCall(oldState, host);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    const beforeDelay = host.renderers.length;
+    await new Promise(resolve => setTimeout(resolve, 120));
+    out.deferredFallback = {
+      beforeDelay,
+      afterDelay: host.renderers.length,
+      maxConcurrent: host.maxConcurrent,
+    };
+    await globalThis.__ekdNative.cleanup();
+    await new Promise(resolve => core.close(resolve));
+  }
+
+  // Scenario C: concurrent installNativeBootstrap calls serialize cleanly.
+  {
+    const coreState = { pairCalls: 0, pairDelayMs: 25, expired: new Set() };
+    const core = makeCore(coreState);
+    const port = await listen(core);
+    const coreURL = 'http://127.0.0.1:' + port;
+    const host = makeContents(20);
+    makeElectron(host);
+    fs.writeFileSync(runtimePath, JSON.stringify({ url: coreURL, pairingToken: PAIRING_THREE, version: '0.2.7' }), 'utf8');
+    const p1 = runBootstrap(bootOptions(coreURL, PAIRING_TWO, '0.2.7', 250));
+    const p2 = runBootstrap(bootOptions(coreURL, PAIRING_THREE, '0.2.7', 250));
+    const [r1, r2] = await Promise.all([p1, p2]);
+    const finalState = globalThis.__ekdNative;
+    out.concurrentBoot = {
+      firstStatus: r1.status,
+      secondStatus: r2.status,
+      finalCleaned: Boolean(finalState?.cleaned),
+      finalListening: Boolean(finalState?.server?.listening),
+      maxConcurrent: host.maxConcurrent,
+      bindings: host.renderers.length,
+    };
+    await globalThis.__ekdNative.cleanup();
+    await new Promise(resolve => core.close(resolve));
+  }
+
+  process.stdout.write(JSON.stringify(out));
+})().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
+`
+
+func TestBootstrapSerializesInstallAndDefersUpgradeRebind(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed; the executable bootstrap probe needs it")
+	}
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "bootstrap_upgrade_probe.cjs")
+	if err := os.WriteFile(probe, []byte(upgradeRebindProbe), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := filepath.Abs("assets/bootstrap.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := filepath.Join(dir, "runtime.json")
+	output, err := exec.Command(node, probe, source, runtime).CombinedOutput()
+	if err != nil {
+		t.Fatalf("upgrade rebind probe failed: %v\n%s", err, output)
+	}
+	var got struct {
+		DeferredAndCancelled struct {
+			RenewedOK              bool   `json:"renewedOK"`
+			BindingsBeforeTakeover int    `json:"bindingsBeforeTakeover"`
+			BindingsAfterWait      int    `json:"bindingsAfterWait"`
+			TakeoverStatus         string `json:"takeoverStatus"`
+			OldCleaned             bool   `json:"oldCleaned"`
+			MaxConcurrent          int    `json:"maxConcurrent"`
+		} `json:"deferredAndCancelled"`
+		DeferredFallback struct {
+			BeforeDelay   int `json:"beforeDelay"`
+			AfterDelay    int `json:"afterDelay"`
+			MaxConcurrent int `json:"maxConcurrent"`
+		} `json:"deferredFallback"`
+		ConcurrentBoot struct {
+			FirstStatus    string `json:"firstStatus"`
+			SecondStatus   string `json:"secondStatus"`
+			FinalCleaned   bool   `json:"finalCleaned"`
+			FinalListening bool   `json:"finalListening"`
+			MaxConcurrent  int    `json:"maxConcurrent"`
+			Bindings       int    `json:"bindings"`
+		} `json:"concurrentBoot"`
+	}
+	if err := json.Unmarshal(output, &got); err != nil {
+		t.Fatalf("unreadable probe JSON: %v\n%s", err, output)
+	}
+	if !got.DeferredAndCancelled.RenewedOK || got.DeferredAndCancelled.TakeoverStatus != "installed" || !got.DeferredAndCancelled.OldCleaned {
+		t.Fatalf("upgrade takeover did not succeed cleanly: %+v", got.DeferredAndCancelled)
+	}
+	if got.DeferredAndCancelled.BindingsBeforeTakeover != 1 || got.DeferredAndCancelled.BindingsAfterWait != 2 {
+		t.Fatalf("stale upgrade rebind was not deferred and cancelled: %+v", got.DeferredAndCancelled)
+	}
+	if got.DeferredAndCancelled.MaxConcurrent != 1 {
+		t.Fatalf("renderer bindings overlapped during upgrade: %+v", got.DeferredAndCancelled)
+	}
+	if got.DeferredFallback.BeforeDelay != 1 || got.DeferredFallback.AfterDelay != 2 || got.DeferredFallback.MaxConcurrent != 1 {
+		t.Fatalf("deferred upgrade fallback did not fire as expected: %+v", got.DeferredFallback)
+	}
+	if got.ConcurrentBoot.FirstStatus != "removed" || got.ConcurrentBoot.SecondStatus != "installed" || got.ConcurrentBoot.FinalCleaned || !got.ConcurrentBoot.FinalListening {
+		t.Fatalf("concurrent installNativeBootstrap did not serialize cleanly: %+v", got.ConcurrentBoot)
+	}
+	if got.ConcurrentBoot.MaxConcurrent != 1 || got.ConcurrentBoot.Bindings != 1 {
+		t.Fatalf("stale concurrent bootstrap still injected a renderer: %+v", got.ConcurrentBoot)
+	}
+}

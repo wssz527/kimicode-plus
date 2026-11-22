@@ -757,7 +757,7 @@ func TestAttachWindowsMainCarriesRuntimePathAndMainBridgeFlag(t *testing.T) {
 
 	dataDir := t.TempDir()
 	attached, err := attachWindowsMain(context.Background(), WindowsCDPAttachOptions{
-		HostPID: 6001, CoreURL: "http://127.0.0.1:9", PairingToken: strings.Repeat("p", 48),
+		HostPID: 6001, CoreURL: "http://127.0.0.1:9", PairingToken: strings.Repeat("p", 48), CoreVersion: "0.2.7",
 	}, dataDir, port, func(context.Context) error { return nil })
 	if err != nil {
 		t.Fatalf("attachWindowsMain: %v", err)
@@ -771,6 +771,9 @@ func TestAttachWindowsMainCarriesRuntimePathAndMainBridgeFlag(t *testing.T) {
 	}
 	if !strings.Contains(evaluatedExpr, `"windowsMainBridge":true`) {
 		t.Fatalf("windowsMainBridge missing from the injected config: %s", evaluatedExpr)
+	}
+	if !strings.Contains(evaluatedExpr, `"coreVersion":"0.2.7"`) {
+		t.Fatalf("coreVersion missing from the injected config: %s", evaluatedExpr)
 	}
 }
 

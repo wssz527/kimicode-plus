@@ -20,6 +20,7 @@ type AttachConfig struct {
 	Profile      string
 	CoreURL      string
 	PairingToken string
+	CoreVersion  string
 	Executable   string
 }
 

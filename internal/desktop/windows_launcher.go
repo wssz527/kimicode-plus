@@ -236,7 +236,7 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 				return nil, errors.New("当前客户端无法在运行中接入，请从 KimiCode+ 入口重新打开 Kimi Code")
 			}
 			result, err := deps.AttachRunning(ctx, AttachOptions{
-				DataDir: opts.DataDir, Profile: opts.Profile, CoreURL: coreRec.URL, PairingToken: coreRec.PairingToken,
+				DataDir: opts.DataDir, Profile: opts.Profile, CoreURL: coreRec.URL, PairingToken: coreRec.PairingToken, CoreVersion: coreRec.Version,
 				AllowDailyInstance: opts.AllowDailyInstance, AppVersionOverride: opts.AppVersionOverride,
 			}, candidate)
 			if err != nil {
@@ -355,6 +355,7 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 		HostPID:            targetProc.PID,
 		CoreURL:            coreRec.URL,
 		PairingToken:       coreRec.PairingToken,
+		CoreVersion:        coreRec.Version,
 		Profile:            opts.Profile,
 		Daily:              opts.Profile == "",
 		AppVersionOverride: opts.AppVersionOverride,

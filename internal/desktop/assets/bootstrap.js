@@ -7,7 +7,17 @@ async function installNativeBootstrap(options) {
   if (options.windowsMainBridge && (typeof BrowserWindow !== 'function' || typeof WebContentsView !== 'function' || typeof ipcMain?.prependListener !== 'function')) {
     throw new Error('Windows 官方宿主缺少插件窗口所需的 Electron 接口');
   }
+  const bootCtrl = (globalThis.__ekdNativeBoot ??= { seq: 0, chain: Promise.resolve() });
+  const bootSeq = ++bootCtrl.seq;
+  const bootStale = () => bootCtrl.seq !== bootSeq;
+  let releaseBoot;
+  const prevBoot = bootCtrl.chain;
+  bootCtrl.chain = new Promise(resolve => { releaseBoot = resolve; });
+  try {
+  await prevBoot;
+  if (bootStale()) return { status: 'removed', transport: 'main-loopback-rpc', protocol: 1, appVersion: app.getVersion(), electron: process.versions.electron };
   if (globalThis.__ekdNative) await globalThis.__ekdNative.cleanup();
+  if (bootStale()) return { status: 'removed', transport: 'main-loopback-rpc', protocol: 1, appVersion: app.getVersion(), electron: process.versions.electron };
   const isMainRendererURL = url => {
     if (typeof url !== 'string' || !url.startsWith('app://renderer/')) return false;
     if (/screenshot|browser-overlay|browser-control/.test(url)) return false;
@@ -41,11 +51,13 @@ async function installNativeBootstrap(options) {
     return { sessionToken: pair.sessionToken, expiresAtMs: Number.isFinite(expiresAtMs) ? expiresAtMs : Date.now() + 12 * 60 * 60 * 1000 };
   }
   const initialPair = await pairCore(options.pairingToken);
+  if (bootStale()) return { status: 'removed', transport: 'main-loopback-rpc', protocol: 1, appVersion: app.getVersion(), electron: process.versions.electron };
   let coreToken = initialPair.sessionToken;
   let coreTokenExpiresAtMs = initialPair.expiresAtMs;
   let pairedWith = options.pairingToken;
+  const pairedVersion = typeof options.coreVersion === 'string' ? options.coreVersion.trim() : '';
   let pairing = null;
-  const state = { channels: new Map(), windows: new Map(), views: new Map(), pluginViews: new Map(), pluginViewTokens: new Map(), pluginViewOwners: new Map(), pluginViewQueues: new Map(), pluginCommands: new Map(), bounds: new Map(), browserWindow: null, server: null, cleanup: null, overlayEntries: [], activeOverlayMenu: null };
+  const state = { channels: new Map(), windows: new Map(), views: new Map(), pluginViews: new Map(), pluginViewTokens: new Map(), pluginViewOwners: new Map(), pluginViewQueues: new Map(), pluginCommands: new Map(), bounds: new Map(), bindChains: new Map(), rebindTimer: null, cleanupPromise: null, browserWindow: null, server: null, cleanup: null, overlayEntries: [], activeOverlayMenu: null };
   globalThis.__ekdNative = state;
   const browserSession = session.fromPartition('persist:ekd-native-browser');
   function json(response, status, value, origin) {
@@ -78,8 +90,26 @@ async function installNativeBootstrap(options) {
         // Only a different pairing token means the core is a new instance, and
         // only then is re-injecting the renderer safe. A plain token expiry on
         // the same core must never tear down the windows the user has open.
+        // When the core upgraded to a new version, defer stale re-injection
+        // briefly so the new core's reattach can replace bootstrap cleanly once.
         pairedWith = runtime.pairingToken;
-        setImmediate(rebindRenderers);
+        const nextVersion = typeof runtime.version === 'string' ? runtime.version.trim() : '';
+        const versionChanged = Boolean(pairedVersion && nextVersion && nextVersion !== pairedVersion);
+        if (state.rebindTimer) {
+          clearTimeout(state.rebindTimer);
+          state.rebindTimer = null;
+        }
+        if (versionChanged) {
+          const delayMs = Number.isFinite(options.upgradeRebindDelayMs) && options.upgradeRebindDelayMs >= 0
+            ? options.upgradeRebindDelayMs
+            : 1500;
+          state.rebindTimer = setTimeout(() => {
+            state.rebindTimer = null;
+            rebindRenderers();
+          }, delayMs);
+        } else {
+          setImmediate(rebindRenderers);
+        }
       }
       return true;
     })().finally(() => { pairing = null; });
@@ -301,19 +331,30 @@ async function installNativeBootstrap(options) {
     win.show(); win.focus();
     return { opened: true };
   }
-  async function bindRenderer(target, surface, extra = {}) {
-    for (const [key, owner] of [...state.pluginCommands]) if (owner === target.id) state.pluginCommands.delete(key);
-    releaseOwnedPluginViews(target.id);
-    const key = crypto.randomBytes(32).toString('base64url');
-    const instanceId = crypto.randomBytes(16).toString('base64url');
-    state.channels.set(target.id, { key, instanceId, expectedOrigin: target === currentWC ? 'app://renderer' : 'null' });
-    const config = {
-      endpoint: state.endpoint, bridgeKey: key, instanceId, moduleSource: options.moduleSource, cssSource: options.cssSource,
-      coreURL: options.windowsMainBridge ? options.coreURL : '',
-      appVersion: options.reportedApp || app.getVersion(), electron: process.versions.electron,
-      surface, ...extra,
-    };
-    return target.executeJavaScript('(' + options.rendererSource + ')(' + JSON.stringify(config) + ')');
+  function bindRenderer(target, surface, extra = {}) {
+    const contentsId = target.id;
+    const prev = state.bindChains.get(contentsId) || Promise.resolve();
+    const run = prev.catch(() => {}).then(async () => {
+      if (state.cleaned || !target || target.isDestroyed()) return { status: 'removed' };
+      for (const [key, owner] of [...state.pluginCommands]) if (owner === contentsId) state.pluginCommands.delete(key);
+      releaseOwnedPluginViews(contentsId);
+      const key = crypto.randomBytes(32).toString('base64url');
+      const instanceId = crypto.randomBytes(16).toString('base64url');
+      state.channels.set(contentsId, { key, instanceId, expectedOrigin: target === currentWC ? 'app://renderer' : 'null' });
+      const config = {
+        endpoint: state.endpoint, bridgeKey: key, instanceId, moduleSource: options.moduleSource, cssSource: options.cssSource,
+        coreURL: options.windowsMainBridge ? options.coreURL : '',
+        appVersion: options.reportedApp || app.getVersion(), electron: process.versions.electron,
+        surface, ...extra,
+      };
+      return target.executeJavaScript('(' + options.rendererSource + ')(' + JSON.stringify(config) + ')');
+    });
+    const settled = run.catch(() => {});
+    state.bindChains.set(contentsId, settled);
+    settled.finally(() => {
+      if (state.bindChains.get(contentsId) === settled) state.bindChains.delete(contentsId);
+    });
+    return run;
   }
   function rebindRenderers() {
     const target = mainWindow();
@@ -782,9 +823,12 @@ async function installNativeBootstrap(options) {
   const onBeforeQuit = () => { void state.cleanup(); };
   if (typeof app?.on === 'function') app.on('web-contents-created', onWebContentsCreated);
   if (typeof app?.once === 'function') app.once('before-quit', onBeforeQuit);
-  state.cleanup = async () => {
-    if (state.cleaned) return;
+  state.cleanup = () => (state.cleanupPromise ??= (async () => {
     state.cleaned = true;
+    if (state.rebindTimer) {
+      clearTimeout(state.rebindTimer);
+      state.rebindTimer = null;
+    }
     coreToken = '';
     if (typeof app?.removeListener === 'function') {
       app.removeListener('web-contents-created', onWebContentsCreated);
@@ -817,9 +861,22 @@ async function installNativeBootstrap(options) {
       await closed;
     }
     if (closing && !closing.isDestroyed()) await closing.executeJavaScript('window.__ekdNativeUI?.remove()').catch(() => {});
+    const pendingBinds = [...state.bindChains.values()];
+    if (pendingBinds.length > 0) {
+      await Promise.race([Promise.allSettled(pendingBinds), new Promise(resolve => setTimeout(resolve, 1500))]);
+      if (closing && !closing.isDestroyed()) await closing.executeJavaScript('window.__ekdNativeUI?.remove()').catch(() => {});
+    }
+    state.bindChains.clear();
     if (globalThis.__ekdNative === state) delete globalThis.__ekdNative;
-  };
+  })());
+  if (bootStale()) {
+    await state.cleanup();
+    return { status: 'removed', transport: 'main-loopback-rpc', protocol: 1, appVersion: app.getVersion(), electron: process.versions.electron };
+  }
   attachMainWebContents(initialWC);
   const mounted = await bindRenderer(initialWC, 'host');
   return { status: mounted.status, transport: 'main-loopback-rpc', protocol: 1, appVersion: app.getVersion(), electron: process.versions.electron };
+  } finally {
+    releaseBoot();
+  }
 }

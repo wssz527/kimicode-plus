@@ -446,6 +446,7 @@ func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachRe
 		HostStarted:        proc.Started,
 		CoreURL:            options.CoreURL,
 		PairingToken:       options.PairingToken,
+		CoreVersion:        options.CoreVersion,
 		Profile:            options.Profile,
 		Daily:              options.Profile == "",
 		AppVersionOverride: options.AppVersionOverride,

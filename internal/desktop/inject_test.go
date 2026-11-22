@@ -79,6 +79,27 @@ func TestBootstrapSeparatesRuntimePathFromMainBridge(t *testing.T) {
 	}
 }
 
+func TestBootstrapConfigCarriesCoreVersion(t *testing.T) {
+	withVersion, err := bootstrapConfig(AttachOptions{
+		CoreURL: "http://127.0.0.1:9", PairingToken: strings.Repeat("t", 48), CoreVersion: "0.2.7",
+	}, "1.3.7", "1.3.7", SupportedElectron, "module", "css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withVersion["coreVersion"] != "0.2.7" {
+		t.Fatalf("coreVersion: got %v, want 0.2.7", withVersion["coreVersion"])
+	}
+	withoutVersion, err := bootstrapConfig(AttachOptions{
+		CoreURL: "http://127.0.0.1:9", PairingToken: strings.Repeat("t", 48),
+	}, "1.3.7", "1.3.7", SupportedElectron, "module", "css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := withoutVersion["coreVersion"]; present {
+		t.Fatalf("empty coreVersion should be omitted: %#v", withoutVersion)
+	}
+}
+
 // Writes the runtime record the way the core does, so other tests read a real
 // file rather than a fixture string.
 func writeCoreRuntime(t *testing.T, path, coreURL, pairingToken string) {
