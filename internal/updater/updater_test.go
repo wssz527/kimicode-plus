@@ -277,6 +277,179 @@ func TestManifestReleaseValidation(t *testing.T) {
 	}
 }
 
+func serveCNBManifestRelease(t *testing.T, releaseData *fakeRelease) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		base := "/test-owner/test-repo/-/releases"
+		switch r.URL.Path {
+		case base + "/latest/download/manifest.json":
+			releaseData.get.Add(1)
+			if releaseData.status != 0 {
+				w.WriteHeader(releaseData.status)
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]releaseManifestEntry{{
+				Version: strings.TrimPrefix(releaseData.tag, "v"), Target: "darwin-amd64", Archive: releaseData.name,
+				PackageBytes: int64(len(releaseData.archive)), PublishedAt: fixedTime.Format(time.RFC3339), ReleaseNotes: "## Changes\nFrom CNB mirror",
+			}})
+		case base + "/download/" + releaseData.tag + "/SHA256SUMS":
+			releaseData.checksumGet.Add(1)
+			if releaseData.servePackage != nil && releaseData.sums == "" {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			_, _ = w.Write([]byte(releaseData.sums))
+		case base + "/download/" + releaseData.tag + "/" + releaseData.name:
+			releaseData.packageGet.Add(1)
+			if releaseData.servePackage != nil {
+				releaseData.servePackage(w, r)
+				return
+			}
+			_, _ = w.Write(releaseData.archive)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestDualSourceManifestDefaultsAndMirrorControl(t *testing.T) {
+	t.Setenv("EKD_UPDATE_REPO", "")
+	t.Setenv("EKD_UPDATE_API_BASE", "")
+	t.Setenv("EKD_UPDATE_MIRROR_BASE", "")
+	m := New(Options{CurrentVersion: "0.2.0"})
+	defer m.Close()
+	if m.configErr != nil {
+		t.Fatalf("unexpected default configErr: %v", m.configErr)
+	}
+	want := []string{
+		"https://cnb.cool/wssz527/kimicode-plus/-/releases",
+		"https://github.com/wssz527/kimicode-plus/releases",
+	}
+	if len(m.releaseSources) != len(want) || m.releaseSources[0] != want[0] || m.releaseSources[1] != want[1] {
+		t.Fatalf("unexpected default release sources: %v", m.releaseSources)
+	}
+
+	t.Setenv("EKD_UPDATE_MIRROR_BASE", "off")
+	disabled := New(Options{CurrentVersion: "0.2.0"})
+	defer disabled.Close()
+	if len(disabled.releaseSources) != 1 || disabled.releaseSources[0] != want[1] {
+		t.Fatalf("expected mirror opt-out to keep GitHub only: %v", disabled.releaseSources)
+	}
+
+	invalid := New(Options{CurrentVersion: "0.2.0", MirrorReleaseBaseURL: "http://example.com"})
+	defer invalid.Close()
+	if invalid.configErr == nil {
+		t.Fatal("expected insecure non-loopback mirror URL to fail validation")
+	}
+}
+
+func TestDualSourceMirrorPrimaryAndFallback(t *testing.T) {
+	t.Run("CNB primary serves check and download without touching GitHub", func(t *testing.T) {
+		cnbRelease := darwinRelease(t, "\xcf\xfa\xed\xfe from cnb")
+		ghRelease := darwinRelease(t, "\xcf\xfa\xed\xfe from github")
+		ghServer := serveManifestRelease(t, ghRelease)
+		cnbServer := serveCNBManifestRelease(t, cnbRelease)
+		options := testOptions(t, ghServer.URL, "darwin")
+		options.APIBaseURL = ""
+		options.ReleaseBaseURL = ghServer.URL
+		options.MirrorReleaseBaseURL = cnbServer.URL
+		restarted := false
+		options.RequestRestart = func() { restarted = true }
+		options.launchSupervisor = func(_, _ string) error { return nil }
+		m := New(options)
+		defer m.Close()
+		status, err := m.Check(t.Context())
+		if err != nil || status.State != Available || !strings.Contains(status.ReleaseNotes, "From CNB mirror") {
+			t.Fatalf("primary check failed: %+v, %v", status, err)
+		}
+		if ghRelease.get.Load() != 0 || cnbRelease.get.Load() != 1 {
+			t.Fatalf("expected CNB-only check traffic: cnb=%d gh=%d", cnbRelease.get.Load(), ghRelease.get.Load())
+		}
+		status, err = m.Apply(t.Context())
+		if err != nil || status.State != Restarting || !restarted {
+			t.Fatalf("primary apply failed: %+v, %v", status, err)
+		}
+		if cnbRelease.packageGet.Load() != 1 || ghRelease.packageGet.Load() != 0 {
+			t.Fatalf("expected CNB-only download traffic: cnb=%d gh=%d", cnbRelease.packageGet.Load(), ghRelease.packageGet.Load())
+		}
+	})
+
+	t.Run("CNB check failure falls back to GitHub", func(t *testing.T) {
+		for _, cnbStatus := range []int{http.StatusNotFound, http.StatusBadGateway} {
+			cnbRelease := darwinRelease(t, "\xcf\xfa\xed\xfe from cnb")
+			cnbRelease.status = cnbStatus
+			ghRelease := darwinRelease(t, "\xcf\xfa\xed\xfe from github")
+			ghServer := serveManifestRelease(t, ghRelease)
+			cnbServer := serveCNBManifestRelease(t, cnbRelease)
+			options := testOptions(t, ghServer.URL, "darwin")
+			options.APIBaseURL = ""
+			options.ReleaseBaseURL = ghServer.URL
+			options.MirrorReleaseBaseURL = cnbServer.URL
+			m := New(options)
+			status, err := m.Check(t.Context())
+			m.Close()
+			if err != nil || status.State != Available || !strings.Contains(status.ReleaseNotes, "Updated from manifest") {
+				t.Fatalf("fallback on CNB HTTP %d failed: %+v, %v", cnbStatus, status, err)
+			}
+			if cnbRelease.get.Load() != 1 || ghRelease.get.Load() != 1 {
+				t.Fatalf("expected fallback traffic on HTTP %d: cnb=%d gh=%d", cnbStatus, cnbRelease.get.Load(), ghRelease.get.Load())
+			}
+		}
+	})
+
+	t.Run("CNB download failure falls back to GitHub archive with checksum verification", func(t *testing.T) {
+		shared := darwinRelease(t, "\xcf\xfa\xed\xfe shared payload")
+		cnbRelease := &fakeRelease{
+			tag: shared.tag, name: shared.name, archive: shared.archive, sums: shared.sums,
+			servePackage: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadGateway)
+			},
+		}
+		ghRelease := &fakeRelease{tag: shared.tag, name: shared.name, archive: shared.archive, sums: shared.sums}
+		ghServer := serveManifestRelease(t, ghRelease)
+		cnbServer := serveCNBManifestRelease(t, cnbRelease)
+		options := testOptions(t, ghServer.URL, "darwin")
+		options.APIBaseURL = ""
+		options.ReleaseBaseURL = ghServer.URL
+		options.MirrorReleaseBaseURL = cnbServer.URL
+		restarted := false
+		options.RequestRestart = func() { restarted = true }
+		options.launchSupervisor = func(_, _ string) error { return nil }
+		m := New(options)
+		defer m.Close()
+		if status, err := m.Check(t.Context()); err != nil || status.State != Available {
+			t.Fatalf("check failed: %+v, %v", status, err)
+		}
+		if status, err := m.Apply(t.Context()); err != nil || status.State != Restarting || !restarted {
+			t.Fatalf("download fallback failed: %+v, %v", status, err)
+		}
+		if cnbRelease.packageGet.Load() != 1 || ghRelease.packageGet.Load() != 1 || ghRelease.checksumGet.Load() != 1 {
+			t.Fatalf("expected fallback download traffic: cnbPkg=%d ghPkg=%d ghSums=%d", cnbRelease.packageGet.Load(), ghRelease.packageGet.Load(), ghRelease.checksumGet.Load())
+		}
+	})
+
+	t.Run("both sources 404 reports no release published", func(t *testing.T) {
+		cnbRelease := darwinRelease(t, "\xcf\xfa\xed\xfe cnb")
+		cnbRelease.status = http.StatusNotFound
+		ghRelease := darwinRelease(t, "\xcf\xfa\xed\xfe gh")
+		ghRelease.status = http.StatusNotFound
+		ghServer := serveManifestRelease(t, ghRelease)
+		cnbServer := serveCNBManifestRelease(t, cnbRelease)
+		options := testOptions(t, ghServer.URL, "darwin")
+		options.APIBaseURL = ""
+		options.ReleaseBaseURL = ghServer.URL
+		options.MirrorReleaseBaseURL = cnbServer.URL
+		m := New(options)
+		defer m.Close()
+		status, err := m.Check(t.Context())
+		if err != nil || status.State != UpToDate || !strings.Contains(status.Note, "尚未发布") {
+			t.Fatalf("expected UpToDate no-release note: %+v, %v", status, err)
+		}
+	})
+}
+
 func TestSelectAssetsRequiresExactVersionAndPlatform(t *testing.T) {
 	for _, platform := range []struct{ os, arch, ext string }{
 		{"darwin", "arm64", ".tar.gz"}, {"darwin", "amd64", ".tar.gz"}, {"windows", "amd64", ".zip"},

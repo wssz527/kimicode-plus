@@ -484,7 +484,7 @@ function CoreUpdateSection({ host, fallbackVersion, onVersion, onRecovered }: {
         <span className="ekds-row-label">
           <strong>新版本 {status.latestVersion}</strong>
           {published ? <small>发布于 {published}</small> : null}
-          {status.releaseUrl ? <a className="ekds-update-link" href={status.releaseUrl} target="_blank" rel="noreferrer">GitHub 发布页</a> : null}
+          {status.releaseUrl ? <a className="ekds-update-link" href={status.releaseUrl} target="_blank" rel="noreferrer">查看发布页</a> : null}
         </span>
         {status.canApply ? (
           <button type="button" className="ekds-btn is-primary" onClick={() => void apply()} disabled={busy}>下载并更新</button>
@@ -498,7 +498,7 @@ function CoreUpdateSection({ host, fallbackVersion, onVersion, onRecovered }: {
         <pre className="ekds-log" tabIndex={0} aria-label="更新说明">{status.releaseNotes}</pre>
       </details> : null}
     </> : status?.releaseUrl && (error || status.state === "error" || status.state === "rolled_back" || (status.state === "up_to_date" && status.latestVersion)) ? (
-      <p className="ekds-note ekds-update-note"><a className="ekds-update-link" href={status.releaseUrl} target="_blank" rel="noreferrer">GitHub 发布页</a></p>
+      <p className="ekds-note ekds-update-note"><a className="ekds-update-link" href={status.releaseUrl} target="_blank" rel="noreferrer">查看发布页</a></p>
     ) : null}
   </div>;
 }

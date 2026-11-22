@@ -22,6 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -72,7 +74,9 @@ jobs:
               print(f'prerelease={"true" if prerelease else "false"}', file=output)
           PY
       - name: Verify release packaging
-        run: python3 scripts/test_package.py
+        run: |
+          python3 scripts/test_package.py
+          python3 scripts/test_sync_cnb_release.py
       - name: Prepare release metadata
         run: |
           echo "RELEASE_PUBLISHED_AT=$(git log -1 --format=%cI)" >> "$GITHUB_ENV"
@@ -119,4 +123,28 @@ jobs:
             dist/release/*.zip
             dist/release/SHA256SUMS
             dist/release/manifest.json
+            dist/THIRD_PARTY_NOTICES.txt
+      - name: Sync release to CNB mirror
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          CNB_REPO: wssz527/kimicode-plus
+          TAG: v${{ steps.version.outputs.version }}
+          IS_PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          if [ -z "${CNB_TOKEN:-}" ]; then
+            echo 'CNB_TOKEN secret is not configured; skipping CNB mirror sync.'
+            exit 0
+          fi
+          extra=""
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            extra="--prerelease"
+          fi
+          python3 scripts/sync_cnb_release.py \
+            --tag "$TAG" \
+            --repo "$CNB_REPO" \
+            $extra \
+            dist/release/*.tar.gz \
+            dist/release/*.zip \
+            dist/release/SHA256SUMS \
+            dist/release/manifest.json \
             dist/THIRD_PARTY_NOTICES.txt

@@ -10,11 +10,18 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 )
+
+type downloadCandidate struct {
+	archive   asset
+	checksums asset
+}
 
 const (
 	maxArchiveBytes = 128 << 20
@@ -118,10 +125,6 @@ func (m *Manager) apply(ctx context.Context) (err error) {
 	defer cancel()
 	stop := context.AfterFunc(m.ctx, cancel)
 	defer stop()
-	checksum, err := m.downloadChecksum(ctx)
-	if err != nil {
-		return err
-	}
 	downloads := filepath.Join(m.options.DataDir, "updates", "downloads")
 	if err = os.MkdirAll(downloads, 0o700); err != nil {
 		return fmt.Errorf("无法创建更新下载目录：%w", err)
@@ -136,8 +139,8 @@ func (m *Manager) apply(ctx context.Context) (err error) {
 			_ = os.RemoveAll(stage)
 		}
 	}()
-	archivePath := filepath.Join(stage, "release.archive")
-	if err = m.downloadArchive(ctx, archivePath, checksum); err != nil {
+	archivePath, err := m.downloadWithFallback(ctx, stage, status.LatestVersion)
+	if err != nil {
 		return err
 	}
 	files, err := extractArchive(archivePath, stage, m.options.GOOS, m.options.GOARCH)
@@ -173,10 +176,67 @@ func (m *Manager) apply(ctx context.Context) (err error) {
 	return nil
 }
 
-func (m *Manager) downloadChecksum(ctx context.Context) (string, error) {
+func (m *Manager) downloadCandidates(latestVersion string) []downloadCandidate {
+	candidates := []downloadCandidate{{archive: m.archive, checksums: m.checksums}}
+	if !m.manifest || m.archive.Name == "" || m.checksums.Name == "" {
+		return candidates
+	}
+	tag := "v" + strings.TrimPrefix(latestVersion, "v")
+	for _, base := range m.releaseSources {
+		archiveURL := base + "/download/" + url.PathEscape(tag) + "/" + url.PathEscape(m.archive.Name)
+		checksumURL := base + "/download/" + url.PathEscape(tag) + "/" + url.PathEscape(m.checksums.Name)
+		if archiveURL == m.archive.URL && checksumURL == m.checksums.URL {
+			continue
+		}
+		candidates = append(candidates, downloadCandidate{
+			archive:   asset{Name: m.archive.Name, URL: archiveURL, Size: m.archive.Size},
+			checksums: asset{Name: m.checksums.Name, URL: checksumURL},
+		})
+	}
+	return candidates
+}
+
+func (m *Manager) downloadWithFallback(ctx context.Context, stage, latestVersion string) (string, error) {
+	candidates := m.downloadCandidates(latestVersion)
+	var lastErr error
+	for idx, candidate := range candidates {
+		m.change(func(s *Status) {
+			s.State = Downloading
+			s.DownloadedBytes = 0
+			s.TotalBytes = max(0, candidate.archive.Size)
+		})
+		checksum, err := m.downloadChecksum(ctx, candidate)
+		if err != nil {
+			lastErr = err
+			if ctx.Err() != nil {
+				break
+			}
+			continue
+		}
+		attemptCtx := ctx
+		attemptCancel := func() {}
+		if len(candidates) > 1 && idx < len(candidates)-1 {
+			attemptCtx, attemptCancel = context.WithTimeout(ctx, 2*time.Minute)
+		}
+		attemptPath := filepath.Join(stage, fmt.Sprintf("release-%d.archive", idx))
+		err = m.downloadArchive(attemptCtx, candidate, attemptPath, checksum)
+		attemptCancel()
+		if err == nil {
+			return attemptPath, nil
+		}
+		_ = os.Remove(attemptPath)
+		lastErr = err
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return "", lastErr
+}
+
+func (m *Manager) downloadChecksum(ctx context.Context, candidate downloadCandidate) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	res, err := m.get(ctx, m.checksums.URL, "application/octet-stream")
+	res, err := m.get(ctx, candidate.checksums.URL, "application/octet-stream")
 	if err != nil {
 		return "", fmt.Errorf("无法下载 SHA256SUMS：%w", err)
 	}
@@ -193,7 +253,7 @@ func (m *Manager) downloadChecksum(ctx context.Context) (string, error) {
 	lines.Buffer(make([]byte, 1024), maxSumsBytes+1)
 	for lines.Scan() {
 		entry := checksumPattern.FindStringSubmatch(lines.Text())
-		if entry != nil && entry[2] == m.archive.Name {
+		if entry != nil && entry[2] == candidate.archive.Name {
 			if digest != "" {
 				return "", errors.New("SHA256SUMS 中存在重复的安装包校验值")
 			}
@@ -209,11 +269,11 @@ func (m *Manager) downloadChecksum(ctx context.Context) (string, error) {
 	return digest, nil
 }
 
-func (m *Manager) downloadArchive(ctx context.Context, destination, checksum string) error {
-	if m.archive.Size > maxArchiveBytes {
+func (m *Manager) downloadArchive(ctx context.Context, candidate downloadCandidate, destination, checksum string) error {
+	if candidate.archive.Size > maxArchiveBytes {
 		return errors.New("安装包超过 128 MiB 下载上限")
 	}
-	res, err := m.get(ctx, m.archive.URL, "application/octet-stream")
+	res, err := m.get(ctx, candidate.archive.URL, "application/octet-stream")
 	if err != nil {
 		return fmt.Errorf("无法下载安装包：%w", err)
 	}
