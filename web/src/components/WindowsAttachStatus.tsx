@@ -31,8 +31,18 @@ export function WindowsAttachStatusPanel({ status, host, refresh }: {
   const action = useAction<{ reopening: boolean }>();
   const state = status.host.attachState ?? "unattached";
   const reopening = state === "reopening";
+  useEffect(() => {
+    // A reopen takes a few seconds. Without this poll the panel stays on
+    // 正在重新打开 until the user presses 刷新; stop as soon as it settles.
+    if (!reopening) return;
+    const timer = window.setTimeout(refresh, 1800);
+    return () => window.clearTimeout(timer);
+  }, [reopening, refresh]);
+  const copy = attachCopy[state] ?? (status.host.running
+    ? `当前接入状态：${state}。若界面未生效，可重新打开 Kimi Code 后再试。`
+    : "请打开 Kimi Code。");
   return <div data-ekd-windows-attach-state={state}>
-    <p role="status">{status.host.running || reopening ? attachCopy[reopening ? "reopening" : state] : "请打开 Kimi Code。"}</p>
+    <p role="status">{status.host.running || reopening ? copy : "请打开 Kimi Code。"}</p>
     <div className="inline-actions">
       {status.host.canReopen && state !== "attached" ? <ActionButton
         busy={action.busy || reopening}

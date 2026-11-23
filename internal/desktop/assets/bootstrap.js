@@ -79,10 +79,36 @@ async function installNativeBootstrap(options) {
   function refreshCoreSession() {
     pairing ??= (async () => {
       if (!options.runtimePath || state.cleaned) return false;
-      const runtime = JSON.parse(await req('node:fs/promises').readFile(options.runtimePath, 'utf8'));
-      if (runtime.url !== options.coreURL || typeof runtime.pairingToken !== 'string' || runtime.pairingToken.length < 32) return false;
-      const refreshed = await pairCore(runtime.pairingToken);
-      if (state.cleaned) return false;
+      // A core restart momentarily refuses the connection and rewrites
+      // runtime.json a beat later. Both are transient: re-read the record and
+      // retry a few times before treating the attach as broken.
+      const attempts = 4;
+      let runtime = null;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        if (state.cleaned) return false;
+        try {
+          runtime = JSON.parse(await req('node:fs/promises').readFile(options.runtimePath, 'utf8'));
+          if (runtime.url === options.coreURL && typeof runtime.pairingToken === 'string' && runtime.pairingToken.length >= 32) break;
+          runtime = null;
+        } catch {
+          runtime = null;
+        }
+        if (attempt < attempts - 1) await new Promise(resolve => setTimeout(resolve, 250 * 2 ** attempt));
+      }
+      if (!runtime || runtime.url !== options.coreURL || typeof runtime.pairingToken !== 'string' || runtime.pairingToken.length < 32) return false;
+      let refreshed = null;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        if (state.cleaned) return false;
+        try {
+          refreshed = await pairCore(runtime.pairingToken);
+          break;
+        } catch (error) {
+          const transient = error?.name === 'TimeoutError' || /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up/i.test(String(error?.message || error));
+          if (!transient || attempt === attempts - 1) throw error;
+          await new Promise(resolve => setTimeout(resolve, 250 * 2 ** attempt));
+        }
+      }
+      if (!refreshed || state.cleaned) return false;
       const restarted = pairedWith !== runtime.pairingToken;
       coreToken = refreshed.sessionToken;
       coreTokenExpiresAtMs = refreshed.expiresAtMs;

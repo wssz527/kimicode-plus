@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { BRIDGE_RECONNECT_TEXT, isBridgeCredentialError } from "../../api";
 import type { DemoMessage } from "../../native";
 import { Icon } from "../Icon";
@@ -70,15 +70,41 @@ export function ClockBadge({ children }: { children: ReactNode }) {
   return <span className="wb-clock">{children}</span>;
 }
 
+const SAFE_LINK_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
+
+/** Markdown can carry `javascript:` and other schemes; a message from a model or
+ * a tool must not turn that into a live link in the workbench. */
+function safeHref(href?: string): string | null {
+  if (!href) return null;
+  try {
+    const protocol = new URL(href, "https://workbench.invalid").protocol;
+    return SAFE_LINK_PROTOCOLS.has(protocol) ? href : null;
+  } catch {
+    return null;
+  }
+}
+
 export function MessageBody({ text }: { text: string }) {
-  return <div className="wb-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ({ children, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer">{children}</a>, img: ({ alt }) => <span>{alt || "图片"}</span> }}>{text}</ReactMarkdown></div>;
+  return <div className="wb-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ({ children, href, ...props }) => {
+    const safe = safeHref(href);
+    return safe
+      ? <a {...props} href={safe} target="_blank" rel="noopener noreferrer">{children}</a>
+      : <span className="wb-link-blocked" title={href ? `已拦截不安全的链接协议：${href}` : undefined}>{children}</span>;
+  }, img: ({ alt }) => <span>{alt || "图片"}</span> }}>{text}</ReactMarkdown></div>;
 }
 
 function MessageActions({ message, onReply }: { message: DemoMessage; onReply?: (text: string) => void }) {
   const [status, setStatus] = useState("");
+  const timer = useRef<number | null>(null);
+  useEffect(() => () => { if (timer.current !== null) window.clearTimeout(timer.current); }, []);
+  function flash(text: string) {
+    setStatus(text);
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => { timer.current = null; setStatus(""); }, 2400);
+  }
   async function copy() {
-    try { await navigator.clipboard.writeText(message.text); setStatus("已复制"); }
-    catch { setStatus("复制失败，请选择文字后复制"); }
+    try { await navigator.clipboard.writeText(message.text); flash("已复制"); }
+    catch { flash("复制失败，请选择文字后复制"); }
   }
   return <div className="wb-message-actions">
     <button type="button" className="wb-icon-btn" aria-label="复制消息" title="复制消息" onClick={() => void copy()}><Icon name="copy" size={14} /></button>

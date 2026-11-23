@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth";
 import { Icon } from "./Icon";
 import { CacheSettings } from "./CacheSettings";
@@ -36,11 +36,11 @@ export interface ContractReport {
 }
 
 const FEATURE_ENTRIES = [
-  { label: "缓存与用量", where: "「缓存与用量」标签页", note: "命中率、会话空闲时长、保活与压缩策略。" },
-  { label: "插件", where: "官方「插件 → KimiCode+」", note: "本地增强插件、配置与授权管理。" },
-  { label: "实验室", where: "官方「实验室」标签页", note: "会话并排与规划等实验性功能。" },
-  { label: "账户", where: "官方「账户」标签页", note: "多账号切换、额度与登录状态。" },
-  { label: "智能体与会话", where: "官方「智能体与会话」标签页", note: "模型、权限与子智能体设置。" },
+  { label: "缓存与用量", where: "「缓存与用量」标签页", tab: "cache", note: "命中率、会话空闲时长、保活与压缩策略。" },
+  { label: "插件", where: "官方「插件 → KimiCode+」", tab: "plugins-ekd", note: "本地增强插件、配置与授权管理。" },
+  { label: "实验室", where: "官方「实验室」标签页", tab: "lab", note: "会话并排与规划等实验性功能。" },
+  { label: "账户", where: "官方「账户」标签页", tab: "account", note: "多账号切换、额度与登录状态。" },
+  { label: "智能体与会话", where: "官方「智能体与会话」标签页", tab: "agent", note: "模型、权限与子智能体设置。" },
 ];
 
 /**
@@ -58,19 +58,30 @@ export function SettingsWindow({
   initialContracts?: ContractReport | null;
 }) {
   const [contracts, setContracts] = useState<ContractReport | null>(initialContracts);
+  const contractsPromise = useRef<Promise<ContractReport | null> | null>(null);
 
   const loadContracts = useCallback(async () => {
-    try {
-      const next = await host.request<ContractReport>("contracts.status");
-      if (next && typeof next === "object") setContracts(next);
-    } catch {
-      // DiagnosticsSection reports any transport errors directly.
-    }
+    // The diagnostics body and this summary both need the report on mount. One
+    // shared in-flight request keeps them from hitting `contracts.status` twice.
+    if (contractsPromise.current) return contractsPromise.current;
+    const request = host.request<ContractReport>("contracts.status")
+      .then((next) => {
+        if (next && typeof next === "object") setContracts(next);
+        return next ?? null;
+      })
+      .catch(() => null)
+      .finally(() => { contractsPromise.current = null; });
+    contractsPromise.current = request;
+    return request;
   }, [host]);
 
   useEffect(() => {
     void loadContracts();
   }, [loadContracts]);
+
+  // One report feeds both this summary and the diagnostics body; the panel's own
+  // read and this initial read used to hit `contracts.status` twice on mount.
+  const onContractsChange = useCallback((next: ContractReport | null) => setContracts(next), []);
 
   const fallbacks = resolveSettingsFallbacks(contracts?.probes);
 
@@ -83,14 +94,19 @@ export function SettingsWindow({
         <p className="ekds-sec-desc">
           查看增强核心与官方客户端的接入状态、各项契约检测结果、接入日志与开源许可。
         </p>
-        <DiagnosticsSection host={host} contracts={contracts} onContractsChange={setContracts} />
+        <DiagnosticsSection
+          host={host}
+          contracts={contracts}
+          onContractsChange={onContractsChange}
+          reloadContracts={loadContracts}
+        />
       </section>
 
       <section className="ekds-sec" data-ekd-section="entries">
         <div className="ekds-sec-head">
           <h2 className="ekds-sec-title">功能入口</h2>
         </div>
-        <p className="ekds-sec-desc">KimiCode+ 的各项功能都放在官方设置里对应的位置，不在这里重复提供开关。</p>
+        <p className="ekds-sec-desc">KimiCode+ 的各项功能都放在官方设置里对应的位置，不在这里重复提供开关。点击右侧位置可直接跳转。</p>
         <div className="ekds-group" data-ekd-entry-summary="true">
           {FEATURE_ENTRIES.map(entry => (
             <div className="ekds-row" key={entry.label}>
@@ -98,7 +114,15 @@ export function SettingsWindow({
                 <strong>{entry.label}</strong>
                 <small>{entry.note}</small>
               </span>
-              <span className="ekds-row-aside">{entry.where}</span>
+              <button
+                type="button"
+                className="ekds-row-aside ekds-entry-link"
+                title={`打开${entry.where}`}
+                onClick={() => { void host.openSettings(entry.tab).catch(() => {}); }}
+              >
+                {entry.where}
+                <span aria-hidden="true">›</span>
+              </button>
             </div>
           ))}
         </div>
@@ -367,7 +391,12 @@ function CoreUpdateSection({ host, fallbackVersion, onVersion, onRecovered }: {
   // Background auto-checks and top-bar update actions publish the same status, so
   // the card stays in sync without polling while the user is reading it.
   useEffect(() => host.subscribe<CoreUpdateStatus>("update", next => {
-    if (next && typeof next === "object" && "state" in next) receive(next);
+    if (next && typeof next === "object" && "state" in next) {
+      receive(next);
+      // A download started from the top-bar pill must make this card poll too,
+      // otherwise it would sit on "正在下载" until the user reopens the page.
+      if (coreUpdateBusy(next.state)) setTracking(true);
+    }
   }), [host, receive]);
 
   useEffect(() => {
@@ -512,10 +541,12 @@ function DiagnosticsSection({
   host,
   contracts,
   onContractsChange,
+  reloadContracts,
 }: {
   host: NativeHost;
   contracts: ContractReport | null;
   onContractsChange: (next: ContractReport | null) => void;
+  reloadContracts: () => Promise<ContractReport | null>;
 }) {
   const { health } = useAuth();
   const [coreVersion, setCoreVersion] = useState("");
@@ -532,7 +563,8 @@ function DiagnosticsSection({
       const [next, files, contractReport] = await Promise.all([
         host.request<AttachStatus>("attach.status"),
         host.request<Diagnostics>("diagnostics.get"),
-        host.request<ContractReport>("contracts.status").catch(() => null),
+        // Shares the summary's single in-flight read instead of issuing a third.
+        reloadContracts().catch(() => null),
       ]);
       setStatus(next);
       setDiagnostics(files);
@@ -541,7 +573,7 @@ function DiagnosticsSection({
     } catch (cause) {
       setError(errorText(cause));
     }
-  }, [host, onContractsChange]);
+  }, [host, onContractsChange, reloadContracts]);
 
   useEffect(() => {
     void reload();

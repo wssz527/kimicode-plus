@@ -10,6 +10,25 @@ type Attachment = { path: string; name: string };
 type PermissionMode = "" | "manual" | "auto" | "yolo";
 type SessionRecoveryHint = { enabled: boolean; nextAt?: string; note?: string };
 
+type ApprovalOption = { label: string; value: string };
+
+const DEFAULT_APPROVAL_OPTIONS: ApprovalOption[] = [
+  { label: "允许", value: "approved" },
+  { label: "拒绝", value: "rejected" },
+];
+
+// Both spellings reach this pane: the core sends `approved`/`rejected` while an
+// older reply path used `allow`/`deny`.
+const APPROVAL_DECISIONS: Record<string, string> = {
+  approved: "approved",
+  allow: "approved",
+  rejected: "rejected",
+  deny: "rejected",
+  denied: "rejected",
+  cancelled: "cancelled",
+  cancel: "cancelled",
+};
+
 type SessionInput = { draft?: string; model?: string; permission?: PermissionMode; attachments?: Attachment[] };
 type SessionInputs = Record<string, SessionInput>;
 const SessionInputContext = createContext<[SessionInputs, Dispatch<SetStateAction<SessionInputs>>] | null>(null);
@@ -190,11 +209,18 @@ export function SessionPane({
     }
   }
 
-  async function reply(interactionId: string, value: string) {
+  async function reply(interactionId: string, value: string, fromServer: boolean) {
     if (!sid) return;
+    const decision = APPROVAL_DECISIONS[value];
+    // Only a label that the server itself listed may be sent with its copy; a
+    // value we do not recognize is never guessed into an approval.
+    const payload = decision ?? (fromServer ? { decision: "approved", selectedLabel: value } : null);
+    if (!payload) {
+      setError("这个审批选项无法识别，请在官方窗口中处理。");
+      return;
+    }
     setReplying(interactionId);
     try {
-      const payload = ["approved", "rejected", "cancelled"].includes(value) ? value : { decision: "approved", selectedLabel: value };
       await host.request("session.reply", { id: sid, interactionId, value: payload });
     } catch (cause) {
       setError(errorText(cause));
@@ -285,18 +311,22 @@ export function SessionPane({
               </div>
               {approval.detail ? <pre className="wb-approval-detail">{approval.detail}</pre> : null}
               <div className="wb-approval-actions">
-                {(approval.options ?? [{ label: "允许", value: "allow" }, { label: "拒绝", value: "deny" }]).map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={`wb-btn ${option.value === "deny" ? "is-quiet" : ""}`}
-                    disabled={replying !== null}
-                    onClick={() => void reply(approval.id, option.value)}
-                  >
-                    {replying === approval.id ? <Spinner size={12} /> : null}
-                    {option.label}
-                  </button>
-                ))}
+                {(approval.options ?? DEFAULT_APPROVAL_OPTIONS).map((option) => {
+                  const fromServer = Boolean(approval.options?.length);
+                  const denied = option.value === "rejected" || option.value === "deny";
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      className={`wb-btn ${denied ? "is-quiet" : ""}`}
+                      disabled={replying !== null}
+                      onClick={() => void reply(approval.id, option.value, fromServer)}
+                    >
+                      {replying === approval.id ? <Spinner size={12} /> : null}
+                      {option.label}
+                    </button>
+                  );
+                })}
               </div>
             </div>
           ))}

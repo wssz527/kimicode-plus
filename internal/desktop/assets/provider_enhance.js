@@ -43,6 +43,9 @@ function createProviderEnhance(options) {
     { label: '1M', value: 1048576 },
   ];
 
+  const CONFIG_TTL_MS = 2000;
+  const configCache = { value: null, at: 0, promise: null };
+
   // ---------------------------------------------------------------- rendering
 
   function el(tag, props, children) {
@@ -178,6 +181,27 @@ function createProviderEnhance(options) {
     }
   }
 
+  /** Explicit off / toggle / always. Keeping `always` separate from the effort
+   * pills is what lets an `always_thinking` model be downgraded and restored
+   * without losing the stored adaptive_thinking flag. */
+  function setThinkingMode(draft, mode) {
+    const next = mode === 'always' ? 'always' : (mode === 'toggle' || mode === 'on') ? 'toggle' : 'none';
+    draft.thinking = next;
+    if (next === 'none') {
+      draft.adaptiveThinking = false;
+      draft.supportEfforts = [];
+      return;
+    }
+    if (next === 'toggle') {
+      const preserved = typeof draft.preservedAdaptiveThinking === 'boolean'
+        ? draft.preservedAdaptiveThinking
+        : draft.adaptiveThinking === true;
+      draft.adaptiveThinking = preserved;
+      return;
+    }
+    draft.adaptiveThinking = false;
+  }
+
   /** Turns one stored model into the editable draft the inline panel starts from. */
   function draftOf(model) {
     const capabilities = Array.isArray(model?.capabilities) ? model.capabilities : [];
@@ -204,8 +228,22 @@ function createProviderEnhance(options) {
   }
 
   async function readConfig() {
-    const config = await request('config.get');
-    return config && typeof config === 'object' ? config : {};
+    const now = Date.now();
+    if (configCache.value && now - configCache.at < CONFIG_TTL_MS) return configCache.value;
+    if (configCache.promise) return configCache.promise;
+    configCache.promise = request('config.get')
+      .then(config => {
+        configCache.value = config && typeof config === 'object' ? config : {};
+        configCache.at = Date.now();
+        return configCache.value;
+      })
+      .finally(() => { configCache.promise = null; });
+    return configCache.promise;
+  }
+
+  function invalidateConfig() {
+    configCache.value = null;
+    configCache.at = 0;
   }
 
   function rowInputs(row) {
@@ -595,12 +633,20 @@ function createProviderEnhance(options) {
       return;
     }
     const models = config.models || {};
-    const key = providerId + '/' + modelId;
-    const model = models[key] || Object.entries(models).find(([k, item]) => {
-      const p = providerPart(k) || (item && typeof item.provider === 'string' ? item.provider.trim() : '');
-      const m = providerPart(k) ? modelPart(k) : (item && typeof item.model === 'string' && item.model.trim() ? item.model.trim() : k);
-      return p === providerId && m === modelId;
-    })?.[1];
+    const exactKey = providerId + '/' + modelId;
+    let key = exactKey;
+    let model = models[exactKey];
+    if (!model) {
+      const found = Object.entries(models).find(([k, item]) => {
+        const p = providerPart(k) || (item && typeof item.provider === 'string' ? item.provider.trim() : '');
+        const m = providerPart(k) ? modelPart(k) : (item && typeof item.model === 'string' && item.model.trim() ? item.model.trim() : k);
+        return p === providerId && m === modelId;
+      });
+      if (found) {
+        key = found[0];
+        model = found[1];
+      }
+    }
     if (!model) {
       openUnsavedDrawer(row, button, '该模型尚未写入配置。请先点击右下角「保存」保存供应商，再展开设置能力与思考强度。');
       return;
@@ -673,12 +719,64 @@ function createProviderEnhance(options) {
     }
 
     // 2. 思考强度（直接点选：no / low / medium / high / xhigh / max）
+    const modePills = el('div', { class: 'ekd-px-pills', role: 'group', 'aria-label': '思考模式' });
+    const modeButtons = new Map();
+    const THINKING_MODES = [
+      { value: 'none', label: '关闭', title: '不声明思考能力，也不发送任何思考强度' },
+      { value: 'toggle', label: '可切换', title: '声明 thinking 能力，由思考强度决定本次请求是否思考' },
+      { value: 'always', label: '始终思考', title: '声明 always_thinking，每次请求都开启思考' },
+    ];
+    for (const mode of THINKING_MODES) {
+      const button = el('button', {
+        type: 'button',
+        class: 'ekd-px-pill',
+        'data-kind': 'mode',
+        'data-mode': mode.value,
+        'aria-pressed': 'false',
+        title: mode.title,
+        text: mode.label,
+      });
+      button.disabled = managed;
+      button.addEventListener('click', () => {
+        setThinkingMode(draft, mode.value);
+        syncThinkingUI();
+      });
+      modeButtons.set(mode.value, button);
+      modePills.append(button);
+    }
+
+    const supportsAdaptive = typeof draft.preservedAdaptiveThinking === 'boolean';
+    const adaptiveButton = supportsAdaptive
+      ? el('button', {
+        type: 'button',
+        class: 'ekd-px-pill',
+        'data-kind': 'adaptive',
+        'aria-pressed': 'false',
+        title: '向核心声明 adaptive_thinking，由服务端按难度决定思考深度',
+        text: '自适应思考（adaptive_thinking）',
+      })
+      : null;
+    if (adaptiveButton) {
+      adaptiveButton.disabled = managed;
+      adaptiveButton.addEventListener('click', () => {
+        draft.adaptiveThinking = !(draft.adaptiveThinking === true && draft.thinking === 'toggle');
+        syncThinkingUI();
+      });
+    }
+    const adaptiveRow = adaptiveButton
+      ? el('div', { class: 'ekd-px-pills', role: 'group', 'aria-label': '自适应思考' }, [adaptiveButton])
+      : null;
+
     const thinkingPills = el('div', { class: 'ekd-px-pills', role: 'group', 'aria-label': '思考强度' });
     const thinkingHint = el('span', { class: 'ekd-px-meta' });
+    const modeHint = el('span', { class: 'ekd-px-meta' });
     const optionButtons = new Map();
 
     function syncThinkingUI() {
       const isNo = draft.thinking === 'none' && draft.supportEfforts.length === 0;
+      for (const [value, button] of modeButtons) {
+        button.setAttribute('aria-pressed', draft.thinking === value ? 'true' : 'false');
+      }
       for (const [value, button] of optionButtons) {
         if (value === 'no') {
           button.setAttribute('aria-pressed', isNo ? 'true' : 'false');
@@ -686,10 +784,22 @@ function createProviderEnhance(options) {
           button.setAttribute('aria-pressed', draft.supportEfforts.includes(value) ? 'true' : 'false');
         }
       }
+      if (adaptiveButton) {
+        const on = draft.thinking === 'toggle' && draft.adaptiveThinking === true;
+        adaptiveButton.setAttribute('aria-pressed', on ? 'true' : 'false');
+        adaptiveButton.disabled = managed || draft.thinking !== 'toggle';
+      }
+      modeHint.textContent = draft.thinking === 'always'
+        ? '始终思考：保存后写入 always_thinking，每次请求都开启思考'
+        : draft.thinking === 'toggle'
+          ? '可切换：思考能力已声明，是否思考由下面的强度决定'
+          : '关闭：保存后不声明思考能力';
       if (isNo) {
         thinkingHint.textContent = '已选 no（不开启思考）';
       } else if (draft.supportEfforts.length === 0) {
-        thinkingHint.textContent = '当前开启默认思考；可点选 low–max 指定可用强度，或点 no 关闭思考';
+        thinkingHint.textContent = draft.thinking === 'always'
+          ? '始终思考，未指定强度；可点选 low–max 补充可用档位'
+          : '当前开启默认思考；可点选 low–max 指定可用强度，或点 no 关闭思考';
       } else {
         thinkingHint.textContent = '已启用思考强度：' + draft.supportEfforts.join(' / ') + '（可多选，点 no 关闭思考）';
       }
@@ -911,10 +1021,12 @@ function createProviderEnhance(options) {
         };
         if (mapped.thinking === 'toggle') {
           if (typeof draft.preservedAdaptiveThinking === 'boolean') {
-            edit.adaptive_thinking = draft.preservedAdaptiveThinking;
+            edit.adaptive_thinking = draft.adaptiveThinking === true;
           } else if (mapped.adaptive_thinking) {
             edit.adaptive_thinking = true;
           }
+        } else if (mapped.thinking === 'always' && draft.preservedAdaptiveThinking === true) {
+          edit.adaptive_thinking = false;
         } else if (mapped.thinking === 'none' && draft.preservedAdaptiveThinking === false) {
           edit.adaptive_thinking = false;
         }
@@ -923,6 +1035,10 @@ function createProviderEnhance(options) {
           model: context.key,
           edit,
         });
+        invalidateConfig();
+        if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+          window.dispatchEvent(new CustomEvent('ekd:config-saved', { detail: { key: context.key } }));
+        }
         syncOfficialRowContextInput(context.row, contextParsed.value);
         status.textContent = '已保存并读回核对，当前窗口立即生效。';
         status.dataset.tone = 'ok';
@@ -957,9 +1073,13 @@ function createProviderEnhance(options) {
           capabilityPills,
         ]),
         el('div', { class: 'ekd-px-section' }, [
+          el('span', { class: 'ekd-px-title', text: '思考模式' }),
+          modePills,
+          modeHint,
           el('span', { class: 'ekd-px-title', text: '思考强度' }),
           thinkingPills,
           thinkingHint,
+          adaptiveRow,
         ]),
       ]),
       el('div', { class: 'ekd-px-limits' }, [
@@ -1020,21 +1140,95 @@ function createProviderEnhance(options) {
   // ---------------------------------------------------------------- lifecycle
 
   let scanning = false;
+  let scanAgain = false;
+  let scanTimer = null;
+  let configListener = null;
+  let enabled = true;
+
+  function startObserver() {
+    if (!state.observer || state.removed) return;
+    state.observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function stopObserver() {
+    state.observer?.disconnect();
+  }
+
+  /** Coalesces a burst of unrelated DOM mutations into one decoration pass. The
+   * pass itself is guarded, so a mutation caused by our own injection cannot
+   * start a second concurrent scan. */
   function scan() {
-    if (state.removed || scanning) return;
+    if (state.removed || !enabled) return;
+    if (scanTimer !== null) return;
+    // The unit-test harness runs this factory in a bare VM context without
+    // timers; both scheduling paths must be optional.
+    if (typeof setTimeout !== 'function') {
+      void runScan();
+      return;
+    }
+    scanTimer = setTimeout(() => {
+      scanTimer = null;
+      if (state.removed || !enabled) return;
+      void runScan();
+    }, 0);
+  }
+
+  async function runScan() {
+    if (scanning) {
+      scanAgain = true;
+      return;
+    }
     scanning = true;
     ensureStyle();
-    void decorate().catch(() => {}).finally(() => { scanning = false; });
+    try {
+      await decorate();
+    } catch {
+      // A transient contract miss is retried by the next observer pass.
+    } finally {
+      scanning = false;
+      if (scanAgain) {
+        scanAgain = false;
+        scan();
+      }
+    }
+  }
+
+  /** Called by the renderer when `dom.settings_providers` flips. Removing the
+   * decorations while the observer is disconnected is what keeps clearDecorations
+   * from re-decorating in an endless loop. */
+  function setEnabled(next) {
+    const value = Boolean(next);
+    if (value === enabled) return;
+    enabled = value;
+    if (!value) {
+      stopObserver();
+      if (scanTimer !== null) {
+        clearTimeout(scanTimer);
+        scanTimer = null;
+      }
+      clearDecorations();
+      return;
+    }
+    if (state.removed) return;
+    startObserver();
+    scan();
   }
 
   function install() {
     ensureStyle();
     state.observer = new MutationObserver(() => scan());
-    state.observer.observe(document.body, { childList: true, subtree: true });
+    startObserver();
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      configListener = () => invalidateConfig();
+      window.addEventListener('ekd:config-saved', configListener);
+      window.addEventListener('ekd:official-config-changed', configListener);
+    }
     scan();
   }
 
   function clearDecorations() {
+    const wasObserving = enabled && Boolean(state.observer);
+    if (wasObserving) stopObserver();
     closePanel();
     for (const node of document.querySelectorAll('[data-ekd-px-button],[data-ekd-px-head-pad],[data-ekd-px-hint],[data-ekd-px-note],[data-ekd-provider-enhance]')) {
       node.remove();
@@ -1045,13 +1239,23 @@ function createProviderEnhance(options) {
     for (const row of document.querySelectorAll('[data-ekd-px-row]')) {
       delete row.dataset.ekdPxRow;
     }
+    if (wasObserving && enabled && !state.removed) startObserver();
   }
 
   function remove() {
     if (state.removed) return;
     state.removed = true;
+    if (scanTimer !== null) {
+      clearTimeout(scanTimer);
+      scanTimer = null;
+    }
     state.observer?.disconnect();
     state.observer = null;
+    if (configListener && typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('ekd:config-saved', configListener);
+      window.removeEventListener('ekd:official-config-changed', configListener);
+    }
+    configListener = null;
     clearDecorations();
     state.style?.remove();
     state.style = null;
@@ -1061,6 +1265,7 @@ function createProviderEnhance(options) {
     install,
     remove,
     clearDecorations,
+    setEnabled,
     scan,
     formatSize,
     parseSize,
@@ -1068,6 +1273,7 @@ function createProviderEnhance(options) {
     readThinkingState,
     applyThinkingState,
     selectThinkingOption,
+    setThinkingMode,
     draftOf,
     resolveProvider,
     openPanel,

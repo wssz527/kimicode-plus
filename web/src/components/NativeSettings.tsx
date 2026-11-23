@@ -201,9 +201,14 @@ function NumberField({
   }, [value]);
   const trimmed = text.trim();
   const parsed = trimmed === "" ? null : commitNumberField(text, min, max);
-  const issue = trimmed === "" ? null : parsed === null ? `填写 ${min}–${max} 之间的整数。` : null;
+  const issue = trimmed === ""
+    ? `不能留空，填写 ${min}–${max} 之间的整数；离开输入框会恢复上一个有效值。`
+    : parsed === null
+      ? `填写 ${min}–${max} 之间的整数。`
+      : null;
   function commit() {
     if (parsed !== null && String(parsed) !== value) onCommit(parsed);
+    else if (parsed === null) setText(value);
   }
   return (
     <label className="ns-field">
@@ -266,6 +271,29 @@ export function NativeSettings({
   const [saveError, setSaveError] = useState<string | null>(null);
   const savingRef = useRef<string | null>(null);
   savingRef.current = saving;
+  // A background config change must not erase an edit the user has not saved
+  // yet. Each section marks itself dirty on the first local change and is only
+  // cleared by a readback that includes that edit.
+  const [poolDirty, setPoolDirty] = useState(false);
+  const [rulesDirty, setRulesDirty] = useState(false);
+  const dirtyRef = useRef({ pool: false, rules: false });
+  dirtyRef.current = { pool: poolDirty, rules: rulesDirty };
+  const markPoolDirty = useCallback((..._args: unknown[]) => {
+    if (!dirtyRef.current.pool) setPoolDirty(true);
+  }, []);
+  const markRulesDirty = useCallback(() => {
+    if (!dirtyRef.current.rules) setRulesDirty(true);
+  }, []);
+  // Edits go through these wrappers so the draft guard sees them; a config
+  // readback writes the state setters directly and therefore never marks dirty.
+  const editPool = useCallback((action: Parameters<typeof setPool>[0]) => {
+    markPoolDirty();
+    setPool(action);
+  }, [markPoolDirty]);
+  const editRules = useCallback((action: Parameters<typeof setRules>[0]) => {
+    markRulesDirty();
+    setRules(action);
+  }, [markRulesDirty]);
 
   const applyConfig = useCallback((cfg: Dic) => {
     setConfig(cfg);
@@ -282,6 +310,9 @@ export function NativeSettings({
     let alive = true;
     const refresh = () => {
       if (savingRef.current !== null) return;
+      // A draft in either editor wins over an automatic refresh; the next save
+      // or an explicit remount is what reconciles it.
+      if (dirtyRef.current.pool || dirtyRef.current.rules) return;
       host
         .request<Dic>("config.get")
         .then((next) => {
@@ -342,7 +373,7 @@ export function NativeSettings({
   const ruleIssues = rules.map((rule) => patternIssue(rule.pattern));
 
   function movePoolEntry(id: string, delta: -1 | 1) {
-    setPool((current) => {
+    editPool((current) => {
       const index = current.entries.findIndex((item) => item.id === id);
       const target = index + delta;
       if (index === -1 || target < 0 || target >= current.entries.length) return current;
@@ -383,6 +414,8 @@ export function NativeSettings({
         setSaveError(READBACK_MISMATCH);
         return;
       }
+      if (key === "pool") setPoolDirty(false);
+      if (key === "permission") setRulesDirty(false);
       setSaved({ key, timing, note: options.note });
       if (typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent("ekd:config-saved", { detail: { key } }));
@@ -600,7 +633,7 @@ export function NativeSettings({
               type="button"
               className="wb-btn is-quiet is-compact"
               onClick={() =>
-                setPool((current) => ({
+                editPool((current) => ({
                   ...current,
                   entries: [...current.entries, { id: nextId("pool"), key: "", desc: "" }],
                 }))
@@ -667,7 +700,7 @@ export function NativeSettings({
                     const sourceId = draggingId || event.dataTransfer.getData("text/plain");
                     const position = dropTarget?.id === entry.id ? dropTarget.position : "before";
                     if (sourceId && sourceId !== entry.id) {
-                      setPool((current) => ({
+                      editPool((current) => ({
                         ...current,
                         entries: reorderPoolEntries(current.entries, sourceId, entry.id, position),
                       }));
@@ -708,7 +741,7 @@ export function NativeSettings({
                         options={modelOptions}
                         value={entry.key}
                         onChange={(key) =>
-                          setPool((current) => ({
+                          editPool((current) => ({
                             ...current,
                             entries: current.entries.map((item) => (item.id === entry.id ? { ...item, key } : item)),
                           }))
@@ -728,7 +761,7 @@ export function NativeSettings({
                         value={entry.desc}
                         placeholder="用途说明（例如 日常实现）"
                         onChange={(event) =>
-                          setPool((current) => ({
+                          editPool((current) => ({
                             ...current,
                             entries: current.entries.map((item) =>
                               item.id === entry.id ? { ...item, desc: event.target.value } : item,
@@ -766,7 +799,7 @@ export function NativeSettings({
                       aria-label="移除这个模型"
                       title="移除这个模型"
                       onClick={() =>
-                        setPool((current) => ({
+                        editPool((current) => ({
                           ...current,
                           entries: current.entries.filter((item) => item.id !== entry.id),
                         }))
@@ -874,7 +907,7 @@ export function NativeSettings({
               type="button"
               className="wb-btn is-quiet is-compact"
               onClick={() =>
-                setRules((current) => [
+                editRules((current) => [
                   ...current,
                   { id: nextId("rule"), decision: "ask", scope: "user", pattern: "", reason: "", rest: {} },
                 ])
@@ -911,7 +944,7 @@ export function NativeSettings({
                           aria-label="判定结果"
                           value={rule.decision}
                           onChange={(event) =>
-                            setRules((current) =>
+                            editRules((current) =>
                               current.map((item) =>
                                 item.id === rule.id ? { ...item, decision: event.target.value } : item,
                               ),
@@ -932,7 +965,7 @@ export function NativeSettings({
                           value={rule.pattern}
                           placeholder="例如 bash(rm -rf*)"
                           onChange={(event) =>
-                            setRules((current) =>
+                            editRules((current) =>
                               current.map((item) =>
                                 item.id === rule.id ? { ...item, pattern: event.target.value } : item,
                               ),
@@ -946,7 +979,7 @@ export function NativeSettings({
                           aria-label="生效范围"
                           value={rule.scope}
                           onChange={(event) =>
-                            setRules((current) =>
+                            editRules((current) =>
                               current.map((item) =>
                                 item.id === rule.id ? { ...item, scope: event.target.value } : item,
                               ),
@@ -967,7 +1000,7 @@ export function NativeSettings({
                           value={rule.reason}
                           placeholder="备注（可选）"
                           onChange={(event) =>
-                            setRules((current) =>
+                            editRules((current) =>
                               current.map((item) =>
                                 item.id === rule.id ? { ...item, reason: event.target.value } : item,
                               ),
@@ -979,7 +1012,7 @@ export function NativeSettings({
                         type="button"
                         className="wb-icon-btn ns-row-remove"
                         title="删除这条规则"
-                        onClick={() => setRules((current) => current.filter((item) => item.id !== rule.id))}
+                        onClick={() => editRules((current) => current.filter((item) => item.id !== rule.id))}
                       >
                         <Icon name="trash" size={13} />
                       </button>

@@ -71,13 +71,17 @@ const KIND_LABEL: Record<string, string> = {
   recovery: "额度恢复",
 };
 
-function NumberField({ label, value, min, max, unit, hideLabel = false, onCommit, onEditingChange }: {
+function NumberField({ label, value, min, max, unit, hideLabel = false, hint, validate, onCommit, onEditingChange }: {
   label: string;
   value: number;
   min: number;
   max: number;
   unit: string;
   hideLabel?: boolean;
+  hint?: string;
+  /** Extra rule beyond the numeric range; returns a message when the value is
+   * rejected. 0-versus-2..240 for the "other provider" TTL is one of these. */
+  validate?: (value: number) => string | null;
   onCommit: (value: number | null) => void;
   onEditingChange?: (editing: boolean) => void;
 }) {
@@ -90,7 +94,13 @@ function NumberField({ label, value, min, max, unit, hideLabel = false, onCommit
     if (!focused.current) setText(String(value));
   }, [value]);
   const parsed = commitNumberField(text, min, max);
-  const valid = parsed !== null;
+  const ruleIssue = parsed !== null && validate ? validate(parsed) : null;
+  const valid = parsed !== null && !ruleIssue;
+  const issue = text.trim() === ""
+    ? `不能留空，填写 ${min}–${max} 之间的整数；离开输入框会恢复上一个有效值。`
+    : parsed === null
+      ? `填写 ${min}–${max} 之间的整数。`
+      : ruleIssue;
   return <span className="eks-field">
     <label htmlFor={id} className={hideLabel ? "eks-sr" : undefined}>{label}</label>
     <input
@@ -101,17 +111,25 @@ function NumberField({ label, value, min, max, unit, hideLabel = false, onCommit
       min={min}
       max={max}
       aria-invalid={valid ? undefined : true}
+      aria-describedby={issue ? `${id}-issue` : undefined}
       value={text}
       onFocus={() => { focused.current = true; onEditingChange?.(true); }}
       onChange={event => setText(event.target.value)}
       onBlur={() => {
         focused.current = false;
         onEditingChange?.(false);
-        if (parsed !== null) onCommit(parsed);
-        else setText(String(value));
+        if (valid && parsed !== null) {
+          // Committing an unchanged value would write the policy again and make
+          // two idle tabs overwrite each other with stale closures.
+          if (parsed !== value) onCommit(parsed);
+          else setText(String(value));
+        } else {
+          setText(String(value));
+        }
       }}
     />
     <span className="eks-unit">{unit}</span>
+    {issue ? <span className="eks-issue" id={`${id}-issue`} role="status">{issue}</span> : hint ? <span className="eks-hint">{hint}</span> : null}
   </span>;
 }
 
@@ -132,6 +150,9 @@ export function CacheSettings({ host }: { host: NativeHost }) {
   const [history, setHistory] = useState<CacheHistory | null>(null);
   const [range, setRange] = useState<"24h" | "7d" | "30d">("24h");
   const [policy, setPolicy] = useState<CachePolicySettings>(DEFAULTS);
+  // Switches stay disabled until the persisted policy has been read: writing a
+  // toggle against `DEFAULTS` would erase whatever is already on disk.
+  const [policyReady, setPolicyReady] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(true);
@@ -157,15 +178,23 @@ export function CacheSettings({ host }: { host: NativeHost }) {
   useEffect(() => {
     let alive = true;
     (async () => {
-      try {
-        await loadReadings();
-        const nextPolicy = await host.request<CachePolicySettings>("automation.get");
-        if (alive) setPolicy(mergePolicy(DEFAULTS, nextPolicy));
-      } catch (cause) {
-        if (alive) setError(errorText(cause));
-      } finally {
-        if (alive) setLoading(false);
+      // The read-only statistics and the editable policy are independent reads.
+      // One failing must not blank the other or let `DEFAULTS` overwrite a
+      // policy that is already on disk.
+      const [readings, policyResult] = await Promise.allSettled([
+        loadReadings(),
+        host.request<CachePolicySettings>("automation.get"),
+      ]);
+      if (!alive) return;
+      if (readings.status === "rejected") setError(errorText(readings.reason));
+      if (policyResult.status === "fulfilled") {
+        setPolicy(mergePolicy(DEFAULTS, policyResult.value));
+        setPolicyReady(true);
+      } else {
+        setError(previous => previous || `读取自动化策略失败：${errorText(policyResult.reason)}`);
+        setPolicyReady(false);
       }
+      setLoading(false);
     })();
     return () => { alive = false; };
   }, [host, loadReadings]);
@@ -193,6 +222,9 @@ export function CacheSettings({ host }: { host: NativeHost }) {
   }), [host]);
 
   const savePolicy = useCallback(async (next: CachePolicySettings, successNote: string) => {
+    // Serialize writes: two switches toggled quickly used to race, and the slower
+    // answer could restore the older snapshot.
+    if (writing.current) return;
     writing.current = true;
     setError("");
     setNotice("");
@@ -311,6 +343,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
         <Toggle
           label="启用后台等待保活"
           checked={policy.keepAlive.enabled}
+          disabled={!policyReady}
           onChange={value => void savePolicy({ ...policy, keepAlive: { ...policy.keepAlive, enabled: value } }, value ? "后台等待保活已开启。" : "后台等待保活已关闭。")}
         />
       </div>
@@ -331,6 +364,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
         <Toggle
           label="启用空闲会话保活"
           checked={idleKeepAlive.enabled}
+          disabled={!policyReady}
           onChange={value => void savePolicy(
             mergePolicy(policy, { idleKeepAlive: { ...idleKeepAlive, enabled: value } }),
             value ? "空闲会话保活已开启。" : "空闲会话保活已关闭。",
@@ -420,6 +454,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
               min={0}
               max={240}
               unit="分钟"
+              validate={value => (value === 0 || value >= 2 ? null : "只接受 0（未知，不自动保活）或 2–240 分钟；填 1 没有可推导的保活间隔。")}
               onEditingChange={value => { editing.current = value; }}
               onCommit={value => {
                 if (value !== null && (value === 0 || value >= 2)) {
@@ -493,6 +528,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
         <Toggle
           label="启用空闲自动压缩"
           checked={policy.compaction.enabled}
+          disabled={!policyReady}
           onChange={value => void savePolicy({ ...policy, compaction: { ...policy.compaction, enabled: value } }, value ? "空闲自动压缩已开启。" : "空闲自动压缩已关闭。")}
         />
       </div>
@@ -514,6 +550,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
         <Toggle
           label="启用额度恢复自动继续"
           checked={policy.recovery.enabled}
+          disabled={!policyReady}
           onChange={value => void savePolicy({ ...policy, recovery: { ...policy.recovery, enabled: value } }, value ? "额度恢复已开启。" : "额度恢复已关闭。")}
         />
       </div>
