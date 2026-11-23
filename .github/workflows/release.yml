@@ -29,6 +29,22 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # Fail before building anything: the draft release and the CNB mirror must be
+      # updated together, so a missing CNB_TOKEN has to stop the run while the tag
+      # still has no release and no mirror entry.
+      - name: Require CNB_TOKEN unless the mirror is explicitly skipped
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          SKIP_CNB_MIRROR: ${{ inputs.skip_cnb_mirror || 'false' }}
+        run: |
+          if [ "$SKIP_CNB_MIRROR" = "true" ]; then
+            echo 'skip_cnb_mirror=true: this run will not touch the CNB mirror.'
+            exit 0
+          fi
+          if [ -z "${CNB_TOKEN:-}" ]; then
+            echo 'CNB_TOKEN secret is not configured. Add the secret, or re-run with skip_cnb_mirror=true if the mirror is intentionally left on the previous release.' >&2
+            exit 1
+          fi
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -90,22 +106,22 @@ jobs:
             git log -1 --format=%B
             echo '__EKD_RELEASE_NOTES__'
           } >> "$GITHUB_ENV"
+      # `repos/{repo}/releases/tags/{tag}` answers 404 for drafts, so a run
+      # interrupted after the draft upload would look like "no release" and the
+      # next attempt would append a second copy of the notes to the same draft.
+      # `gh release view` sees drafts, so use it for the existence check.
       - name: Refuse to overwrite an existing release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag=$(jq -rn --arg tag "$GITHUB_REF_NAME" '$tag | @uri')
-          set +e
-          result=$(gh api --include "repos/$GITHUB_REPOSITORY/releases/tags/$tag" 2>&1)
-          code=$?
-          set -e
-          if [ "$code" -eq 0 ]; then
-            echo 'This tag already has a release. Use a new version to publish.' >&2
-            echo 'If the existing release is a draft left by a failed run, delete it (gh release delete <tag> --yes) or publish it after checking its assets, then re-run.' >&2
-            exit 1
-          fi
-          if ! printf '%s\n' "$result" | grep -q '^HTTP/[^ ]* 404'; then
-            echo 'Could not verify whether the release exists.' >&2
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || echo unknown)
+            echo "A release already exists for $GITHUB_REF_NAME (draft=$is_draft)." >&2
+            if [ "$is_draft" = "false" ]; then
+              echo 'The published release is never overwritten. Use a new version to publish.' >&2
+            else
+              echo 'It is a draft left by an interrupted run. Delete it first: gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag=false, then re-run this workflow.' >&2
+            fi
             exit 1
           fi
       - name: Cross-build and package
@@ -173,4 +189,10 @@ jobs:
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "v${{ steps.version.outputs.version }}" --repo "${{ github.repository }}" --draft=false
+        run: |
+          # --latest is explicit: a pre-release must never become "latest", and a
+          # stable release must become it even when the tag was created earlier.
+          gh release edit "v${{ steps.version.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --draft=false \
+            --latest=${{ steps.version.outputs.prerelease != 'true' }}

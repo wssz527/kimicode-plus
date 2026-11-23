@@ -37,7 +37,7 @@ Go Core 仍可独立运行。当前原生路径已在隔离 Kimi Code 1.4.2 / El
 5. 钩子借主进程 webContents 向 renderer 注入 UI，并在 `did-finish-load` 后重新挂载；卸载与核心重启时清理入口、视图和连接。
 6. 关闭时清除 deadline 并自宿主内部关闭 inspector，随后最多轮询 15 秒确认端口真的关闭；关不掉时明确报告，而不是留下调试端口。
 
-EKD 由 `internal/desktop/inject.go`、`cdp.go`、`contracts.go`、`inspector_fuse.go` 和内嵌 JS 实现该机制。接入不再依赖官方版本号白名单：只要安全门槛（唯一主进程身份、Electron fuse 允许 inspector、渲染协议 `app://renderer/`）通过即允许附着；`1.3.4`/`1.3.5`/`1.3.7`/`1.4.2` 作为已人工验证记录，遇到未验证版本会在「状态与诊断」标注"该版本未经人工验证，契约检测通过"。各界面注入点与官方本地接口（`/config`、`/providers`、`/models`、`/oauth/usage`、`/sessions`）逐项探测，任一项失效仅停用并清理对应功能，其余功能照常运行。
+EKD 由 `internal/desktop/inject.go`、`cdp.go`、`contracts.go`、`inspector_fuse.go` 和内嵌 JS 实现该机制。接入不再依赖官方版本号白名单：只要安全门槛（唯一主进程身份、Electron fuse 允许 inspector、渲染协议 `app://renderer/`）通过即允许附着。`internal/desktop/cdp.go` 的 `SupportedHosts` 目前只把 `1.3.4`/`1.3.5`/`1.3.7` 标为已人工验证；1.4.2 已在 macOS ARM64 与 Windows x64 完成实机接入与 KAP 验收（见 `docs/VALIDATION.md`），但该验证表尚未收录，因此在 1.4.2 上「状态与诊断」仍会显示"该版本未经人工验证，契约检测通过"，而不是已验证。把新版本加入该表属于代码改动，需与对应实机证据一起提交。各界面注入点与官方本地接口（`/config`、`/providers`、`/models`、`/oauth/usage`、`/sessions`）逐项探测，任一项失效仅停用并清理对应功能，其余功能照常运行。
 
 **不再要求 `--user-data-dir`**。这一条曾把接入限制成"只能接隔离副本"，而从程序坞正常启动的实例没有该参数。现在的规则：
 
@@ -117,7 +117,7 @@ Monitor 位于会话侧栏，默认约 233px 的紧凑布局，详情折叠。�
 | 用量 | 独立账本、用户导入、轻量聊天与本地网关响应入账、账号归因 | 官方 Token 事件接入 |
 | 双向任务 | 原生 `handoff` 向真实 Code 会话发送文本，`session.send` 发送本机文件；旧 Outbox 保留附件、幂等与 Mock 回执 | 系统文件选择窗口 GUI 点选、网站内发送/回复/上传、两条链路统一 |
 | 聊天 | Go 四协议轻量聊天；原生规划有流式、停止、工具审批；本地网关通过官方 CLI 合成文本与 Read 回合 | 真实付费供应商验收；轻量聊天仍无流式和工具 |
-| 凭据 | 系统钥匙串托管密钥（macOS Keychain / Windows DPAPI）的 AES-GCM 库、启动免密自动解锁、旧主口令库兼容、secretRef、显式路径只读导入 | refresh_token 刷新；不回写官方存储 |
+| 凭据 | 系统钥匙串托管密钥（macOS Keychain / Windows DPAPI）的 AES-GCM 库、启动免密自动解锁、旧主口令库兼容、secretRef；多账号切换经备份后原子更新官方凭证文件并失败回滚，旧的显式只读导入接口不回写 | refresh_token 刷新；其他平台无钥匙串后端时不回写官方存储 |
 | 内置浏览器 | 自建 WebContentsView/窗口、选区/正文提取、编辑并交接 Code，视图可见性与坐标已核对 | 网站内对话、上传、登录态恢复与完整窗口合成截图 |
 | 压缩与保活 | 原生后台调度、真实 KAP 请求、意图/回执、Goal/审批/竞争保护；合成回归通过 | 真实账号上的自动动作验收 |
 | 多会话/Tower | 最多三个 KAP 会话，逐次追加、主窗格跟随与交换去重；独立草稿/模型/模式/权限/附件/停止/审批；本地 Worktree 和布局偏好 | Reviewer 仍只是本地偏好 |

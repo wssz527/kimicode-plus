@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for scripts/sync_cnb_release.py against a local stub HTTP server."""
+import gc
 import http.server
 import json
 from pathlib import Path
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import warnings
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sync_cnb_release as sync
@@ -222,6 +224,24 @@ class SyncCNBReleaseTest(unittest.TestCase):
 
     def test_prerelease_detection(self):
         self.assertFalse(sync.is_prerelease('v0.2.4'))
+
+    def test_failed_upload_response_is_closed(self):
+        # A non-2xx PUT arrives as HTTPError, which owns the socket. If it is not
+        # closed there, the failed attempt leaves a connection open until GC and
+        # the suite reports `ResourceWarning: unclosed <socket.socket>`.
+        server = FakeCNBServer()
+        server.fail_first_upload = True
+        self.addCleanup(server.close)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always', ResourceWarning)
+            with self.assertRaises(RuntimeError) as raised:
+                sync.upload_file_put(f'{server.base_url}/upload/asset.bin', self.files[2])
+            gc.collect()
+        self.assertIn('HTTP 502', str(raised.exception))
+        leaked = [w for w in caught if issubclass(w.category, ResourceWarning)]
+        self.assertEqual(leaked, [], f'unclosed sockets: {[str(w.message) for w in leaked]}')
+        # The rejected attempt never counted as an upload.
+        self.assertEqual(server.upload_order, [])
 
     def test_plugin_channel_uploads_plugins_manifest_last_and_keeps_non_latest(self):
         plugin_dir = Path(tempfile.mkdtemp(prefix='cnb-plugins-test-'))

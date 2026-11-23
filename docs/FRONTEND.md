@@ -79,7 +79,7 @@ ENHANCE_DEV_TARGET=http://127.0.0.1:8899 npm run dev       # 覆盖目标
 
 设置不再使用单层 5 项列表加子页返回，改为官方原生标签归位：官方「账户」页顶部由 `AccountsSection.tsx` 提供多账号列表与切换（钥匙串可用时直接显示免密解锁状态）；官方「模型供应商」模型行通过 `internal/desktop/assets/provider_enhance.js` 行内展开「能力与限制」面板，补齐图片/视频/工具能力、思考强度（`no` / `low` / `medium` / `high` / `xhigh` / `max`）与上下文/最大输出长度（保存时无损保留已有的 `adaptive_thinking` 与未知字段）；官方「智能体与会话」页由 `NativeSettings.tsx` 注入子代理模型池、子代理时限、单轮步数上限与权限规则；官方「实验室」页由 `OfficialSettingsSections.tsx` 注入会话并排与规划实验开关；官方「插件」页新增 KimiCode+ 分段承载增强插件的安装、启停与授权；独立的「缓存与用量」标签页由 `CacheSettings.tsx` 承载缓存、保活、压缩与实际用量；「KimiCode+」标签页由 `SettingsSurface.tsx` 提供状态与诊断、功能归位索引，以及任一官方页探针失效时的回落小节。凭据增改删嵌入申请该凭据的插件详情页（`PluginCredentials.tsx`）。`CacheSettings`、浏览器权限复用已有 `Toggle`，缓存保存后读回再更新草稿基线。opaque origin 的请求 ID 使用随机回退；缓存、布局、权限、供应商能力补齐和子代理模型池的实机流程已通过。
 
-原生视觉沿用官方右侧面板、主聊天区和侧栏结构，不再使用常驻工作台外壳、会话选择栏、空闲状态带或多会话常驻底部恢复栏。renderer 通过容器属性与 CSS 持续隐藏 Vue 动态重建的官方子节点，原生工具/标签切换时释放。插件 `ui:entry` 同时注入官方“会话信息 → 可打开”、右侧空白面板列表与 `+` `browser-overlay` 菜单，`ui:sidebar-nav` 注入左侧栏“新建会话”下方；`Monitor`（`plugins/monitor/`）按上游桌面客户端版复刻模块化面板、Rive 蓝球形象与三区拖拽，并展示 Kimi Code 额度、加油包与外部供应商余额。自动化总开关与额度恢复自动继续策略统一位于“缓存与额度”，三项均默认关闭。
+原生视觉沿用官方右侧面板、主聊天区和侧栏结构，不再使用常驻工作台外壳、会话选择栏、空闲状态带或多会话常驻底部恢复栏。renderer 通过容器属性与 CSS 持续隐藏 Vue 动态重建的官方子节点，原生工具/标签切换时释放。插件 `ui:entry` 同时注入官方“会话信息 → 可打开”、右侧空白面板列表与 `+` `browser-overlay` 菜单，`ui:sidebar-nav` 注入左侧栏“新建会话”下方；`Monitor`（`plugins/monitor/`）按上游桌面客户端版复刻模块化面板、Rive 蓝球形象与三区拖拽，并展示 Kimi Code 额度、加油包与外部供应商余额。自动化总开关与额度恢复自动继续策略统一位于「缓存与用量」，三项均默认关闭。
 
 ## 页面
 

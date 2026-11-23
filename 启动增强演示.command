@@ -32,9 +32,23 @@ RUNTIME="$DATA_DIR/runtime.json"
 # must be reused, never deleted: removing it would strand the running instance
 # without its pairing record. Check the recorded pid first and only clean up a
 # record whose process is gone.
-if [ -e "$RUNTIME" ]; then
+if [ -f "$RUNTIME" ] && [ -r "$RUNTIME" ]; then
   EXISTING_PID=$(sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p' "$RUNTIME" | head -n 1)
-  if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+  # `kill -0 0` signals the caller's own process group, so pid 0 must never count
+  # as a live core. The recorded pid also has to belong to an enhanced-kimi
+  # process: after a reboot the pid may exist again and name something unrelated.
+  EXISTING_PID_ALIVE=0
+  case "$EXISTING_PID" in
+    ''|*[!0-9]*) EXISTING_PID_ALIVE=0 ;;
+    *)
+      if [ "$EXISTING_PID" -gt 0 ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+        if ps -p "$EXISTING_PID" -o comm= 2>/dev/null | grep -q 'enhanced-kimi'; then
+          EXISTING_PID_ALIVE=1
+        fi
+      fi
+      ;;
+  esac
+  if [ "$EXISTING_PID_ALIVE" -eq 1 ]; then
     echo "检测到增强核心已在运行（PID ${EXISTING_PID}），复用现有实例，不重启也不改动 runtime.json。"
     URL=$(sed -n 's/.*"pairingUrl": *"\([^"]*\)".*/\1/p' "$RUNTIME" | head -n 1)
     if [ -n "$URL" ]; then
@@ -64,6 +78,15 @@ for _ in $(seq 1 100); do
   fi
   sleep 0.2
 done
+
+# The wait loop can also end by timeout with no runtime.json at all, and `sed`
+# on a missing file is a hard error under `set -e`.
+if [ ! -f "$RUNTIME" ]; then
+  echo "等待 20 秒仍未见 $RUNTIME，请查看 ${LOG}。"
+  tail -n 20 "$LOG" || true
+  read -r -p "按回车键关闭窗口。" _
+  exit 1
+fi
 
 URL=$(sed -n 's/.*"pairingUrl": *"\([^"]*\)".*/\1/p' "$RUNTIME" | head -n 1)
 if [ -z "$URL" ]; then

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Sync a built KimiCode+ release tag and assets to the CNB domestic mirror."""
 import argparse
-import http.client
 import json
 import os
 from pathlib import Path
@@ -44,6 +43,26 @@ def is_prerelease(tag):
     return '-' in version.split('+', 1)[0]
 
 
+def close_response_socket(resp):
+    """Release the socket behind a urllib response.
+
+    `HTTPResponse.close()` only closes the buffered reader; when the server ends
+    the connection itself, urllib leaves `resp.fp` attached to a `SocketIO` that
+    still owns the socket. Dropping that object unclosed is what produced
+    `ResourceWarning: unclosed <socket.socket>` under `-W default`, so close the
+    socket explicitly before closing the response.
+    """
+    fp = getattr(resp, 'fp', None)
+    sock_io = getattr(fp, 'raw', None)
+    sock = getattr(sock_io, '_sock', None)
+    if sock is not None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    resp.close()
+
+
 def cnb_json_request(url, token, method='GET', payload=None, timeout=30):
     headers = {
         'Authorization': f'Bearer {token}',
@@ -58,36 +77,43 @@ def cnb_json_request(url, token, method='GET', payload=None, timeout=30):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
-            return resp.status, (json.loads(raw.decode('utf-8')) if raw else {})
+            try:
+                return resp.status, (json.loads(raw.decode('utf-8')) if raw.strip() else {})
+            finally:
+                close_response_socket(resp)
     except urllib.error.HTTPError as err:
-        body = err.read().decode('utf-8', errors='replace')[:500]
+        with err:
+            body = err.read().decode('utf-8', errors='replace')[:500]
         return err.code, {'_raw': body}
 
 
 def upload_file_put(upload_url, file_path, timeout=180):
     size = file_path.stat().st_size
-    parts = urllib.parse.urlsplit(upload_url)
-    if parts.scheme not in ('http', 'https') or not parts.hostname:
-        raise RuntimeError(f'Unsupported upload URL for {file_path.name}: {upload_url}')
-    connection_cls = http.client.HTTPSConnection if parts.scheme == 'https' else http.client.HTTPConnection
-    target = parts.path or '/'
-    if parts.query:
-        target = f'{target}?{parts.query}'
-    connection = connection_cls(parts.hostname, parts.port, timeout=timeout)
-    try:
-        with file_path.open('rb') as handle:
-            connection.request(
-                'PUT',
-                target,
-                body=handle,
-                headers={'Content-Length': str(size), 'Content-Type': 'application/octet-stream'},
-            )
-            response = connection.getresponse()
-            response.read()
-            if response.status < 200 or response.status >= 300:
-                raise RuntimeError(f'Upload PUT failed for {file_path.name}: HTTP {response.status}')
-    finally:
-        connection.close()
+    headers = {
+        'Content-Length': str(size),
+        'Content-Type': 'application/octet-stream',
+    }
+    # urlopen keeps proxy settings and redirect handling that a raw
+    # http.client connection would bypass; the socket is closed explicitly in
+    # the same block so the response object cannot linger until GC.
+    with file_path.open('rb') as handle:
+        req = urllib.request.Request(upload_url, data=handle, headers=headers, method='PUT')
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as err:
+            # A non-2xx answer arrives as HTTPError, which is itself a response
+            # holding the socket. `with` never runs for it, so close it here or
+            # the connection leaks until GC.
+            with err:
+                err.read()
+            raise RuntimeError(f'Upload PUT failed for {file_path.name}: HTTP {err.code}') from None
+        with resp:
+            try:
+                resp.read()
+                if resp.status < 200 or resp.status >= 300:
+                    raise RuntimeError(f'Upload PUT failed for {file_path.name}: HTTP {resp.status}')
+            finally:
+                close_response_socket(resp)
 
 
 def ensure_release(api_base, repo, token, tag, notes, prerelease, make_latest=None):

@@ -46,6 +46,22 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: web/package-lock.json
+      # Fail before anything reaches the network: once the GitHub plugins-latest
+      # channel is replaced, a missing CNB_TOKEN would leave domestic users on the
+      # previous packages while GitHub already serves the new ones.
+      - name: Require CNB_TOKEN unless the mirror is explicitly skipped
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          SKIP_CNB_MIRROR: ${{ inputs.skip_cnb_mirror || 'false' }}
+        run: |
+          if [ "$SKIP_CNB_MIRROR" = "true" ]; then
+            echo 'skip_cnb_mirror=true: this run will not touch the CNB plugin mirror.'
+            exit 0
+          fi
+          if [ -z "${CNB_TOKEN:-}" ]; then
+            echo 'CNB_TOKEN secret is not configured. Add the secret, or re-run with skip_cnb_mirror=true if the CNB channel is intentionally left on the previous packages.' >&2
+            exit 1
+          fi
       - name: Verify plugin packages and signing CLI
         run: |
           go test ./internal/plugins/... ./plugins/... ./cmd/plugin-release/... -count=1
@@ -54,7 +70,11 @@ jobs:
         run: |
           (cd web && npm ci)
           node plugins/monitor-src/build/bundle.mjs
-          if ! git diff --exit-code plugins/monitor/; then
+          # Untracked output counts as stale too: a new bundle file that was never
+          # committed would otherwise be signed into the release unnoticed.
+          status="$(git status --porcelain plugins/monitor/)"
+          if [ -n "$status" ]; then
+            printf '%s\n' "$status" >&2
             echo 'plugins/monitor is stale: rebuild and commit monitor-src output before signing a release.' >&2
             exit 1
           fi
@@ -120,8 +140,7 @@ jobs:
             exit 0
           fi
           if [ -z "${CNB_TOKEN:-}" ]; then
-            echo 'CNB_TOKEN secret is not configured. The domestic CNB plugin channel would stay on the previous packages, so this run fails instead of reporting success.' >&2
-            echo 'Configure the secret, sync manually with scripts/sync_cnb_release.py, or re-run with skip_cnb_mirror=true.' >&2
+            echo 'CNB_TOKEN secret is not configured; this run must not update the plugin channel without the mirror.' >&2
             exit 1
           fi
           python3 scripts/sync_cnb_release.py \
