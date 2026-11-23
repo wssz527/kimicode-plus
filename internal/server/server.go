@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -34,7 +35,7 @@ import (
 	bundledPlugins "enhancedkimi/plugins"
 )
 
-var Version = "0.2.7"
+var Version = "0.2.8"
 
 type Module struct {
 	ID      string `json:"id"`
@@ -51,11 +52,15 @@ type NativeOptions struct {
 	PairingToken          string
 	RestartState          func() updater.RestartState
 	RequestRestart        func()
-	UpdateAPIBaseURL      string
-	UpdateHTTPClient      *http.Client
-	VaultKeyStore         credentials.OSKeyStore
-	EnableOSKeyStore      bool
-	EnableAutoUpdateCheck bool
+	UpdateAPIBaseURL              string
+	UpdateHTTPClient              *http.Client
+	PluginUpdateReleaseBaseURL    string
+	PluginUpdateMirrorBaseURL     string
+	PluginUpdateAllowInsecureHTTP bool
+	PluginOfficialKeys            map[string]ed25519.PublicKey
+	VaultKeyStore                 credentials.OSKeyStore
+	EnableOSKeyStore              bool
+	EnableAutoUpdateCheck         bool
 }
 
 type App struct {
@@ -183,7 +188,25 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 		// the Kimi Code client version (1.3.x), which is discovered when the
 		// enhancer attaches, not to this core's own 0.2.0. An unknown host version
 		// leaves the version gate open rather than inventing a compatibility claim.
-		s, e := plugins.New(db, cfg.Safe, plugins.WithDataDir(native.DataDir), plugins.WithBundled(bundledPlugins.BundledPlugins), plugins.WithOfficial(bundledPlugins.OfficialDigests))
+		officialKeys := native.PluginOfficialKeys
+		if len(officialKeys) == 0 {
+			officialKeys = bundledPlugins.OfficialPublicKeys()
+		}
+		s, e := plugins.New(
+			db,
+			cfg.Safe,
+			plugins.WithDataDir(native.DataDir),
+			plugins.WithBundled(bundledPlugins.BundledPlugins),
+			plugins.WithOfficial(bundledPlugins.OfficialDigests),
+			plugins.WithUpdater(plugins.UpdateOptions{
+				CoreVersion:          Version,
+				ReleaseBaseURL:       native.PluginUpdateReleaseBaseURL,
+				MirrorReleaseBaseURL: native.PluginUpdateMirrorBaseURL,
+				AllowInsecureHTTP:    native.PluginUpdateAllowInsecureHTTP,
+				HTTPClient:           native.UpdateHTTPClient,
+				OfficialKeys:         officialKeys,
+			}),
+		)
 		if e == nil {
 			s.Register(mux)
 			app.pluginManager = s
@@ -389,6 +412,9 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 	})
 	if native.EnableAutoUpdateCheck && app.updater != nil {
 		app.updater.StartAutoCheck()
+	}
+	if native.EnableAutoUpdateCheck && app.pluginManager != nil {
+		app.pluginManager.StartAutoUpdateCheck()
 	}
 	mux.HandleFunc("GET /enhance/v1/settings", func(w http.ResponseWriter, r *http.Request) {
 		v, e := cfg.Get()

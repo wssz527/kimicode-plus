@@ -459,6 +459,39 @@ export interface PluginList {
   apiVersion?: number;
 }
 
+export interface PluginUpdateItem {
+  pluginId: string;
+  name?: string;
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+  canApply: boolean;
+  cannotApplyReason?: string;
+  needsConsent: boolean;
+  addedCapabilities?: string[];
+  addedPrivileged?: string[];
+  archiveBytes?: number;
+  publishedAt?: string;
+  releaseNotes?: string;
+  minCoreVersion?: string;
+  hostCompatible: boolean;
+}
+
+export interface PluginUpdateStatus {
+  state: "idle" | "checking" | "ready" | "error";
+  checkedAt?: string;
+  source?: string;
+  error?: string;
+  availableCount: number;
+  items: Record<string, PluginUpdateItem>;
+}
+
+export interface PluginUpdateRequest {
+  expectedVersion?: string;
+  confirmCapabilities?: boolean;
+  confirmPrivileged?: boolean;
+}
+
 /** Mirrors kctmigration.Report: the handover state, with no secret in it. */
 export interface KctMigrationReport {
   pluginId: string;
@@ -873,6 +906,10 @@ export const api = {
     restore: (id: string) => request<PluginRecord>(`/plugins/${encodeURIComponent(id)}/restore`, { method: "POST", body: {} }),
     forceEnable: (id: string) =>
       request<PluginRecord>(`/plugins/${encodeURIComponent(id)}/force-enable`, { method: "POST", body: {} }),
+    updates: () => request<PluginUpdateStatus>("/plugins/updates"),
+    checkUpdates: () => request<PluginUpdateStatus>("/plugins/updates/check", { method: "POST", body: {} }),
+    update: (id: string, body?: PluginUpdateRequest) =>
+      request<PluginRecord>(`/plugins/${encodeURIComponent(id)}/update`, { method: "POST", body: body ?? {} }),
     activity: async (id: string, before = 0) =>
       asList<PluginActivity>(await request<unknown>(`/plugins/${encodeURIComponent(id)}/activity`, { query: { before, limit: 50 } })),
     /** The standalone KCT handover. It is a core route because the adapter plugin

@@ -479,6 +479,70 @@
   white-space: nowrap;
 }
 
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-tag.is-update {
+  border-color: color-mix(in srgb, var(--ekds-accent, #2563eb) 36%, transparent);
+  background: color-mix(in srgb, var(--ekds-accent, #2563eb) 11%, transparent);
+  color: var(--ekds-accent, #2563eb);
+  font-weight: 500;
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-update-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--ekds-accent, #2563eb) 32%, var(--ekds-line, rgba(128, 128, 128, 0.24)));
+  border-radius: var(--ekds-radius, 12px);
+  background: color-mix(in srgb, var(--ekds-accent, #2563eb) 6%, var(--ekds-surface, transparent));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-update-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-update-head > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-update-head strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ekds-text, var(--color-text, inherit));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-update-meta {
+  font-size: 12px;
+  color: var(--ekds-muted, var(--color-text-secondary, inherit));
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-update-notes {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--ekds-text, var(--color-text, inherit));
+  white-space: pre-wrap;
+}
+
+:is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-update-consent {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ekds-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
 :is(.ekd-surface-settings-plugins, .ekds) .ekds-plugins .plugin-glyph {
   background: color-mix(in srgb, var(--ekds-muted, #888) 12%, transparent);
   color: var(--ekds-muted, var(--color-text-secondary, inherit));

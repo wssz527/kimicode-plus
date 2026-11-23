@@ -39,7 +39,7 @@ class FakeCNBServer:
                 if self.headers.get('Authorization') != 'Bearer test-token':
                     self._send_json(401, {'error': 'unauthorized'})
                     return
-                if self.path == '/owner/repo/-/releases/tags/v0.2.4':
+                if self.path in ('/owner/repo/-/releases/tags/v0.2.4', '/owner/repo/-/releases/tags/plugins-latest'):
                     if outer.existing_release_id:
                         self._send_json(200, {'id': outer.existing_release_id})
                     else:
@@ -158,6 +158,39 @@ class SyncCNBReleaseTest(unittest.TestCase):
 
     def test_prerelease_detection(self):
         self.assertFalse(sync.is_prerelease('v0.2.4'))
+
+    def test_plugin_channel_uploads_plugins_manifest_last_and_keeps_non_latest(self):
+        plugin_dir = Path(tempfile.mkdtemp(prefix='cnb-plugins-test-'))
+        self.addCleanup(lambda: [p.unlink() for p in plugin_dir.iterdir()] and plugin_dir.rmdir())
+        files = []
+        for name, content in [
+            ('plugins-manifest.json', b'{"format":"kimicode-plus.plugins-manifest.v1"}'),
+            ('kimicode-plus.kct-1.0.5.zip', b'kct-zip'),
+            ('kimicode-plus.monitor-1.1.1.zip', b'monitor-zip'),
+        ]:
+            p = plugin_dir / name
+            p.write_bytes(content)
+            files.append(p)
+        server = FakeCNBServer()
+        self.addCleanup(server.close)
+        release_id, uploaded = sync.sync_release(
+            api_base=server.base_url,
+            web_base=server.base_url,
+            repo='owner/repo',
+            token='test-token',
+            tag='plugins-latest',
+            notes='Plugin channel update',
+            files=files,
+            prerelease=False,
+            push_git=False,
+            make_latest=False,
+        )
+        self.assertEqual(release_id, 'rel-42')
+        self.assertEqual(len(server.created_payloads), 1)
+        self.assertEqual(server.created_payloads[0]['make_latest'], 'false')
+        self.assertEqual(server.created_payloads[0]['prerelease'], False)
+        self.assertEqual(uploaded[-1], 'plugins-manifest.json')
+        self.assertEqual(server.upload_order, uploaded)
         self.assertTrue(sync.is_prerelease('v0.2.4-rc.1'))
         self.assertTrue(sync.is_prerelease('v0.2.4-beta.2+build1'))
 

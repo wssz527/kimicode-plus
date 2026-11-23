@@ -1,0 +1,111 @@
+name: Release Official Plugins
+
+on:
+  push:
+    tags: ['plugin-*']
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: 'Release notes shown to users in the plugin updater'
+        required: false
+        type: string
+        default: ''
+      min_core_version:
+        description: 'Minimum KimiCode+ core version required by these plugin packages'
+        required: false
+        type: string
+        default: '0.2.8'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-plugins-latest
+  cancel-in-progress: false
+
+jobs:
+  release-plugins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify plugin packages and signing CLI
+        run: |
+          go test ./internal/plugins/... ./plugins/... ./cmd/plugin-release/... -count=1
+          python3 scripts/test_sync_cnb_release.py
+      - name: Prepare plugin release metadata
+        env:
+          INPUT_NOTES: ${{ inputs.notes }}
+          INPUT_MIN_CORE: ${{ inputs.min_core_version }}
+        run: |
+          echo "PLUGIN_PUBLISHED_AT=$(git log -1 --format=%cI)" >> "$GITHUB_ENV"
+          min_core="${INPUT_MIN_CORE:-0.2.8}"
+          echo "PLUGIN_MIN_CORE=$min_core" >> "$GITHUB_ENV"
+          {
+            echo 'PLUGIN_RELEASE_NOTES<<__EKD_PLUGIN_NOTES__'
+            if [ -n "$INPUT_NOTES" ]; then
+              printf '%s\n' "$INPUT_NOTES"
+            else
+              git log -1 --format=%B
+            fi
+            echo '__EKD_PLUGIN_NOTES__'
+          } >> "$GITHUB_ENV"
+      - name: Package and sign official plugins
+        env:
+          PLUGIN_SIGNING_PRIVATE_KEY: ${{ secrets.PLUGIN_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "${PLUGIN_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo 'PLUGIN_SIGNING_PRIVATE_KEY secret is required to sign official plugin releases.' >&2
+            exit 1
+          fi
+          rm -rf dist/plugins-release
+          go run ./cmd/plugin-release package \
+            --out dist/plugins-release \
+            --key-env PLUGIN_SIGNING_PRIVATE_KEY \
+            --min-core "$PLUGIN_MIN_CORE" \
+            --published-at "$PLUGIN_PUBLISHED_AT" \
+            --notes "$PLUGIN_RELEASE_NOTES"
+          go run ./cmd/plugin-release verify --dir dist/plugins-release
+      - name: Publish to GitHub plugins-latest channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag -f plugins-latest HEAD
+          git push origin -f refs/tags/plugins-latest
+          if ! gh release view plugins-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create plugins-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --title 'Official Plugins Channel' \
+              --notes 'Signed official KimiCode+ plugin packages. Rolling channel that does not replace core releases/latest.' \
+              --latest=false
+          fi
+          # Upload versioned archives before replacing plugins-manifest.json so the manifest never references missing zips.
+          gh release upload plugins-latest dist/plugins-release/*.zip --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload plugins-latest dist/plugins-release/plugins-manifest.json --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Sync plugins-latest channel to CNB mirror
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          CNB_REPO: wssz527/kimicode-plus
+        run: |
+          if [ -z "${CNB_TOKEN:-}" ]; then
+            echo 'CNB_TOKEN secret is not configured; skipping CNB plugin mirror sync.'
+            exit 0
+          fi
+          python3 scripts/sync_cnb_release.py \
+            --tag plugins-latest \
+            --repo "$CNB_REPO" \
+            --no-prerelease \
+            --make-latest false \
+            --force-tag \
+            --notes "$PLUGIN_RELEASE_NOTES" \
+            dist/plugins-release/*.zip \
+            dist/plugins-release/plugins-manifest.json

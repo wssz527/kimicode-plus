@@ -104,9 +104,19 @@ func directoryDigest(dir string, module *servedModule) (string, error) {
 	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
-// officialFor checks the installed copy against the compiled allowlist.
-func (m *Manager) officialFor(manifest Manifest, dir, source string) bool {
-	return digestMatches(dir, m.officialDigest(manifest, source), nil)
+// officialForEntry checks the installed copy against either the compiled
+// bundled allowlist or a verified Ed25519-signed official plugin manifest.
+func (m *Manager) officialForEntry(item entry, module *servedModule) bool {
+	if item.source != SourceBundled {
+		return false
+	}
+	if expected := m.officialDigest(item.manifest, item.source); expected != "" && digestMatches(item.dir, expected, module) {
+		return true
+	}
+	if expected := m.signedOfficialDigest(item); expected != "" && digestMatches(item.dir, expected, module) {
+		return true
+	}
+	return false
 }
 
 func (m *Manager) officialDigest(manifest Manifest, source string) string {
@@ -120,6 +130,32 @@ func (m *Manager) officialDigest(manifest Manifest, source string) string {
 	return allowlist[manifest.ID]
 }
 
+func (m *Manager) signedOfficialDigest(item entry) string {
+	if item.source != SourceBundled || len(item.officialManifest) == 0 || len(m.officialKeys) == 0 {
+		return ""
+	}
+	catalog, err := VerifySignedPluginManifest(item.officialManifest, m.officialKeys)
+	if err != nil {
+		return ""
+	}
+	entryMeta, ok := catalog.Find(item.manifest.ID)
+	if !ok || entryMeta.Version != item.manifest.Version {
+		return ""
+	}
+	if m.bundled != nil {
+		if set, err := m.bundled(); err == nil {
+			if files, exists := set[item.manifest.ID]; exists {
+				if bundledM, mErr := bundledManifest(item.manifest.ID, files); mErr == nil {
+					if newerVersion(bundledM.Version, item.manifest.Version) {
+						return ""
+					}
+				}
+			}
+		}
+	}
+	return entryMeta.ContentDigest
+}
+
 func digestMatches(dir, expected string, module *servedModule) bool {
 	if expected == "" {
 		return false
@@ -129,11 +165,15 @@ func digestMatches(dir, expected string, module *servedModule) bool {
 }
 
 func (m *Manager) privilegeIntact(item entry) bool {
+	return m.privilegeIntactForModule(item, nil)
+}
+
+func (m *Manager) privilegeIntactForModule(item entry, module *servedModule) bool {
 	switch item.source {
 	case SourceBundled:
-		return m.officialFor(item.manifest, item.dir, item.source)
+		return m.officialForEntry(item, module)
 	case SourceLocal:
-		return digestMatches(item.dir, item.installDigest, nil)
+		return digestMatches(item.dir, item.installDigest, module)
 	}
 	return false
 }

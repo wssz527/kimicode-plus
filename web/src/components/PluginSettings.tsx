@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { api, ApiError, type KctMigrationResult, type MonitorMigrationResult, type PluginActivity, type PluginPlatformLimitation, type PluginPreview, type PluginRecord, type PluginUpstream } from "../api";
+import { api, ApiError, type KctMigrationResult, type MonitorMigrationResult, type PluginActivity, type PluginPlatformLimitation, type PluginPreview, type PluginRecord, type PluginUpdateItem, type PluginUpdateStatus, type PluginUpstream } from "../api";
 import { pluginHostBridge, syncPluginHost } from "../plugin-runtime/host";
 import type { NativeHost } from "../native";
 import { Icon } from "./Icon";
@@ -8,7 +8,7 @@ import { PluginCredentials } from "./PluginCredentials";
 import { requestWindowsReopen } from "./WindowsAttachStatus";
 import { PageError } from "../AppShell";
 import { errorMessage, errorRecovery, useAction, useResource } from "../lib/useResource";
-import { fmtDateTime, stateLabel, stateTone } from "../lib/format";
+import { fmtBytes, fmtDateTime, stateLabel, stateTone } from "../lib/format";
 
 /** Capability copy in user language. A plugin page that shows `metrics:read` to a
  * non-developer is not explaining what the plugin will actually do. */
@@ -291,7 +291,7 @@ function PluginSettingsPanel({ plugin }: { plugin: PluginRecord }) {
       released = true;
       dispose?.();
     };
-  }, [plugin.id]);
+  }, [plugin.id, plugin.version, plugin.updatedAt]);
 
   return (
     <section className="plugin-settings-section" aria-label="增强插件设置">
@@ -553,6 +553,7 @@ export interface PluginSettingsProps {
 
 export function PluginSettings({ embedded = false, host = null, onDetailChange }: PluginSettingsProps) {
   const plugins = useResource("plugins/list", () => api.plugins.list());
+  const updates = useResource("plugins/updates", () => api.plugins.updates());
   const [selected, setSelected] = useState<string | null>(null);
   const returnToRef = useRef<string | null>(null);
   const backRef = useRef<HTMLButtonElement>(null);
@@ -578,6 +579,11 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
   const [syncError, setSyncError] = useState<string | null>(null);
   const [quickBusy, setQuickBusy] = useState<string | null>(null);
   const [quickError, setQuickError] = useState<string | null>(null);
+  const [updateSnapshot, setUpdateSnapshot] = useState<PluginUpdateStatus | null>(null);
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [updateCheckError, setUpdateCheckError] = useState<string | null>(null);
+  const [updatingPluginId, setUpdatingPluginId] = useState<string | null>(null);
+  const [confirmUpdatePrivileged, setConfirmUpdatePrivileged] = useState(false);
 
   useEffect(() => {
     if (!flash) return;
@@ -628,10 +634,14 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
     }
   }, [detailActive]);
 
+  const effectiveUpdates = updateSnapshot ?? updates.data ?? null;
+  const updateItems = effectiveUpdates?.items ?? {};
+
   function openDetail(id: string) {
     returnToRef.current = id;
     setConfirmForce(false);
     setConfirmUninstall(false);
+    setConfirmUpdatePrivileged(false);
     setSelected(id);
   }
 
@@ -639,7 +649,69 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
     if (selected) returnToRef.current = selected;
     setConfirmForce(false);
     setConfirmUninstall(false);
+    setConfirmUpdatePrivileged(false);
     setSelected(null);
+  }
+
+  async function checkUpdates() {
+    if (checkingUpdates || updatingPluginId !== null) return;
+    setCheckingUpdates(true);
+    setUpdateCheckError(null);
+    setQuickError(null);
+    try {
+      const status = await api.plugins.checkUpdates();
+      setUpdateSnapshot(status);
+      const visibleAvailable = Object.values(status.items ?? {}).filter(
+        item => item.updateAvailable && item.pluginId !== PLANNER_PLUGIN_ID,
+      ).length;
+      const plannerAvailable = Boolean(status.items?.[PLANNER_PLUGIN_ID]?.updateAvailable);
+      if (visibleAvailable > 0) {
+        setFlash(`发现 ${visibleAvailable} 个官方增强插件可在线更新。`);
+      } else if (plannerAvailable) {
+        setFlash("「规划」插件有可用更新，可在「实验室」标签页一键更新。");
+      } else {
+        setFlash("当前官方增强插件均已是最新版本。");
+      }
+    } catch (error) {
+      setUpdateCheckError(errorMessage(error) || "无法检查插件更新，请稍后重试。");
+    } finally {
+      setCheckingUpdates(false);
+    }
+  }
+
+  async function applyPluginUpdate(plugin: PluginRecord, update: PluginUpdateItem, confirmConsent = false) {
+    if (updatingPluginId !== null || checkingUpdates || syncing || action.busy) return;
+    const hasAddedPriv = (update.addedPrivileged?.length ?? 0) > 0;
+    if (update.needsConsent && !confirmConsent) {
+      openDetail(plugin.id);
+      return;
+    }
+    if (hasAddedPriv && !confirmUpdatePrivileged) return;
+    setUpdatingPluginId(plugin.id);
+    setQuickError(null);
+    setUpdateCheckError(null);
+    action.clearError();
+    try {
+      const updated = await api.plugins.update(plugin.id, {
+        expectedVersion: update.latestVersion,
+        confirmCapabilities: update.needsConsent ? true : undefined,
+        confirmPrivileged: hasAddedPriv ? true : undefined,
+      });
+      await syncHost();
+      setConfirmUpdatePrivileged(false);
+      setFlash(`已将「${updated.name || updated.id}」热更新到 v${updated.version}，无需重启 Kimi Code。`);
+      plugins.reload();
+      const refreshed = await api.plugins.updates().catch(() => null);
+      if (refreshed) setUpdateSnapshot(refreshed);
+      else updates.reload();
+      if (selected === plugin.id) activity.reload();
+    } catch (error) {
+      const message = errorMessage(error) || "插件更新失败，已保持原版本。";
+      if (selected === plugin.id) setUpdateCheckError(message);
+      else setQuickError(message);
+    } finally {
+      setUpdatingPluginId(null);
+    }
   }
   const activity = useResource<PluginActivity[]>(
     `plugins/activity/${selected ?? ""}`,
@@ -986,6 +1058,11 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
     const ungranted = (current.declaredCapabilities ?? []).filter(name => !capabilities.includes(name));
     const hasScheduler = capabilities.includes("schedule:manage")
       || (current.declaredCapabilities ?? []).includes("schedule:manage");
+    const currentUpdate = updateItems[current.id];
+    const hasUpdate = Boolean(currentUpdate?.updateAvailable);
+    const addedCaps = currentUpdate?.addedCapabilities ?? [];
+    const addedPrivCaps = currentUpdate?.addedPrivileged ?? [];
+    const isUpdatingThis = updatingPluginId === current.id;
     return (
       <div className={embedded ? "ekds-plugins ekds-subpage" : "page"} data-ekd-plugin-detail={current.id}>
         <button type="button" className="ekds-back" ref={backRef} onClick={closeDetail}>
@@ -1008,8 +1085,19 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
             </div>
           </div>
           <div className="plugins-detail-header-actions">
+            {current.source === "BUNDLED" ? (
+              <ActionButton
+                icon="refresh"
+                variant="quiet"
+                onClick={() => void checkUpdates()}
+                busy={checkingUpdates}
+                disabled={updatingPluginId !== null || action.busy || syncing}
+              >
+                检查更新
+              </ActionButton>
+            ) : null}
             {current.enabled ? (
-              <ActionButton icon="power" onClick={() => void run(current.id, "disable")} busy={action.busy || syncing}>
+              <ActionButton icon="power" onClick={() => void run(current.id, "disable")} busy={action.busy || syncing} disabled={isUpdatingThis}>
                 停用增强插件
               </ActionButton>
             ) : (
@@ -1018,13 +1106,13 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                 icon="power"
                 onClick={() => void run(current.id, "enable")}
                 busy={action.busy || syncing}
-                disabled={safeMode}
+                disabled={safeMode || isUpdatingThis}
               >
                 启用增强插件
               </ActionButton>
             )}
             {!current.enabled && !current.compatible ? (
-              <ActionButton icon="alert" onClick={() => setConfirmForce(true)} busy={action.busy || syncing} disabled={safeMode}>
+              <ActionButton icon="alert" onClick={() => setConfirmForce(true)} busy={action.busy || syncing} disabled={safeMode || isUpdatingThis}>
                 强制启用
               </ActionButton>
             ) : null}
@@ -1040,8 +1128,90 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
         ) : null}
         {autoAttachDialog}
         {syncNotice}
+        {updateCheckError ? (
+          <ErrorNotice message={updateCheckError} onDismiss={() => setUpdateCheckError(null)} />
+        ) : null}
         {action.error ? (
           <ErrorNotice message={errorMessage(action.error)} recovery={errorRecovery(action.error)} onDismiss={action.clearError} />
+        ) : null}
+
+        {hasUpdate && currentUpdate ? (
+          <section className="plugin-update-card" aria-label="官方插件更新" data-ekd-plugin-update={current.id}>
+            <div className="plugin-update-head">
+              <div>
+                <strong>发现新版本 v{currentUpdate.latestVersion}</strong>
+                <span className="plugin-update-meta num">
+                  v{current.version} → v{currentUpdate.latestVersion}
+                  {currentUpdate.archiveBytes ? ` · ${fmtBytes(currentUpdate.archiveBytes)}` : ""}
+                  {currentUpdate.publishedAt ? ` · ${fmtDateTime(currentUpdate.publishedAt)}` : ""}
+                </span>
+              </div>
+              {!currentUpdate.needsConsent && currentUpdate.canApply ? (
+                <ActionButton
+                  variant="primary"
+                  icon="download"
+                  onClick={() => void applyPluginUpdate(current, currentUpdate, false)}
+                  busy={isUpdatingThis}
+                  disabled={checkingUpdates || action.busy || syncing}
+                >
+                  {isUpdatingThis ? "正在更新…" : `更新到 v${currentUpdate.latestVersion}`}
+                </ActionButton>
+              ) : null}
+            </div>
+            {currentUpdate.releaseNotes ? (
+              <p className="plugin-update-notes">{currentUpdate.releaseNotes}</p>
+            ) : null}
+            {!currentUpdate.canApply && currentUpdate.cannotApplyReason ? (
+              <InfoNote tone="warn">
+                <p>{currentUpdate.cannotApplyReason}</p>
+              </InfoNote>
+            ) : null}
+            {currentUpdate.canApply && currentUpdate.needsConsent ? (
+              <div className="plugin-update-consent">
+                <InfoNote tone="warn">
+                  <p>
+                    <strong>v{currentUpdate.latestVersion} 申请了 {addedCaps.length} 项新增权限</strong>
+                    ，请确认后再更新。更新会保留现有配置与私有存储，无需重启 Kimi Code。
+                  </p>
+                </InfoNote>
+                <ul className="capability-list">
+                  {addedCaps.map(name => {
+                    const label = capabilityLabel(name);
+                    return (
+                      <li key={name}>
+                        <Icon name="shield" size={14} />
+                        <div>
+                          <CapabilityTitle name={name} privileged={addedPrivCaps} />
+                          <p>{label.detail}</p>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+                {addedPrivCaps.length > 0 ? (
+                  <label className="capability-choice">
+                    <input
+                      type="checkbox"
+                      checked={confirmUpdatePrivileged}
+                      onChange={event => setConfirmUpdatePrivileged(event.target.checked)}
+                    />
+                    <span>我了解上述新增高权限能力的影响范围，确认授予并更新</span>
+                  </label>
+                ) : null}
+                <div className="inline-actions">
+                  <ActionButton
+                    variant="primary"
+                    icon="download"
+                    onClick={() => void applyPluginUpdate(current, currentUpdate, true)}
+                    busy={isUpdatingThis}
+                    disabled={checkingUpdates || action.busy || syncing || (addedPrivCaps.length > 0 && !confirmUpdatePrivileged)}
+                  >
+                    {isUpdatingThis ? "正在更新…" : `确认新增权限并更新到 v${currentUpdate.latestVersion}`}
+                  </ActionButton>
+                </div>
+              </div>
+            ) : null}
+          </section>
         ) : null}
 
         {current.error ? <PluginFaultNotice reason={current.error} /> : null}
@@ -1246,11 +1416,14 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
           </p>
         </div>
         <div className="plugins-list-actions">
+          <ActionButton icon="download" onClick={() => void checkUpdates()} busy={checkingUpdates} disabled={updatingPluginId !== null}>
+            检查更新
+          </ActionButton>
           <ActionButton icon="refresh" onClick={plugins.reload} busy={plugins.loading}>
             刷新
           </ActionButton>
           <ActionButton variant="primary" icon="plus" aria-expanded={installOpen} onClick={() => installOpen ? closeInstall() : setInstallOpen(true)}
-            disabled={safeMode || previewBusy || pickerBusy !== null || action.busy || syncing}>
+            disabled={safeMode || previewBusy || pickerBusy !== null || action.busy || syncing || updatingPluginId !== null}>
             安装本地增强插件
           </ActionButton>
         </div>
@@ -1262,6 +1435,8 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
           {flash}
         </div>
       ) : null}
+
+      {updateCheckError ? <ErrorNotice message={updateCheckError} onDismiss={() => setUpdateCheckError(null)} /> : null}
 
       {autoAttachDialog}
       {syncNotice}
@@ -1431,6 +1606,9 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
           {items.map(plugin => {
             const name = plugin.name || plugin.id;
             const summary = plugin.description?.trim();
+            const update = updateItems[plugin.id];
+            const hasUpdate = Boolean(update?.updateAvailable);
+            const isUpdating = updatingPluginId === plugin.id;
             return (
               <li key={plugin.id} className={plugin.enabled ? "plugin" : "plugin muted"}>
                 <button
@@ -1452,6 +1630,9 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                         v{plugin.version} · {plugin.source === "BUNDLED" ? "预装" : "本地"}
                       </span>
                       {plugin.hasSettings ? <span className="plugin-tag">可配置</span> : null}
+                      {hasUpdate && update ? (
+                        <span className="plugin-tag is-update">可更新 v{update.latestVersion}</span>
+                      ) : null}
                     </span>
                     {summary ? <span className="plugin-desc" title={plugin.description}>{summary}</span> : null}
                   </span>
@@ -1464,12 +1645,32 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                   </span>
                 </button>
                 <div className="plugin-row-actions">
+                  {hasUpdate && update ? (
+                    update.canApply && !update.needsConsent ? (
+                      <ActionButton
+                        icon="download"
+                        onClick={() => void applyPluginUpdate(plugin, update, false)}
+                        busy={isUpdating}
+                        disabled={updatingPluginId !== null || checkingUpdates || quickBusy !== null || syncing}
+                      >
+                        {isUpdating ? "更新中…" : "更新"}
+                      </ActionButton>
+                    ) : (
+                      <ActionButton
+                        variant="quiet"
+                        onClick={() => openDetail(plugin.id)}
+                        disabled={updatingPluginId !== null}
+                      >
+                        查看更新
+                      </ActionButton>
+                    )
+                  ) : null}
                   {canQuickToggle(plugin) ? (
                     <Toggle
                       hideLabel
                       label={plugin.enabled ? `停用「${name}」` : `启用「${name}」`}
                       checked={Boolean(plugin.enabled)}
-                      disabled={quickBusy !== null || (!plugin.enabled && safeMode)}
+                      disabled={quickBusy !== null || updatingPluginId !== null || (!plugin.enabled && safeMode)}
                       onChange={next => void quickToggle(plugin, next)}
                     />
                   ) : null}

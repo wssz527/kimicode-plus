@@ -721,9 +721,13 @@ func (m *Manager) adopt(ctx context.Context, id, dir, source string) error {
 	}
 	desired := false
 	var installDigest string
+	var officialManifest []byte
 	if persisted != nil {
 		if source == SourceLocal && persisted.source == source {
 			installDigest = persisted.installDigest
+		} else if source == SourceBundled && persisted.source == SourceBundled && persisted.version == manifest.Version && len(persisted.officialManifest) > 0 {
+			installDigest = persisted.installDigest
+			officialManifest = persisted.officialManifest
 		}
 		if stored, storedErr := ParseCapabilities(persisted.capabilities); storedErr == nil {
 			grants = stored
@@ -741,7 +745,8 @@ func (m *Manager) adopt(ctx context.Context, id, dir, source string) error {
 	now := m.now()
 	item := &entry{
 		manifest: manifest, grants: grants, declared: manifest.CapabilityNames(),
-		source: source, dir: dir, installDigest: installDigest, state: StateDisabled, enabled: desired,
+		source: source, dir: dir, installDigest: installDigest, officialManifest: officialManifest,
+		state: StateDisabled, enabled: desired,
 		forced:  desired && !m.compatible(manifest),
 		updated: now, installed: now,
 	}
@@ -768,7 +773,8 @@ func (m *Manager) adopt(ctx context.Context, id, dir, source string) error {
 	stored := record{
 		id: manifest.ID, name: manifest.Name, version: manifest.Version,
 		manifest: data, capabilities: grants.Names(), source: source, installDigest: installDigest,
-		desired: item.state == StateEnabled, state: item.state, err: item.errText,
+		officialManifest: officialManifest,
+		desired:          item.state == StateEnabled, state: item.state, err: item.errText,
 		installedAt: item.installed, updatedAt: now,
 	}
 	return saveRecord(ctx, m.db, stored)

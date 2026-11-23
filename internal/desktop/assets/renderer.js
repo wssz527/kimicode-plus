@@ -205,6 +205,7 @@ async function installNativeRenderer(options) {
     plugins: null,
     popoutRoot: null,
     pluginReleases: new Map(),
+    pluginRevisions: new Map(),
     pluginTokens: new Map(),
     pluginAssets: new Map(),
     pluginSettings: new Map(),
@@ -1948,6 +1949,7 @@ async function installNativeRenderer(options) {
     state.pluginMainAreas.clear();
     state.pluginEntries.clear();
     state.pluginReleases.clear();
+    state.pluginRevisions.clear();
     for (const release of [...state.pluginSettings.values()]) release.dispose();
     state.pluginSettings.clear();
     state.browserNavListeners.clear();
@@ -2790,15 +2792,19 @@ async function installNativeRenderer(options) {
         activeSession,
       });
     }
-    // A plugin the runtime reports as stopped must leave the page: dropping the
-    // module, the token and the DOM together is what makes "disabled" observable.
-    const wanted = new Set(enabled.map(plugin => plugin.id));
+    // A plugin the runtime reports as stopped or upgraded to a new revision must
+    // leave the page first: dropping the module, the token, the asset cache and
+    // the DOM together ensures hot updates activate the new bundle cleanly.
+    const pluginRevision = plugin => `${plugin?.version || ''}|${plugin?.updatedAt || ''}|${Array.isArray(plugin?.capabilities) ? plugin.capabilities.join(',') : ''}`;
+    const wanted = new Map(enabled.map(plugin => [plugin.id, plugin]));
     for (const id of [...state.pluginReleases.keys()]) {
-      if (wanted.has(id)) continue;
+      const next = wanted.get(id);
+      if (next && state.pluginRevisions.get(id) === pluginRevision(next)) continue;
       state.pluginSettings.get(id)?.dispose();
       state.pluginSettings.delete(id);
       state.pluginReleases.get(id)?.();
       state.pluginReleases.delete(id);
+      state.pluginRevisions.delete(id);
       state.pluginTokens.delete(id);
       for (const key of [...state.pluginAssets.keys()]) {
         if (key.startsWith(id + '/')) state.pluginAssets.delete(key);
@@ -2827,12 +2833,14 @@ async function installNativeRenderer(options) {
           return;
         }
         state.pluginReleases.set(plugin.id, () => runtime.deactivate(plugin.id));
+        state.pluginRevisions.set(plugin.id, pluginRevision(plugin));
       } catch (error) {
         if (state.removed || isStale()) return;
         // One plugin failing to activate must not stop the others. The plugin
         // that failed is stopped by the core with the reason recorded.
         noteActivationFault(plugin.id, error);
         state.pluginTokens.delete(plugin.id);
+        state.pluginRevisions.delete(plugin.id);
       }
     }
   }

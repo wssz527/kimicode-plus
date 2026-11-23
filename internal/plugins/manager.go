@@ -2,6 +2,7 @@ package plugins
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
@@ -65,6 +66,11 @@ type Options struct {
 	// Official is the build-time allowlist of bundled plugin content digests.
 	// A nil allowlist leaves bundled plugins without v2 privileges.
 	Official OfficialDigests
+	// OfficialKeys holds trusted Ed25519 public keys used to verify signed
+	// standalone official plugin updates.
+	OfficialKeys map[string]ed25519.PublicKey
+	// Updater configures online checking and installation of official plugin updates.
+	Updater UpdateOptions
 	// StopPluginWork ends background work a plugin started outside this package.
 	StopPluginWork func(ctx context.Context, id string) error
 }
@@ -182,18 +188,19 @@ type Plugin struct {
 
 // entry holds the installed manifest, grants, runtime state and integrity baseline.
 type entry struct {
-	manifest      Manifest
-	grants        Grants
-	declared      []string
-	source        string
-	dir           string
-	state         string
-	errText       string
-	enabled       bool
-	forced        bool
-	updated       time.Time
-	installed     time.Time
-	installDigest string
+	manifest         Manifest
+	grants           Grants
+	declared         []string
+	source           string
+	dir              string
+	state            string
+	errText          string
+	enabled          bool
+	forced           bool
+	updated          time.Time
+	installed        time.Time
+	installDigest    string
+	officialManifest []byte
 }
 
 type Manager struct {
@@ -209,6 +216,8 @@ type Manager struct {
 	gates    []EnableGate
 
 	officialDigests OfficialDigests
+	officialKeys    map[string]ed25519.PublicKey
+	updater         *pluginUpdater
 	views           map[string]map[string]*browserView
 	commands        map[string]command
 	// sessionWatches counts, per plugin, how many of its own handles watch each
@@ -258,6 +267,17 @@ func New(db *sql.DB, safe func() bool, options ...Option) (*Manager, error) {
 	if err := migrate(db); err != nil {
 		return nil, err
 	}
+	officialKeys := make(map[string]ed25519.PublicKey)
+	for k, v := range opts.OfficialKeys {
+		officialKeys[k] = v
+	}
+	for k, v := range opts.Updater.OfficialKeys {
+		officialKeys[k] = v
+	}
+	var upd *pluginUpdater
+	if opts.Updater.CoreVersion != "" || opts.Updater.Repo != "" || opts.Updater.ReleaseBaseURL != "" || opts.Updater.MirrorReleaseBaseURL != "" || len(officialKeys) > 0 {
+		upd = newPluginUpdater(opts.Updater)
+	}
 	manager := &Manager{
 		platform:        runtime.GOOS,
 		db:              db,
@@ -268,6 +288,8 @@ func New(db *sql.DB, safe func() bool, options ...Option) (*Manager, error) {
 		vault:           opts.Vault,
 		bundled:         opts.Bundled,
 		officialDigests: opts.Official,
+		officialKeys:    officialKeys,
+		updater:         upd,
 		stopPluginWork:  opts.StopPluginWork,
 		views:           map[string]map[string]*browserView{},
 		commands:        map[string]command{},
@@ -423,7 +445,8 @@ func (m *Manager) load() error {
 		m.entries[item.id] = &entry{
 			manifest: manifest, grants: grants, declared: manifest.CapabilityNames(),
 			source: item.source, dir: dir, installDigest: item.installDigest,
-			state: state, errText: item.err, enabled: item.desired,
+			officialManifest: item.officialManifest,
+			state:            state, errText: item.err, enabled: item.desired,
 			// Force-enabling an incompatible plugin is not a separate column: it is
 			// exactly a desired plugin the host version does not cover, so the flag
 			// is re-derived instead of drifting from what was stored.
@@ -508,7 +531,7 @@ func (m *Manager) effectiveGrants(item entry) Grants {
 }
 
 func (m *Manager) present(item entry, host string) Plugin {
-	official := m.officialFor(item.manifest, item.dir, item.source)
+	official := m.officialForEntry(item, nil)
 	grants := item.grants
 	if item.source == SourceBundled {
 		if !official {
@@ -1090,6 +1113,9 @@ func (m *Manager) Close() error {
 		return nil
 	}
 	m.closed = true
+	if m.updater != nil {
+		m.updater.close()
+	}
 	// Shutdown releases live resources but preserves the user's enable intent, so
 	// the next renderer can adopt the plugin without the user re-enabling it.
 	//
@@ -1189,12 +1215,15 @@ func (m *Manager) Register(mux *http.ServeMux) {
 	}
 	mux.HandleFunc("GET "+APIPrefix+"/plugins", m.handleList)
 	mux.HandleFunc("GET "+APIPrefix+"/plugins/health", m.handleHealth)
+	mux.HandleFunc("GET "+APIPrefix+"/plugins/updates", m.handleUpdateStatus)
+	mux.HandleFunc("POST "+APIPrefix+"/plugins/updates/check", m.handleUpdateCheck)
 	mux.HandleFunc("POST "+APIPrefix+"/plugins/preview", m.handlePreview)
 	mux.HandleFunc("POST "+APIPrefix+"/plugins/install", m.handleInstall)
 	// Bundled plugins can be restored after the user uninstalled them, and an
 	// unverified host version can be overridden with an explicit confirmation.
 	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}/restore", m.handleRestore)
 	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}/force-enable", m.handleForceEnable)
+	mux.HandleFunc("POST "+APIPrefix+"/plugins/{id}/update", m.handleUpdateApply)
 	// The plugin runtime calls this route with its token in the body. The host
 	// bridge only forwards a fixed header allowlist, so a token header would not
 	// reach the core; identifying the plugin by its token is also the stronger
@@ -1474,11 +1503,7 @@ func (m *Manager) handleAssets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if entryFile && item.grants.hasPrivileged() {
-		expected := item.installDigest
-		if item.source == SourceBundled {
-			expected = m.officialDigest(item.manifest, item.source)
-		}
-		if !digestMatches(item.dir, expected, &servedModule{name: file, data: data}) {
+		if !m.privilegeIntactForModule(item, &servedModule{name: file, data: data}) {
 			fail(w, privilegeDenied())
 			return
 		}

@@ -48,6 +48,27 @@ RELEASE_PUBLISHED_AT="<ISO8601时间>" RELEASE_NOTES="<更新说明>" python3 sc
 
 手工在 GitHub 创建 Release 时，必须先保存为 Draft，将 `dist/release/*.tar.gz`、`dist/release/*.zip`、`dist/release/SHA256SUMS`、`dist/release/manifest.json` 与 `dist/THIRD_PARTY_NOTICES.txt` 全部上传完整后再点击 Publish；同步到 CNB 时可使用 `CNB_TOKEN=... python3 scripts/sync_cnb_release.py --tag v<X.Y.Z> ...`（该脚本会自动按“归档 → `SHA256SUMS` → `manifest.json`”顺序上传）。
 
+## 官方插件独立在线更新与发布契约
+
+从 `v0.2.8` 起，官方预装插件（`kimicode-plus.kct`、`kimicode-plus.monitor`、`kimicode-plus.planner`、`kimicode-plus.scheduler`）支持独立于主程序发版并热更新，无需重装核心或重启 Kimi Code。
+
+客户端采用与核心一致的“CNB 镜像优先、GitHub 兜底”双源策略，从独立的非 latest 固定通道标签 `plugins-latest` 拉取内嵌 Ed25519 签名的 `plugins-manifest.json`（不影响主程序 `releases/latest`）：
+
+```text
+https://cnb.cool/wssz527/kimicode-plus/-/releases/download/plugins-latest/plugins-manifest.json
+https://github.com/wssz527/kimicode-plus/releases/download/plugins-latest/plugins-manifest.json
+```
+
+### 独立发布官方插件流程
+
+1. 修改 `plugins/<name>/` 下的插件代码并递增该插件 `plugin.json` 的 `version`。
+2. 推送 `plugin-*` 标签（如 `plugin-kct-v1.0.5`）或在 GitHub Actions 手动运行 `Release Official Plugins`（`.github/workflows/release-plugins.yml`）。
+3. 工作流使用 GitHub 仓库 Secret `PLUGIN_SIGNING_PRIVATE_KEY`（与仓库 `plugins/official_keys.go` 内置公钥配对的 Ed25519 私钥，禁止提交到仓库）执行：
+   - `go run ./cmd/plugin-release package` 打包并签名生成 `*.zip` 与 `plugins-manifest.json`；
+   - `go run ./cmd/plugin-release verify` 用内置公钥反向校验签名与每个压缩包的 SHA-256 及目录内容摘要；
+   - 先上传各版本化 `*.zip`，最后原子覆盖上传 `plugins-manifest.json` 到 GitHub `plugins-latest`（`--latest=false`），再通过 `scripts/sync_cnb_release.py --tag plugins-latest --no-prerelease --make-latest false --force-tag` 同步到 CNB 镜像。
+4. 客户端检查更新时校验证书公钥签名、最低核心版本（`minCoreVersion`）和权限变更：能力未扩权可直接一键热更新，新增能力会要求用户明确确认；已验签清单随插件记录持久化，v2 高权限插件更新及重启后均保持官方签名校验有效。
+
 ## 日常开发与验证
 
 - 隔离验收必须使用 `work/` 下的独立 `--data-dir`、`--host-profile` 与 `--kimi-home`，避免触碰日常配置；中间产物放入 `work/`，不纳入 git 提交。

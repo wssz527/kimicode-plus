@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type PluginRecord } from "../api";
+import { api, type PluginRecord, type PluginUpdateItem } from "../api";
 import { readAddonFeatures, writeAddonFeatures, type AddonFeatures, type NativeHost } from "../native";
 import { syncPluginHost } from "../plugin-runtime/host";
 import { AccountsManagerSection } from "./AccountsSection";
@@ -75,6 +75,11 @@ export function LabSettingsSection({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [planner, setPlanner] = useState<PluginRecord | null>(null);
+  const [plannerUpdate, setPlannerUpdate] = useState<PluginUpdateItem | null>(null);
+  const [plannerUpdating, setPlannerUpdating] = useState(false);
+  const [plannerConsentOpen, setPlannerConsentOpen] = useState(false);
+  const [plannerPrivConfirmed, setPlannerPrivConfirmed] = useState(false);
+  const [plannerFlash, setPlannerFlash] = useState<string | null>(null);
   const [plannerBusy, setPlannerBusy] = useState(false);
   const [plannerError, setPlannerError] = useState<string | null>(null);
   const [safeMode, setSafeMode] = useState(false);
@@ -106,9 +111,10 @@ export function LabSettingsSection({
   useEffect(() => {
     let alive = true;
     const loadPlanner = async () => {
-      const [record, list] = await Promise.allSettled([
+      const [record, list, updates] = await Promise.allSettled([
         api.plugins.get(PLANNER_PLUGIN_ID),
         api.plugins.list(),
+        api.plugins.updates(),
       ]);
       if (!alive) return;
       if (list.status === "fulfilled") setSafeMode(Boolean(list.value.safeMode));
@@ -118,6 +124,10 @@ export function LabSettingsSection({
         // An uninstalled bundled plugin keeps a row in the list, and that row is
         // the only way to offer 恢复并启用.
         setPlanner(list.value.items.find((item) => item.id === PLANNER_PLUGIN_ID) ?? null);
+      }
+      if (updates.status === "fulfilled") {
+        const item = updates.value.items?.[PLANNER_PLUGIN_ID] ?? null;
+        setPlannerUpdate(item?.updateAvailable ? item : null);
       }
     };
     void loadPlanner();
@@ -191,6 +201,38 @@ export function LabSettingsSection({
     }
   }
 
+  async function updatePlanner(confirmConsent = false) {
+    if (!plannerUpdate || plannerUpdating || plannerBusy) return;
+    const hasAddedPriv = (plannerUpdate.addedPrivileged?.length ?? 0) > 0;
+    if (plannerUpdate.needsConsent && !confirmConsent) {
+      setPlannerPrivConfirmed(false);
+      setPlannerConsentOpen(true);
+      return;
+    }
+    if (hasAddedPriv && !plannerPrivConfirmed) return;
+    setPlannerUpdating(true);
+    setPlannerError(null);
+    setPlannerFlash(null);
+    try {
+      const updated = await api.plugins.update(PLANNER_PLUGIN_ID, {
+        expectedVersion: plannerUpdate.latestVersion,
+        confirmCapabilities: plannerUpdate.needsConsent ? true : undefined,
+        confirmPrivileged: hasAddedPriv ? true : undefined,
+      });
+      setPlanner(updated);
+      setPlannerUpdate(null);
+      setPlannerConsentOpen(false);
+      setPlannerPrivConfirmed(false);
+      const syncMessage = await syncPluginHost();
+      if (syncMessage) setPlannerError(syncMessage);
+      else setPlannerFlash(`「规划」已热更新到 v${updated.version}，无需重启 Kimi Code。`);
+    } catch (cause) {
+      setPlannerError(errorText(cause));
+    } finally {
+      setPlannerUpdating(false);
+    }
+  }
+
   const enabled = features?.multiSession === true;
   const plannerUninstalled = planner?.state === "UNINSTALLED";
   const plannerEnabled = planner?.enabled === true;
@@ -236,25 +278,78 @@ export function LabSettingsSection({
               在右侧面板中提供网页对话提取与本地规划引擎，支持可编辑预览后交接给会话。开启后立即显示入口，关闭后立即隐藏。
             </small>
           </span>
-          {plannerUninstalled ? (
+          <div className="ekds-row-actions">
+            {!plannerUninstalled && plannerUpdate?.updateAvailable && plannerUpdate.canApply ? (
+              <button
+                type="button"
+                className="ekds-btn"
+                onClick={() => void updatePlanner()}
+                disabled={plannerUpdating || plannerBusy || safeMode}
+                title={plannerUpdate.releaseNotes || `更新规划插件到 v${plannerUpdate.latestVersion}`}
+              >
+                {plannerUpdating ? "更新中…" : `更新到 v${plannerUpdate.latestVersion}`}
+              </button>
+            ) : null}
+            {plannerUninstalled ? (
+              <button
+                type="button"
+                className="ekds-btn"
+                onClick={() => void restorePlanner()}
+                disabled={plannerBusy || safeMode}
+              >
+                {plannerBusy ? "正在恢复…" : "恢复并启用"}
+              </button>
+            ) : (
+              <Toggle
+                label="规划"
+                checked={plannerEnabled}
+                disabled={!planner || plannerBusy || plannerUpdating || (!plannerEnabled && (safeMode || planner.state === "CORRUPT"))}
+                onChange={(value) => void togglePlanner(value)}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+      {plannerConsentOpen && plannerUpdate?.updateAvailable && plannerUpdate.needsConsent ? (
+        <div className="plugin-confirm" role="dialog" aria-modal="true" aria-label="确认规划插件新增权限">
+          <p>
+            <strong>「规划」v{plannerUpdate.latestVersion} 申请了新增权限：</strong>
+            {(plannerUpdate.addedCapabilities ?? []).join("、")}
+          </p>
+          {(plannerUpdate.addedPrivileged?.length ?? 0) > 0 ? (
+            <label className="capability-choice">
+              <input
+                type="checkbox"
+                checked={plannerPrivConfirmed}
+                onChange={(event) => setPlannerPrivConfirmed(event.target.checked)}
+              />
+              <span>我了解上述新增高权限能力的影响范围，确认授予并更新</span>
+            </label>
+          ) : null}
+          <div className="inline-actions">
             <button
               type="button"
               className="ekds-btn"
-              onClick={() => void restorePlanner()}
-              disabled={plannerBusy || safeMode}
+              onClick={() => void updatePlanner(true)}
+              disabled={plannerUpdating || ((plannerUpdate.addedPrivileged?.length ?? 0) > 0 && !plannerPrivConfirmed)}
             >
-              {plannerBusy ? "正在恢复…" : "恢复并启用"}
+              {plannerUpdating ? "更新中…" : `确认并更新到 v${plannerUpdate.latestVersion}`}
             </button>
-          ) : (
-            <Toggle
-              label="规划"
-              checked={plannerEnabled}
-              disabled={!planner || plannerBusy || (!plannerEnabled && (safeMode || planner.state === "CORRUPT"))}
-              onChange={(value) => void togglePlanner(value)}
-            />
-          )}
+            <button
+              type="button"
+              className="ekds-btn"
+              onClick={() => setPlannerConsentOpen(false)}
+              disabled={plannerUpdating}
+            >
+              取消
+            </button>
+          </div>
         </div>
-      </div>
+      ) : null}
+      {plannerFlash ? <p className="ekds-note" role="status">{plannerFlash}</p> : null}
+      {!plannerUninstalled && plannerUpdate?.updateAvailable && !plannerUpdate.canApply && plannerUpdate.cannotApplyReason ? (
+        <p className="ekds-note">「规划」有新版本 v{plannerUpdate.latestVersion}：{plannerUpdate.cannotApplyReason}</p>
+      ) : null}
       {plannerError ? <p className="ekds-note is-error" role="alert">{plannerError}</p> : null}
       {plannerStatusIssue ? (
         <p className="ekds-note is-error" role="alert">{plannerStatusIssue}</p>

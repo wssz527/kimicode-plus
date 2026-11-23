@@ -2315,6 +2315,63 @@
   white-space: nowrap;
 }
 
+.plugin-tag.is-update {
+  border-color: color-mix(in srgb, var(--accent, #2563eb) 36%, transparent);
+  background: color-mix(in srgb, var(--accent, #2563eb) 10%, transparent);
+  color: var(--accent, #2563eb);
+  font-weight: 500;
+}
+
+.plugin-update-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent, #2563eb) 32%, var(--line));
+  border-radius: var(--radius-md, 10px);
+  background: color-mix(in srgb, var(--accent, #2563eb) 5%, var(--surface));
+}
+
+.plugin-update-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.plugin-update-head > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.plugin-update-head strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-strong);
+}
+
+.plugin-update-meta {
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.plugin-update-notes {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--ink);
+  white-space: pre-wrap;
+}
+
+.plugin-update-consent {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
 .plugin.muted .plugin-line strong {
   color: var(--ink-muted);
 }

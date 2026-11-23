@@ -21,7 +21,7 @@ CNB_ACCEPT = 'application/vnd.cnb.api+json'
 
 
 def ordered_assets(paths):
-    """Order release files so manifest.json is uploaded last."""
+    """Order release files so manifest files are uploaded last."""
     resolved = [Path(item) for item in paths]
     missing = [str(item) for item in resolved if not item.is_file()]
     if missing:
@@ -31,9 +31,10 @@ def ordered_assets(paths):
         if item.name in seen:
             raise SystemExit(f'Duplicate asset filename: {item.name}')
         seen[item.name] = item
-    regular = [item for item in resolved if item.name not in ('SHA256SUMS', 'manifest.json')]
+    manifest_names = ('manifest.json', 'plugins-manifest.json')
+    regular = [item for item in resolved if item.name not in ('SHA256SUMS', *manifest_names)]
     sums = [item for item in resolved if item.name == 'SHA256SUMS']
-    manifests = [item for item in resolved if item.name == 'manifest.json']
+    manifests = [item for item in resolved if item.name in manifest_names]
     return regular + sums + manifests
 
 
@@ -76,7 +77,7 @@ def upload_file_put(upload_url, file_path, timeout=180):
                 raise RuntimeError(f'Upload PUT failed for {file_path.name}: HTTP {resp.status}')
 
 
-def ensure_release(api_base, repo, token, tag, notes, prerelease):
+def ensure_release(api_base, repo, token, tag, notes, prerelease, make_latest=None):
     encoded_tag = urllib.parse.quote(tag, safe='')
     tag_url = f'{api_base}/{repo}/-/releases/tags/{encoded_tag}'
     status, data = cnb_json_request(tag_url, token, method='GET')
@@ -85,6 +86,7 @@ def ensure_release(api_base, repo, token, tag, notes, prerelease):
     if status != 404:
         raise RuntimeError(f'Failed to query CNB release {tag}: HTTP {status} {data.get("_raw", "")}')
 
+    latest_flag = (not prerelease) if make_latest is None else bool(make_latest)
     create_url = f'{api_base}/{repo}/-/releases'
     payload = {
         'tag_name': tag,
@@ -92,7 +94,7 @@ def ensure_release(api_base, repo, token, tag, notes, prerelease):
         'body': notes,
         'draft': False,
         'prerelease': bool(prerelease),
-        'make_latest': 'false' if prerelease else 'true',
+        'make_latest': 'true' if latest_flag else 'false',
     }
     status, data = cnb_json_request(create_url, token, method='POST', payload=payload)
     if status not in (200, 201) or not data.get('id'):
@@ -136,7 +138,7 @@ def upload_release_asset(api_base, repo, token, release_id, file_path, attempts=
     raise RuntimeError(f'Failed to upload {file_path.name} after {attempts} attempts: {last_err}')
 
 
-def push_git_refs(web_base, repo, token, tag, prerelease):
+def push_git_refs(web_base, repo, token, tag, prerelease, push_main=True, force_tag=False):
     remote_url = f'{web_base.rstrip("/")}/{repo}.git'
     with tempfile.NamedTemporaryFile('w', prefix='cnb-askpass-', suffix='.sh', delete=False, encoding='utf-8') as script:
         script.write(
@@ -153,7 +155,7 @@ def push_git_refs(web_base, repo, token, tag, prerelease):
         env['GIT_ASKPASS'] = str(askpass)
         env['GIT_TERMINAL_PROMPT'] = '0'
         env['CNB_GIT_PASSWORD'] = token
-        if not prerelease:
+        if push_main and not prerelease:
             subprocess.run(
                 ['git', 'push', remote_url, 'HEAD:refs/heads/main'],
                 env=env,
@@ -163,8 +165,9 @@ def push_git_refs(web_base, repo, token, tag, prerelease):
                 text=True,
                 timeout=120,
             )
+        refspec = f'+refs/tags/{tag}:refs/tags/{tag}' if force_tag else f'refs/tags/{tag}:refs/tags/{tag}'
         result = subprocess.run(
-            ['git', 'push', remote_url, f'refs/tags/{tag}:refs/tags/{tag}'],
+            ['git', 'push', remote_url, refspec],
             env=env,
             check=False,
             stdout=subprocess.PIPE,
@@ -181,12 +184,25 @@ def push_git_refs(web_base, repo, token, tag, prerelease):
             pass
 
 
-def sync_release(api_base, web_base, repo, token, tag, notes, files, prerelease, push_git=True):
+def sync_release(
+    api_base,
+    web_base,
+    repo,
+    token,
+    tag,
+    notes,
+    files,
+    prerelease,
+    push_git=True,
+    make_latest=None,
+    force_tag=False,
+):
     api_base = api_base.rstrip('/')
     assets = ordered_assets(files)
     if push_git:
-        push_git_refs(web_base, repo, token, tag, prerelease)
-    release_id = ensure_release(api_base, repo, token, tag, notes, prerelease)
+        push_main = True if make_latest is None else bool(make_latest)
+        push_git_refs(web_base, repo, token, tag, prerelease, push_main=push_main, force_tag=force_tag)
+    release_id = ensure_release(api_base, repo, token, tag, notes, prerelease, make_latest=make_latest)
     for asset_path in assets:
         print(f'Uploading {asset_path.name} ({asset_path.stat().st_size} bytes) to CNB {repo} {tag}...', flush=True)
         upload_release_asset(api_base, repo, token, release_id, asset_path)
@@ -200,7 +216,9 @@ def main():
     parser.add_argument('--api-base', default=os.environ.get('CNB_API_BASE', DEFAULT_CNB_API))
     parser.add_argument('--web-base', default=os.environ.get('CNB_WEB_BASE', DEFAULT_CNB_WEB))
     parser.add_argument('--notes', default=os.environ.get('RELEASE_NOTES', ''))
-    parser.add_argument('--prerelease', action='store_true', default=None)
+    parser.add_argument('--prerelease', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--make-latest', choices=('auto', 'true', 'false'), default='auto')
+    parser.add_argument('--force-tag', action='store_true', help='Force-update rolling git tag on CNB (e.g. plugins-latest)')
     parser.add_argument('--skip-git-push', action='store_true', help='Skip pushing git tag/main to CNB')
     parser.add_argument('files', nargs='+', help='Release asset files to upload')
     args = parser.parse_args()
@@ -210,6 +228,7 @@ def main():
         raise SystemExit('CNB_TOKEN environment variable is required')
 
     prerelease = is_prerelease(args.tag) if args.prerelease is None else args.prerelease
+    make_latest = None if args.make_latest == 'auto' else (args.make_latest == 'true')
     release_id, uploaded = sync_release(
         api_base=args.api_base,
         web_base=args.web_base,
@@ -220,6 +239,8 @@ def main():
         files=args.files,
         prerelease=prerelease,
         push_git=not args.skip_git_push,
+        make_latest=make_latest,
+        force_tag=args.force_tag,
     )
     print(f'Synced CNB release {args.tag} (id={release_id}): {", ".join(uploaded)}')
 

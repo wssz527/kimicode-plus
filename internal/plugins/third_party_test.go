@@ -155,10 +155,13 @@ func TestLegacyInstallWithoutDigestRequiresReinstallForPrivilege(t *testing.T) {
 	if err := manager.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := manager.db.Exec(`ALTER TABLE plugin_installs DROP COLUMN official_manifest`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := manager.db.Exec(`ALTER TABLE plugin_installs DROP COLUMN install_digest`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.db.Exec(`UPDATE schema_versions SET version=? WHERE module='plugins'`, len(migrations)-1); err != nil {
+	if _, err := manager.db.Exec(`UPDATE schema_versions SET version=5 WHERE module='plugins'`); err != nil {
 		t.Fatal(err)
 	}
 	manager = reopen(t, manager, root)

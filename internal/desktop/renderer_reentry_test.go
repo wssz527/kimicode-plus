@@ -38,6 +38,7 @@ func TestRendererCleanupAllowsReentrantInstall(t *testing.T) {
 	for _, field := range []string{
 		"plugins: null,",
 		"pluginReleases: new Map(),",
+		"pluginRevisions: new Map(),",
 		"pluginTokens: new Map(),",
 		"pluginAssets: new Map(),",
 		"pluginSettings: new Map(),",
@@ -527,5 +528,95 @@ const install = new Function(
 	}
 	if !got.Teardown.UICleared || !got.Teardown.PluginsCleared || !got.Teardown.BrowserNavCleared {
 		t.Fatalf("renderer teardown did not clear globals cleanly: %+v", got.Teardown)
+	}
+}
+
+func TestReconcilePluginsHotReloadsOnVersionChange(t *testing.T) {
+	source := strings.ReplaceAll(rendererSource, "\r\n", "\n")
+	for _, want := range []string{
+		"pluginRevisions: new Map()",
+		"state.pluginRevisions.clear()",
+		"state.pluginRevisions.get(id) === pluginRevision(next)",
+		"state.pluginRevisions.set(plugin.id, pluginRevision(plugin))",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("renderer.js missing plugin hot-reload guard: %s", want)
+		}
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed; skipping JS hot-reload simulation")
+	}
+	rendererAbs, err := filepath.Abs("assets/renderer.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := `
+const fs = require('node:fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const start = source.indexOf('    // A plugin the runtime reports as stopped or upgraded');
+const end = source.indexOf('\n  }\n\n  // The settings surface owns the settings module lifecycle', start);
+if (start < 0 || end < 0) throw new Error('reconcilePlugins block not found');
+const snippet = source.slice(start, end);
+(async () => {
+  const events = [];
+  const state = {
+    removed: false,
+    pluginReleases: new Map(),
+    pluginRevisions: new Map(),
+    pluginTokens: new Map(),
+    pluginAssets: new Map(),
+    pluginSettings: new Map(),
+    plugins: {
+      activate: async (entry, meta) => { events.push('activate:' + meta.id + '@' + meta.version + ':' + entry.ver + ':' + meta.token); },
+      deactivate: id => { events.push('deactivate:' + id); },
+    },
+  };
+  let currentList = [];
+  let tokenSeq = 0;
+  let assetLoads = 0;
+  const isStale = () => false;
+  const corePost = async () => ({ token: 'tok-' + (++tokenSeq) });
+  const module = { pluginEntryPath: p => p };
+  const loadPluginAsset = async (id, entryPath) => {
+    const key = id + '/' + entryPath + '/activate';
+    if (state.pluginAssets.has(key)) return state.pluginAssets.get(key);
+    assetLoads += 1;
+    const loaded = { ver: 'bundle-' + assetLoads };
+    state.pluginAssets.set(key, loaded);
+    return loaded;
+  };
+  const noteActivationFault = (_id, err) => { throw err; };
+  const reconcile = new Function('state', 'enabled', 'isStale', 'corePost', 'loadPluginAsset', 'module', 'noteActivationFault', 'return (async () => {\n' + snippet + '\n})();');
+
+  const v1 = [{ id: 'kimicode-plus.kct', version: '1.0.4', updatedAt: 't1', apiVersion: 1, capabilities: ['ui:thinking'], entry: { renderer: 'renderer.js' } }];
+  await reconcile(state, v1, isStale, corePost, loadPluginAsset, module, noteActivationFault);
+  // Same revision must not reload.
+  await reconcile(state, v1, isStale, corePost, loadPluginAsset, module, noteActivationFault);
+  // Version bump must deactivate v1, clear asset cache, fetch fresh token & bundle, and activate v2.
+  const v2 = [{ id: 'kimicode-plus.kct', version: '1.0.5', updatedAt: 't2', apiVersion: 1, capabilities: ['ui:thinking'], entry: { renderer: 'renderer.js' } }];
+  await reconcile(state, v2, isStale, corePost, loadPluginAsset, module, noteActivationFault);
+  process.stdout.write(JSON.stringify({ events, assetLoads, activeToken: state.pluginTokens.get('kimicode-plus.kct') }));
+})().catch(err => { console.error(err); process.exitCode = 1; });
+`
+	output, err := exec.Command(node, "-e", script, rendererAbs).CombinedOutput()
+	if err != nil {
+		t.Fatalf("hot-reload probe failed: %v\n%s", err, output)
+	}
+	var res struct {
+		Events      []string `json:"events"`
+		AssetLoads  int      `json:"assetLoads"`
+		ActiveToken string   `json:"activeToken"`
+	}
+	if err := json.Unmarshal(output, &res); err != nil {
+		t.Fatalf("decode hot-reload probe output: %v\n%s", err, output)
+	}
+	wantEvents := []string{
+		"activate:kimicode-plus.kct@1.0.4:bundle-1:tok-1",
+		"deactivate:kimicode-plus.kct",
+		"activate:kimicode-plus.kct@1.0.5:bundle-2:tok-2",
+	}
+	if strings.Join(res.Events, "|") != strings.Join(wantEvents, "|") || res.AssetLoads != 2 || res.ActiveToken != "tok-2" {
+		t.Fatalf("unexpected hot-reload lifecycle: %+v", res)
 	}
 }

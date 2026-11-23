@@ -411,9 +411,11 @@ export async function activate(ctx) {
       return;
     }
     if (!node) {
-      node = pickSource(state.body)?.cloneNode(false) ?? document.createElement("pre");
+      const source = pickSource(state.body);
+      node = source?.cloneNode(false) ?? document.createElement("pre");
       node.removeAttribute("id");
-      node.className = "ekdp-kct-translated";
+      node.removeAttribute("data-ekdp-kct-hidden");
+      node.classList.add("ekdp-kct-translated");
       node.setAttribute("data-ekdp-owned", "1");
       state.body.appendChild(node);
     }
@@ -1365,6 +1367,7 @@ function injectStyles() {
 .ekdp-kct-status{color:var(--color-text-secondary,var(--color-text-muted,light-dark(#666,#aaa)));font-size:11px}
 .ekdp-kct-status:empty{display:none}
 .ekdp-kct-status[data-state="error"]{color:var(--color-danger,var(--red,light-dark(#b42318,#f97066)))}
+:where(.ekdp-kct-translated){font:var(--text-base,13px)/var(--leading-normal,1.5) var(--font-ui,sans-serif);font-weight:var(--weight-regular,400);color:var(--color-text-muted,var(--color-text-secondary,light-dark(#666,#aaa)));margin:0;padding:6px 0 0}
 .ekdp-kct-translated{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
 .ekdp-kct-panel{position:fixed;z-index:2147483000;display:flex;flex-direction:column;gap:10px;box-sizing:border-box;padding:12px 14px;border:1px solid var(--color-line,var(--line,light-dark(rgba(0,0,0,.14),rgba(255,255,255,.16))));border-radius:10px;background:var(--color-surface,var(--surface-raised,light-dark(#fff,#1e1f22)));color:var(--color-text,light-dark(#222,#eee));box-shadow:0 12px 32px light-dark(rgba(15,23,42,.18),rgba(0,0,0,.5));font:12px/1.5 var(--font-ui,sans-serif);text-align:left}
 .ekdp-kct-panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
