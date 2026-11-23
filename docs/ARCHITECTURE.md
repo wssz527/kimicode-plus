@@ -2,6 +2,8 @@
 
 第一阶段使用单一 Go 进程运行业务模块、受保护 Loopback HTTP 和 SQLite。前端静态资源通过 go:embed 随二进制发布。TS 适配层保留在单独目录中，不要求常驻 Node，不加载官方引擎。
 
+核心不运行插件宿主进程：增强插件是本地受信任的 ES Module 包（清单 + 单文件入口），由核心登记、授权并从插件自己的目录下发源码，renderer 用 blob URL `import()` 执行。`apiVersion: 1` 提供指标、会话、配置、界面插槽与私有存储；`apiVersion: 2` 增加会话发送、主区整页/分栏、右侧面板、独立网页视图与命令等挂载点，高权限能力安装时需要二次确认。官方预装插件与第三方插件走同一套接口，没有私有通道。
+
 ## 从工作台到数据
 
 浏览器从本程序自己的运行文件获得一次运行期随机配对凭据。配对接口签发有限有效期、按资源授权的内存会话。每次 API 请求携带 Bearer；同时校验精确 Host、同源 Origin、跨站标记、请求容量和速率。页面 CSP 禁止外部脚本、外连和被嵌入。API 不使用 Cookie 鉴权，配对 fragment 不进入 HTTP 请求或 Referer。
@@ -30,19 +32,21 @@ Core 路由将请求交给 registry、usage、bridge、plugins 或 chat。模块
 
 `KAPClient` 从指定隔离 KIMI_CODE_HOME 读取实例记录与本地服务 token，通过官方 `/api/v1` 读取会话/配置、创建会话、发送 prompt、停止和回复审批。WebSocket 事件按 session scope 进入 EventBus；`turn.ended` 只更新结束状态，不覆盖已流式保存的 Items。消息保留官方时间和附件名称/类型。规划由 Go Planner 单独持久化并通过配置供应商生成，网页选区由增强自建的 WebContentsView/窗口读取，编辑预览后经 `handoff` 向已有或新建 Code 会话发送。没有显式选择时请求不带 model 或 permission_mode，避免暗改目标；原生附件通过 Electron 文件选择取得路径，Go 校验最多 16 个本机常规文件后复用 KAP prompt 的 image/video/file 部件，不经过旧 Outbox blob store。
 
-多会话 surface 最多挂载三个窗格。同一入口逐次追加，官方侧栏驱动主窗格，已显示会话通过交换避免重复。`SessionInputProvider` 按 session ID 集中保存草稿、模型、模式、权限及附件，事件仍按会话订阅。它复用官方会话服务，但不是官方原生的多视图 API。规划位于官方右侧 `pt-body`，多会话位于 `.chat-main`，容器属性与 CSS 持续隐藏 Vue 重建的原生子节点，退出时释放。设置嵌入官方对话框，单层 5 项导航加一条跳转行，插件在内嵌页面里直接管理；模型与凭据改由自建 BrowserWindow 承载，只接受 `/models`、`/credentials` 两条固定路由，窗口禁用 devtools 并拒绝除 `about:blank` 之外的导航，经同一 `core.fetch` 通道访问核心；Monitor/设置入口沿用官方侧栏结构，网页在菜单/设置弹层出现时隐藏，避免 WebContentsView 覆盖控件。
+多会话 surface 最多挂载三个窗格。同一入口逐次追加，官方侧栏驱动主窗格，已显示会话通过交换避免重复。`SessionInputProvider` 按 session ID 集中保存草稿、模型、模式、权限及附件，事件仍按会话订阅。它复用官方会话服务，但不是官方原生的多视图 API。规划位于官方右侧 `pt-body`，多会话位于 `.chat-main`，容器属性与 CSS 持续隐藏 Vue 重建的原生子节点，退出时释放。设置不再维护平行配置页：多账号挂载到官方「账户」页，权限规则与子代理池挂载到官方「智能体与会话」页，会话并排与规划实验开关注入官方「实验室」页，本地增强插件挂在官方「插件」页的 KimiCode+ 分段，缓存与策略独立为「缓存与用量」标签页，「KimiCode+」标签页只保留状态诊断与探针回落内容。模型能力与限制通过原生行内抽屉读写，凭据在申请它的插件详情页维护。Monitor/设置入口沿用官方侧栏结构，网页在菜单/设置弹层出现时隐藏，避免 WebContentsView 覆盖控件。
 
 ## 降级与后续边界
 
 旧 DesktopAdapter 与 Code/Web Outbox 任务传输仍为 Mock。原生网页路径可以提取增强自建网页的选区/正文并交接给 Code，但不会向第三方网站填写或发送消息，也不读取网站回复。轻量聊天通过 Go provider.Client 直接使用供应商 HTTP 协议，未经过 Node 中转。发送前保存稳定 intent 与 INFLIGHT，收到有效文本后记录结果；超时、未知和重启中断不自动重发。最近 12 条独立历史构成请求上下文。原始用量随请求保存并转入账本，读回线程时可补写，不把缺失 Token 转为零。
 
-凭据库使用 PBKDF2-SHA256 派生密钥和 AES-256-GCM，随机 nonce 与引用作为附加认证数据。解锁密钥只在进程内，重启锁定；API 仅列引用，不提供明文导出。用户提供的 Cookie JSON 进入独立密文表，普通凭据接口不能列出、读取或删除其中内容；供应商密钥仍限制为 32 KiB，浏览器数据单项限制为 8 MiB。升级只迁移与既有迁移记录关联的内部引用并保留密文字节。预览 24 小时后不可应用，启动及浏览器请求会清理到期密文，迁移记录不含值。冲突按目标分区、域、路径、名称等识别，与来源浏览器 storeId 无关。该路径不读真实浏览器数据库，也不恢复真实登录态。
+凭据库使用 PBKDF2-SHA256 派生密钥和 AES-256-GCM，随机 nonce 与引用作为附加认证数据。密钥本身交给操作系统钥匙串保管：macOS 用 Keychain（`MACOS_KEYCHAIN`），Windows 用 DPAPI（`WINDOWS_DPAPI`），首次运行生成随机密钥并由系统保护，之后每次启动 `AutoUnlock` 直接解密，用户不再输入主口令。旧的主口令库继续可打开，但保持锁定状态并在状态里标记 `legacyPasswordVault`，用户输入一次口令后才解除；忘记口令时只能重置整个库。API 仅列引用，不提供明文导出。用户提供的 Cookie JSON 进入独立密文表，普通凭据接口不能列出、读取或删除其中内容；供应商密钥仍限制为 32 KiB，浏览器数据单项限制为 8 MiB。升级只迁移与既有迁移记录关联的内部引用并保留密文字节。预览 24 小时后不可应用，启动及浏览器请求会清理到期密文，迁移记录不含值。冲突按目标分区、域、路径、名称等识别，与来源浏览器 storeId 无关。该路径不读真实浏览器数据库，也不恢复真实登录态。
 
 会话引用、布局、Reviewer 偏好与旧压缩策略保存于本地 SQLite。原生布局 UI 只提供 1–3 列，旧 API 为兼容数据仍接受 1–4 列。旧策略按会话、项目、模型、全局匹配，主控/工具忙、恢复、审批和 Worker 运行会阻止评估到期；到期只返回 BLOCKED_NATIVE_UNCONNECTED。`native_state` 另外保存保活、压缩和额度恢复设置，三项独立且默认 false。五秒后台调度器复用官方会话状态；保活与压缩使用 `automation_intents` 保存意图和回执，恢复还使用持久监听项。保活要求任务仍忙且无审批/Goal 阻断；压缩要求空闲、官方上下文用量达到阈值，并等待完成事件；恢复要求最后一轮明确 429、官方额度明确可用且 Goal 硬预算允许。核心重启将未完成意图标为 UNKNOWN，不自动重发。Worktree 功能仅在用户指定 Git 仓库下创建 detached 工作树。
 
-插件运行可信内置 Go 指令整理和 Monitor 兼容事件导入，不运行原版采集器或安装器。Monitor 的界面参考 `bfjnbvf/kimi-code-monitor@1d529f0b424a708971cfac097238df444f3b5beb`，MIT 归属和全文加入 `scripts/notices.py` 生成的依赖通知。额度来自官方 `/oauth/usage`，仅 AVAILABLE 数据可显示已用比例；缓存自动化回执与真实命中指标分开，缺少样本保持未知。复用生命周期与故障隔离，不加载外部代码；资源计数仍是模拟记账，不能代表真实 OS 句柄。没有额外插件宿主进程。
+增强插件运行在核心登记的本地包内，不属于核心的可信 Go 指令集：插件源码由核心按能力表授权后下发，renderer 在独立作用域内执行，动作一律经 `POST /plugin-runtime/{action}` 受令牌约束。Monitor 的界面参考 `bfjnbvf/kimi-code-monitor@1d529f0b424a708971cfac097238df444f3b5beb`，MIT 归属与全文加入 `scripts/notices.py` 生成的依赖通知（该归属只出现一次，来自 `plugins/monitor/LICENSE` 与 `NOTICE`）。额度来自官方 `/oauth/usage`，仅 AVAILABLE 数据可显示已用比例；缓存自动化回执与真实命中指标分开，缺少样本保持未知。复用生命周期与故障隔离；资源计数仍是模拟记账，不能代表真实 OS 句柄。没有额外插件宿主进程。
 
 前端提供独立静态管理页和原生 surface ES 模块。mountEnhancement 保留独立页面嵌入能力；mountSurface 通过 createNativeHost 接入规划、多会话、设置和 Monitor。Shadow DOM 隔离样式，主题继承宿主变量。正式本地 RPC、宿主会话上下文、官方设置内嵌与原生布局已接入并通过隔离回归；后续需要覆盖宿主升级与其他平台。
+
+自更新与插件热更新各有独立的可信来源。核心更新默认按 CNB 国内镜像优先、GitHub Releases 兜底的顺序读取 `latest/download/manifest.json`，再从同一源的 `download/v<版本>/` 取归档与 `SHA256SUMS`，校验 SHA-256 后交给独立监督进程替换并做健康检查，失败回滚旧核心。官方预装插件走固定的 `plugins-latest` 通道：清单内嵌 Ed25519 签名，客户端用内置公钥验签后才比较 `minCoreVersion` 与能力差异，未扩权直接热替换，新增能力需用户确认，已验签清单随插件记录持久化。
 
 未来适配器版本失配只能停用对应能力。官方升级不影响独立核心启动。本机文件经 KAP 发送已验证，但系统文件选择窗口未 GUI 点选；网站上传、网站内对话、浏览器登录态恢复、真实账号自动化及其他平台运行仍按 [原生接入门槛](NATIVE_INTEGRATION.md) 独立验收。
 

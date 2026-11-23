@@ -9,6 +9,11 @@ on:
         description: 'Optional version confirmation matching the selected release tag'
         required: false
         type: string
+      skip_cnb_mirror:
+        description: 'Skip the CNB domestic mirror sync for this run (leaves it on the previous version)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -96,6 +101,7 @@ jobs:
           set -e
           if [ "$code" -eq 0 ]; then
             echo 'This tag already has a release. Use a new version to publish.' >&2
+            echo 'If the existing release is a draft left by a failed run, delete it (gh release delete <tag> --yes) or publish it after checking its assets, then re-run.' >&2
             exit 1
           fi
           if ! printf '%s\n' "$result" | grep -q '^HTTP/[^ ]* 404'; then
@@ -109,12 +115,17 @@ jobs:
           VERSION="$VER" sh scripts/crossbuild.sh
           python3 scripts/notices.py
           python3 scripts/package.py --version "$VER"
-      - name: Publish the GitHub Release
+      # Upload every archive, SHA256SUMS, manifest.json and the notices file into a
+      # draft first: a draft release is not mapped by releases/latest, so no client
+      # can see a release while its archives are still uploading. Publishing is a
+      # separate step once the asset list is complete.
+      - name: Upload release assets to a draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           repository: ${{ github.repository }}
           tag_name: v${{ steps.version.outputs.version }}
           target_commitish: ${{ github.sha }}
+          draft: true
           prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -130,10 +141,17 @@ jobs:
           CNB_REPO: wssz527/kimicode-plus
           TAG: v${{ steps.version.outputs.version }}
           IS_PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          SKIP_CNB_MIRROR: ${{ inputs.skip_cnb_mirror || 'false' }}
         run: |
-          if [ -z "${CNB_TOKEN:-}" ]; then
-            echo 'CNB_TOKEN secret is not configured; skipping CNB mirror sync.'
+          if [ "$SKIP_CNB_MIRROR" = "true" ]; then
+            echo 'skip_cnb_mirror=true: CNB mirror sync explicitly skipped for this run.'
             exit 0
+          fi
+          if [ -z "${CNB_TOKEN:-}" ]; then
+            echo 'CNB_TOKEN secret is not configured. The domestic CNB mirror would stay on the previous release, so this run fails instead of reporting success.' >&2
+            echo 'Configure the secret, sync manually with scripts/sync_cnb_release.py, or re-run with skip_cnb_mirror=true.' >&2
+            echo 'The GitHub release stays a draft until this step succeeds; the tag cannot be published by a plain re-run until that draft is deleted or published.' >&2
+            exit 1
           fi
           extra=""
           if [ "$IS_PRERELEASE" = "true" ]; then
@@ -148,3 +166,11 @@ jobs:
             dist/release/SHA256SUMS \
             dist/release/manifest.json \
             dist/THIRD_PARTY_NOTICES.txt
+      # Publishing comes last: the draft is only made public once every asset is
+      # uploaded and the CNB mirror carries the same files. A failure before this
+      # point leaves the release in draft, so releases/latest never points at a
+      # partially uploaded release on either source.
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "v${{ steps.version.outputs.version }}" --repo "${{ github.repository }}" --draft=false

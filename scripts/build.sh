@@ -2,6 +2,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 (cd web && npm ci && npm run build && npm run build:host)
+node plugins/monitor-src/build/bundle.mjs
 rm -rf internal/webassets/dist
 mkdir -p internal/webassets/dist dist
 touch internal/webassets/dist/.gitkeep

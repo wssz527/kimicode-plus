@@ -16,13 +16,18 @@ web/
   src/native.ts         原生 Host、按 scope 共享事件通道（含微任务合并与新增作用域即时补齐）、Core transport
   src/host-entry.tsx    独立 mountEnhancement、原生 mountSurface 与插件运行时导出
   src/components/Surfaces.tsx 共享 bootstrap、设置与会话导出
-  src/components/SettingsSurface.tsx 官方设置内的单层五项列表与子页
+  src/components/SettingsSurface.tsx 「KimiCode+」状态/诊断标签页与探针回落小节
+  src/components/OfficialSettingsSections.tsx 官方「账户」「智能体与会话」「实验室」「插件」页内的注入小节
+  src/components/CacheSettings.tsx 「缓存与用量」标签页
   src/components/NativeSettings.tsx Kimi Code 原生配置与官方模型目录下拉的子代理模型池
   src/components/ModelSelect.tsx 统一模型选择组件（子代理池、聊天与插件共用）
   src/components/PluginSettings.tsx 插件列表、详情、启停安装与插件凭据入口
   src/components/PluginCredentials.tsx 插件申请凭据的添加、替换与删除面板（不回显明文）
+  src/components/AccountsSection.tsx 官方「账户」页内的多账号切换与钥匙串状态
   src/components/SessionGrid.tsx 最多三个同屏会话
-  src/components/workbench/ 规划、网页与会话组件
+  src/components/workbench/SessionPanes.tsx 会话窗格与输入区
+  src/components/workbench/ControlMenu.tsx 窗格头部菜单与模型/权限选择
+  src/components/workbench/pieces.tsx 窗格共享的小组件与图标
   src/components/       图标与共享 UI 原语
   src/lib/              纯函数：合同、用量读数、预览差异渲染、models.dev 目录校验、脱敏、格式化
   src/styles/           设计 token、共享组件样式与页面样式
@@ -72,7 +77,7 @@ ENHANCE_DEV_TARGET=http://127.0.0.1:8899 npm run dev       # 覆盖目标
 
 原生功能边界：统一规划入口默认网页，来源、地址与配置放菜单；本地规划有流式、停止、预设、工具审批和交接，网页只提取增强自建页面的选区/正文并交接 Code，不是网站内自动聊天。菜单、设置及会话选择弹层出现时隐藏网页子视图。多会话最多三个，同一入口逐次追加；主窗格跟随官方侧栏，已显示会话交换而不重复，`SessionInputProvider` 以 session ID 保存草稿、模型、权限和附件，切换位置不丢状态；多会话输入框与官方单会话保持一致（仅展示发送权限与模型，不含额外的发送方式下拉框）。消息复用 Markdown 渲染、时间、复制与引用回复；附件加号调用系统文件选择，文件通过真实 KAP prompt 发送。
 
-设置首页当前为单层 5 项列表（缓存与额度、Kimi Code 配置、插件、附加功能、状态与诊断），子页带返回，嵌入官方设置对话框的 KimiCode+ 标签，位于“已归档”前；已移除独立管理窗口跳转行、七分类、嵌套胶囊与 `.ekds-embed` 硬嵌页面（后续按 N6 归位到官方对应设置页并平铺 KimiCode+ 三节）。官方“模型供应商”模型行通过 `internal/desktop/assets/provider_enhance.js` 行内展开“能力与限制”面板，补齐图片/视频/工具能力、思考强度（`no` / `low` / `medium` / `high` / `xhigh` / `max`）与上下文/最大输出长度（保存时无损保留已有的 `adaptive_thinking` 与未知字段）；“Kimi Code 配置”（`NativeSettings.tsx`）仅管理子代理模型池、子代理时限、单轮步数上限与权限规则，不重复模型能力编辑页；凭据增改删嵌入申请该凭据的插件详情页（`PluginCredentials.tsx`）。`CacheSettings`、浏览器权限复用已有 `Toggle`，缓存保存后读回再更新草稿基线。opaque origin 的请求 ID 使用随机回退；缓存、布局、权限、供应商能力补齐和子代理模型池的实机流程已通过。
+设置不再使用单层 5 项列表加子页返回，改为官方原生标签归位：官方「账户」页顶部由 `AccountsSection.tsx` 提供多账号列表与切换（钥匙串可用时直接显示免密解锁状态）；官方「模型供应商」模型行通过 `internal/desktop/assets/provider_enhance.js` 行内展开「能力与限制」面板，补齐图片/视频/工具能力、思考强度（`no` / `low` / `medium` / `high` / `xhigh` / `max`）与上下文/最大输出长度（保存时无损保留已有的 `adaptive_thinking` 与未知字段）；官方「智能体与会话」页由 `NativeSettings.tsx` 注入子代理模型池、子代理时限、单轮步数上限与权限规则；官方「实验室」页由 `OfficialSettingsSections.tsx` 注入会话并排与规划实验开关；官方「插件」页新增 KimiCode+ 分段承载增强插件的安装、启停与授权；独立的「缓存与用量」标签页由 `CacheSettings.tsx` 承载缓存、保活、压缩与实际用量；「KimiCode+」标签页由 `SettingsSurface.tsx` 提供状态与诊断、功能归位索引，以及任一官方页探针失效时的回落小节。凭据增改删嵌入申请该凭据的插件详情页（`PluginCredentials.tsx`）。`CacheSettings`、浏览器权限复用已有 `Toggle`，缓存保存后读回再更新草稿基线。opaque origin 的请求 ID 使用随机回退；缓存、布局、权限、供应商能力补齐和子代理模型池的实机流程已通过。
 
 原生视觉沿用官方右侧面板、主聊天区和侧栏结构，不再使用常驻工作台外壳、会话选择栏、空闲状态带或多会话常驻底部恢复栏。renderer 通过容器属性与 CSS 持续隐藏 Vue 动态重建的官方子节点，原生工具/标签切换时释放。插件 `ui:entry` 同时注入官方“会话信息 → 可打开”、右侧空白面板列表与 `+` `browser-overlay` 菜单，`ui:sidebar-nav` 注入左侧栏“新建会话”下方；`Monitor`（`plugins/monitor/`）按上游桌面客户端版复刻模块化面板、Rive 蓝球形象与三区拖拽，并展示 Kimi Code 额度、加油包与外部供应商余额。自动化总开关与额度恢复自动继续策略统一位于“缓存与额度”，三项均默认关闭。
 
@@ -126,7 +131,7 @@ ENHANCE_DEV_TARGET=http://127.0.0.1:8899 npm run dev       # 覆盖目标
 
 ## 测试
 
-`npm test` 编译并运行前端用例；最近一轮原生返修为 61 项，实际数量以当前测试输出为准。原生 Host 回归另覆盖官方主会话跟随、交换去重、请求与 scope 订阅。覆盖：
+`npm test` 编译并运行前端用例；实际数量以当前测试输出为准，不在文档里写死。原生 Host 回归另覆盖官方主会话跟随、交换去重、请求与 scope 订阅。覆盖：
 
 - 合同构造：pair body、列表包装、错误体、usage 查询、任务提交 body、供应商更新 body、分页查询、revision 校验、幂等键
 - 导航：路径规范化、路由解析、订阅/取消订阅通知
@@ -135,4 +140,4 @@ ENHANCE_DEV_TARGET=http://127.0.0.1:8899 npm run dev       # 覆盖目标
 - 适配器：规范 JSON、SHA-256、detect/extract/partial、草稿 expectedHash 与回读、意图幂等与 UNKNOWN、外链安全属性
 - 用量与模型：Go 预览差异渲染（新增/更新/来源变化/无变化，不虚构删除）、`retrieved_at` 来源与两种目录形态、规范 count 字段（不再解析 raw）、费用只取 Go summary、分组与直方图
 
-独立桌面 1280×720 的历史截图与窄屏检查只覆盖旧管理页。当前脚本与 `review-*.png` 位于 `../work/ekd-final-integration/`：`verify-review-fixes.mjs` 检查动态容器、官方侧栏跟随、追加同屏、深浅/窄窗、单层设置与 Monitor；`verify-settings-flow.mjs` 检查布局/权限保存恢复及模型目录；规划、多会话、网页、附件和手动恢复各有独立业务脚本。网页使用真实子视图截图和坐标核对；附件 KAP 发送是真实调用，但系统选择窗口使用确定性返回值，未 GUI 点选。主 WebContents 不能捕获子 WebContentsView，当前录屏权限也未取得完整窗口合成截图；因此这里不宣称已有完整窗口级截图。
+独立桌面 1280×720 的历史截图与窄屏检查只覆盖旧管理页。`../work/ekd-final-integration/` 下的脚本记录的是设置归位之前的层级：`verify-review-fixes.mjs` 检查动态容器、官方侧栏跟随、追加同屏、深浅/窄窗、当时的单层设置与 Monitor；`verify-settings-flow.mjs` 检查布局/权限保存恢复及模型目录；规划、多会话、网页、附件和手动恢复各有独立业务脚本。现行原生标签归位（账户、智能体与会话、实验室、插件页 KimiCode+ 分段、缓存与用量、KimiCode+ 诊断页）以及顶栏更新胶囊、账号切号与 KCT 译文样式在 v0.2.8 发布前逐页复核，结果记录在 `docs/VALIDATION.md`。网页使用真实子视图截图和坐标核对；附件 KAP 发送是真实调用，但系统选择窗口使用确定性返回值，未 GUI 点选。主 WebContents 不能捕获子 WebContentsView，当前录屏权限也未取得完整窗口合成截图；因此这里不宣称已有完整窗口级截图。

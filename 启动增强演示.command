@@ -3,7 +3,7 @@
 # 接入官方客户端需要额外的隔离宿主参数，见 README「本机验证」一节。
 set -euo pipefail
 cd "$(dirname "$0")"
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/go-sdk/go/bin:$HOME/.local/nodejs/bin:$PATH"
 
 DATA_DIR="${EKD_DATA_DIR:-./work/development}"
 PORT="${EKD_PORT:-0}"
@@ -28,9 +28,24 @@ echo "日志：$LOG"
 RUNTIME="$DATA_DIR/runtime.json"
 # A previous run killed by SIGKILL or a power loss never reached its `defer
 # os.Remove`, so a stale file would hand this script the old port and the old
-# (already invalid) pairing token. Remove only this data directory's file before
-# starting, so the wait loop below can only observe the new process's record.
+# (already invalid) pairing token. But a runtime.json still owned by a live core
+# must be reused, never deleted: removing it would strand the running instance
+# without its pairing record. Check the recorded pid first and only clean up a
+# record whose process is gone.
 if [ -e "$RUNTIME" ]; then
+  EXISTING_PID=$(sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p' "$RUNTIME" | head -n 1)
+  if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+    echo "检测到增强核心已在运行（PID ${EXISTING_PID}），复用现有实例，不重启也不改动 runtime.json。"
+    URL=$(sed -n 's/.*"pairingUrl": *"\([^"]*\)".*/\1/p' "$RUNTIME" | head -n 1)
+    if [ -n "$URL" ]; then
+      echo "配对地址：$URL"
+      open "$URL" || echo "请手动在浏览器打开上面的地址完成配对。"
+    else
+      echo "runtime.json 中没有读到配对地址，请查看 ${LOG}。"
+    fi
+    read -r -p "按回车键关闭窗口。" _
+    exit 0
+  fi
   echo "清理上次异常退出残留的 runtime.json"
   rm -f "$RUNTIME"
 fi
@@ -52,7 +67,7 @@ done
 
 URL=$(sed -n 's/.*"pairingUrl": *"\([^"]*\)".*/\1/p' "$RUNTIME" | head -n 1)
 if [ -z "$URL" ]; then
-  echo "没有读到 runtime.json 中的配对地址，请查看 $LOG。"
+  echo "没有读到 runtime.json 中的配对地址，请查看 ${LOG}。"
 else
   echo "配对地址：$URL"
   open "$URL" || echo "请手动在浏览器打开上面的地址完成配对。"

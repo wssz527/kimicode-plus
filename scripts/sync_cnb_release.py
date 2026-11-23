@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Sync a built KimiCode+ release tag and assets to the CNB domestic mirror."""
 import argparse
+import http.client
 import json
 import os
 from pathlib import Path
@@ -65,16 +66,28 @@ def cnb_json_request(url, token, method='GET', payload=None, timeout=30):
 
 def upload_file_put(upload_url, file_path, timeout=180):
     size = file_path.stat().st_size
-    headers = {
-        'Content-Length': str(size),
-        'Content-Type': 'application/octet-stream',
-    }
-    with file_path.open('rb') as handle:
-        req = urllib.request.Request(upload_url, data=handle, headers=headers, method='PUT')
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp.read()
-            if resp.status < 200 or resp.status >= 300:
-                raise RuntimeError(f'Upload PUT failed for {file_path.name}: HTTP {resp.status}')
+    parts = urllib.parse.urlsplit(upload_url)
+    if parts.scheme not in ('http', 'https') or not parts.hostname:
+        raise RuntimeError(f'Unsupported upload URL for {file_path.name}: {upload_url}')
+    connection_cls = http.client.HTTPSConnection if parts.scheme == 'https' else http.client.HTTPConnection
+    target = parts.path or '/'
+    if parts.query:
+        target = f'{target}?{parts.query}'
+    connection = connection_cls(parts.hostname, parts.port, timeout=timeout)
+    try:
+        with file_path.open('rb') as handle:
+            connection.request(
+                'PUT',
+                target,
+                body=handle,
+                headers={'Content-Length': str(size), 'Content-Type': 'application/octet-stream'},
+            )
+            response = connection.getresponse()
+            response.read()
+            if response.status < 200 or response.status >= 300:
+                raise RuntimeError(f'Upload PUT failed for {file_path.name}: HTTP {response.status}')
+    finally:
+        connection.close()
 
 
 def ensure_release(api_base, repo, token, tag, notes, prerelease, make_latest=None):
@@ -82,7 +95,18 @@ def ensure_release(api_base, repo, token, tag, notes, prerelease, make_latest=No
     tag_url = f'{api_base}/{repo}/-/releases/tags/{encoded_tag}'
     status, data = cnb_json_request(tag_url, token, method='GET')
     if status == 200 and data.get('id'):
-        return str(data['id'])
+        release_id = str(data['id'])
+        # Rolling channels such as plugins-latest keep the same release id across
+        # runs; refresh its description so the CNB body never stays at the first
+        # publication's notes while the packages underneath move on.
+        if notes:
+            patch_url = f'{api_base}/{repo}/-/releases/{release_id}'
+            patch_status, patch_data = cnb_json_request(patch_url, token, method='PATCH', payload={'body': notes})
+            if patch_status < 200 or patch_status >= 300:
+                raise RuntimeError(
+                    f'Failed to update CNB release {tag} notes: HTTP {patch_status} {patch_data.get("_raw", "")}'
+                )
+        return release_id
     if status != 404:
         raise RuntimeError(f'Failed to query CNB release {tag}: HTTP {status} {data.get("_raw", "")}')
 
