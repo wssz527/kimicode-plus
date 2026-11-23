@@ -29,6 +29,24 @@ const APPROVAL_DECISIONS: Record<string, string> = {
   cancel: "cancelled",
 };
 
+/** Values that read as a refusal, whatever spelling the core used. */
+export const DENIED_APPROVAL_VALUES = new Set(["rejected", "deny", "denied", "cancelled", "cancel"]);
+
+/** What a reply click sends. A value we do not recognize is never guessed into
+ * an approval; only a label the server itself listed keeps its own copy. */
+export function approvalDecision(value: string, fromServer: boolean): string | { decision: string; selectedLabel: string } | null {
+  if (typeof value !== "string" || value === "") return null;
+  const decision = APPROVAL_DECISIONS[value];
+  if (decision) return decision;
+  return fromServer ? { decision: "approved", selectedLabel: value } : null;
+}
+
+/** The fallback list must not depend on the core sending a non-empty one: an
+ * empty `options` array would otherwise render a card with no buttons. */
+export function approvalOptions(options?: ApprovalOption[] | null): ApprovalOption[] {
+  return options?.length ? options : DEFAULT_APPROVAL_OPTIONS;
+}
+
 type SessionInput = { draft?: string; model?: string; permission?: PermissionMode; attachments?: Attachment[] };
 type SessionInputs = Record<string, SessionInput>;
 const SessionInputContext = createContext<[SessionInputs, Dispatch<SetStateAction<SessionInputs>>] | null>(null);
@@ -211,10 +229,7 @@ export function SessionPane({
 
   async function reply(interactionId: string, value: string, fromServer: boolean) {
     if (!sid) return;
-    const decision = APPROVAL_DECISIONS[value];
-    // Only a label that the server itself listed may be sent with its copy; a
-    // value we do not recognize is never guessed into an approval.
-    const payload = decision ?? (fromServer ? { decision: "approved", selectedLabel: value } : null);
+    const payload = approvalDecision(value, fromServer);
     if (!payload) {
       setError("这个审批选项无法识别，请在官方窗口中处理。");
       return;
@@ -311,9 +326,9 @@ export function SessionPane({
               </div>
               {approval.detail ? <pre className="wb-approval-detail">{approval.detail}</pre> : null}
               <div className="wb-approval-actions">
-                {(approval.options ?? DEFAULT_APPROVAL_OPTIONS).map((option) => {
+                {(approvalOptions(approval.options)).map((option) => {
                   const fromServer = Boolean(approval.options?.length);
-                  const denied = option.value === "rejected" || option.value === "deny";
+                  const denied = DENIED_APPROVAL_VALUES.has(option.value);
                   return (
                     <button
                       key={option.value}

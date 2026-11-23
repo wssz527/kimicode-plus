@@ -59,6 +59,20 @@ function nextId(prefix: string): string {
   return `${prefix}-${seq}`;
 }
 
+/**
+ * The visible validation message for a number field. An unset setting arrives as
+ * an empty `value`; that is a normal state, not an error. Only an edit that
+ * erased a valid value needs the red hint, and an invalid partial edit needs the
+ * range hint.
+ */
+export function numberFieldIssue(value: string, text: string, min: number, max: number): string | null {
+  const trimmed = text.trim();
+  if (value === "" && trimmed === "") return null;
+  if (trimmed === "") return `不能留空，填写 ${min}–${max} 之间的整数；离开输入框会恢复上一个有效值。`;
+  if (commitNumberField(text, min, max) === null) return `填写 ${min}–${max} 之间的整数。`;
+  return null;
+}
+
 function omit(source: Dic, keys: string[]): Dic {
   const rest: Dic = { ...source };
   for (const key of keys) delete rest[key];
@@ -201,11 +215,7 @@ function NumberField({
   }, [value]);
   const trimmed = text.trim();
   const parsed = trimmed === "" ? null : commitNumberField(text, min, max);
-  const issue = trimmed === ""
-    ? `不能留空，填写 ${min}–${max} 之间的整数；离开输入框会恢复上一个有效值。`
-    : parsed === null
-      ? `填写 ${min}–${max} 之间的整数。`
-      : null;
+  const issue = numberFieldIssue(value, text, min, max);
   function commit() {
     if (parsed !== null && String(parsed) !== value) onCommit(parsed);
     else if (parsed === null) setText(value);

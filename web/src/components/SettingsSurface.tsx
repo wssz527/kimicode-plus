@@ -575,6 +575,8 @@ function DiagnosticsSection({
     }
   }, [host, onContractsChange, reloadContracts]);
 
+  const refreshAttach = useCallback(() => { void reload(); }, [reload]);
+
   useEffect(() => {
     void reload();
   }, [reload]);
@@ -705,7 +707,7 @@ function DiagnosticsSection({
       {status.platform === "windows" ? <div className="ekds-row">
         <div className="ekds-row-label">
           <strong>当前接入</strong>
-          <WindowsAttachStatusPanel status={status} host={host} refresh={() => void reload()} />
+          <WindowsAttachStatusPanel status={status} host={host} refresh={refreshAttach} />
         </div>
       </div> : null}
       {status.last && status.platform !== "windows" ? <div className="ekds-row">

@@ -72,16 +72,23 @@ export function ClockBadge({ children }: { children: ReactNode }) {
 
 const SAFE_LINK_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
 
-/** Markdown can carry `javascript:` and other schemes; a message from a model or
- * a tool must not turn that into a live link in the workbench. */
-function safeHref(href?: string): string | null {
+/**
+ * Markdown can carry `javascript:` and other schemes; a message from a model or
+ * a tool must not turn that into a live link in the workbench. Only an explicit
+ * http/https/mailto URL survives: a protocol-relative `//host` or a bare
+ * relative path is refused too, because both resolve against whatever origin
+ * the workbench happens to run on.
+ */
+export function safeHref(href?: string): string | null {
   if (!href) return null;
-  try {
-    const protocol = new URL(href, "https://workbench.invalid").protocol;
-    return SAFE_LINK_PROTOCOLS.has(protocol) ? href : null;
-  } catch {
-    return null;
-  }
+  const raw = href.trim();
+  if (!raw || raw.startsWith("//")) return null;
+  // The scheme is what authorizes the link, so it is read directly instead of
+  // through URL: a relative path has no scheme and must stay text.
+  const match = /^([a-z][a-z0-9+.-]*):/i.exec(raw);
+  if (!match?.[1]) return null;
+  const protocol = `${match[1].toLowerCase()}:`;
+  return SAFE_LINK_PROTOCOLS.has(protocol) ? raw : null;
 }
 
 export function MessageBody({ text }: { text: string }) {

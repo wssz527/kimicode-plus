@@ -349,7 +349,9 @@ test("inline panel exposes direct thinking options (no/low/medium/high/xhigh/max
   assert.deepEqual(plain(enhance.parseSize("1M", false)), { value: 1048576, error: "" });
   assert.deepEqual(plain(enhance.parseSize("1MB", false)), { value: 1048576, error: "" });
 
-  // No thinking -> `no` pressed, all efforts unpressed, no 自适应思考 anywhere
+  // No thinking -> `no` pressed, all efforts unpressed. The adaptive switch is
+  // still offered: the core's omitempty drops an unset field, and a model that
+  // never wrote adaptive_thinking must not lose the control.
   enhance.openPanel({
     providerId: "custom",
     key: "custom/m-none",
@@ -358,7 +360,8 @@ test("inline panel exposes direct thinking options (no/low/medium/high/xhigh/max
   });
   let drawer = enhance.state.panel!;
   assert.equal(drawer.tagName, "DIV");
-  assert.ok(!allText(drawer).includes("自适应思考"), "adaptive thinking must not appear");
+  assert.ok(allText(drawer).includes("自适应思考"), "adaptive thinking must be offered for a custom model");
+  assert.equal(findButton(drawer, "自适应思考（adaptive_thinking）").getAttribute("aria-pressed"), "false");
   const contextPresetsGroup = drawer.querySelectorAll(".ekd-px-presets")[0]!;
   assert.deepEqual(
     contextPresetsGroup.querySelectorAll("button").map(b => allText(b).trim()),
@@ -651,4 +654,47 @@ test("decorates provider form inside 1.3.2 ui-dialog / role=dialog without .sett
   btn.click();
   await new Promise(resolve => setTimeout(resolve, 10));
   assert.ok(enhance.state.panel?.shown, "clicking enhance button inside .ui-dialog should open inline drawer");
+});
+
+test("adaptive thinking can be switched on for a model that never stored the field, and survives an effort click", async () => {
+  const requests: Array<{ action: string; payload?: Record<string, unknown> }> = [];
+  const { doc, enhance } = loadProviderEnhance(async (action, payload) => {
+    requests.push({ action, payload });
+    return {};
+  });
+
+  const row = doc.createElement("div");
+  row.className = "pmt-grid";
+  const idInput = doc.createElement("input");
+  idInput.value = "m-adaptive";
+  const ctxInput = doc.createElement("input");
+  ctxInput.value = "200000";
+  row.append(idInput, ctxInput);
+  doc.body.append(row);
+
+  // The core answers with no adaptive_thinking field at all (`omitempty`).
+  enhance.openPanel({
+    providerId: "openrouter",
+    key: "openrouter/m-adaptive",
+    model: { displayName: "Custom", maxContextSize: 200000, capabilities: ["tool_use", "thinking"] },
+    managed: false,
+    row,
+  });
+  const drawer = enhance.state.panel!;
+  const adaptive = findButton(drawer, "自适应思考（adaptive_thinking）");
+  assert.equal(adaptive.getAttribute("aria-pressed"), "false");
+
+  adaptive.click();
+  assert.equal(adaptive.getAttribute("aria-pressed"), "true", "clicking the switch turns it on");
+
+  // A later effort click must not silently drop the switch that was just turned on.
+  findButton(drawer, "high").click();
+  assert.equal(adaptive.getAttribute("aria-pressed"), "true", "an effort click keeps the adaptive switch on");
+
+  findButton(drawer, "保存").click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const edit = requests[0]?.payload?.edit as Record<string, unknown>;
+  assert.equal(edit.thinking, "toggle");
+  assert.equal(edit.adaptive_thinking, true, "the saved edit carries adaptive_thinking: true");
+  assert.deepEqual(plain(edit.support_efforts), ["high"]);
 });

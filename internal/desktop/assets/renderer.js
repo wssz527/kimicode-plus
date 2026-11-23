@@ -1323,9 +1323,16 @@ async function installNativeRenderer(options) {
       const fill = previous.fill;
       if (fill) fill.style.width = `${percent}%`;
       if (previous.progress) previous.progress.textContent = `正在下载更新… ${percent}%`;
+      // The heading carries the same percentage, so patching only the body would
+      // leave a stale number above a moving bar.
+      if (previous.title) {
+        previous.title.textContent = status.state === 'available'
+          ? `发现新版本 v${status.latestVersion || ''}`
+          : `KimiCode+ ${updatePillLabel(status)}`;
+      }
       return;
     }
-    const painted = { popover, shape, fill: null, progress: null };
+    const painted = { popover, shape, fill: null, progress: null, title: null };
     state.updatePainted = painted;
     popover.replaceChildren();
     if (!status) return;
@@ -1336,6 +1343,7 @@ async function installNativeRenderer(options) {
     title.textContent = status.state === 'available'
       ? `发现新版本 v${status.latestVersion || ''}`
       : `KimiCode+ ${updatePillLabel(status)}`;
+    painted.title = title;
     const meta = document.createElement('span');
     meta.className = 'ekd-upd-meta';
     meta.textContent = status.currentVersion ? `KimiCode+ · 当前 v${status.currentVersion}` : 'KimiCode+';
@@ -1652,6 +1660,12 @@ async function installNativeRenderer(options) {
   }
   const nativeStyle = document.createElement('style');
   nativeStyle.textContent = `
+    /* light-dark() resolves from the element's color-scheme property, not from
+       the host's data attribute. A standalone window is about:blank, so nothing
+       else declares it there and every light-dark() fallback painted white in
+       dark mode. */
+    html[data-color-scheme="dark"]{color-scheme:dark}
+    html[data-color-scheme="light"]{color-scheme:light}
     [data-ekd-containment=sessions]>:not(.ekd-session-host),[data-ekd-containment=settings]>:not(.ekd-settings-mount){display:none!important}
     .ekd-session-host{display:flex;flex:1;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden;padding-top:44px;box-sizing:border-box;-webkit-app-region:no-drag}
     header.chat-header~.chat-layout .ekd-session-host,header.chat-header~.ekd-session-host{padding-top:0}
@@ -2031,7 +2045,7 @@ async function installNativeRenderer(options) {
       syncNativeEntries();
     } finally {
       if (!state.removed && !isStale()) {
-        state.observer?.observe(document.body, { childList: true, subtree: true, attributes: true, attributeOldValue: true, attributeFilter: ['class', 'style', 'aria-selected', 'data-session-id'] });
+        state.observer?.observe(document.body, { childList: true, subtree: true });
         if (state.settingsDialog?.isConnected && state.settingsObserver) {
           state.settingsObserver.observe(state.settingsDialog, {
             childList: true,
@@ -2155,8 +2169,15 @@ async function installNativeRenderer(options) {
   };
   document.addEventListener('click', settingsTabClick, true);
   document.addEventListener('scroll', settingsScroll, true);
+  function applyStandaloneTheme(theme) {
+    const scheme = theme === 'light' ? 'light' : 'dark';
+    document.documentElement.dataset.colorScheme = scheme;
+    // A standalone window has no host stylesheet declaring color-scheme, so the
+    // light-dark() fallbacks resolve from this inline declaration.
+    document.documentElement.style.colorScheme = scheme;
+  }
   if (options.surface === 'plugin') {
-    document.documentElement.dataset.colorScheme = options.theme || 'dark';
+    applyStandaloneTheme(options.theme);
     document.title = 'KimiCode+ 增强插件';
     document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:var(--color-surface,var(--color-bg,light-dark(#fff,#121212)));color:var(--color-text,light-dark(#1a1c20,#eee))';
     state.popoutRoot = document.createElement('div');
@@ -2164,7 +2185,7 @@ async function installNativeRenderer(options) {
     document.body.replaceChildren(state.popoutRoot);
     window.__ekdNativeUI = publishNativeUI();
   } else if (options.surface === 'settings') {
-    document.documentElement.dataset.colorScheme = options.theme || 'dark';
+    applyStandaloneTheme(options.theme);
     document.title = 'KimiCode+ 设置';
     document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:var(--color-surface,var(--color-bg,light-dark(#fff,#121212)));color:var(--color-text,light-dark(#1a1c20,#eee))';
     const element = document.createElement('div');
@@ -2327,26 +2348,17 @@ async function installNativeRenderer(options) {
   void refreshAccountsCache(true);
   ensure();
   state.observer = new MutationObserver(records => {
-    const list = Array.isArray(records) ? records : [];
-    // Every keystroke and hover toggles short-lived classes such as `scrolling`
-    // or `dragging`. Only a structural change can move a contract target, so a
-    // class-only mutation is skipped instead of triggering a full re-evaluation.
-    const structural = list.length === 0 || list.some(record => {
-      if (record.type !== 'attributes') return true;
-      const name = record.attributeName || '';
-      if (name === 'data-session-id' || name === 'aria-selected' || name === 'style') return true;
-      if (name !== 'class') return false;
-      const target = record.target;
-      const before = record.oldValue || '';
-      if (!(target instanceof Element)) return true;
-      const after = target.getAttribute('class') || '';
-      const meaningful = value => value.split(/\s+/).filter(token => token && token !== 'scrolling' && token !== 'dragging' && token !== 'is-dragging');
-      const next = meaningful(after).join(' ');
-      return next !== meaningful(before).join(' ');
-    });
-    if (structural) ensure();
+    // Only structural changes can move a contract target. Attribute churn (class
+    // toggles such as `scrolling`, inline style during scrolling) is covered by
+    // the settings observer where it actually matters, so it is not watched on
+    // the whole document.
+    if (Array.isArray(records) && records.length > 0 && records.every(record => record.type === 'attributes')) {
+      const meaningful = records.some(record => (record.attributeName || '') !== 'class' && (record.attributeName || '') !== 'style');
+      if (!meaningful) return;
+    }
+    ensure();
   });
-  state.observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeOldValue: true, attributeFilter: ['class', 'style', 'aria-selected', 'data-session-id'] });
+  state.observer.observe(document.body, { childList: true, subtree: true });
   // Plugin host wiring. The runtime implementation lives in the host bundle
   // (exported from host-entry); this file only supplies mount points and drives
   // the lifecycle.
@@ -2723,10 +2735,19 @@ async function installNativeRenderer(options) {
   // token, so close sends the token the runtime still holds in scope.
   //
   // Deleting a plugin's token must not leave its pages unclosable: the last
-  // token it held is kept aside, because a view opened with it is still that
-  // plugin's to destroy.
+  // token it held is kept aside, and only `browser.view.close` may fall back to
+  // it. Every other action keeps requiring a live token, so a revoked identity
+  // can never open, navigate or run a command again.
+  const pluginViewTokens = new Map();
+  let closingView = false;
   function pluginToken(id) {
-    return state.pluginTokens.get(id) || state.pluginRetiredTokens?.get(id) || '';
+    const live = state.pluginTokens.get(id) || '';
+    if (live) return live;
+    return closingView ? (state.pluginRetiredTokens?.get(id) || '') : '';
+  }
+  function retirePluginToken(id) {
+    const current = state.pluginTokens.get(id);
+    if (current) (state.pluginRetiredTokens ??= new Map()).set(id, current);
   }
   const pluginWindowHost = {
     popout: async pluginId => { await transport.request('plugin.window.open', { token: pluginToken(pluginId), sourceSessionId: activeSession() }); },
@@ -2747,7 +2768,14 @@ async function installNativeRenderer(options) {
   };
   window.__ekdPluginBrowserNavigated = publishedBrowserNav;
   const pluginBrowserHost = {
-    open: (pluginId, viewId, url) => transport.request("browser.view.open", { token: pluginToken(pluginId), viewId, url }),
+    open: async (pluginId, viewId, url) => {
+      const result = await transport.request("browser.view.open", { token: pluginToken(pluginId), viewId, url });
+      // Remembered per view so a close still names the token that opened it,
+      // even after a hot update replaced the plugin's live token.
+      const token = state.pluginTokens.get(pluginId);
+      if (token) pluginViewTokens.set(pluginId + '/' + viewId, token);
+      return result;
+    },
     navigate: (pluginId, viewId, url) => transport.request("browser.view.navigate", { token: pluginToken(pluginId), viewId, url }),
     history: async (pluginId, viewId, operation) => Boolean((await transport.request("browser.view.history", { token: pluginToken(pluginId), viewId, operation }))?.changed),
     external: (pluginId, viewId) => transport.request("browser.view.external", { token: pluginToken(pluginId), viewId }).then(() => {}),
@@ -2767,7 +2795,28 @@ async function installNativeRenderer(options) {
         if (set.size === 0) state.browserNavListeners.delete(key);
       };
     },
-    close: (pluginId, viewId) => transport.request("browser.view.close", { token: pluginToken(pluginId), viewId }),
+    close: (pluginId, viewId) => {
+      const viewKey = pluginId + '/' + viewId;
+      const active = state.pluginTokens.get(pluginId);
+      const recorded = pluginViewTokens.get(viewKey);
+      // A view opened before a hot update is still that plugin's to destroy, so
+      // close is the one action allowed to name the token it was created with.
+      const promote = Boolean(recorded && recorded !== active);
+      if (promote) state.pluginTokens.set(pluginId, recorded);
+      closingView = true;
+      let request;
+      try {
+        request = transport.request("browser.view.close", { token: pluginToken(pluginId), viewId });
+      } finally {
+        closingView = false;
+        if (promote) {
+          if (active) state.pluginTokens.set(pluginId, active);
+          else state.pluginTokens.delete(pluginId);
+        }
+        pluginViewTokens.delete(viewKey);
+      }
+      return request;
+    },
   };
 
   // `core.fetch` carries the request body as base64 (`bodyBase64`) and ignores a
@@ -2882,8 +2931,10 @@ async function installNativeRenderer(options) {
   let syncPromise = null;
   let syncPending = false;
 
-  async function loadPluginAsset(id, entryPath, requiredExport = 'activate') {
-    const key = id + '/' + entryPath + '/' + requiredExport;
+  async function loadPluginAsset(id, entryPath, requiredExport = 'activate', revision = '') {
+    // The revision is part of the key: a hot update changes version/updatedAt,
+    // so the old bundle can never be served for the new one.
+    const key = id + '/' + entryPath + '/' + requiredExport + (revision ? '/' + revision : '');
     if (state.pluginAssets.has(key)) return state.pluginAssets.get(key);
     const asset = await coreGet('/plugins/' + encodeURIComponent(id) + '/assets/' + entryPath.split('/').map(encodeURIComponent).join('/'));
     const loaded = await module.loadPluginModule(asset?.source || '', requiredExport);
@@ -3020,13 +3071,18 @@ async function installNativeRenderer(options) {
   // module and the container, and closing the page releases both. The runtime
   // never mounts a plugin's settings page on its own, because the host's own
   // settings body belongs to the official client.
+  //
+  // This copy exists because the activation block below keeps its own inline
+  // `pluginRevision` (the desktop contract probe slices that block and runs it
+  // standalone). Both spell the same identity: version, updatedAt, capabilities.
+  const pluginRevisionOf = plugin => `${plugin?.version || ''}|${plugin?.updatedAt || ''}|${Array.isArray(plugin?.capabilities) ? plugin.capabilities.join(',') : ''}`;
   async function mountPluginSettings(id, element) {
     if (state.removed) throw new Error('插件宿主已卸载');
     const plugin = (state.pluginList || []).find(item => item.id === id);
     const active = state.plugins?.get(id);
     if (!active) throw new Error('插件未运行，无法打开设置页');
     if (!plugin?.entry?.settings) throw new Error('这个插件没有设置页');
-    const settingsModule = await loadPluginAsset(id, module.pluginEntryPath(plugin.entry.settings), 'renderSettings');
+    const settingsModule = await loadPluginAsset(id, module.pluginEntryPath(plugin.entry.settings), 'renderSettings', pluginRevisionOf(plugin));
     const release = await active.mountSettings(settingsModule, element);
     state.pluginSettings.set(id, release);
     return () => {

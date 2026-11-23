@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type {
   CacheHistory,
   CachePolicySettings,
@@ -71,7 +71,50 @@ const KIND_LABEL: Record<string, string> = {
   recovery: "额度恢复",
 };
 
-function NumberField({ label, value, min, max, unit, hideLabel = false, hint, validate, onCommit, onEditingChange }: {
+/**
+ * The difference between the policy on screen and the one a caller built from
+ * it. Only these fields are merged at write time, so a queued write never
+ * resurrects a stale copy of the fields it did not touch.
+ */
+function policyPatch(base: CachePolicySettings, next: CachePolicySettings): Record<string, unknown> | null {
+  const patch: Record<string, unknown> = {};
+  if (next.keepAlive.enabled !== base.keepAlive.enabled) patch.keepAlive = { enabled: next.keepAlive.enabled };
+  if (next.keepAlive.minutes !== base.keepAlive.minutes) {
+    patch.keepAlive = { ...(patch.keepAlive as Record<string, unknown> | undefined), minutes: next.keepAlive.minutes };
+  }
+  const baseIdle = base.idleKeepAlive;
+  const nextIdle = next.idleKeepAlive;
+  const idle: Record<string, unknown> = {};
+  if (nextIdle.enabled !== baseIdle.enabled) idle.enabled = nextIdle.enabled;
+  if (nextIdle.defaultCount !== baseIdle.defaultCount) idle.defaultCount = nextIdle.defaultCount;
+  if (nextIdle.minQuotaPercent !== baseIdle.minQuotaPercent) idle.minQuotaPercent = nextIdle.minQuotaPercent;
+  if (
+    nextIdle.providerTTL.subscriptionMinutes !== baseIdle.providerTTL.subscriptionMinutes
+    || nextIdle.providerTTL.openPlatformMinutes !== baseIdle.providerTTL.openPlatformMinutes
+    || nextIdle.providerTTL.otherMinutes !== baseIdle.providerTTL.otherMinutes
+  ) {
+    idle.providerTTL = { ...nextIdle.providerTTL };
+  }
+  if (Object.keys(idle).length > 0) patch.idleKeepAlive = idle;
+  const baseCompaction = base.compaction;
+  const nextCompaction = next.compaction;
+  const compaction: Record<string, unknown> = {};
+  if (nextCompaction.enabled !== baseCompaction.enabled) compaction.enabled = nextCompaction.enabled;
+  if (nextCompaction.idleMinutes !== baseCompaction.idleMinutes) compaction.idleMinutes = nextCompaction.idleMinutes;
+  if (nextCompaction.contextThreshold !== baseCompaction.contextThreshold) compaction.contextThreshold = nextCompaction.contextThreshold;
+  // The core merges `compaction` key by key, so the patch above is enough; a
+  // switch-only edit stays a one-field object.
+  if (Object.keys(compaction).length > 0) patch.compaction = compaction;
+  const baseRecovery = base.recovery;
+  const nextRecovery = next.recovery;
+  const recovery: Record<string, unknown> = {};
+  if (nextRecovery.enabled !== baseRecovery.enabled) recovery.enabled = nextRecovery.enabled;
+  if (nextRecovery.intervalSeconds !== baseRecovery.intervalSeconds) recovery.intervalSeconds = nextRecovery.intervalSeconds;
+  if (Object.keys(recovery).length > 0) patch.recovery = recovery;
+  return Object.keys(patch).length > 0 ? patch : null;
+}
+
+function NumberField({ label, value, min, max, unit, hideLabel = false, hint, validate, disabled = false, onCommit, onEditingChange }: {
   label: string;
   value: number;
   min: number;
@@ -79,6 +122,7 @@ function NumberField({ label, value, min, max, unit, hideLabel = false, hint, va
   unit: string;
   hideLabel?: boolean;
   hint?: string;
+  disabled?: boolean;
   /** Extra rule beyond the numeric range; returns a message when the value is
    * rejected. 0-versus-2..240 for the "other provider" TTL is one of these. */
   validate?: (value: number) => string | null;
@@ -113,6 +157,7 @@ function NumberField({ label, value, min, max, unit, hideLabel = false, hint, va
       aria-invalid={valid ? undefined : true}
       aria-describedby={issue ? `${id}-issue` : undefined}
       value={text}
+      disabled={disabled}
       onFocus={() => { focused.current = true; onEditingChange?.(true); }}
       onChange={event => setText(event.target.value)}
       onBlur={() => {
@@ -155,6 +200,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
   const [policyReady, setPolicyReady] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   // While a policy write is in flight, incoming automation events are ignored so the
   // user's switches are not bounced back to the previous value. `editing` does the
@@ -218,30 +264,39 @@ export function CacheSettings({ host }: { host: NativeHost }) {
     // A background event refreshes the persisted policy, but never while the user has
     // an edit or write in flight.
     if (!shouldApplyPolicyEvent({ writing: writing.current, editing: editing.current })) return;
-    if (event && typeof event === "object" && "keepAlive" in event) setPolicy(mergePolicy(DEFAULTS, event));
+    if (event && typeof event === "object" && "keepAlive" in event) {
+      setPolicy(mergePolicy(DEFAULTS, event));
+      // An event proves the core answered, so the switches can be enabled even if
+      // the initial read failed.
+      setPolicyReady(true);
+    }
+  }), [host]);
+
+  const policyRef = useRef(policy);
+  policyRef.current = policy;
+  const policyReadyRef = useRef(policyReady);
+  policyReadyRef.current = policyReady;
+
+  const enqueuePolicy = useMemo(() => createPolicyQueue({
+    read: () => policyRef.current,
+    write: payload => host.request<CachePolicySettings>("automation.set", payload),
+    apply: next => setPolicy(next),
+    fail: cause => {
+      setError(errorText(cause));
+      // Re-read the authoritative value so the UI does not keep showing a lie.
+      void host.request<CachePolicySettings>("automation.get")
+        .then(authoritative => setPolicy(mergePolicy(DEFAULTS, authoritative)))
+        .catch(() => {});
+    },
+    busy: value => { writing.current = value; setSaving(value); },
   }), [host]);
 
   const savePolicy = useCallback(async (next: CachePolicySettings, successNote: string) => {
-    // Serialize writes: two switches toggled quickly used to race, and the slower
-    // answer could restore the older snapshot.
-    if (writing.current) return;
-    writing.current = true;
     setError("");
     setNotice("");
-    try {
-      const confirmed = await host.request<CachePolicySettings>("automation.set", next as unknown as Record<string, unknown>);
-      setPolicy(mergePolicy(DEFAULTS, confirmed));
-      setNotice(successNote);
-    } catch (cause) {
-      setError(errorText(cause));
-      // Re-read the authoritative value so the UI does not keep showing a lie.
-      try {
-        setPolicy(mergePolicy(DEFAULTS, await host.request<CachePolicySettings>("automation.get")));
-      } catch { /* the error notice already explains the state */ }
-    } finally {
-      writing.current = false;
-    }
-  }, [host]);
+    await enqueuePolicy(next, policyReadyRef.current);
+    if (policyReadyRef.current) setNotice(successNote);
+  }, [enqueuePolicy]);
 
   if (loading && !summary && !error) {
     return <div className="eks-loading"><Spinner size={15} />正在读取缓存数据</div>;
@@ -343,13 +398,14 @@ export function CacheSettings({ host }: { host: NativeHost }) {
         <Toggle
           label="启用后台等待保活"
           checked={policy.keepAlive.enabled}
-          disabled={!policyReady}
+          disabled={!policyReady || saving}
           onChange={value => void savePolicy({ ...policy, keepAlive: { ...policy.keepAlive, enabled: value } }, value ? "后台等待保活已开启。" : "后台等待保活已关闭。")}
         />
       </div>
       {!keepAliveOff ? <div className="eks-row is-sub">
         <span className="eks-row-label"><strong>主代理静默阈值</strong><small>主代理距上一次模型请求达到这个时长才保活。5–60 分钟。</small></span>
         <NumberField label="主代理静默阈值" hideLabel value={policy.keepAlive.minutes} min={5} max={60} unit="分钟"
+              disabled={!policyReady || saving}
           onEditingChange={value => { editing.current = value; }} onCommit={value => { if (value !== null) void savePolicy(mergePolicy(policy, { keepAlive: { ...policy.keepAlive, minutes: value } }), "保活阈值已保存。"); }} />
       </div> : null}
 
@@ -364,7 +420,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
         <Toggle
           label="启用空闲会话保活"
           checked={idleKeepAlive.enabled}
-          disabled={!policyReady}
+          disabled={!policyReady || saving}
           onChange={value => void savePolicy(
             mergePolicy(policy, { idleKeepAlive: { ...idleKeepAlive, enabled: value } }),
             value ? "空闲会话保活已开启。" : "空闲会话保活已关闭。",
@@ -385,6 +441,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
           min={1}
           max={20}
           unit="次"
+              disabled={!policyReady || saving}
           onEditingChange={value => { editing.current = value; }}
           onCommit={value => {
             if (value !== null) {
@@ -408,6 +465,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
               min={2}
               max={240}
               unit="分钟"
+              disabled={!policyReady || saving}
               onEditingChange={value => { editing.current = value; }}
               onCommit={value => {
                 if (value !== null) {
@@ -431,6 +489,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
               min={2}
               max={240}
               unit="分钟"
+              disabled={!policyReady || saving}
               onEditingChange={value => { editing.current = value; }}
               onCommit={value => {
                 if (value !== null) {
@@ -454,6 +513,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
               min={0}
               max={240}
               unit="分钟"
+              disabled={!policyReady || saving}
               validate={value => (value === 0 || value >= 2 ? null : "只接受 0（未知，不自动保活）或 2–240 分钟；填 1 没有可推导的保活间隔。")}
               onEditingChange={value => { editing.current = value; }}
               onCommit={value => {
@@ -478,6 +538,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
               min={0}
               max={100}
               unit="%"
+              disabled={!policyReady || saving}
               onEditingChange={value => { editing.current = value; }}
               onCommit={value => {
                 if (value !== null) {
@@ -528,7 +589,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
         <Toggle
           label="启用空闲自动压缩"
           checked={policy.compaction.enabled}
-          disabled={!policyReady}
+          disabled={!policyReady || saving}
           onChange={value => void savePolicy({ ...policy, compaction: { ...policy.compaction, enabled: value } }, value ? "空闲自动压缩已开启。" : "空闲自动压缩已关闭。")}
         />
       </div>
@@ -536,8 +597,10 @@ export function CacheSettings({ host }: { host: NativeHost }) {
         <span className="eks-row-label"><strong>压缩条件</strong><small>空闲时长与上下文阈值同时满足才提交。</small></span>
         <span className="eks-controls">
           <NumberField label="空闲" value={policy.compaction.idleMinutes} min={5} max={1440} unit="分钟"
+              disabled={!policyReady || saving}
             onEditingChange={value => { editing.current = value; }} onCommit={value => { if (value !== null) void savePolicy(mergePolicy(policy, { compaction: { ...policy.compaction, idleMinutes: value } }), "空闲阈值已保存。"); }} />
           <NumberField label="上下文超过" value={policy.compaction.contextThreshold} min={1} max={100} unit="%"
+              disabled={!policyReady || saving}
             onEditingChange={value => { editing.current = value; }} onCommit={value => { if (value !== null) void savePolicy(mergePolicy(policy, { compaction: { ...policy.compaction, contextThreshold: value } }), "上下文阈值已保存。"); }} />
         </span>
       </div> : null}
@@ -550,13 +613,14 @@ export function CacheSettings({ host }: { host: NativeHost }) {
         <Toggle
           label="启用额度恢复自动继续"
           checked={policy.recovery.enabled}
-          disabled={!policyReady}
+          disabled={!policyReady || saving}
           onChange={value => void savePolicy({ ...policy, recovery: { ...policy.recovery, enabled: value } }, value ? "额度恢复已开启。" : "额度恢复已关闭。")}
         />
       </div>
       {!recoveryOff ? <div className="eks-row is-sub">
         <span className="eks-row-label"><strong>检测间隔</strong><small>等待恢复的会话按此间隔重试。</small></span>
         <NumberField label="检测间隔" hideLabel value={policy.recovery.intervalSeconds} min={15} max={3600} unit="秒"
+              disabled={!policyReady || saving}
           onEditingChange={value => { editing.current = value; }} onCommit={value => { if (value !== null) void savePolicy(mergePolicy(policy, { recovery: { ...policy.recovery, intervalSeconds: value } }), "检测间隔已保存。"); }} />
       </div> : null}
     </Group>
@@ -624,4 +688,44 @@ export function CacheSettings({ host }: { host: NativeHost }) {
 
     {notice ? <p className="eks-notice" role="status">{notice}</p> : null}
   </div>;
+}
+
+/**
+ * Serializes policy writes. Two edits made in quick succession used to race: the
+ * slower answer restored the older snapshot, and a write discarded while another
+ * was in flight made a number edit followed by a toggle look like a no-op.
+ *
+ * Each call captures only the fields it changed against the policy at that
+ * moment, then merges that patch onto the latest policy when its turn comes.
+ */
+export function createPolicyQueue(options: {
+  read: () => CachePolicySettings;
+  write: (payload: Record<string, unknown>) => Promise<CachePolicySettings>;
+  apply: (next: CachePolicySettings) => void;
+  fail: (cause: unknown) => void;
+  busy?: (busy: boolean) => void;
+}) {
+  let tail: Promise<void> = Promise.resolve();
+  let pending = 0;
+  return async function enqueue(next: CachePolicySettings, enabled: boolean): Promise<void> {
+    if (!enabled) return;
+    const patch = policyPatch(options.read(), next);
+    if (!patch) return;
+    pending += 1;
+    options.busy?.(true);
+    const run = async () => {
+      const payload = mergePolicy(options.read(), patch);
+      try {
+        options.apply(mergePolicy(DEFAULTS, await options.write(payload as unknown as Record<string, unknown>)));
+      } catch (cause) {
+        options.fail(cause);
+      } finally {
+        pending = Math.max(0, pending - 1);
+        if (pending === 0) options.busy?.(false);
+      }
+    };
+    const chained = tail.then(run, run);
+    tail = chained.catch(() => {});
+    return chained;
+  };
 }

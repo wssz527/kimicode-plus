@@ -1,153 +1,307 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import ts from "typescript";
 import { createEventChannel } from "../src/native.js";
 
-const source = (path: string) => readFileSync(path, "utf8");
+/**
+ * These tests execute the real decision logic the components call, not a regex
+ * over their source: each helper is located in the file, transpiled on its own,
+ * and evaluated with the same inputs a click or a keystroke produces.
+ */
+function extract(file: string, names: string[], extra = ""): Record<string, unknown> {
+  const source = readFileSync(file, "utf8");
+  const parsed = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const found = new Set(names);
+  const body = parsed.statements
+    .filter((statement): statement is ts.FunctionDeclaration =>
+      ts.isFunctionDeclaration(statement) && found.has(statement.name?.text ?? ""))
+    .map(statement => statement.getText(parsed))
+    .join("\n");
+  assert.ok(body, `${file} no longer declares ${names.join(", ")}`);
+  const { outputText } = ts.transpileModule(`${extra}\n${body}\nexport { ${names.join(", ")} };`, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  });
+  const exports: Record<string, unknown> = {};
+  new Function("exports", "require", outputText)(exports, (id: string) => {
+    throw new Error(`unexpected require ${id}`);
+  });
+  return exports;
+}
 
-const sessionPanes = source("src/components/workbench/SessionPanes.tsx");
-const pieces = source("src/components/workbench/pieces.tsx");
-const sessionGrid = source("src/components/SessionGrid.tsx");
-const api = source("src/api.ts");
-const native = source("src/native.ts");
-const renderer = source("../internal/desktop/assets/renderer.js");
-const bootstrap = source("../internal/desktop/assets/bootstrap.js");
-const providerEnhance = source("../internal/desktop/assets/provider_enhance.js");
-const nativeSettings = source("src/components/NativeSettings.tsx");
-const cacheSettings = source("src/components/CacheSettings.tsx");
-const settingsSurface = source("src/components/SettingsSurface.tsx");
-const windowsAttach = source("src/components/WindowsAttachStatus.tsx");
-const accounts = source("src/components/AccountsSection.tsx");
-const pairing = source("src/PairingScreen.tsx");
-const useResource = source("src/lib/useResource.ts");
+const sessionPanesFile = "src/components/workbench/SessionPanes.tsx";
+const piecesFile = "src/components/workbench/pieces.tsx";
+const nativeSettingsFile = "src/components/NativeSettings.tsx";
+const cacheSettingsFile = "src/components/CacheSettings.tsx";
 
-test("an approval fallback never turns an unknown value into an approval", () => {
-  // The pane used to send { decision: "approved" } for anything it did not
-  // recognize, so a `deny` fallback button approved the tool call.
-  assert.match(sessionPanes, /label: "允许", value: "approved"/);
-  assert.match(sessionPanes, /label: "拒绝", value: "rejected"/);
-  assert.match(sessionPanes, /allow: "approved"/);
-  assert.match(sessionPanes, /deny: "rejected"/);
-  assert.match(sessionPanes, /option\.value === "rejected" \|\| option\.value === "deny"/);
-  assert.equal(/\[\s*\{ label: "允许", value: "allow" \}/.test(sessionPanes), false);
+// ---------------------------------------------------------------- 同屏审批
 
-  // A server-supplied custom label keeps its copy, but only when the option came
-  // from `approval.options`; an unrecognized fallback sends nothing at all.
-  assert.match(sessionPanes, /fromServer \? \{ decision: "approved", selectedLabel: value \} : null/);
-  assert.match(sessionPanes, /if \(!payload\) \{/);
-  assert.match(sessionPanes, /const fromServer = Boolean\(approval\.options\?\.length\)/);
+type Option = { label: string; value: string };
+const approval = extract(sessionPanesFile, ["approvalDecision", "approvalOptions"], `
+type ApprovalOption = { label: string; value: string };
+const DEFAULT_APPROVAL_OPTIONS: ApprovalOption[] = [
+  { label: "允许", value: "approved" },
+  { label: "拒绝", value: "rejected" },
+];
+const APPROVAL_DECISIONS: Record<string, string> = {
+  approved: "approved",
+  allow: "approved",
+  rejected: "rejected",
+  deny: "rejected",
+  denied: "rejected",
+  cancelled: "cancelled",
+  cancel: "cancelled",
+};
+`) as {
+  approvalDecision(value: string, fromServer: boolean): string | { decision: string; selectedLabel: string } | null;
+  approvalOptions(options?: Option[] | null): Option[];
+};
+
+test("an approval click can never turn a refusal or an unknown value into an approval", () => {
+  // Both spellings of a refusal map to a refusal; nothing falls through to "approved".
+  assert.equal(approval.approvalDecision("rejected", false), "rejected");
+  assert.equal(approval.approvalDecision("deny", false), "rejected");
+  assert.equal(approval.approvalDecision("denied", true), "rejected");
+  assert.equal(approval.approvalDecision("approved", true), "approved");
+  assert.equal(approval.approvalDecision("allow", false), "approved");
+  assert.equal(approval.approvalDecision("cancelled", true), "cancelled");
+  assert.equal(approval.approvalDecision("cancel", false), "cancelled");
+
+  // An unrecognized value from a server list keeps its label but still approves;
+  // the same value from a fallback list is refused instead of being guessed.
+  assert.deepEqual(approval.approvalDecision("继续执行 rm -rf", true), {
+    decision: "approved",
+    selectedLabel: "继续执行 rm -rf",
+  });
+  assert.equal(approval.approvalDecision("继续执行 rm -rf", false), null);
+  assert.equal(approval.approvalDecision("", true), null);
 });
 
-test("pane keys are stable and markdown links are protocol-checked", () => {
-  assert.match(sessionGrid, /key=\{id \|\| `pane-\$\{index\}`\}/);
-  assert.equal(/key=\{index\}/.test(sessionGrid), false);
-  for (const protocol of ['"http:"', '"https:"', '"mailto:"']) {
-    assert.ok(pieces.includes(protocol), `missing allowed protocol ${protocol}`);
+test("an empty server option list still renders the allow and refuse buttons", () => {
+  assert.deepEqual(approval.approvalOptions([]), [
+    { label: "允许", value: "approved" },
+    { label: "拒绝", value: "rejected" },
+  ]);
+  assert.deepEqual(approval.approvalOptions(undefined), [
+    { label: "允许", value: "approved" },
+    { label: "拒绝", value: "rejected" },
+  ]);
+  const custom = [{ label: "只允许本次", value: "once" }];
+  assert.equal(approval.approvalOptions(custom), custom);
+});
+
+// ---------------------------------------------------------------- 链接协议
+
+const links = extract(piecesFile, ["safeHref"], `
+const SAFE_LINK_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
+`) as { safeHref(href?: string): string | null };
+
+test("only explicit http, https and mailto links survive markdown rendering", () => {
+  assert.equal(links.safeHref("https://example.com/a?b=1"), "https://example.com/a?b=1");
+  assert.equal(links.safeHref("http://127.0.0.1:8787/x"), "http://127.0.0.1:8787/x");
+  assert.equal(links.safeHref("mailto:dev@example.com"), "mailto:dev@example.com");
+  assert.equal(links.safeHref("  https://example.com  "), "https://example.com");
+
+  for (const blocked of [
+    "javascript:alert(1)",
+    "JAVASCRIPT:alert(1)",
+    "data:text/html,<script>alert(1)</script>",
+    "vbscript:msgbox(1)",
+    "file:///etc/passwd",
+    "//evil.example.com/path",
+    "/relative/path",
+    "relative/path",
+    "ftp://example.com/x",
+    "",
+    undefined,
+  ]) {
+    assert.equal(links.safeHref(blocked), null, `${String(blocked)} must not become a link`);
   }
-  assert.match(pieces, /SAFE_LINK_PROTOCOLS\.has\(protocol\) \? href : null/);
-  assert.match(pieces, /wb-link-blocked/);
-  // A copy confirmation is a short flash, not a permanent label.
-  assert.match(pieces, /window\.setTimeout\(\(\) => \{ timer\.current = null; setStatus\(""\); \}, 2400\)/);
-  assert.match(pieces, /if \(timer\.current !== null\) window\.clearTimeout\(timer\.current\)/);
 });
 
-test("a host bridge 401 keeps the transport and its error code", () => {
-  // In bridge mode the transport belongs to the official host: clearing it would
-  // drop every later request the surface still needs.
-  assert.match(api, /if \(coreTransport === null\) \{\s*clearSession\(/);
-  assert.match(api, /const candidate = error as \{ code\?: unknown; status\?: unknown; message\?: unknown \}/);
-  assert.match(api, /throw new ApiError\(status, candidate\.code, message\)/);
+// -------------------------------------------------------- 未配置数字不报红
+
+const numbers = extract(nativeSettingsFile, ["numberFieldIssue"], `
+function commitNumberField(text: string, min: number, max: number): number | null {
+  const trimmed = text.trim();
+  if (!/^-?\\d+$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  if (!Number.isInteger(value) || value < min || value > max) return null;
+  return value;
+}
+`) as {
+  numberFieldIssue(value: string, text: string, min: number, max: number): string | null;
+};
+
+test("an unset number setting opens clean while an erased one explains the range", () => {
+  // The core omits an unset timeout/steps, so the field starts as "" and must
+  // not look like a validation failure on open.
+  assert.equal(numbers.numberFieldIssue("", "", 1, 10080), null);
+  assert.equal(numbers.numberFieldIssue("", "", 0, 10000), null);
+  // Erasing a value that was set is the case the hint exists for.
+  assert.match(String(numbers.numberFieldIssue("120", "", 1, 10080)), /不能留空/);
+  assert.match(String(numbers.numberFieldIssue("256", "   ", 0, 10000)), /不能留空/);
+  // A partial or out-of-range edit explains the range instead.
+  assert.match(String(numbers.numberFieldIssue("120", "abc", 1, 10080)), /1–10080/);
+  assert.match(String(numbers.numberFieldIssue("120", "0", 1, 10080)), /1–10080/);
+  assert.equal(numbers.numberFieldIssue("120", "30", 1, 10080), null);
+  assert.equal(numbers.numberFieldIssue("0", "0", 0, 10000), null);
 });
 
-test("the event channel backs off to a ceiling and stops its timer on close", () => {
-  assert.match(native, /const retryCeilingMs = 10_000/);
-  assert.match(native, /retryMs \* 2 \*\* Math\.min\(failures, 4\)/);
-  assert.match(native, /clearTimeout\(wakeTimer\)/);
-  assert.match(native, /wakeTimer = setTimeout\(release, delay\)/);
-  assert.match(native, /signal\.addEventListener\("abort", onAbort, \{ once: true \}\)/);
+// ------------------------------------------------------ 缓存策略串行写入
+
+type Policy = {
+  keepAlive: { enabled: boolean; minutes: number };
+  idleKeepAlive: {
+    enabled: boolean;
+    defaultCount: number;
+    minQuotaPercent: number;
+    providerTTL: { subscriptionMinutes: number; openPlatformMinutes: number; otherMinutes: number };
+  };
+  compaction: { enabled: boolean; idleMinutes: number; contextThreshold: number };
+  recovery: { enabled: boolean; intervalSeconds: number; entries: unknown[] };
+};
+
+const policyHelpers = extract(cacheSettingsFile, ["policyPatch", "createPolicyQueue"], `
+const DEFAULTS = {
+  keepAlive: { enabled: false, minutes: 25 },
+  idleKeepAlive: {
+    enabled: false,
+    defaultCount: 2,
+    minQuotaPercent: 10,
+    providerTTL: { subscriptionMinutes: 30, openPlatformMinutes: 5, otherMinutes: 0 },
+  },
+  compaction: { enabled: false, idleMinutes: 25, contextThreshold: 60 },
+  recovery: { enabled: false, intervalSeconds: 60, entries: [] },
+};
+function mergePolicy(base, patch) {
+  if (!patch || typeof patch !== "object") return base;
+  const merge = (left, right) => {
+    if (!right || typeof right !== "object") return left;
+    const next = { ...left };
+    for (const [key, value] of Object.entries(right)) {
+      next[key] = value && typeof value === "object" && !Array.isArray(value) && left?.[key] && typeof left[key] === "object"
+        ? merge(left[key], value)
+        : value;
+    }
+    return next;
+  };
+  return merge(base, patch);
+}
+`) as {
+  policyPatch(base: Policy, next: Policy): Record<string, unknown> | null;
+  createPolicyQueue(options: {
+    read: () => Policy;
+    write: (payload: Record<string, unknown>) => Promise<Policy>;
+    apply: (next: Policy) => void;
+    fail: (cause: unknown) => void;
+    busy?: (busy: boolean) => void;
+  }): (next: Policy, enabled: boolean) => Promise<void>;
+};
+
+const basePolicy = (): Policy => JSON.parse(JSON.stringify({
+  keepAlive: { enabled: false, minutes: 25 },
+  idleKeepAlive: {
+    enabled: false,
+    defaultCount: 2,
+    minQuotaPercent: 10,
+    providerTTL: { subscriptionMinutes: 30, openPlatformMinutes: 5, otherMinutes: 0 },
+  },
+  compaction: { enabled: false, idleMinutes: 25, contextThreshold: 60 },
+  recovery: { enabled: false, intervalSeconds: 60, entries: [] },
+})) as Policy;
+
+test("a policy patch carries only the fields the edit actually changed", () => {
+  const base = basePolicy();
+  const minutes = { ...base, keepAlive: { ...base.keepAlive, minutes: 40 } };
+  assert.deepEqual(policyHelpers.policyPatch(base, minutes), { keepAlive: { minutes: 40 } });
+
+  const other = basePolicy();
+  other.idleKeepAlive.providerTTL.otherMinutes = 12;
+  assert.deepEqual(policyHelpers.policyPatch(base, other), {
+    idleKeepAlive: { providerTTL: { subscriptionMinutes: 30, openPlatformMinutes: 5, otherMinutes: 12 } },
+  });
+
+  // A switch carries only its own flag, never the neighbours it was built from.
+  const compaction = basePolicy();
+  compaction.compaction.enabled = true;
+  assert.deepEqual(policyHelpers.policyPatch(base, compaction), { compaction: { enabled: true } });
+
+  // An unchanged copy is not a write at all.
+  assert.equal(policyHelpers.policyPatch(base, basePolicy()), null);
 });
 
-test("provider enhance pauses its observer, caches config and writes the matched key", () => {
-  assert.match(providerEnhance, /function setEnabled\(next\)/);
-  assert.match(providerEnhance, /setEnabled,/);
-  assert.match(providerEnhance, /const wasObserving = enabled && Boolean\(state\.observer\)/);
-  assert.match(providerEnhance, /const CONFIG_TTL_MS = 2000/);
-  assert.match(providerEnhance, /invalidateConfig\(\)/);
-  assert.match(providerEnhance, /key = found\[0\]/);
-  assert.match(providerEnhance, /new CustomEvent\('ekd:config-saved'/);
-  // Explicit off / toggle / always plus the adaptive switch the old drawer lacked.
-  assert.match(providerEnhance, /function setThinkingMode\(draft, mode\)/);
-  assert.match(providerEnhance, /label: '始终思考'/);
-  assert.match(providerEnhance, /'data-mode': mode\.value/);
-  assert.match(providerEnhance, /text: '自适应思考（adaptive_thinking）'/);
-  assert.match(renderer, /state\.providerEnhance\?\.setEnabled\?\.\(false\)/);
+test("a queued write is not dropped and never resurrects an older snapshot", async () => {
+  let policy = basePolicy();
+  const writes: Record<string, unknown>[] = [];
+  const busyStates: boolean[] = [];
+  const gate: { release?: () => void } = {};
+
+  const enqueue = policyHelpers.createPolicyQueue({
+    read: () => policy,
+    write: async payload => {
+      writes.push(payload);
+      // The first write stays in flight long enough for the second edit to land.
+      if (writes.length === 1) await new Promise<void>(resolve => { gate.release = resolve; });
+      // The core merges a section key by key; the stub does the same so a
+      // one-field switch patch cannot be mistaken for a whole-section rewrite.
+      const merged = structuredClone(policy) as Record<string, unknown>;
+      for (const [section, value] of Object.entries(payload)) {
+        merged[section] = { ...(merged[section] as object), ...(value as object) };
+      }
+      policy = merged as unknown as Policy;
+      return policy;
+    },
+    apply: next => { policy = next; },
+    fail: cause => { throw cause; },
+    busy: value => busyStates.push(value),
+  });
+
+  // A number edit followed immediately by a switch: both must reach the core.
+  const withMinutes = { ...policy, keepAlive: { ...policy.keepAlive, minutes: 40 } };
+  const first = enqueue(withMinutes, true);
+  const withToggle = { ...withMinutes, compaction: { ...policy.compaction, enabled: true } };
+  const second = enqueue(withToggle, true);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(writes.length, 1, "the second write waits for the first");
+  gate.release?.();
+  await Promise.all([first, second]);
+
+  assert.equal(writes.length, 2, "the queued switch was not silently dropped");
+  // The payload sent for the switch carries the merged section, and it was built
+  // from the policy that already contains the minute edit.
+  const secondCompaction = writes[1]?.compaction as { enabled: boolean; idleMinutes: number };
+  assert.equal(secondCompaction.enabled, true);
+  assert.equal(secondCompaction.idleMinutes, 25);
+  const firstKeepAlive = writes[0]?.keepAlive as { enabled: boolean; minutes: number };
+  assert.equal(firstKeepAlive.minutes, 40);
+  assert.equal((policy.compaction as { enabled: boolean }).enabled, true);
+  assert.equal(policy.keepAlive.minutes, 40, "the later write kept the earlier edit");
+  // Busy turns on for each accepted edit and only turns off when the queue drains.
+  assert.equal(busyStates[0], true);
+  assert.equal(busyStates[busyStates.length - 1], false);
+  assert.equal(busyStates.filter(value => value === false).length, 1);
 });
 
-test("plugin hot updates drop assets and keep the token that opened each view", () => {
-  // A revision change tears the plugin down and clears every cached asset entry,
-  // so a repaired or upgraded bundle is always fetched again.
-  assert.match(renderer, /if \(next && state\.pluginRevisions\.get\(id\) === pluginRevision\(next\)\) continue/);
-  assert.match(renderer, /if \(key\.startsWith\(id \+ '\/'\)\) state\.pluginAssets\.delete\(key\)/);
-  assert.match(renderer, /if \(key\.startsWith\(plugin\.id \+ '\/'\)\) state\.pluginAssets\.delete\(key\)/);
-  assert.match(renderer, /state\.pluginRevisions\.set\(plugin\.id, pluginRevision\(plugin\)\)/);
-  // The token a view was created with stays resolvable after the plugin loses it,
-  // otherwise close cannot authorize and the WebContentsView is orphaned.
-  assert.match(renderer, /return state\.pluginTokens\.get\(id\) \|\| state\.pluginRetiredTokens\?\.get\(id\) \|\| ''/);
-  assert.match(renderer, /state\.pluginTokens\.delete\(id\);\s*\n\s*if \(retiredToken\) \(state\.pluginRetiredTokens \?\?= new Map\(\)\)\.set\(id, retiredToken\)/);
-  assert.match(renderer, /"browser\.view\.close", \{ token: pluginToken\(pluginId\), viewId \}/);
+test("a write is refused until the persisted policy has been read", async () => {
+  let policy = basePolicy();
+  const writes: unknown[] = [];
+  const enqueue = policyHelpers.createPolicyQueue({
+    read: () => policy,
+    write: async payload => { writes.push(payload); return policy; },
+    apply: next => { policy = next; },
+    fail: () => {},
+  });
+  const next = { ...policy, keepAlive: { ...policy.keepAlive, enabled: true } };
+  await enqueue(next, false);
+  assert.deepEqual(writes, [], "nothing may be written before automation.get succeeds");
+  await enqueue(next, true);
+  assert.equal(writes.length, 1);
 });
 
-test("official auth refreshes once and account switches reach the sidebar", () => {
-  assert.match(renderer, /if \(state\.officialAuthRefresh\) return state\.officialAuthRefresh/);
-  assert.match(renderer, /officialAuthRefresh = doRefreshOfficialAuth\(\)\.finally/);
-  assert.match(renderer, /window\.dispatchEvent\(new CustomEvent\('ekd:account-switched', \{ detail: event \}\)\)/);
-  assert.match(accounts, /dispatchAccountSwitched\(event\)/);
-  assert.match(accounts, /setError\(null\);\s*\n\s*setNotice\("已完成账号切换。"\)/);
-});
+// ------------------------------------------------------ 长轮询退避
 
-test("renderer observers coalesce, update popover patches in place, and links fall back", () => {
-  assert.match(renderer, /state\.ensureFrame = typeof requestAnimationFrame === 'function'/);
-  assert.match(renderer, /token !== 'scrolling' && token !== 'dragging' && token !== 'is-dragging'/);
-  assert.match(renderer, /previous\.popover === popover && previous\.shape === shape/);
-  assert.match(renderer, /if \(fill\) fill\.style\.width = `\$\{percent\}%`/);
-  assert.match(renderer, /window\.localStorage\.setItem\(UPDATE_DISMISS_KEY, JSON\.stringify\(\[\.\.\.versions\]\)\)/);
-  assert.match(renderer, /window\.open\(safe, '_blank', 'noopener,noreferrer'\)/);
-  assert.match(renderer, /window\.open\(url, '_blank', 'noopener,noreferrer'\)/);
-  assert.match(renderer, /const listed = Array\.isArray\(result\?\.items\) \? result\.items : \[\]/);
-  assert.match(renderer, /watchKeepAliveMenuSize/);
-  assert.match(renderer, /new ResizeObserver/);
-  assert.match(bootstrap, /const attempts = 4/);
-  assert.match(renderer, /wrapped\.code = 'BRIDGE_SESSION_EXPIRED'/);
-});
-
-test("settings drafts survive background refreshes and invalid numbers explain themselves", () => {
-  assert.match(nativeSettings, /if \(dirtyRef\.current\.pool \|\| dirtyRef\.current\.rules\) return/);
-  assert.match(nativeSettings, /if \(key === "pool"\) setPoolDirty\(false\)/);
-  assert.match(nativeSettings, /if \(key === "permission"\) setRulesDirty\(false\)/);
-  assert.match(nativeSettings, /不能留空，填写/);
-  assert.match(nativeSettings, /else if \(parsed === null\) setText\(value\)/);
-
-  assert.match(cacheSettings, /Promise\.allSettled\(\[/);
-  assert.match(cacheSettings, /setPolicyReady\(true\)/);
-  assert.match(cacheSettings, /disabled=\{!policyReady\}/);
-  assert.match(cacheSettings, /if \(writing\.current\) return/);
-  assert.match(cacheSettings, /if \(parsed !== value\) onCommit\(parsed\)/);
-  assert.match(cacheSettings, /只接受 0（未知，不自动保活）或 2–240 分钟/);
-
-  assert.match(useResource, /const reload = useCallback\(\(\) => setRevision/);
-});
-
-test("settings entries link straight to their official tabs and the panel polls a reopen", () => {
-  assert.match(settingsSurface, /void host\.openSettings\(entry\.tab\)/);
-  assert.match(settingsSurface, /if \(coreUpdateBusy\(next\.state\)\) setTracking\(true\)/);
-  assert.match(windowsAttach, /if \(!reopening\) return/);
-  assert.match(windowsAttach, /const copy = attachCopy\[state\] \?\?/);
-  assert.match(pairing, /<strong>KimiCode\+<\/strong>/);
-  assert.match(pairing, /pairing-steps/);
-  assert.match(pairing, /连接本地增强核心/);
-});
-
-test("retry delay grows with consecutive failures", async () => {
+test("the event channel backs off to a ceiling between consecutive failures", async () => {
   const delays: number[] = [];
   const original = globalThis.setTimeout;
   let attempts = 0;
@@ -175,4 +329,3 @@ test("retry delay grows with consecutive failures", async () => {
   }
   assert.deepEqual(delays, [1500, 3000, 6000, 10000]);
 });
-

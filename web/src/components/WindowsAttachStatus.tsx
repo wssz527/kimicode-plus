@@ -32,11 +32,12 @@ export function WindowsAttachStatusPanel({ status, host, refresh }: {
   const state = status.host.attachState ?? "unattached";
   const reopening = state === "reopening";
   useEffect(() => {
-    // A reopen takes a few seconds. Without this poll the panel stays on
-    // 正在重新打开 until the user presses 刷新; stop as soon as it settles.
+    // A reopen takes several seconds and the state can stay `reopening` across
+    // more than one poll, so this keeps asking until it settles instead of
+    // firing once.
     if (!reopening) return;
-    const timer = window.setTimeout(refresh, 1800);
-    return () => window.clearTimeout(timer);
+    const timer = window.setInterval(refresh, 1800);
+    return () => window.clearInterval(timer);
   }, [reopening, refresh]);
   const copy = attachCopy[state] ?? (status.host.running
     ? `当前接入状态：${state}。若界面未生效，可重新打开 Kimi Code 后再试。`
@@ -64,12 +65,8 @@ export function StandaloneWindowsAttachStatus() {
     const response = await coreRequest<{ value: WindowsAttachReport }>("/desktop/actions/attach.status", { method: "POST", body: {} });
     return response.value;
   });
-  const isReopening = status.data?.host.attachState === "reopening";
-  useEffect(() => {
-    if (!isReopening || status.loading) return;
-    const timeout = window.setTimeout(status.reload, 1800);
-    return () => window.clearTimeout(timeout);
-  }, [isReopening, status]);
+  // The panel owns the reopen polling; a second timer here would double every
+  // request while the state is `reopening`.
   if (status.data?.platform !== "windows") return null;
   return <Panel title="Kimi Code 接入">
     <WindowsAttachStatusPanel status={status.data} refresh={status.reload} />

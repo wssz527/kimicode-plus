@@ -105,3 +105,11 @@
   background: var(--surface-raised, var(--color-surface, transparent));
   border: 1px solid var(--line, var(--color-line));
 }
+
+/* 被拦截的 Markdown 链接：保留原文可读，只弱化并可加下划线提示不可点击。 */
+.wb-link-blocked {
+  color: var(--ink-muted, var(--color-text-secondary, inherit));
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: help;
+}

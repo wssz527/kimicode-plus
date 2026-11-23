@@ -44,7 +44,9 @@ function createProviderEnhance(options) {
   ];
 
   const CONFIG_TTL_MS = 2000;
-  const configCache = { value: null, at: 0, promise: null };
+  // `generation` guards an in-flight read: invalidating the cache while a
+  // request is in flight must keep that stale answer from being written back.
+  const configCache = { value: null, at: 0, promise: null, generation: 0 };
 
   // ---------------------------------------------------------------- rendering
 
@@ -231,19 +233,29 @@ function createProviderEnhance(options) {
     const now = Date.now();
     if (configCache.value && now - configCache.at < CONFIG_TTL_MS) return configCache.value;
     if (configCache.promise) return configCache.promise;
+    const generation = configCache.generation;
     configCache.promise = request('config.get')
       .then(config => {
-        configCache.value = config && typeof config === 'object' ? config : {};
-        configCache.at = Date.now();
-        return configCache.value;
+        const next = config && typeof config === 'object' ? config : {};
+        // A save that landed mid-flight already invalidated this generation;
+        // writing the older answer back would resurrect the pre-save config.
+        if (generation === configCache.generation) {
+          configCache.value = next;
+          configCache.at = Date.now();
+        }
+        return next;
       })
-      .finally(() => { configCache.promise = null; });
+      .finally(() => {
+        if (generation === configCache.generation) configCache.promise = null;
+      });
     return configCache.promise;
   }
 
   function invalidateConfig() {
+    configCache.generation += 1;
     configCache.value = null;
     configCache.at = 0;
+    configCache.promise = null;
   }
 
   function rowInputs(row) {
@@ -531,6 +543,11 @@ function createProviderEnhance(options) {
     } catch {
       return;
     }
+    // The await can outlive an uninstall, a disable, or the dialog closing; the
+    // caller has no cancellation channel, so the settings are re-checked here.
+    // Comparing against a fresh lookup is the honest test: a replaced dialog is
+    // a different form even if the old node still claims to be connected.
+    if (!enabled || state.removed || findProviderForm() !== form) return;
     const providerId = resolveProvider(form, config);
     if (!providerId) return;
     const managed = providerId.startsWith('managed:');
@@ -745,27 +762,28 @@ function createProviderEnhance(options) {
       modePills.append(button);
     }
 
-    const supportsAdaptive = typeof draft.preservedAdaptiveThinking === 'boolean';
-    const adaptiveButton = supportsAdaptive
-      ? el('button', {
-        type: 'button',
-        class: 'ekd-px-pill',
-        'data-kind': 'adaptive',
-        'aria-pressed': 'false',
-        title: '向核心声明 adaptive_thinking，由服务端按难度决定思考深度',
-        text: '自适应思考（adaptive_thinking）',
-      })
-      : null;
-    if (adaptiveButton) {
-      adaptiveButton.disabled = managed;
-      adaptiveButton.addEventListener('click', () => {
-        draft.adaptiveThinking = !(draft.adaptiveThinking === true && draft.thinking === 'toggle');
-        syncThinkingUI();
-      });
-    }
-    const adaptiveRow = adaptiveButton
-      ? el('div', { class: 'ekd-px-pills', role: 'group', 'aria-label': '自适应思考' }, [adaptiveButton])
-      : null;
+    // The switch exists for every editable model. The core's `omitempty` drops
+    // an unset `adaptive_thinking`, so a model that never wrote it answers with
+    // no field at all — that must still offer the switch, not hide it.
+    const adaptiveButton = el('button', {
+      type: 'button',
+      class: 'ekd-px-pill',
+      'data-kind': 'adaptive',
+      'aria-pressed': draft.adaptiveThinking === true ? 'true' : 'false',
+      title: '向核心声明 adaptive_thinking，由服务端按难度决定思考深度',
+      text: '自适应思考（adaptive_thinking）',
+    });
+    adaptiveButton.disabled = managed;
+    adaptiveButton.addEventListener('click', () => {
+      // Enabling adaptive thinking is meaningless without a togglable mode, so
+      // the click moves the mode there instead of silently doing nothing.
+      if (draft.thinking !== 'toggle') setThinkingMode(draft, 'toggle');
+      draft.adaptiveThinking = !(draft.adaptiveThinking === true);
+      draft.preservedAdaptiveThinking = draft.adaptiveThinking;
+      draft.adaptiveTouched = true;
+      syncThinkingUI();
+    });
+    const adaptiveRow = el('div', { class: 'ekd-px-pills', role: 'group', 'aria-label': '自适应思考' }, [adaptiveButton]);
 
     const thinkingPills = el('div', { class: 'ekd-px-pills', role: 'group', 'aria-label': '思考强度' });
     const thinkingHint = el('span', { class: 'ekd-px-meta' });
@@ -787,7 +805,8 @@ function createProviderEnhance(options) {
       if (adaptiveButton) {
         const on = draft.thinking === 'toggle' && draft.adaptiveThinking === true;
         adaptiveButton.setAttribute('aria-pressed', on ? 'true' : 'false');
-        adaptiveButton.disabled = managed || draft.thinking !== 'toggle';
+        adaptiveButton.disabled = managed;
+        adaptiveButton.dataset.state = draft.thinking === 'toggle' ? 'active' : 'linked';
       }
       modeHint.textContent = draft.thinking === 'always'
         ? '始终思考：保存后写入 always_thinking，每次请求都开启思考'
@@ -1020,10 +1039,10 @@ function createProviderEnhance(options) {
           support_efforts: mapped.thinking === 'none' ? [] : normalizeEfforts(draft.supportEfforts),
         };
         if (mapped.thinking === 'toggle') {
-          if (typeof draft.preservedAdaptiveThinking === 'boolean') {
-            edit.adaptive_thinking = draft.adaptiveThinking === true;
-          } else if (mapped.adaptive_thinking) {
+          if (draft.adaptiveThinking === true) {
             edit.adaptive_thinking = true;
+          } else if (typeof draft.preservedAdaptiveThinking === 'boolean' || draft.adaptiveTouched === true) {
+            edit.adaptive_thinking = false;
           }
         } else if (mapped.thinking === 'always' && draft.preservedAdaptiveThinking === true) {
           edit.adaptive_thinking = false;
