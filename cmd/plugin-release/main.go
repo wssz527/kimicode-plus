@@ -169,6 +169,10 @@ func packagePlugins(
 		}
 		archiveSum := sha256.Sum256(archiveBytes)
 		contentDigest := plugins.ContentDigest(files)
+		entryMinCore := strings.TrimSpace(manifest.MinCoreVersion)
+		if entryMinCore == "" {
+			entryMinCore = minCore
+		}
 		entries = append(entries, plugins.OfficialPluginEntry{
 			ID:             manifest.ID,
 			Name:           manifest.Name,
@@ -176,7 +180,7 @@ func packagePlugins(
 			APIVersion:     manifest.APIVersion,
 			Description:    manifest.Description,
 			HostVersions:   manifest.HostVersions,
-			MinCoreVersion: minCore,
+			MinCoreVersion: entryMinCore,
 			Capabilities:   manifest.CapabilityNames(),
 			Archive:        archiveName,
 			ArchiveBytes:   int64(len(archiveBytes)),

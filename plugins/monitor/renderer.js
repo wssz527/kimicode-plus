@@ -9968,6 +9968,7 @@ var ASSETS = define_MONITOR_ASSETS_default;
 var memory = /* @__PURE__ */ new Map();
 var pendingWrites = /* @__PURE__ */ new Map();
 var bridge = null;
+var installed = false;
 function isPluginStorageKey(key) {
   const name = String(key);
   return name.startsWith("kimi-statusbar.") || name.startsWith("kcm.");
@@ -10196,6 +10197,8 @@ var localStorageShim = new Proxy(localStorageTarget, {
   }
 });
 function installHost() {
+  if (installed) return;
+  installed = true;
   globalThis.chrome = chromeShim;
   try {
     const current = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
@@ -10210,7 +10213,6 @@ function installHost() {
   } catch (error) {
   }
 }
-installHost();
 function syncStorageKey(key, value) {
   const name = String(key);
   if (!isPluginStorageKey(name)) return;
@@ -10228,10 +10230,17 @@ function disposeHost() {
   }
   pendingWrites.clear();
   if (nativeLocalStorage) Object.defineProperty(globalThis, "localStorage", nativeLocalStorage);
-  else delete globalThis.localStorage;
+  else {
+    try {
+      delete globalThis.localStorage;
+    } catch (error) {
+    }
+  }
   nativeLocalStorage = null;
   delete globalThis.chrome;
   bridge = null;
+  installed = false;
+  memory.clear();
 }
 
 // plugins/monitor-src/vendor/metrics.js
@@ -11291,7 +11300,10 @@ function setAgentStatus(status) {
     }, wait);
   }
 }
-function renderAll() {
+var renderFrame = 0;
+function renderAllNow() {
+  renderFrame = 0;
+  if (hooks.isDisposed()) return;
   updateTokenDisplay();
   updateCacheDisplay();
   updatePerfDisplay();
@@ -11300,6 +11312,22 @@ function renderAll() {
   renderAgents();
   renderExternal();
   renderStatSlots();
+}
+function renderAll() {
+  if (typeof requestAnimationFrame !== "function") {
+    renderAllNow();
+    return;
+  }
+  if (renderFrame) return;
+  renderFrame = requestAnimationFrame(renderAllNow);
+}
+function cancelRenderAll() {
+  if (!renderFrame || typeof cancelAnimationFrame !== "function") {
+    renderFrame = 0;
+    return;
+  }
+  cancelAnimationFrame(renderFrame);
+  renderFrame = 0;
 }
 var SPARK_DEFS = {
   input: { values: () => sessionSamples.map((s) => s.input), fmt: (v) => formatTokenCount(v), marks: () => sessionSamples.map((s) => s.turnEnd === true) },
@@ -11312,7 +11340,6 @@ function renderSparks() {
   if (!panel.els?.sparks) return;
   for (const [id, def] of Object.entries(SPARK_DEFS)) {
     const svg = panel.els.sparks[id];
-    sparkRectCache.delete(svg);
     renderSpark(svg, def.values(), def.fmt, def.marks?.());
   }
 }
@@ -11322,6 +11349,7 @@ var sparkResizeObserver = new ResizeObserver(() => {
   if (sparkResizeRaf) return;
   sparkResizeRaf = requestAnimationFrame(() => {
     sparkResizeRaf = 0;
+    sparkRectCache = /* @__PURE__ */ new WeakMap();
     renderSparks();
   });
 });
@@ -11800,6 +11828,7 @@ function setResetTooltip(prefix, text) {
   if (group) group.title = text;
 }
 function disposeRender() {
+  cancelRenderAll();
   if (pendingStatusTimer) clearTimeout(pendingStatusTimer);
   pendingStatusTimer = null;
   pendingDisplayStatus = null;
@@ -11811,8 +11840,8 @@ function disposeRender() {
 }
 
 // plugins/monitor-src/vendor/content/pet-panel.js
-var PET_RIV_URL = chrome.runtime.getURL("rive/kimi_avatar_web-PnsTWI-X.riv");
-var PET_WASM_URL = chrome.runtime.getURL("rive/rive.wasm");
+var PET_RIV_ASSET = "rive/kimi_avatar_web-PnsTWI-X.riv";
+var PET_WASM_ASSET = "rive/rive.wasm";
 var PET_IDLE_ANIM = "paopao";
 var PET_LOADING_ANIM = "loading";
 var PET_DONE_ANIM = "stars";
@@ -11851,7 +11880,8 @@ var PET_CLOCK_STATUSES = ["thinking", "executing", "replying", "subagent", "rate
 var roamPet = null;
 var deps = {
   isDisposed: () => false,
-  getSessionId: () => ""
+  getSessionId: () => "",
+  assets: {}
 };
 function initPet(nextDeps) {
   deps = { ...deps, ...nextDeps };
@@ -12005,10 +12035,10 @@ function petStart() {
     petClearIdleAmbient();
   }
   if (!panel.els?.petCanvas) return;
-  api.RuntimeLoader.setWasmUrl(PET_WASM_URL);
+  api.RuntimeLoader.setWasmUrl(deps.assets?.[PET_WASM_ASSET] || "");
   api.RuntimeLoader.setWasmFallbackUrl(null);
   const instance = new api.Rive({
-    src: PET_RIV_URL,
+    src: deps.assets?.[PET_RIV_ASSET] || "",
     canvas: panel.els.petCanvas,
     autoplay: false,
     fit: api.Fit?.Contain,
@@ -12074,6 +12104,8 @@ function disposePet() {
   if (petClockTimer) clearInterval(petClockTimer);
   petClockTimer = null;
   petClearIdleAmbient();
+  petClickBoundCanvas = null;
+  petCanvasEl = null;
   if (petRive) {
     try {
       petRive.cleanup();
@@ -13874,6 +13906,8 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
   let seenSeq = 0;
   let currentSession = "";
   let activeTurnSession = "";
+  const pushedStepIds = /* @__PURE__ */ new Set();
+  let forceNext = false;
   const send = (message) => {
     if (!disposed) push(message);
   };
@@ -13888,6 +13922,7 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
   function enterSession(sessionId, busy, updatedAt) {
     if (!sessionId || sessionId === currentSession) return;
     currentSession = sessionId;
+    pushedStepIds.clear();
     send({
       v: 1,
       type: "session",
@@ -13898,11 +13933,15 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
   function pushSteps(steps, sessionId) {
     for (const step of Array.isArray(steps) ? steps : []) {
       if (!step?.stepId) continue;
+      if (pushedStepIds.has(step.stepId)) continue;
+      pushedStepIds.add(step.stepId);
       seenSeq += 1;
       send(stepEvent(step, sessionId, seenSeq));
     }
   }
   async function refresh(includeBalances = true) {
+    const forced = forceNext;
+    forceNext = false;
     const sessionId = getSessionId2();
     const [summary, history24h, history30d, turns, balances] = await Promise.all([
       request("cache.summary"),
@@ -13916,7 +13955,7 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
     if (disposed) return null;
     if (summary) {
       const nextStatus = statusFromSummary(summary);
-      if (activeTurnSession !== sessionId || nextStatus !== "idle") {
+      if (forced || activeTurnSession !== sessionId || nextStatus !== "idle") {
         send({ v: 1, type: "status", sessionId, status: nextStatus });
       }
       const quota = summary.quota;
@@ -14048,6 +14087,26 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
       if (disposed) return Promise.resolve(null);
       if (timer) clearTimeout(timer);
       timer = null;
+      if (cooldownTimer) clearTimeout(cooldownTimer);
+      cooldownTimer = null;
+      return run(true);
+    },
+    /**
+     * 切换账号后立刻重读。上一账号的额度与余额属于另一个人，保留它们会让
+     * 面板继续显示旧数字；先清空快照与逐轮去重表，再绕过 Mini 模式的跳过
+     * 判断强制刷新一次。
+     */
+    resetForAccountSwitch() {
+      if (disposed) return Promise.resolve(null);
+      pushedStepIds.clear();
+      seenSeq = 0;
+      currentSession = "";
+      activeTurnSession = "";
+      forceNext = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      if (followUpTimer) clearTimeout(followUpTimer);
+      followUpTimer = null;
       if (cooldownTimer) clearTimeout(cooldownTimer);
       cooldownTimer = null;
       return run(true);
@@ -15916,6 +15975,10 @@ html[data-color-scheme="dark"] .ksb-pet-status.ksb-cache-warn {
     return handle;
   };
   ctx.onDispose(() => {
+    disposed = true;
+    cancelRenderAll();
+    if (tidyScan) clearTimeout(tidyScan);
+    tidyScan = null;
     for (const handle of disposables.reverse()) {
       try {
         if (typeof handle === "function") handle();
@@ -15931,8 +15994,10 @@ html[data-color-scheme="dark"] .ksb-pet-status.ksb-cache-warn {
   panel.standaloneMode = true;
   const syncTidy = () => applyTidy(panel.widgetConfig.modules.pet?.sidebarTidy === true);
   let datasource = null;
+  let disposed = false;
+  const isDisposed = () => disposed;
   initWidgetStructure({
-    isDisposed: () => false,
+    isDisposed,
     // 标题行点击：本地数值与折线样本清空重计，随后由数据源补齐
     manualRefresh: () => {
       resetMetrics();
@@ -15953,14 +16018,16 @@ html[data-color-scheme="dark"] .ksb-pet-status.ksb-cache-warn {
     enableSidebarTidyMenu: true,
     onConfigChange: () => syncTidy()
   });
-  initPet({ isDisposed: () => false, getSessionId });
+  initPet({ isDisposed, getSessionId, assets: ASSETS });
   initRender({
-    isDisposed: () => false,
+    isDisposed,
     petUpdateStatus,
     // 桌面漫游宠物不启用
     roamPetSetStatus: () => {
     },
-    refreshBalance: () => datasource?.refreshBalance()
+    refreshBalance: () => datasource?.refreshBalance(),
+    // 额度到点重置后立刻补拉一次，而不是等下一个 60 秒周期
+    onQuotaReset: () => void datasource?.refresh(true)
   });
   installBridge();
   track(ctx.ui.mount("sidebar", (element) => {
@@ -15987,13 +16054,24 @@ html[data-color-scheme="dark"] .ksb-pet-status.ksb-cache-warn {
   }
   await loadWidgetConfig();
   syncTidy();
-  const tidyWatch = new MutationObserver(() => {
-    const wanted = panel.widgetConfig.modules.pet?.sidebarTidy === true;
-    const applied = document.documentElement.classList.contains("ksb-sidebar-tidy");
-    if (wanted !== applied) syncTidy();
-  });
+  let tidyScan = null;
+  const scheduleTidyScan = () => {
+    if (tidyScan || disposed) return;
+    tidyScan = setTimeout(() => {
+      tidyScan = null;
+      if (disposed) return;
+      const wanted = panel.widgetConfig.modules.pet?.sidebarTidy === true;
+      const applied = document.documentElement.classList.contains("ksb-sidebar-tidy");
+      if (wanted !== applied) syncTidy();
+    }, 250);
+  };
+  const tidyWatch = new MutationObserver(scheduleTidyScan);
   tidyWatch.observe(document.documentElement, { childList: true, subtree: true });
-  track(() => tidyWatch.disconnect());
+  track(() => {
+    if (tidyScan) clearTimeout(tidyScan);
+    tidyScan = null;
+    tidyWatch.disconnect();
+  });
   const onSettingsStorage = (event) => {
     const key = event?.detail?.key;
     if (key !== CONFIG_STORAGE_KEY && key !== MINI_STORAGE_KEY) return;
@@ -16034,6 +16112,20 @@ html[data-color-scheme="dark"] .ksb-pet-status.ksb-cache-warn {
   };
   globalThis.addEventListener?.("ekd:active-session", onActiveSession);
   track(() => globalThis.removeEventListener?.("ekd:active-session", onActiveSession));
+  const onAccountSwitched = () => {
+    if (disposed) return;
+    panel.lastWallet = null;
+    panel.lastWalletFetchedAt = "";
+    panel.lastQuotaPct = { "5h": null, week: null, month: null };
+    panel.quotaResetAt = { "5h": null, week: null, month: null };
+    panel.externalProviders = [];
+    panel.externalUnsupported = [];
+    resetMetrics();
+    renderAll();
+    void datasource?.resetForAccountSwitch();
+  };
+  globalThis.addEventListener?.("ekd:account-switched", onAccountSwitched);
+  track(() => globalThis.removeEventListener?.("ekd:account-switched", onAccountSwitched));
   void datasource.start();
   return { status: "active" };
 }

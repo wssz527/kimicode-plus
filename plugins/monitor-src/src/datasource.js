@@ -227,6 +227,13 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
   let seenSeq = 0;
   let currentSession = "";
   let activeTurnSession = "";
+  // Every step already pushed for the current session. A refresh re-reads the
+  // same cache.turns page, so replaying it would re-send up to 120 steps each
+  // minute and re-render the whole panel for data it already had.
+  const pushedStepIds = new Set();
+  // A forced refresh (manual, or an account switch) must not be swallowed by the
+  // "nothing moved" short circuit below.
+  let forceNext = false;
 
   const send = (message) => {
     if (!disposed) push(message);
@@ -246,6 +253,9 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
   function enterSession(sessionId, busy, updatedAt) {
     if (!sessionId || sessionId === currentSession) return;
     currentSession = sessionId;
+    // Step ids belong to one session's transcript; another session's ids are a
+    // different space, so the seen set must not suppress its first steps.
+    pushedStepIds.clear();
     send({
       v: 1,
       type: "session",
@@ -254,17 +264,21 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
     });
   }
 
-  /** 把本会话的 step 逐条推成 turn.step.completed。seq 单调递增，
-   *  上游按 stepId 去重，重复推送只丢重复、不会双算。 */
+  /** 把本会话尚未推送过的 step 逐条推成 turn.step.completed。seq 单调递增，
+   *  上游也按 stepId 去重；这里先过滤一次，避免每分钟把同一页重放一遍。 */
   function pushSteps(steps, sessionId) {
     for (const step of Array.isArray(steps) ? steps : []) {
       if (!step?.stepId) continue;
+      if (pushedStepIds.has(step.stepId)) continue;
+      pushedStepIds.add(step.stepId);
       seenSeq += 1;
       send(stepEvent(step, sessionId, seenSeq));
     }
   }
 
   async function refresh(includeBalances = true) {
+    const forced = forceNext;
+    forceNext = false;
     const sessionId = getSessionId();
     const [summary, history24h, history30d, turns, balances] = await Promise.all([
       request("cache.summary"),
@@ -279,7 +293,7 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
 
     if (summary) {
       const nextStatus = statusFromSummary(summary);
-      if (activeTurnSession !== sessionId || nextStatus !== "idle") {
+      if (forced || activeTurnSession !== sessionId || nextStatus !== "idle") {
         send({ v: 1, type: "status", sessionId, status: nextStatus });
       }
       const quota = summary.quota;
@@ -419,6 +433,26 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
       if (disposed) return Promise.resolve(null);
       if (timer) clearTimeout(timer);
       timer = null;
+      if (cooldownTimer) clearTimeout(cooldownTimer);
+      cooldownTimer = null;
+      return run(true);
+    },
+    /**
+     * 切换账号后立刻重读。上一账号的额度与余额属于另一个人，保留它们会让
+     * 面板继续显示旧数字；先清空快照与逐轮去重表，再绕过 Mini 模式的跳过
+     * 判断强制刷新一次。
+     */
+    resetForAccountSwitch() {
+      if (disposed) return Promise.resolve(null);
+      pushedStepIds.clear();
+      seenSeq = 0;
+      currentSession = "";
+      activeTurnSession = "";
+      forceNext = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      if (followUpTimer) clearTimeout(followUpTimer);
+      followUpTimer = null;
       if (cooldownTimer) clearTimeout(cooldownTimer);
       cooldownTimer = null;
       return run(true);

@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
-import { api, type PluginRecord, type PluginUpdateItem } from "../api";
+import { api, type PluginActivity, type PluginLegal, type PluginRecord, type PluginUpdateItem } from "../api";
 import { readAddonFeatures, writeAddonFeatures, type AddonFeatures, type NativeHost } from "../native";
 import { syncPluginHost } from "../plugin-runtime/host";
 import { AccountsManagerSection } from "./AccountsSection";
-import { PluginSettings } from "./PluginSettings";
+import { PluginSettings, capabilityLabel } from "./PluginSettings";
 import { Toggle } from "./ui";
 import { errorText } from "./workbench/pieces";
+import { useResource } from "../lib/useResource";
+import { fmtDateTime } from "../lib/format";
 import "../styles/native-settings-surface.css";
 
 const PLANNER_PLUGIN_ID = "kimicode-plus.planner";
@@ -83,6 +85,7 @@ export function LabSettingsSection({
   const [plannerBusy, setPlannerBusy] = useState(false);
   const [plannerError, setPlannerError] = useState<string | null>(null);
   const [safeMode, setSafeMode] = useState(false);
+  const [checkingPlannerUpdate, setCheckingPlannerUpdate] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -111,18 +114,13 @@ export function LabSettingsSection({
   useEffect(() => {
     let alive = true;
     const loadPlanner = async () => {
-      const [record, list, updates] = await Promise.allSettled([
-        api.plugins.get(PLANNER_PLUGIN_ID),
-        api.plugins.list(),
-        api.plugins.updates(),
-      ]);
+      // The list already carries the installed row and, for an uninstalled
+      // bundled plugin, the restorable row. Asking GET /plugins/<id> as well
+      // would answer 404 for exactly the uninstalled case this panel exists for.
+      const [list, updates] = await Promise.allSettled([api.plugins.list(), api.plugins.updates()]);
       if (!alive) return;
-      if (list.status === "fulfilled") setSafeMode(Boolean(list.value.safeMode));
-      if (record.status === "fulfilled") {
-        setPlanner(record.value);
-      } else if (list.status === "fulfilled") {
-        // An uninstalled bundled plugin keeps a row in the list, and that row is
-        // the only way to offer 恢复并启用.
+      if (list.status === "fulfilled") {
+        setSafeMode(Boolean(list.value.safeMode));
         setPlanner(list.value.items.find((item) => item.id === PLANNER_PLUGIN_ID) ?? null);
       }
       if (updates.status === "fulfilled") {
@@ -201,6 +199,27 @@ export function LabSettingsSection({
     }
   }
 
+  async function checkPlannerUpdate() {
+    if (checkingPlannerUpdate || plannerUpdating || plannerBusy) return;
+    setCheckingPlannerUpdate(true);
+    setPlannerError(null);
+    setPlannerFlash(null);
+    try {
+      const status = await api.plugins.checkUpdates();
+      const item = status.items?.[PLANNER_PLUGIN_ID] ?? null;
+      setPlannerUpdate(item?.updateAvailable ? item : null);
+      setPlannerFlash(
+        item?.updateAvailable
+          ? `「规划」可更新到 v${item.latestVersion}。`
+          : "「规划」已是最新版本。",
+      );
+    } catch (cause) {
+      setPlannerError(errorText(cause) || "无法检查「规划」更新，请稍后重试。");
+    } finally {
+      setCheckingPlannerUpdate(false);
+    }
+  }
+
   async function updatePlanner(confirmConsent = false) {
     if (!plannerUpdate || plannerUpdating || plannerBusy) return;
     const hasAddedPriv = (plannerUpdate.addedPrivileged?.length ?? 0) > 0;
@@ -224,8 +243,11 @@ export function LabSettingsSection({
       setPlannerConsentOpen(false);
       setPlannerPrivConfirmed(false);
       const syncMessage = await syncPluginHost();
-      if (syncMessage) setPlannerError(syncMessage);
-      else setPlannerFlash(`「规划」已热更新到 v${updated.version}，无需重启 Kimi Code。`);
+      if (syncMessage) {
+        setPlannerError(`已热更新到 v${updated.version}，但界面同步失败：${syncMessage}`);
+      } else {
+        setPlannerFlash(`「规划」已热更新到 v${updated.version}，无需重启 Kimi Code。`);
+      }
     } catch (cause) {
       setPlannerError(errorText(cause));
     } finally {
@@ -279,6 +301,16 @@ export function LabSettingsSection({
             </small>
           </span>
           <div className="ekds-row-actions">
+            {!plannerUninstalled ? (
+              <button
+                type="button"
+                className="ekds-btn"
+                onClick={() => void checkPlannerUpdate()}
+                disabled={checkingPlannerUpdate || plannerUpdating || plannerBusy}
+              >
+                {checkingPlannerUpdate ? "检查中…" : "检查更新"}
+              </button>
+            ) : null}
             {!plannerUninstalled && plannerUpdate?.updateAvailable && plannerUpdate.canApply ? (
               <button
                 type="button"
@@ -314,8 +346,19 @@ export function LabSettingsSection({
         <div className="plugin-confirm" role="dialog" aria-modal="true" aria-label="确认规划插件新增权限">
           <p>
             <strong>「规划」v{plannerUpdate.latestVersion} 申请了新增权限：</strong>
-            {(plannerUpdate.addedCapabilities ?? []).join("、")}
           </p>
+          <ul className="ekds-note-list">
+            {(plannerUpdate.addedCapabilities ?? []).map((name) => {
+              const label = capabilityLabel(name);
+              return (
+                <li key={name}>
+                  <strong>{label.title}</strong>
+                  {(plannerUpdate.addedPrivileged ?? []).includes(name) ? "（高权限）" : ""}
+                  <span className="ekds-muted"> · {label.detail}</span>
+                </li>
+              );
+            })}
+          </ul>
           {(plannerUpdate.addedPrivileged?.length ?? 0) > 0 ? (
             <label className="capability-choice">
               <input
@@ -361,6 +404,85 @@ export function LabSettingsSection({
         <p className="ekds-note">安全模式已开启，所有增强插件都被停用，「规划」暂时无法启用。</p>
       ) : null}
       {features === null && !error ? <p className="ekds-note">正在读取实验开关状态…</p> : null}
+      <PlannerDetails planner={planner} />
     </div>
+  );
+}
+
+/**
+ * The planner's licence and activity log, a disclosure rather than a link out:
+ * the plugin page is filtered to official marketplaces, and a lab visitor who
+ * wants to check what the planner did should not have to leave the tab.
+ */
+function PlannerDetails({ planner }: { planner: PluginRecord | null }) {
+  const [section, setSection] = useState<"license" | "notice" | "activity" | null>(null);
+  const installed = planner !== null && planner.state !== "UNINSTALLED";
+  const legal = useResource<PluginLegal>(
+    `lab/planner/legal/${planner?.version ?? ""}/${planner?.updatedAt ?? ""}`,
+    () => api.pluginLegal(PLANNER_PLUGIN_ID),
+    { enabled: installed && (section === "license" || section === "notice") },
+  );
+  const activity = useResource<PluginActivity[]>(
+    `lab/planner/activity/${planner?.updatedAt ?? ""}`,
+    async () => (await api.plugins.activity(PLANNER_PLUGIN_ID)).items,
+    { enabled: installed && section === "activity" },
+  );
+  if (!installed) return null;
+  const notice = section === "notice";
+  const text = notice ? legal.data?.noticeText : legal.data?.licenseText;
+  const truncated = notice ? legal.data?.noticeTruncated : legal.data?.licenseTruncated;
+  const filename = notice ? legal.data?.noticeFile || "NOTICE" : "LICENSE";
+  return (
+    <details className="ekds-plugins planner-details" data-ekd-planner-details="true">
+      <summary>
+        <span>「规划」开源许可与活动记录</span>
+        <span className="num">v{planner.version}</span>
+      </summary>
+      <div className="inline-actions">
+        <button type="button" className="ekds-btn" onClick={() => setSection(section === "license" ? null : "license")}>
+          查看 LICENSE
+        </button>
+        {planner.hasNotice ? (
+          <button type="button" className="ekds-btn" onClick={() => setSection(section === "notice" ? null : "notice")}>
+            查看 NOTICE
+          </button>
+        ) : null}
+        <button type="button" className="ekds-btn" onClick={() => setSection(section === "activity" ? null : "activity")}>
+          活动记录
+        </button>
+      </div>
+      {section === "license" || section === "notice" ? (
+        legal.loading ? (
+          <p className="ekds-note">正在读取 {filename}…</p>
+        ) : legal.error ? (
+          <p className="ekds-note is-error" role="alert">无法读取 {filename}：{errorText(legal.error)}</p>
+        ) : text ? (
+          <>
+            {truncated ? <p className="ekds-note">{filename} 超过 128 KiB，此处显示文件开头。</p> : null}
+            <pre className="plugin-legal-text" tabIndex={0} aria-label={filename}>{text}</pre>
+          </>
+        ) : (
+          <p className="ekds-note">{filename} 没有可显示的内容。</p>
+        )
+      ) : null}
+      {section === "activity" ? (
+        activity.loading ? (
+          <p className="ekds-note">正在读取活动记录…</p>
+        ) : activity.error ? (
+          <p className="ekds-note is-error" role="alert">无法读取活动记录：{errorText(activity.error)}</p>
+        ) : (activity.data ?? []).length === 0 ? (
+          <p className="ekds-note">还没有记录。启用、停用和「规划」发起的动作都会记录在这里。</p>
+        ) : (
+          <ul className="activity-list">
+            {(activity.data ?? []).map((item) => (
+              <li key={item.id}>
+                <span className="num">{fmtDateTime(item.at)}</span>
+                <span>{item.detail}</span>
+              </li>
+            ))}
+          </ul>
+        )
+      ) : null}
+    </details>
   );
 }

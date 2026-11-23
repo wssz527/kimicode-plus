@@ -103,9 +103,6 @@ const OPEN_SETTINGS_CAPABILITIES = [
   "ui:main-area", "ui:sidebar-nav", "ui:right-panel", "ui:sidebar", "ui:settings", "ui:entry", "schedule:manage",
 ];
 
-/** Poll cadence for a plugin with no subscribers, so a loop ends instead of idling. */
-const EVENT_IDLE_MS = 5000;
-
 export function createPluginRuntime(options: RuntimeOptions) {
   const hub = new DecorationHub();
   const active = new Map<string, ActivePlugin>();
@@ -114,7 +111,8 @@ export function createPluginRuntime(options: RuntimeOptions) {
   // functions the owning plugin registered in its own scope.
   const handlers = new Map<string, (args: unknown) => unknown>();
   const theme = options.theme ?? defaultTheme;
-  // One loop for the whole renderer, created once and shared by every plugin.
+  // One pump for the whole renderer, but one independent loop per plugin: a
+  // plugin's five-second long poll or error backoff never delays another.
   const pump = createEventPump((id, error, code, message) => reportFailure(id, error, code, message));
 
   function grantedSlots(granted: string[]): SlotName[] {
@@ -448,7 +446,10 @@ export function createPluginRuntime(options: RuntimeOptions) {
           await options.commandHost?.register(pluginId, registered.name);
           const key = `${pluginId}:${registered.name}`;
           const handler = input?.run;
-          if (typeof handler === "function" && !handlers.has(key)) {
+          if (typeof handler === "function") {
+            // Re-registering a command lets a plugin replace its own callback.
+            // The cleanup checks identity, so the old registration releasing
+            // cannot delete a callback that replaced it.
             handlers.set(key, handler);
             scope.add(() => {
               if (handlers.get(key) === handler) handlers.delete(key);
@@ -774,12 +775,10 @@ export function createPluginRuntime(options: RuntimeOptions) {
 export type PluginRuntime = ReturnType<typeof createPluginRuntime>;
 
 /**
- * The one event loop for this renderer. Every plugin subscription registers a
- * scope here and the loop asks each plugin's own bridge for its scopes in a
- * single long poll per plugin token. There is never a poll per subscription and
- * never a poll per plugin beyond the one request each plugin's token requires:
- * the core authorizes a poll by token, so one request cannot carry two plugins'
- * grants, but the loop that drives them is shared and sequential.
+ * One independent event loop per plugin. Every subscription belongs to that
+ * plugin's group, and the group's own bridge is polled with its own cursor and
+ * its own error backoff. There is never a poll per subscription, and a long
+ * poll or a 15-second retry in one plugin cannot delay another plugin's stream.
  */
 interface PumpSubscriber {
   id: string;
@@ -787,90 +786,95 @@ interface PumpSubscriber {
   listener: (payload: unknown) => void;
 }
 
+interface PumpGroup {
+  bridge: ReturnType<typeof createBridge>;
+  subscriptions: Set<PumpSubscriber>;
+  cursor: number;
+  failures: number;
+  running: boolean;
+  wake: (() => void) | null;
+}
+
 function createEventPump(reportFailure: (id: string, error: unknown, code: string, message: string) => void) {
   // One entry per plugin: the bridge is bound to that plugin's token and grants.
-  const groups = new Map<string, { bridge: ReturnType<typeof createBridge>; subscriptions: Set<PumpSubscriber>; cursor: number; failures: number }>();
-  let running = false;
+  const groups = new Map<string, PumpGroup>();
+  const running = new Set<PumpGroup>();
   let stopped = false;
-  // A pending wait must end the moment the runtime is disposed, otherwise the
-  // loop outlives its owner by up to one poll interval and the process keeps a
-  // timer alive with nothing to do.
-  let wake: (() => void) | null = null;
 
-  function wait(ms: number): Promise<void> {
+  function wait(group: PumpGroup, ms: number): Promise<void> {
     return new Promise(resolve => {
-      const timer = setTimeout(() => {
-        wake = null;
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (group.wake === wake) group.wake = null;
         resolve();
-      }, ms);
+      };
+      const timer = setTimeout(finish, ms);
       // The wait belongs to a subscription, not to the host process: an idle
       // event loop must never be the reason a page or a test cannot exit.
       (timer as unknown as { unref?: () => void }).unref?.();
-      wake = () => {
+      const wake = () => {
         clearTimeout(timer);
-        wake = null;
-        resolve();
+        finish();
       };
+      group.wake = wake;
     });
   }
 
-  function scopesFor(group: { subscriptions: Set<PumpSubscriber> }): string[] {
+  function scopesFor(group: PumpGroup): string[] {
     const wanted = new Set<string>();
     for (const subscription of group.subscriptions) wanted.add(subscription.scope);
     return [...wanted];
   }
 
-  async function loop() {
-    if (running || stopped) return;
-    running = true;
+  async function runGroup(id: string, group: PumpGroup) {
+    if (group.running || stopped) return;
+    group.running = true;
+    running.add(group);
     try {
-      while (!stopped && groups.size > 0) {
-        let worked = false;
-        for (const [id, group] of groups) {
-          if (stopped) break;
-          const wanted = scopesFor(group);
-          if (!wanted.length) continue;
-          worked = true;
-          try {
-            const started = Date.now();
-            const page = await group.bridge.call<{
-              events: Array<{ sequence: number; scope: string; value: unknown }>;
-              next: number;
-            }>("events.poll", { after: group.cursor, scopes: wanted, waitMs: 5000 });
-            if (stopped) break;
-            group.cursor = page.next;
-            group.failures = 0;
-            for (const event of page.events) {
-              for (const subscription of [...group.subscriptions]) {
-                if (subscription.scope !== event.scope) continue;
-                try {
-                  subscription.listener(event.value);
-                } catch (error) {
-                  // A throwing listener stops only its own subscription; the other
-                  // plugins and the remaining subscriptions keep running.
-                  reportFailure(id, error, "PLUGIN_EVENT_FAILED", `处理 ${event.scope} 事件失败`);
-                  group.subscriptions.delete(subscription);
-                }
+      while (!stopped && groups.get(id) === group && group.subscriptions.size > 0) {
+        const wanted = scopesFor(group);
+        if (!wanted.length) break;
+        try {
+          const started = Date.now();
+          const page = await group.bridge.call<{
+            events: Array<{ sequence: number; scope: string; value: unknown }>;
+            next: number;
+          }>("events.poll", { after: group.cursor, scopes: wanted, waitMs: 5000 });
+          if (stopped || groups.get(id) !== group) break;
+          group.cursor = page.next;
+          group.failures = 0;
+          for (const event of page.events) {
+            for (const subscription of [...group.subscriptions]) {
+              if (subscription.scope !== event.scope) continue;
+              try {
+                subscription.listener(event.value);
+              } catch (error) {
+                // A throwing listener stops only its own subscription; the other
+                // plugins and the remaining subscriptions keep running.
+                reportFailure(id, error, "PLUGIN_EVENT_FAILED", `处理 ${event.scope} 事件失败`);
+                group.subscriptions.delete(subscription);
               }
             }
-            // The core long-polls, so a fast answer means the wait was cut short
-            // (or the transport is a stub). Yielding between rounds keeps a fast
-            // hop from starving timers and the page: an event stream has no
-            // natural backpressure, so the loop supplies it.
-            if (Date.now() - started < 50) await wait(page.events.length ? 20 : 50);
-          } catch (error) {
-            if (stopped) break;
-            group.failures += 1;
-            // A disabled plugin answers every poll with the same refusal, so the
-            // loop reports once and then waits instead of spinning against the core.
-            if (group.failures === 1) reportFailure(id, error, "PLUGIN_EVENT_POLL_FAILED", "事件轮询失败");
-            await wait(group.failures > 3 ? 15000 : 1000);
           }
+          // The core long-polls, so a fast answer means the wait was cut short
+          // (or the transport is a stub). Yielding between rounds keeps a fast
+          // hop from starving timers and the page: an event stream has no
+          // natural backpressure, so the loop supplies it.
+          if (Date.now() - started < 50) await wait(group, page.events.length ? 20 : 50);
+        } catch (error) {
+          if (stopped || groups.get(id) !== group) break;
+          group.failures += 1;
+          // A disabled plugin answers every poll with the same refusal, so the
+          // loop reports once and then waits instead of spinning against the core.
+          if (group.failures === 1) reportFailure(id, error, "PLUGIN_EVENT_POLL_FAILED", "事件轮询失败");
+          await wait(group, group.failures > 3 ? 15000 : 1000);
         }
-        if (!worked) await wait(EVENT_IDLE_MS);
       }
     } finally {
-      running = false;
+      group.running = false;
+      running.delete(group);
     }
   }
 
@@ -878,12 +882,15 @@ function createEventPump(reportFailure: (id: string, error: unknown, code: strin
     subscribe(id: string, bridge: ReturnType<typeof createBridge>, scope: string, listener: (payload: unknown) => void, owner: Scope): Disposable {
       let group = groups.get(id);
       if (!group) {
-        group = { bridge, subscriptions: new Set(), cursor: 0, failures: 0 };
+        group = { bridge, subscriptions: new Set(), cursor: 0, failures: 0, running: false, wake: null };
         groups.set(id, group);
       }
       const subscription: PumpSubscriber = { id, scope, listener };
       group.subscriptions.add(subscription);
-      void loop();
+      // A new interest is a reason to retry now instead of finishing the
+      // previous plugin's backoff.
+      group.wake?.();
+      void runGroup(id, group);
       let released = false;
       const release = () => {
         if (released) return;
@@ -891,27 +898,30 @@ function createEventPump(reportFailure: (id: string, error: unknown, code: strin
         // Removing a subscription never touches another plugin's group, so
         // deactivating one plugin cannot stop the loop for the others.
         group!.subscriptions.delete(subscription);
-        if (group!.subscriptions.size === 0) groups.delete(id);
-        if (groups.size === 0) wake?.();
+        if (group!.subscriptions.size === 0) {
+          if (groups.get(id) === group) groups.delete(id);
+          group!.wake?.();
+        }
       };
       owner.add(release);
       return { dispose: release };
     },
     /** Drops every subscription of one plugin; other plugins keep polling. */
     release(id: string): void {
+      const group = groups.get(id);
       groups.delete(id);
-      if (groups.size === 0) wake?.();
+      group?.wake?.();
     },
     stop(): void {
-      // The loop leaves on its next boundary; `running` then drops to zero in the
-      // `finally`, so a disposed runtime reports no live loop.
+      // The loops leave on their next boundary; `running` is cleared now so a
+      // disposed runtime reports no live loop even while a poll is in flight.
       stopped = true;
+      for (const group of groups.values()) group.wake?.();
       groups.clear();
-      running = false;
-      wake?.();
+      running.clear();
     },
     get loopCount(): number {
-      return running ? 1 : 0;
+      return stopped ? 0 : running.size;
     },
   };
 }

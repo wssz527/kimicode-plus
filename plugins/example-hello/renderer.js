@@ -1,4 +1,4 @@
-// 最小插件示例：侧栏一行文字 + 一个可停用的定时刷新。
+// 最小插件示例：侧栏一行文字，展示插件能力如何经 ctx 使用。
 // 所有能力都经 ctx 提供，插件不直接访问 fetch、localStorage 或宿主全局对象。
 
 export async function activate(ctx) {
@@ -7,6 +7,11 @@ export async function activate(ctx) {
   // NaN (which JSON turns into null). Treat both as "never enabled before" rather
   // than letting the number render as NaN forever.
   const count = Number.isFinite(Number(stored)) ? Number(stored) : 0;
+  const next = Number(count) + 1;
+  // The counter counts activations, so it is written once here. Writing it from
+  // the mount callback would count every remount of the sidebar instead, and a
+  // host that mounts twice would jump the number by two.
+  if (ctx.storage) void ctx.storage.set("greetings", next).catch(() => {});
 
   const mount = ctx.ui.mount("sidebar", element => {
     const row = document.createElement("div");
@@ -15,11 +20,10 @@ export async function activate(ctx) {
     dot.className = "ekdp-dot";
     const text = document.createElement("span");
     text.className = "ekdp-text";
-    text.textContent = `示例插件：你好（第 ${Number(count) + 1} 次启用）`;
+    text.textContent = `示例插件：你好（第 ${next} 次启用）`;
     row.append(dot, text);
     element.append(row);
 
-    if (ctx.storage) void ctx.storage.set("greetings", Number(count) + 1);
     ctx.log("info", "示例插件侧栏已挂载");
 
     return () => row.remove();

@@ -278,6 +278,7 @@ func TestBrowserViewIDSpaceIsPerPlugin(t *testing.T) {
 	manager.officialDigests = func() (map[string]string, error) {
 		return map[string]string{"test.official": ContentDigest(firstFiles), "test.other": ContentDigest(secondFiles)}, nil
 	}
+	manager.invalidateOfficialDigestCache()
 	second, err := manager.Enable(context.Background(), "test.other")
 	if err != nil {
 		t.Fatal(err)

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -421,5 +422,141 @@ func TestOfficialPluginUpdateConsentAndMinCoreGates(t *testing.T) {
 	}
 	if updated.Version != "1.1.0" || !contains(updated.Capabilities, "net:edge.microsoft.com") {
 		t.Fatalf("expected granted updated capability, got %+v", updated)
+	}
+}
+
+func TestEvaluateUpdateBlocksHostIncompatibleRelease(t *testing.T) {
+	manager, err := newManagerAt(t, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := entry{
+		manifest: Manifest{ID: "kimicode-plus.kct", Name: "KCT", Version: "1.0.0", HostVersions: []string{"1.*"}},
+		source:   SourceBundled,
+	}
+	remote := OfficialPluginEntry{ID: "kimicode-plus.kct", Name: "KCT", Version: "1.0.1", HostVersions: []string{"2.*"}}
+	blocked := manager.evaluateUpdate(item, remote, "1.3.7", false)
+	if !blocked.UpdateAvailable {
+		t.Fatalf("expected the newer version to be reported: %+v", blocked)
+	}
+	if blocked.HostCompatible || blocked.CanApply {
+		t.Fatalf("host-incompatible update must not be applicable: %+v", blocked)
+	}
+	if !strings.Contains(blocked.CannotApplyReason, "1.3.7") || !strings.Contains(blocked.CannotApplyReason, "宿主版本") {
+		t.Fatalf("unexpected block reason: %q", blocked.CannotApplyReason)
+	}
+	allowed := manager.evaluateUpdate(item, remote, "2.0.0", false)
+	if !allowed.HostCompatible || !allowed.CanApply {
+		t.Fatalf("compatible host should be applicable: %+v", allowed)
+	}
+}
+
+type countingEnableGate struct {
+	mu          sync.Mutex
+	calls       int
+	refuseAfter int
+}
+
+func (g *countingEnableGate) CheckEnable(context.Context, string) (string, string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.calls++
+	if g.calls > g.refuseAfter {
+		return "TEST_GATE_BLOCKED", "测试门禁拒绝再次启用"
+	}
+	return "", ""
+}
+
+func TestOfficialUpdateExposesReenableFailure(t *testing.T) {
+	ctx := context.Background()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	keys := map[string]ed25519.PublicKey{DefaultOfficialKeyID: pub}
+	v1Files := map[string][]byte{
+		"plugin.json": []byte(`{"id":"kimicode-plus.kct","name":"KCT","version":"1.0.0","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":["ui:thinking","storage"]}`),
+		"renderer.js": []byte("export function activate() { return 'v1'; }\n"),
+		"LICENSE":     []byte("MIT\n"),
+	}
+	v2Files := map[string][]byte{
+		"plugin.json": []byte(`{"id":"kimicode-plus.kct","name":"KCT","version":"1.0.1","apiVersion":1,"hostVersions":["1.*"],"entry":{"renderer":"renderer.js"},"capabilities":["ui:thinking","storage"]}`),
+		"renderer.js": []byte("export function activate() { return 'v2'; }\n"),
+		"LICENSE":     []byte("MIT\n"),
+	}
+	entryV2, archiveV2 := makeSignedEntry(t, v2Files, "", "")
+	signedManifest, err := SignPluginCatalog(OfficialPluginCatalog{
+		GeneratedAt: "2026-11-23T00:00:00Z",
+		Plugins:     []OfficialPluginEntry{entryV2},
+	}, DefaultOfficialKeyID, priv)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/owner/repo/releases/download/plugins-latest/plugins-manifest.json":
+			_, _ = w.Write(signedManifest)
+		case "/owner/repo/releases/download/plugins-latest/" + entryV2.Archive:
+			_, _ = w.Write(archiveV2)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	root := t.TempDir()
+	db, err := storage.Open(filepath.Join(root, "plugins.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	bundledSet := map[string]map[string][]byte{"kimicode-plus.kct": v1Files}
+	manager, err := New(
+		db,
+		func() bool { return false },
+		WithDataDir(root),
+		WithHostVersion("1.3.7"),
+		WithBundled(func() (map[string]map[string][]byte, error) { return bundledSet, nil }),
+		WithOfficial(func() (map[string]string, error) {
+			return map[string]string{"kimicode-plus.kct": ContentDigest(v1Files)}, nil
+		}),
+		WithUpdater(UpdateOptions{
+			CoreVersion:       "0.2.8",
+			Repo:              "owner/repo",
+			ReleaseBaseURL:    srv.URL,
+			AllowInsecureHTTP: true,
+			OfficialKeys:      keys,
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	gate := &countingEnableGate{refuseAfter: 1}
+	manager.UseEnableGate(gate)
+	if err := manager.ReleaseBundled(ctx, bundledSet); err != nil {
+		t.Fatalf("release bundled: %v", err)
+	}
+	if _, err := manager.Enable(ctx, "kimicode-plus.kct"); err != nil {
+		t.Fatalf("enable v1: %v", err)
+	}
+	if _, err := manager.CheckUpdates(ctx); err != nil {
+		t.Fatalf("check updates: %v", err)
+	}
+	updated, err := manager.ApplyUpdate(ctx, "kimicode-plus.kct", UpdateRequest{ExpectedVersion: "1.0.1"})
+	if err != nil {
+		t.Fatalf("apply update should succeed even when re-enable fails: %v", err)
+	}
+	if updated.Version != "1.0.1" {
+		t.Fatalf("new files were not installed: %+v", updated)
+	}
+	if updated.Enabled {
+		t.Fatalf("a blocked re-enable must not report the plugin as running: %+v", updated)
+	}
+	if !strings.Contains(updated.Error, "重新启用失败") || !strings.Contains(updated.Error, "测试门禁拒绝再次启用") {
+		t.Fatalf("re-enable failure was hidden from the result: %q", updated.Error)
+	}
+	if updated.State != StateBlocked {
+		t.Fatalf("expected the blocked state to survive, got %s", updated.State)
 	}
 }

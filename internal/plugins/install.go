@@ -295,6 +295,7 @@ func (m *Manager) commitLocalInstall(ctx context.Context, pkg stagedPackage, gra
 		m.order = append(m.order, manifest.ID)
 		sortStrings(m.order)
 	}
+	m.invalidateOfficialCache(manifest.ID)
 	return item, m.host, nil
 }
 
@@ -769,6 +770,7 @@ func (m *Manager) adopt(ctx context.Context, id, dir, source string) error {
 		sortStrings(m.order)
 	}
 	m.mu.Unlock()
+	m.invalidateOfficialCache(id)
 
 	stored := record{
 		id: manifest.ID, name: manifest.Name, version: manifest.Version,
@@ -837,6 +839,7 @@ func (m *Manager) markCorrupt(ctx context.Context, id, dir, source, reason strin
 	item.updated = now
 	delete(m.tokens, id)
 	m.mu.Unlock()
+	m.invalidateOfficialCache(id)
 	_ = saveRecord(ctx, m.db, record{
 		id: id, name: id, version: "0.0.0", manifest: mustJSON(map[string]any{"id": id}), capabilities: capabilities,
 		source: source, installDigest: installDigest, desired: desired, state: StateCorrupt, err: message, installedAt: now, updatedAt: now,

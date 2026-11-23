@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -217,6 +218,13 @@ type Manager struct {
 
 	officialDigests OfficialDigests
 	officialKeys    map[string]ed25519.PublicKey
+	// officialSet holds the embedded allowlist loaded once; the atomic pointer
+	// lets a test-supplied loader be invalidated without recreating the manager.
+	officialSet atomic.Pointer[officialDigestSet]
+	// officialCache holds verified verdicts keyed by installed state. It is
+	// guarded separately from mu because present() can run after mu is released.
+	officialCacheMu sync.Mutex
+	officialCache   map[officialVerificationKey]officialVerification
 	updater         *pluginUpdater
 	views           map[string]map[string]*browserView
 	commands        map[string]command
@@ -1016,6 +1024,7 @@ func (m *Manager) UninstallWithOptions(ctx context.Context, id string, deleteDat
 	delete(m.tokens, id)
 	m.order = removeString(m.order, id)
 	m.mu.Unlock()
+	m.invalidateOfficialCache(id)
 	_ = recordActivity(ctx, m.db, id, ActivityUninstall, "插件已卸载；卸载后不会自动恢复预装副本", now)
 	m.notifyChange()
 	return nil

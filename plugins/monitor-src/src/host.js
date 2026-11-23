@@ -22,6 +22,7 @@ import { ASSETS } from "./shim-assets.js";
 const memory = new Map();
 const pendingWrites = new Map();
 let bridge = null;
+let installed = false;
 
 function isPluginStorageKey(key) {
   const name = String(key);
@@ -269,7 +270,14 @@ const localStorageShim = new Proxy(localStorageTarget, {
   }
 });
 
-function installHost() {
+/**
+ * Installs the host stand-ins. It runs from bindStorage, i.e. inside activate(),
+ * so importing this module has no side effect and a deactivated plugin leaves
+ * the page exactly as it found it.
+ */
+export function installHost() {
+  if (installed) return;
+  installed = true;
   globalThis.chrome = chromeShim;
   try {
     const current = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
@@ -285,9 +293,6 @@ function installHost() {
     // 无法覆盖时上游自己的 try/catch 兜底，面板仍可用，只是偏好不持久
   }
 }
-
-// 模块求值即安装：上游模块顶层调用 chrome.runtime.getURL
-installHost();
 
 /** 同步来自同窗口其他视图（如设置页）写入的 storage 键值。 */
 export function syncStorageKey(key, value) {
@@ -308,8 +313,16 @@ export function disposeHost() {
   }
   pendingWrites.clear();
   if (nativeLocalStorage) Object.defineProperty(globalThis, "localStorage", nativeLocalStorage);
-  else delete globalThis.localStorage;
+  else {
+    try {
+      delete globalThis.localStorage;
+    } catch (error) {
+      // 某些宿主把 localStorage 定义成不可配置，留着替身比抛错好
+    }
+  }
   nativeLocalStorage = null;
   delete globalThis.chrome;
   bridge = null;
+  installed = false;
+  memory.clear();
 }

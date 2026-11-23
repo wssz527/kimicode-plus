@@ -28,6 +28,7 @@ interface SchedulerModule {
   parseTimesList(timesOrText: unknown): string[];
   resolveDefaultCwd(prefillCwd: unknown, sessions: unknown[], targetSessionId?: string, activeSessionId?: string): string;
   formatSchedulePreview(draft: Record<string, unknown>): string;
+  estimateNextRun(draft?: Record<string, unknown>, now?: Date): Date | null;
   defaultDraft(prefill?: Record<string, unknown>): Record<string, unknown>;
   switchScheduleKind(draft: Record<string, unknown>, nextKind: string): Record<string, unknown>;
   buildScheduleRule(draft: Record<string, unknown>): Record<string, unknown>;
@@ -1065,4 +1066,69 @@ test("N5 prompt template preview, capability gates, openSettings, and scheduler 
     (globalThis as Record<string, unknown>).document = prevDocument;
     (globalThis as Record<string, unknown>).window = prevWindow;
   }
+});
+
+test("the dialog estimates the next fire time without guessing editable lists", () => {
+  const now = new Date("2026-11-24T10:30:00");
+  const daily = scheduler.estimateNextRun({ scheduleKind: "daily", time: "09:00" }, now);
+  assert.ok(daily instanceof Date);
+  assert.equal(daily!.getDate(), 25, "a passed time must roll to tomorrow");
+  assert.equal(daily!.getHours(), 9);
+
+  const hourly = scheduler.estimateNextRun({ scheduleKind: "hourly", minute: "15" }, now);
+  assert.ok(hourly, "hourly schedule produced no estimate");
+  assert.equal(hourly!.getMinutes(), 15);
+  assert.ok(hourly!.getTime() > now.getTime());
+
+  const interval = scheduler.estimateNextRun({ scheduleKind: "interval", intervalValue: "30", intervalUnit: "minutes" }, now);
+  assert.ok(interval, "interval schedule produced no estimate");
+  assert.equal(interval!.getTime() - now.getTime(), 30 * 60_000);
+
+  // Weekly with an explicit day set lands on that weekday.
+  const wednesday = scheduler.estimateNextRun({ scheduleKind: "weekly", time: "08:00", weekdays: [3] }, now);
+  assert.ok(wednesday, "weekly schedule produced no estimate");
+  assert.equal(wednesday!.getDay(), 3);
+
+  // Lists the user can type into are left to the core.
+  assert.equal(scheduler.estimateNextRun({ scheduleKind: "times", timesText: "09:00" }, now), null);
+  assert.equal(scheduler.estimateNextRun({ scheduleKind: "monthly", daysText: "1" }, now), null);
+  // An expired validity range produces no estimate rather than a past date.
+  assert.equal(
+    scheduler.estimateNextRun({ scheduleKind: "daily", time: "09:00", endDate: "2026-11-01" }, now),
+    null,
+  );
+});
+
+test("the scheduler renders the safesturable guards the fixes rely on", () => {
+  // Two-step inline delete instead of an immediate request.
+  assert.ok(rendererSource.includes('text: "确认删除"'));
+  assert.ok(rendererSource.includes('text: "取消"'));
+  assert.ok(rendererSource.includes("后其运行记录也会一并移除"));
+  // Request-in-flight guard on the card.
+  assert.match(rendererSource, /let cardBusy = false/);
+  assert.match(rendererSource, /if \(cardBusy\) return;/);
+  // One pause entry only: the card's action row no longer repeats the toggle.
+  const actionBlock = rendererSource.slice(rendererSource.indexOf("const actions = [];"), rendererSource.indexOf("function syncCardActions"));
+  assert.equal(actionBlock.includes('text: task.enabled ? "暂停" : "恢复"'), false);
+  assert.ok(rendererSource.includes('"立即试运行"'));
+  // Save writes the new id back before any runNow.
+  const submitBlock = rendererSource.slice(rendererSource.indexOf("async function submit(andRunNow)"), rendererSource.indexOf("const head = el(doc"));
+  assert.match(submitBlock, /if \(saved\?\.id\) draft\.id = saved\.id;/);
+  assert.ok(
+    submitBlock.indexOf("draft.id = saved.id") < submitBlock.indexOf('schedule.runNow"'),
+    "runNow must happen after the id is written back",
+  );
+  // KAP gate on the footer button.
+  assert.ok(rendererSource.includes("disabled: busy || !state.kapConnected"));
+  // Unsaved guardrail drafts survive a background re-render.
+  assert.ok(rendererSource.includes("guardrailsDraft"));
+  assert.ok(rendererSource.includes("maxConcurrentEdited"));
+  // The right panel follows the active session and surfaces errors.
+  assert.ok(rendererSource.includes("state.rightPanelSessionId = ctx.sessions?.activeId?.() || \"\";"));
+  assert.ok(rendererSource.includes("data-ekd-right-error"));
+  // Dialog focus and scroll survive a structural rebuild.
+  assert.ok(rendererSource.includes("data-ekd-focus"));
+  assert.match(rendererSource, /bodyEl\.scrollTop = saved\.scrollTop/);
+  // Date "clear" buttons stay enabled after a date is picked.
+  assert.match(rendererSource, /syncDateClearButtons/);
 });

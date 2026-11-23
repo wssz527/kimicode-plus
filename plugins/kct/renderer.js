@@ -75,6 +75,7 @@ export async function activate(ctx) {
         state.skipped = false;
         state.translatedSource = "";
         state.translatedPrefix = "";
+        state.failedSource = "";
         state.preferOriginal = false;
         state.body.querySelector(".ekdp-kct-translated")?.remove();
         setView(state, "original");
@@ -143,6 +144,8 @@ export async function activate(ctx) {
       source: "",
       translatedSource: "",
       translatedPrefix: "",
+      // 上次失败的原文；相同内容不再自动重试，避免 429 时的重试风暴。
+      failedSource: "",
       view: "original",
       rendered: false,
       running: false,
@@ -166,11 +169,14 @@ export async function activate(ctx) {
         return;
       }
       if (state.running) return;
+      state.failedSource = "";
       state.requested = true;
       schedule(state, true);
     });
     status.addEventListener("click", () => {
       if (status.dataset.state !== "error") return;
+      // 用户手动重试就是这个标记唯一的清除入口（另一个是原文变化）。
+      state.failedSource = "";
       state.requested = true;
       schedule(state, true);
     });
@@ -203,6 +209,7 @@ export async function activate(ctx) {
     popover.dispose();
     decoration.dispose();
     blocks.clear();
+    engine.dispose();
     style.remove();
   });
 
@@ -218,13 +225,17 @@ export async function activate(ctx) {
     }
     // 流式输出期间按固定间隔重试，避免每个 token 都发一次请求。
     if (state.info.streaming) {
-      if (!state.streamSince) state.streamSince = Date.now();
-      if (state.timer) return;
-      const waited = Date.now() - state.streamSince >= STREAM_MAX_WAIT_MS;
-      state.timer = window.setTimeout(() => {
-        state.timer = 0;
-        void maybeRun(state, force);
-      }, waited ? 0 : STREAM_DEBOUNCE_MS);
+      // 每次触发翻译都从此刻重新计时。只在第一次设值会让 streamSince 一直停在
+      // 3 秒前的时刻，之后每次调度都判定「已等够」并退化为 0ms 防抖，等于对
+      // 每个 token 发一次请求。
+      if (!state.timer) {
+        state.streamSince = Date.now();
+        state.timer = window.setTimeout(() => {
+          state.timer = 0;
+          state.streamSince = 0;
+          void maybeRun(state, force);
+        }, STREAM_DEBOUNCE_MS);
+      }
       return;
     }
     if (state.timer) {
@@ -268,6 +279,10 @@ export async function activate(ctx) {
     }
 
     const source = readSource(state);
+    if (state.failedSource && source !== state.failedSource) {
+      // 原文继续增长或变化：上一次失败针对的是旧内容，值得再试一次。
+      state.failedSource = "";
+    }
     if (state.skipped && source !== state.source) {
       state.skipped = false;
       state.done = false;
@@ -294,6 +309,10 @@ export async function activate(ctx) {
     if (!state.running && state.info.open && (settings.autoTranslate || state.requested || force)) {
       if (!source.trim()) return;
       if (source === state.source && state.done) return;
+      // 自动扫描遇到与上次失败完全相同的原文时不再重试：429/断网会让每次
+      // 调度都重新发一遍请求，形成无限重试风暴。只有用户手动点「重试」、
+      // 原文继续增长或翻译配置变更（failedSource 在两者中被清空）才恢复。
+      if (!force && !state.requested && state.failedSource && source === state.failedSource) return;
       if (settings.provider === "custom" && !customEndpoint(settings)) {
         const raw = String(settings.customEndpoint || "").trim();
         setStatus(
@@ -362,10 +381,12 @@ export async function activate(ctx) {
       render(state, translated + nowSource.slice(source.length));
       state.done = nowSource === source && !state.info.streaming;
       state.source = source;
+      state.failedSource = "";
       state.signature = translationSignature(settings);
       setStatus(state, state.done ? "ok" : "loading", state.done ? "" : "后续内容待翻译");
     } catch (error) {
       if (!valid()) return;
+      state.failedSource = source;
       setStatus(state, "error", `重试 · ${errorBrief(error)}`, `翻译失败：${messageOf(error)}`);
     } finally {
       if (state.generation === generation) {
@@ -391,8 +412,24 @@ export async function activate(ctx) {
       // Written as an attribute rather than a class: the hub observes class
       // changes on host nodes, and a class toggle here would look like host churn
       // and invalidate the very translation that caused it.
-      if (view === "translated") source.setAttribute("data-ekdp-kct-hidden", "1");
-      else source.removeAttribute("data-ekdp-kct-hidden");
+      //
+      // A thinking body is not always one <pre>. When it holds several
+      // paragraphs, the picked source is only one of them and hiding it alone
+      // would leave the rest of the original visible above the translation.
+      const originals = [source];
+      const siblings = state.body.children;
+      if (siblings && typeof siblings.length === "number") {
+        for (let index = 0; index < siblings.length; index += 1) {
+          const child = siblings[index];
+          if (!child || child === source) continue;
+          if (child.classList?.contains("ekdp-kct-translated")) continue;
+          originals.push(child);
+        }
+      }
+      for (const node of originals) {
+        if (view === "translated") node.setAttribute("data-ekdp-kct-hidden", "1");
+        else node.removeAttribute("data-ekdp-kct-hidden");
+      }
     }
     state.toggle.textContent = view === "translated" ? "原文" : state.rendered ? "译文" : "翻译";
     state.toggle.title = view === "translated" ? "查看原文" : state.rendered ? "查看译文" : "翻译这段思考";
@@ -444,6 +481,11 @@ async function createEngine(ctx) {
   const index = new Map();
   let indexDirty = false;
   let persistTimer = 0;
+  // 只写回新增或变更的条目：整表重写会在每次 flush 时把 200 条译文全部
+  // 重新 set 一遍（每条都是一次桥调用）。
+  const dirtyKeys = new Set();
+  // prune 淘汰的键要先从磁盘删掉，否则它们会一直占着存储却再也读不到。
+  const deletedKeys = new Set();
 
   async function loadSettings() {
     const stored = await ctx.storage.get(SETTINGS_KEY).catch(() => undefined);
@@ -494,26 +536,36 @@ async function createEngine(ctx) {
     prune();
     const entries = [...index.entries()].sort((a, b) => b[1] - a[1]);
     await ctx.storage.set(CACHE_INDEX_KEY, entries).catch(() => {});
-    for (const [key, text] of cache) {
+    const removed = [...deletedKeys];
+    deletedKeys.clear();
+    for (const key of removed) {
+      await ctx.storage.delete(CACHE_ENTRY_PREFIX + key).catch(() => {});
+    }
+    const changed = [...dirtyKeys];
+    dirtyKeys.clear();
+    for (const key of changed) {
       if (!index.has(key)) continue;
+      const text = cache.get(key);
+      if (typeof text !== "string") continue;
       if (text.length * 2 > 32000) continue;
       await ctx.storage.set(CACHE_ENTRY_PREFIX + key, text).catch(() => {});
     }
   }
 
   function prune(now = Date.now()) {
+    const drop = (key) => {
+      index.delete(key);
+      cache.delete(key);
+      dirtyKeys.delete(key);
+      deletedKeys.add(key);
+      indexDirty = true;
+    };
     for (const [key, usedAt] of index) {
-      if (now - usedAt >= CACHE_TTL_MS) {
-        index.delete(key);
-        cache.delete(key);
-      }
+      if (now - usedAt >= CACHE_TTL_MS) drop(key);
     }
     if (index.size <= CACHE_LIMIT) return;
     const stale = [...index.entries()].sort((a, b) => a[1] - b[1]).slice(0, index.size - CACHE_LIMIT);
-    for (const [key] of stale) {
-      index.delete(key);
-      cache.delete(key);
-    }
+    for (const [key] of stale) drop(key);
   }
 
   function remember(key, text) {
@@ -521,6 +573,8 @@ async function createEngine(ctx) {
     cache.set(key, text);
     index.delete(key);
     index.set(key, Date.now());
+    dirtyKeys.add(key);
+    deletedKeys.delete(key);
     indexDirty = true;
     persist();
   }
@@ -528,6 +582,8 @@ async function createEngine(ctx) {
   function clearMemoryCache() {
     cache.clear();
     index.clear();
+    dirtyKeys.clear();
+    deletedKeys.clear();
     indexDirty = false;
   }
 
@@ -724,7 +780,19 @@ async function createEngine(ctx) {
     return final;
   }
 
-  return { settings, translate, loadSettings, clearMemoryCache, cacheCount: () => cache.size };
+  function dispose() {
+    // 排队中的任务不会再被处理：它们的 promise 必须结束，否则调度方会一直
+    // 挂起；冷却与退避定时器也要清掉，否则插件停用后仍有回调在跑。
+    for (const job of queue.splice(0)) job.reject(new Error("翻译已停止"));
+    active = 0;
+    cooldownUntil = 0;
+    if (persistTimer) window.clearTimeout(persistTimer);
+    persistTimer = 0;
+    dirtyKeys.clear();
+    deletedKeys.clear();
+  }
+
+  return { settings, translate, loadSettings, clearMemoryCache, dispose, cacheCount: () => cache.size };
 }
 
 // ------------------------------------------------------------- 内联设置

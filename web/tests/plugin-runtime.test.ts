@@ -244,45 +244,38 @@ test("an ungranted settings module is refused instead of mounted", async () => {
   runtime.dispose();
 });
 
-test("the runtime runs one shared event loop across plugins, not one per plugin", async () => {
-  let inFlight = 0;
-  let peakInFlight = 0;
-  const seenTokens = new Set<string>();
+test("each plugin polls on its own loop, so an idle plugin never blocks another", async () => {
+  let stalled = 0;
+  let fastPolls = 0;
   const runtime = createPluginRuntime({
     slots: {},
     request: async (path, body) => {
       if (path !== "/plugin-runtime/events.poll") return { value: {} };
       const token = (body as { token: string }).token;
-      inFlight += 1;
-      peakInFlight = Math.max(peakInFlight, inFlight);
-      try {
-        // The real core long-polls; the double must too, or the loop spins.
-        await new Promise(resolve => setTimeout(resolve, 120));
-        return { value: { events: [], next: 1 } };
-      } finally {
-        inFlight -= 1;
-        // Recorded after the poll returns, so the observation is "this plugin was
-        // polled", not "this plugin happened to be first in the round".
-        seenTokens.add(token);
+      if (token === "token-stalled") {
+        // A plugin whose long poll hangs forever (a stalled stream). The old
+        // shared loop would have frozen every other plugin behind it.
+        stalled += 1;
+        await new Promise(() => {});
       }
+      fastPolls += 1;
+      return { value: { events: [], next: 1 } };
     },
   });
   try {
-    const listener = () => {};
     await runtime.activate(
-      { activate: context => { context.events.on("cache", listener); context.events.on("automation", listener); } },
-      { id: "plugin.one", version: "1.0.0", granted: ["metrics:read"], token: "token-one" },
+      { activate: context => { context.events.on("session:s1", () => {}); } },
+      { id: "plugin.stalled", version: "1.0.0", granted: ["sessions:read"], token: "token-stalled" },
     );
     await runtime.activate(
-      { activate: context => { context.events.on("cache", listener); context.events.on("session:s1", listener); } },
-      { id: "plugin.two", version: "1.0.0", granted: ["metrics:read", "sessions:read"], token: "token-two" },
+      { activate: context => { context.events.on("cache", () => {}); } },
+      { id: "plugin.fast", version: "1.0.0", granted: ["metrics:read"], token: "token-fast" },
     );
-    await new Promise(resolve => setTimeout(resolve, 400));
-    // Four subscriptions across two plugins, but never more than one poll in
-    // flight at a time and never more than one loop: the pump serializes.
-    assert.equal(peakInFlight, 1, `the shared loop had ${peakInFlight} concurrent polls`);
-    assert.equal(runtime.eventLoops(), 1, "more than one event loop is running");
-    assert.equal(seenTokens.size, 2, "the loop did not cover both plugins");
+    const deadline = Date.now() + 1500;
+    while (fastPolls < 2 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(stalled >= 1, "the stalled plugin was never polled");
+    assert.ok(fastPolls >= 2, "a stalled plugin blocked another plugin's event loop");
+    assert.equal(runtime.eventLoops(), 2, "each plugin should own one loop");
   } finally {
     runtime.dispose();
   }
@@ -1041,5 +1034,36 @@ test("ui.pickDirectory requires workspace capability and handles selection and c
   assert.equal(picked, "/tmp/project-alpha");
   assert.equal(canceled, null);
   assert.deepEqual(receivedOptions, [{ title: "选择任务目录", defaultPath: "/tmp" }, {}]);
+  runtime.dispose();
+});
+
+test("a plugin can replace its own command callback by registering again", async () => {
+  const runtime = createPluginRuntime({
+    slots: {},
+    request: async (path, body) => {
+      if (path === "/plugin-runtime/commands.register") {
+        const params = (body as { params: { name: string } }).params;
+        return { value: { name: params.name, title: params.name } };
+      }
+      return { value: {} };
+    },
+  });
+  let context: Parameters<Parameters<typeof runtime.activate>[0]["activate"]>[0] | null = null;
+  await runtime.activate(
+    {
+      activate: async ctx => {
+        context = ctx;
+        await ctx.commands?.register("demo.run", { run: () => "first" });
+      },
+    },
+    { id: "plugin.cmd", version: "1.0.0", granted: ["commands"], token: "t" },
+  );
+  assert.equal(await runtime.invokeLocal({ command: "demo.run", ownerId: "plugin.cmd" }), "first");
+  await context!.commands!.register("demo.run", { run: () => "second" });
+  assert.equal(
+    await runtime.invokeLocal({ command: "demo.run", ownerId: "plugin.cmd" }),
+    "second",
+    "re-registering a command kept the stale callback",
+  );
   runtime.dispose();
 });

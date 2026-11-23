@@ -252,3 +252,145 @@ test("KCT translated node preserves official think-text class, Vue scope attr, a
     runtime.removeEventListener = prevRemoveEventListener;
   }
 });
+
+/** Boots the real renderer against a permissive DOM stub so a test can drive
+ * one decorated block through the scheduler. */
+async function bootKct(options: {
+  translate: (text: string) => Promise<unknown>;
+  settings?: Record<string, unknown>;
+}) {
+  const head = new FakeElement("head");
+  const bodyRoot = new FakeElement("body");
+  const runtime = globalThis as unknown as Record<string, any>;
+  const prevDocument = runtime.document;
+  const prevWindow = runtime.window;
+  const prevAddEventListener = runtime.addEventListener;
+  const prevRemoveEventListener = runtime.removeEventListener;
+  runtime.document = {
+    head,
+    body: bodyRoot,
+    createElement: (tag: string) => new FakeElement(tag),
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  runtime.window = {
+    setTimeout,
+    clearTimeout,
+    addEventListener() {},
+    removeEventListener() {},
+    dispatchEvent() {},
+    innerWidth: 1200,
+    innerHeight: 800,
+    navigator: { language: "zh-CN" },
+  };
+  runtime.addEventListener = () => {};
+  runtime.removeEventListener = () => {};
+  let decorator: any = null;
+  const disposers: Array<() => void> = [];
+  const storage = new Map<string, unknown>([
+    ["settings.v1", { targetLanguage: "zh", provider: "bing", autoTranslate: true, ...options.settings }],
+  ]);
+  const stored = new Map<string, number>();
+  const deleted: string[] = [];
+  const ctx = {
+    storage: {
+      get: async (key: string) => storage.get(key),
+      set: async (key: string, value: unknown) => { storage.set(key, value); stored.set(key, (stored.get(key) ?? 0) + 1); },
+      delete: async (key: string) => { storage.delete(key); deleted.push(key); },
+    },
+    net: { fetch: () => options.translate("") },
+    ui: {
+      decorate: (_target: string, fn: any) => { decorator = fn; return { dispose() {} }; },
+      openSettings: async () => {},
+    },
+    onDispose: (fn: () => void) => disposers.push(fn),
+    log: () => {},
+  };
+  const moduleUrl = `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`;
+  const kct = await import(moduleUrl);
+  await kct.activate(ctx);
+  return {
+    decorator,
+    ctx,
+    head,
+    bodyRoot,
+    stored,
+    deleted,
+    cleanup() {
+      for (const dispose of disposers) dispose();
+      runtime.document = prevDocument;
+      runtime.window = prevWindow;
+      runtime.addEventListener = prevAddEventListener;
+      runtime.removeEventListener = prevRemoveEventListener;
+    },
+  };
+}
+
+test("a failed translation is not retried until the source grows or the user asks", async () => {
+  let calls = 0;
+  // A 4xx that is not 429: it fails immediately, with no retry backoff and no
+  // rate-limit cooldown, so the only thing under test is the failed-source guard.
+  const boot = await bootKct({
+    translate: async () => {
+      calls += 1;
+      return { ok: false, status: 400, body: JSON.stringify({ error: "bad request" }) };
+    },
+  });
+  try {
+    const block = new FakeElement("div", "think");
+    const thinkHead = new FakeElement("button", "think-head");
+    const thinkBody = new FakeElement("div", "think-body open");
+    const thinkInner = new FakeElement("div", "think-body-inner");
+    const sourcePre = new FakeElement("pre", "think-text");
+    sourcePre.textContent = "We need to inspect the configuration first.";
+    thinkInner.appendChild(sourcePre);
+    thinkBody.appendChild(thinkInner);
+    block.append(thinkHead, thinkBody);
+    boot.bodyRoot.appendChild(block);
+    const handle = boot.decorator!(block, { open: true, streaming: false });
+    await new Promise(resolve => setTimeout(resolve, 60));
+    const afterFirst = calls;
+    assert.ok(afterFirst >= 1, "the first attempt never ran");
+    // Repeated sweeps with the same failing source must not fire another request.
+    for (let index = 0; index < 4; index += 1) {
+      handle.update({ open: true, streaming: false });
+      await new Promise(resolve => setTimeout(resolve, 40));
+    }
+    assert.equal(calls, afterFirst, "a failed source produced a retry storm");
+    // Growing the source is a new input, so one more attempt is allowed.
+    sourcePre.textContent = "We need to inspect the configuration first. Then check the cache.";
+    handle.update({ open: true, streaming: false });
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.ok(calls > afterFirst, "a grown source was never retried");
+    handle.dispose?.();
+  } finally {
+    boot.cleanup();
+  }
+});
+
+test("cache writes are incremental and pruned entries are deleted", async () => {
+  const boot = await bootKct({
+    translate: async () => ({ ok: true, status: 200, body: JSON.stringify([{ translations: [{ text: "需要检查配置。" }] }]) }),
+  });
+  try {
+    const block = new FakeElement("div", "think");
+    const thinkHead = new FakeElement("button", "think-head");
+    const thinkBody = new FakeElement("div", "think-body open");
+    const thinkInner = new FakeElement("div", "think-body-inner");
+    const sourcePre = new FakeElement("pre", "think-text");
+    sourcePre.textContent = "We need to inspect the configuration first.";
+    thinkInner.appendChild(sourcePre);
+    thinkBody.appendChild(thinkInner);
+    block.append(thinkHead, thinkBody);
+    boot.bodyRoot.appendChild(block);
+    const handle = boot.decorator!(block, { open: true, streaming: false });
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    const indexWrites = boot.stored.get("cache.index.v1") ?? 0;
+    assert.ok(indexWrites >= 1, "the cache index was never written");
+    const entryWrites = [...boot.stored.entries()].filter(([key]) => key.startsWith("cache.e.v1:")).length;
+    assert.equal(entryWrites, 1, `expected one cache entry write, saw ${entryWrites}`);
+    handle.dispose?.();
+  } finally {
+    boot.cleanup();
+  }
+});

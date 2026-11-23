@@ -337,6 +337,79 @@ export function formatSchedulePreview(draft = {}) {
   return `执行计划：${core} · ${validity}`;
 }
 
+/**
+ * Estimates the next fire time for the draft's schedule. It is a preview, not a
+ * scheduler: the core owns the real calculation, and the panel says so. Only the
+ * shapes the dialog can build are handled; an editable field the user typed into
+ * (a times list, a month-day list) returns null rather than a guess.
+ */
+export function estimateNextRun(draft = {}, now = new Date()) {
+  const kind = draft.scheduleKind || "daily";
+  const clock = normalizeClock(draft.time, "09:00");
+  const [hour, minute] = clock.split(":").map(value => Number.parseInt(value, 10));
+  const base = new Date(now.getTime());
+  base.setSeconds(0, 0);
+  const next = new Date(base.getTime());
+  const setClock = (date) => {
+    date.setHours(hour || 0, minute || 0, 0, 0);
+    return date;
+  };
+  const startDate = String(draft.startDate || "").trim();
+  const endDate = String(draft.endDate || "").trim();
+  // Compare local calendar dates: toISOString() is UTC and shifts the day for a
+  // 09:00 local run in most time zones.
+  const localDay = (date) => {
+    const pad = (value) => String(value).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  };
+  const beforeStart = (date) => Boolean(startDate) && localDay(date) < startDate;
+  const afterEnd = (date) => Boolean(endDate) && localDay(date) > endDate;
+
+  if (kind === "once") {
+    const dateStr = String(draft.date || "").trim();
+    if (!dateStr) return null;
+    const at = new Date(`${dateStr}T${clock}:00`);
+    return Number.isNaN(at.getTime()) ? null : at;
+  }
+  if (kind === "hourly") {
+    const atMinute = Math.max(0, Math.min(59, Number.parseInt(String(draft.minute ?? 0), 10) || 0));
+    next.setMinutes(atMinute, 0, 0);
+    if (next <= base) next.setHours(next.getHours() + 1, atMinute, 0, 0);
+    return next;
+  }
+  if (kind === "interval") {
+    const value = Math.max(1, Number.parseInt(String(draft.intervalValue || 1), 10) || 1);
+    const minutes = draft.intervalUnit === "hours" ? value * 60 : value;
+    return new Date(base.getTime() + minutes * 60_000);
+  }
+  if (kind === "times" || kind === "monthly") {
+    // 用户可自由编辑的列表：这里不猜，交给核心在保存后给出真实时间。
+    return null;
+  }
+  if (kind === "weekly") {
+    const days = Array.isArray(draft.weekdays) ? draft.weekdays.map(Number).filter(n => n >= 0 && n <= 6) : [];
+    const wanted = days.length ? new Set(days) : new Set([0, 1, 2, 3, 4, 5, 6]);
+    for (let offset = 0; offset < 8; offset += 1) {
+      const candidate = setClock(new Date(base.getTime() + offset * 86_400_000));
+      if (candidate <= base) continue;
+      if (!wanted.has(candidate.getDay())) continue;
+      if (beforeStart(candidate) || afterEnd(candidate)) return null;
+      return candidate;
+    }
+    return null;
+  }
+  // daily / weekdays
+  const wantedDays = kind === "weekdays" ? new Set([1, 2, 3, 4, 5]) : new Set([0, 1, 2, 3, 4, 5, 6]);
+  for (let offset = 0; offset < 8; offset += 1) {
+    const candidate = setClock(new Date(base.getTime() + offset * 86_400_000));
+    if (candidate <= base) continue;
+    if (!wantedDays.has(candidate.getDay())) continue;
+    if (beforeStart(candidate) || afterEnd(candidate)) return null;
+    return candidate;
+  }
+  return null;
+}
+
 export function defaultDraft(prefill = {}) {
   const scheduleKind = prefill.schedule?.kind || "daily";
   const hasExplicitWeekdays = Array.isArray(prefill.schedule?.weekdays);
@@ -1177,6 +1250,9 @@ export async function activate(ctx) {
   };
 
   const listeners = new Set();
+  // 主区「全局护栏」的未保存草稿；后台推送重建主区时用它保住用户输入。
+  let guardrailsDraft = null;
+
   function notify() {
     for (const fn of [...listeners]) {
       try { fn(); } catch {}
@@ -1231,6 +1307,10 @@ export async function activate(ctx) {
 
   const onActiveSessionChange = () => {
     closeMainArea();
+    // 右侧面板跟随当前会话：切会话后它必须显示新会话的绑定任务，否则卡片
+    // 仍属于上一个会话，点进去的创建按钮也会带错 sessionId。
+    state.rightPanelSessionId = ctx.sessions?.activeId?.() || "";
+    notify();
   };
   const onOpenRunsEvent = event => {
     const detail = event && typeof event === "object" ? event.detail : null;
@@ -1287,6 +1367,9 @@ export async function activate(ctx) {
     let gitStatus = null;
     let gitCheckSeq = 0;
     let gitCheckTimer = null;
+    // 只重建 Git 警告区：检查返回时整块重建对话框会打断输入，也会把用户滚动
+    // 到的时间设置弹回顶部。
+    let refreshYoloRegion = null;
 
     function effectiveYoloCwd() {
       if (draft.cwd && draft.cwd.trim()) return draft.cwd.trim();
@@ -1306,7 +1389,7 @@ export async function activate(ctx) {
         return;
       }
       gitChecking = true;
-      renderDialog();
+      if (typeof refreshYoloRegion === "function") refreshYoloRegion();
       try {
         const res = await ctx.core.request("schedule.checkGit", { cwd: targetCwd });
         if (disposed || seq !== gitCheckSeq || dialogEl !== dialog) return;
@@ -1317,7 +1400,8 @@ export async function activate(ctx) {
       } finally {
         if (!disposed && seq === gitCheckSeq && dialogEl === dialog) {
           gitChecking = false;
-          renderDialog();
+          if (typeof refreshYoloRegion === "function") refreshYoloRegion();
+          else renderDialog();
         }
       }
     }
@@ -1349,6 +1433,7 @@ export async function activate(ctx) {
     }
 
     const dialog = doc.createElement("dialog");
+    let dialogBody = null;
     dialog.className = "ekd-sched-dialog";
     dialog.setAttribute("aria-label", draft.id ? "编辑定时任务" : "新建定时任务");
 
@@ -1445,6 +1530,38 @@ export async function activate(ctx) {
       ]);
     }
 
+    // 每个可聚焦控件带一个稳定键；重建时按它恢复焦点与光标，用户输入路径
+    // 或改时间后不会因为整块 replaceChildren 而丢焦点。
+    const focusKey = (node) => (node && node.getAttribute ? node.getAttribute("data-ekd-focus") : "") || "";
+    function captureFocus(bodyEl) {
+      const active = doc.activeElement;
+      const key = focusKey(active);
+      const scrollTop = bodyEl ? bodyEl.scrollTop : 0;
+      if (!key) return { key: "", scrollTop, start: null, end: null };
+      let start = null;
+      let end = null;
+      try {
+        if (typeof active.selectionStart === "number") {
+          start = active.selectionStart;
+          end = active.selectionEnd;
+        }
+      } catch (error) {
+        start = null;
+      }
+      return { key, scrollTop, start, end };
+    }
+    function restoreFocus(bodyEl, saved) {
+      if (!bodyEl) return;
+      if (saved.scrollTop) bodyEl.scrollTop = saved.scrollTop;
+      if (!saved.key) return;
+      const target = bodyEl.querySelector(`[data-ekd-focus="${saved.key}"]`);
+      if (!target || typeof target.focus !== "function") return;
+      target.focus({ preventScroll: true });
+      if (saved.start != null && typeof target.setSelectionRange === "function") {
+        try { target.setSelectionRange(saved.start, saved.end ?? saved.start); } catch (error) {}
+      }
+    }
+
     function renderDialog() {
       const selectedModel = state.models.find(m => m.id === draft.model) || null;
       const efforts = effortOptionsForModel(selectedModel);
@@ -1480,6 +1597,7 @@ export async function activate(ctx) {
           type: "text",
           class: "ekd-sd-input",
           placeholder: "例如：每日代码变更摘要",
+          "data-ekd-focus": "name",
           value: draft.name,
           onInput: e => { draft.name = e.target.value; },
         }),
@@ -1508,6 +1626,7 @@ export async function activate(ctx) {
       const promptTextarea = el(doc, "textarea", {
         class: "ekd-sd-textarea",
         placeholder: "任务到点后将自动发送此提示词…",
+        "data-ekd-focus": "prompt",
         value: draft.prompt,
         onInput: e => {
           draft.prompt = e.target.value;
@@ -1597,6 +1716,7 @@ export async function activate(ctx) {
           type: "text",
           class: "ekd-sd-input",
           placeholder: "/path/to/project",
+          "data-ekd-focus": "cwd",
           value: draft.cwd,
           onInput: e => {
             const nextCwd = e.target.value;
@@ -1667,6 +1787,13 @@ export async function activate(ctx) {
           el(doc, "p", {
             class: "ekd-sd-hint",
             text: "新开会话标题将自动加上「[定时] 」前缀；不需要自动归档时可取消勾选。",
+          }),
+          el(doc, "p", {
+            class: "ekd-sd-hint",
+            "data-ekd-archive-hint": "true",
+            text: draft.archiveOnRead
+              ? "与「运行记录」页的「完成后自动标为已读」配合使用：任务完成 → 自动标为已读 → 按这里的选择归档。任一步关闭都不会归档。"
+              : "未勾选自动归档：即使「运行记录」开启了「完成后自动标为已读」，会话也不会被归档。",
           }),
         ]));
       } else {
@@ -1745,7 +1872,8 @@ export async function activate(ctx) {
       permSelect.value = draft.permissionMode;
       const permNote = PERMISSION_MODES.find(m => m.value === draft.permissionMode)?.note || "";
 
-      const yoloNodes = [];
+      const buildYoloNodes = () => {
+        const yoloNodes = [];
       if (draft.permissionMode === "yolo") {
         if (gitChecking) {
           yoloNodes.push(el(doc, "p", { class: "ekd-sd-hint", text: "正在检查项目目录的 Git 工作区状态…" }));
@@ -1779,11 +1907,22 @@ export async function activate(ctx) {
         }
       }
 
+        return yoloNodes;
+      };
+      const yoloRegion = el(doc, "div", { "data-ekd-yolo-region": "true" });
+      const rebuildYoloRegion = () => {
+        yoloRegion.replaceChildren(...buildYoloNodes());
+      };
+      rebuildYoloRegion();
+      refreshYoloRegion = () => {
+        if (!yoloRegion.isConnected) return;
+        rebuildYoloRegion();
+      };
       bodyChildren.push(el(doc, "div", { class: "ekd-sd-field" }, [
         el(doc, "label", { class: "ekd-sd-label" }, [el(doc, "strong", { text: "权限模式" })]),
         permSelect,
         el(doc, "p", { class: "ekd-sd-hint", text: permNote }),
-        ...yoloNodes,
+        yoloRegion,
       ]));
 
       bodyChildren.push(el(doc, "div", { class: "ekd-sd-grid2" }, [
@@ -1796,6 +1935,7 @@ export async function activate(ctx) {
             class: "ekd-sd-input",
             style: "font-variant-numeric:tabular-nums",
             "aria-label": "单次超时（分钟）",
+            "data-ekd-focus": "timeout",
             value: String(draft.timeoutMinutes),
             onInput: e => {
               const parsed = Number.parseInt(e.target.value, 10);
@@ -1813,6 +1953,7 @@ export async function activate(ctx) {
             class: "ekd-sd-input",
             style: "font-variant-numeric:tabular-nums",
             "aria-label": "最大回合数",
+            "data-ekd-focus": "maxTurns",
             value: String(draft.maxTurns),
             onInput: e => {
               const parsed = Number.parseInt(e.target.value, 10);
@@ -1823,13 +1964,29 @@ export async function activate(ctx) {
         ]),
       ]));
 
-      const previewTextEl = el(doc, "span", { text: formatSchedulePreview(draft) });
+      const previewTextEl = el(doc, "span", { "data-ekd-preview-text": "true", text: formatSchedulePreview(draft) });
+      const nextRunEl = el(doc, "span", {
+        class: "ekd-sd-hint",
+        "data-ekd-next-run": "true",
+        text: previewNextRun(draft),
+      });
+      function previewNextRun(value) {
+        const next = estimateNextRun(value);
+        if (!next) return draft.scheduleKind === "once" ? "选择日期后显示预计执行时间" : "保存后由核心计算下次执行时间";
+        return `预计下次执行：${formatDateTime(next.toISOString())}（估算，保存后以核心排程为准）`;
+      }
       const previewBar = el(doc, "div", { class: "ekd-sd-preview", role: "status", "aria-live": "polite" }, [
         makeSvg(doc, SCHEDULER_ICON, 15),
         previewTextEl,
+        nextRunEl,
       ]);
       const updatePreview = () => {
         previewTextEl.textContent = formatSchedulePreview(draft);
+        nextRunEl.textContent = previewNextRun(draft);
+        const live = dialog.querySelector("[data-ekd-preview-text]");
+        if (live && live !== previewTextEl) live.textContent = previewTextEl.textContent;
+        const liveNext = dialog.querySelector("[data-ekd-next-run]");
+        if (liveNext && liveNext !== nextRunEl) liveNext.textContent = nextRunEl.textContent;
       };
 
       const tabItems = [...SCHEDULE_TABS];
@@ -2106,6 +2263,7 @@ export async function activate(ctx) {
               type: "text",
               class: "ekd-sd-input",
               placeholder: "每月几号，如 1, 15, 31",
+              "data-ekd-focus": "days",
               value: draft.daysText,
               onInput: e => { draft.daysText = e.target.value; updatePreview(); },
             }),
@@ -2125,6 +2283,53 @@ export async function activate(ctx) {
         );
       }
 
+      // 原生日期选择器在部分客户端只发 input 不发 change，而且没有整块重建。
+      // 「清空」按钮的可用状态必须跟着输入立刻更新，否则选了日期它也一直是灰的。
+      const syncDateClearButtons = () => {
+        startClearBtn.disabled = !draft.startDate;
+        endClearBtn.disabled = !draft.endDate;
+      };
+      const startDateInput = el(doc, "input", {
+        type: "date",
+        class: "ekd-sd-input",
+        "data-ekd-focus": "startDate",
+        value: draft.startDate,
+        onInput: e => { draft.startDate = e.target.value; syncDateClearButtons(); updatePreview(); },
+        onChange: e => { draft.startDate = e.target.value; syncDateClearButtons(); updatePreview(); },
+      });
+      const endDateInput = el(doc, "input", {
+        type: "date",
+        class: "ekd-sd-input",
+        "data-ekd-focus": "endDate",
+        value: draft.endDate,
+        onInput: e => { draft.endDate = e.target.value; syncDateClearButtons(); updatePreview(); },
+        onChange: e => { draft.endDate = e.target.value; syncDateClearButtons(); updatePreview(); },
+      });
+      const startClearBtn = el(doc, "button", {
+        type: "button",
+        class: "ekd-sd-mini-btn",
+        text: "清空",
+        disabled: !draft.startDate,
+        onClick: () => {
+          draft.startDate = "";
+          startDateInput.value = "";
+          syncDateClearButtons();
+          updatePreview();
+        },
+      });
+      const endClearBtn = el(doc, "button", {
+        type: "button",
+        class: "ekd-sd-mini-btn",
+        text: "清空",
+        disabled: !draft.endDate,
+        onClick: () => {
+          draft.endDate = "";
+          endDateInput.value = "";
+          syncDateClearButtons();
+          updatePreview();
+        },
+      });
+
       if (draft.scheduleKind !== "once") {
         schedDetails.push(el(doc, "div", { class: "ekd-sd-validity" }, [
           el(doc, "div", { class: "ekd-sd-subblock" }, [
@@ -2135,37 +2340,15 @@ export async function activate(ctx) {
             el(doc, "div", { class: "ekd-sd-field" }, [
               el(doc, "span", { class: "ekd-sd-hint", text: "开始日期" }),
               el(doc, "div", { class: "ekd-sd-date-wrap" }, [
-                el(doc, "input", {
-                  type: "date",
-                  class: "ekd-sd-input",
-                  value: draft.startDate,
-                  onInput: e => { draft.startDate = e.target.value; updatePreview(); },
-                }),
-                el(doc, "button", {
-                  type: "button",
-                  class: "ekd-sd-mini-btn",
-                  text: "清空",
-                  disabled: !draft.startDate,
-                  onClick: () => { draft.startDate = ""; renderDialog(); },
-                }),
+                startDateInput,
+                startClearBtn,
               ]),
             ]),
             el(doc, "div", { class: "ekd-sd-field" }, [
               el(doc, "span", { class: "ekd-sd-hint", text: "结束日期" }),
               el(doc, "div", { class: "ekd-sd-date-wrap" }, [
-                el(doc, "input", {
-                  type: "date",
-                  class: "ekd-sd-input",
-                  value: draft.endDate,
-                  onInput: e => { draft.endDate = e.target.value; updatePreview(); },
-                }),
-                el(doc, "button", {
-                  type: "button",
-                  class: "ekd-sd-mini-btn",
-                  text: "清空",
-                  disabled: !draft.endDate,
-                  onClick: () => { draft.endDate = ""; renderDialog(); },
-                }),
+                endDateInput,
+                endClearBtn,
               ]),
             ]),
           ]),
@@ -2201,9 +2384,14 @@ export async function activate(ctx) {
         missedSeg,
       ]));
 
-      if (errorMsg) {
-        bodyChildren.push(el(doc, "div", { class: "ekd-sd-error", role: "alert", text: errorMsg }));
-      }
+      const errorNode = el(doc, "div", {
+        class: "ekd-sd-error",
+        role: "alert",
+        "data-ekd-dialog-error": "true",
+        text: errorMsg,
+      });
+      errorNode.hidden = !errorMsg;
+      bodyChildren.push(errorNode);
 
       async function submit(andRunNow) {
         if (busy) return;
@@ -2237,7 +2425,11 @@ export async function activate(ctx) {
             schedule: buildScheduleRule(draft),
           };
           const saved = await ctx.core.request("schedule.save", payload);
-          if (andRunNow && saved?.id) {
+          // 新建时 draft.id 还是空的；先回写保存返回的 id，之后再点「保存」
+          // 才是更新同一条任务，而不是再创建一条重复任务，试运行也才有目标。
+          if (saved?.id) draft.id = saved.id;
+          if (andRunNow) {
+            if (!saved?.id) throw new Error("任务已保存，但核心没有返回任务 id，无法立即试运行。");
             await ctx.core.request("schedule.runNow", { id: saved.id });
             state.activeTab = "runs";
           }
@@ -2264,13 +2456,21 @@ export async function activate(ctx) {
       ]);
 
       const foot = el(doc, "div", { class: "ekd-sd-foot" }, [
-        el(doc, "span", { class: "ekd-sd-foot-note", text: "建议先用低频配置「立即试运行」一次，确认输出与权限符合预期。" }),
+        el(doc, "span", {
+          class: "ekd-sd-foot-note",
+          text: state.kapConnected
+            ? "建议先用低频配置「立即试运行」一次，确认输出与权限符合预期。"
+            : "KAP 未连接：可以先保存任务，等官方客户端连通后再试运行。",
+        }),
         el(doc, "button", { type: "button", class: "ekd-sd-btn", text: "取消", disabled: busy, onClick: closeDialog }),
         el(doc, "button", {
           type: "button",
           class: "ekd-sd-btn",
           text: busy ? "执行中…" : "立即试运行",
-          disabled: busy,
+          // 核心只在 KAP 连通时执行任务；离线状态下点了也只会失败，
+          // 所以直接禁用并把原因写在提示里。
+          disabled: busy || !state.kapConnected,
+          title: state.kapConnected ? "" : "KAP 未连接时无法执行任务；打开官方客户端并保持登录后再试运行。",
           onClick: () => void submit(true),
         }),
         el(doc, "button", {
@@ -2282,7 +2482,17 @@ export async function activate(ctx) {
         }),
       ]);
 
-      dialog.replaceChildren(head, el(doc, "div", { class: "ekd-sd-body" }, bodyChildren), foot);
+      // The body node is built here so focus/scroll are read from and written to
+      // the same element instead of a querySelector the host document may not
+      // support on a detached dialog.
+      const previousBody = dialog.querySelector && typeof dialog.querySelector === "function"
+        ? dialog.querySelector(".ekd-sd-body")
+        : dialogBody;
+      const focusState = captureFocus(previousBody);
+      const body = el(doc, "div", { class: "ekd-sd-body" }, bodyChildren);
+      dialogBody = body;
+      dialog.replaceChildren(head, body, foot);
+      restoreFocus(body, focusState);
     }
 
     renderDialog();
@@ -2332,12 +2542,18 @@ export async function activate(ctx) {
       "aria-pressed": task.enabled ? "true" : "false",
       text: task.enabled ? "启用中" : "已暂停",
       onClick: async () => {
+        if (cardBusy) return;
+        cardBusy = true;
+        syncCardActions();
         try {
           await ctx.core.request("schedule.toggle", { id: task.id, enabled: !task.enabled });
           await refreshAll();
         } catch (error) {
           state.error = error instanceof Error ? error.message : String(error);
           notify();
+        } finally {
+          cardBusy = false;
+          syncCardActions();
         }
       },
     });
@@ -2378,58 +2594,102 @@ export async function activate(ctx) {
       ]));
     }
 
-    const actions = [
-      el(doc, "button", {
-        type: "button",
-        class: "sched-btn",
-        disabled: running || !state.kapConnected,
-        text: "立即运行一次",
-        onClick: async () => {
-          try {
-            await ctx.core.request("schedule.runNow", { id: task.id });
-            if (!options.compact) state.activeTab = "runs";
-            await refreshAll();
-          } catch (error) {
-            state.error = error instanceof Error ? error.message : String(error);
-            notify();
-          }
-        },
-      }),
-      el(doc, "button", {
-        type: "button",
-        class: "sched-btn",
-        text: "编辑",
-        onClick: () => openTaskDialog(task),
-      }),
-      el(doc, "button", {
-        type: "button",
-        class: "sched-btn",
-        text: task.enabled ? "暂停" : "恢复",
-        onClick: async () => {
-          try {
-            await ctx.core.request("schedule.toggle", { id: task.id, enabled: !task.enabled });
-            await refreshAll();
-          } catch (error) {
-            state.error = error instanceof Error ? error.message : String(error);
-            notify();
-          }
-        },
-      }),
-      el(doc, "button", {
-        type: "button",
-        class: "sched-btn danger",
-        text: "删除",
-        onClick: async () => {
-          try {
-            await ctx.core.request("schedule.delete", { id: task.id });
-            await refreshAll();
-          } catch (error) {
-            state.error = error instanceof Error ? error.message : String(error);
-            notify();
-          }
-        },
-      }),
-    ];
+    // 卡片上的每个请求进行中都要禁用操作，否则重复点击会建立多条删除/运行。
+    let cardBusy = false;
+    let confirmingDelete = false;
+    const actions = [];
+    const runNowBtn = el(doc, "button", {
+      type: "button",
+      class: "sched-btn",
+      disabled: running || !state.kapConnected,
+      text: "立即运行一次",
+      title: state.kapConnected ? "" : "KAP 未连接时无法执行任务。",
+      onClick: async () => {
+        if (cardBusy) return;
+        cardBusy = true;
+        syncCardActions();
+        try {
+          await ctx.core.request("schedule.runNow", { id: task.id });
+          if (!options.compact) state.activeTab = "runs";
+          await refreshAll();
+        } catch (error) {
+          state.error = error instanceof Error ? error.message : String(error);
+          notify();
+        } finally {
+          cardBusy = false;
+          syncCardActions();
+        }
+      },
+    });
+    // 卡片标题行的开关已经是暂停/恢复入口，操作区不再重复一份。
+    const editBtn = el(doc, "button", {
+      type: "button",
+      class: "sched-btn",
+      text: "编辑",
+      onClick: () => openTaskDialog(task),
+    });
+    const deleteBtn = el(doc, "button", {
+      type: "button",
+      class: "sched-btn danger",
+      text: "删除",
+      onClick: () => {
+        if (cardBusy) return;
+        confirmingDelete = true;
+        syncCardActions();
+      },
+    });
+    const confirmDeleteBtn = el(doc, "button", {
+      type: "button",
+      class: "sched-btn danger",
+      text: "确认删除",
+      hidden: true,
+      onClick: async () => {
+        if (cardBusy) return;
+        cardBusy = true;
+        syncCardActions();
+        try {
+          await ctx.core.request("schedule.delete", { id: task.id });
+          await refreshAll();
+        } catch (error) {
+          state.error = error instanceof Error ? error.message : String(error);
+          notify();
+        } finally {
+          cardBusy = false;
+          confirmingDelete = false;
+          syncCardActions();
+        }
+      },
+    });
+    const cancelDeleteBtn = el(doc, "button", {
+      type: "button",
+      class: "sched-btn quiet",
+      text: "取消",
+      hidden: true,
+      onClick: () => {
+        confirmingDelete = false;
+        syncCardActions();
+      },
+    });
+    const deleteHint = el(doc, "span", {
+      class: "sched-delete-hint",
+      "data-ekd-delete-hint": "true",
+      hidden: true,
+      text: `删除「${task.name}」后其运行记录也会一并移除，且无法恢复。`,
+    });
+    function syncCardActions() {
+      runNowBtn.disabled = cardBusy || running || !state.kapConnected;
+      editBtn.disabled = cardBusy;
+      deleteBtn.hidden = confirmingDelete;
+      deleteBtn.disabled = cardBusy;
+      confirmDeleteBtn.hidden = !confirmingDelete;
+      cancelDeleteBtn.hidden = !confirmingDelete;
+      confirmDeleteBtn.disabled = cardBusy;
+      cancelDeleteBtn.disabled = cardBusy;
+      deleteHint.hidden = !confirmingDelete;
+      toggleBtn.disabled = cardBusy;
+    }
+    actions.push(runNowBtn, editBtn, deleteBtn, confirmDeleteBtn, cancelDeleteBtn);
+    syncCardActions();
 
     return el(doc, "div", { class: "sched-card" }, [
       el(doc, "div", { class: "sched-card-top" }, [
@@ -2440,6 +2700,7 @@ export async function activate(ctx) {
         toggleBtn,
       ]),
       el(doc, "div", { class: "sched-meta" }, metaRows),
+      deleteHint,
       el(doc, "div", { class: "sched-actions" }, actions),
     ]);
   }
@@ -2687,8 +2948,26 @@ export async function activate(ctx) {
       if (state.loading) {
         bodyChildren.push(el(doc, "div", { class: "sched-banner", text: "正在加载定时任务与运行记录…" }));
       } else if (state.activeTab === "tasks") {
+        // 用户正在编辑但还没保存的值。后台 schedule 推送会重建主区，如果每次都
+        // 用 state.prefs 覆盖输入框，正在输入的护栏值会被悄悄抹掉。
         let maxConcurrentDraft = state.prefs.maxConcurrent;
         let minQuotaDraft = state.prefs.minQuotaPercent;
+        let maxConcurrentEdited = false;
+        let minQuotaEdited = false;
+        if (guardrailsDraft) {
+          maxConcurrentDraft = guardrailsDraft.maxConcurrent;
+          minQuotaDraft = guardrailsDraft.minQuotaPercent;
+          maxConcurrentEdited = guardrailsDraft.maxEdited;
+          minQuotaEdited = guardrailsDraft.minEdited;
+        }
+        const rememberGuardrailsDraft = () => {
+          guardrailsDraft = {
+            maxConcurrent: maxConcurrentDraft,
+            minQuotaPercent: minQuotaDraft,
+            maxEdited: maxConcurrentEdited,
+            minEdited: minQuotaEdited,
+          };
+        };
         const guardrailsBar = el(doc, "div", { class: "sched-guardrails-bar", "data-ekd-global-guardrails": "true" }, [
           el(doc, "div", { class: "sched-guardrails-group" }, [
             el(doc, "strong", { style: "color:var(--sched-text);font-weight:600", text: "全局护栏" }),
@@ -2704,6 +2983,10 @@ export async function activate(ctx) {
                 onInput: e => {
                   const parsed = Number.parseInt(e.target.value, 10);
                   if (Number.isFinite(parsed)) maxConcurrentDraft = parsed;
+                  maxConcurrentEdited = true;
+                  // 编辑中清除上一次的“已保存”，避免它声称刚保存过旧值。
+                  state.prefsNotice = "";
+                  rememberGuardrailsDraft();
                 },
               }),
             ]),
@@ -2719,6 +3002,9 @@ export async function activate(ctx) {
                 onInput: e => {
                   const parsed = Number.parseInt(e.target.value, 10);
                   if (Number.isFinite(parsed)) minQuotaDraft = parsed;
+                  minQuotaEdited = true;
+                  state.prefsNotice = "";
+                  rememberGuardrailsDraft();
                 },
               }),
               "% 时跳过（0 为关闭）",
@@ -2738,6 +3024,7 @@ export async function activate(ctx) {
                     minQuotaPercent: Math.max(0, Math.min(95, Number(minQuotaDraft) || 0)),
                   });
                   state.prefsNotice = "已保存";
+                  guardrailsDraft = null;
                   await refreshAll();
                 } catch (error) {
                   state.error = error instanceof Error ? error.message : String(error);
@@ -2884,6 +3171,7 @@ export async function activate(ctx) {
 
     const draw = () => {
       const activeId = ctx.sessions?.activeId?.() || state.rightPanelSessionId || "";
+      state.rightPanelSessionId = activeId;
       const activeSession = state.sessions.find(s => s.id === activeId);
       const boundTasks = activeId ? state.tasks.filter(t => t.mode === "bound_session" && t.sessionId === activeId) : [];
 
@@ -2948,7 +3236,11 @@ export async function activate(ctx) {
         }
       }
 
-      shell.replaceChildren(head, el(doc, "div", { class: "sched-body" }, bodyChildren));
+      const banners = [];
+      if (state.error) {
+        banners.push(el(doc, "div", { class: "sched-banner error", role: "alert", "data-ekd-right-error": "true", text: state.error }));
+      }
+      shell.replaceChildren(head, ...banners, el(doc, "div", { class: "sched-body" }, bodyChildren));
     };
 
     listeners.add(draw);
