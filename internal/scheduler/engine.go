@@ -730,6 +730,9 @@ func (e *Engine) DeleteTask(ctx context.Context, pluginID, id string) error {
 }
 
 func (e *Engine) RunNow(ctx context.Context, pluginID, id string) (RunRecord, error) {
+	if e.Paused() {
+		return RunRecord{}, errors.New("账号切换中，定时任务已暂停，请稍后重试")
+	}
 	task, err := e.store.GetTask(ctx, pluginID, id)
 	if err != nil {
 		return RunRecord{}, err
@@ -952,6 +955,10 @@ func (e *Engine) executeRun(ctx context.Context, task Task, run RunRecord) {
 		e.finishRun(task, run, RunSkipped, FailureCancelled, "插件已停用，已取消本次运行", "")
 		return
 	}
+	if e.Paused() {
+		e.finishRun(task, run, RunSkipped, FailureCancelled, "账号切换中，定时任务已暂停", "")
+		return
+	}
 
 	run.Status = RunRunning
 	run.Message = "正在执行运行前校验…"
@@ -1031,6 +1038,10 @@ func (e *Engine) executeRun(ctx context.Context, task Task, run RunRecord) {
 	}
 
 	expandedPrompt := ExpandPrompt(task.Prompt, e.now(), e.loc, task.LastRunAt, task.LastSummary)
+	if e.Paused() {
+		e.finishRun(task, run, RunSkipped, FailureCancelled, "账号切换中，定时任务已暂停", targetSessionID)
+		return
+	}
 	if err := e.exec.SendPrompt(execCtx, targetSessionID, expandedPrompt, task.Model, task.Effort, task.PermissionMode); err != nil {
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
 			_ = e.exec.AbortSession(context.Background(), targetSessionID)
@@ -1079,20 +1090,27 @@ func (e *Engine) waitForSessionIdle(ctx context.Context, task Task, run *RunReco
 }
 
 func countNewTurns(turns []TurnInfo, prevLastTurnID string, prevTurnCount int) int {
+	return len(newTurnsSince(turns, prevLastTurnID, prevTurnCount))
+}
+
+// newTurnsSince returns only the turns produced after prevLastTurnID. A bound
+// session carries its whole history, and an approval left in that history must
+// not immediately fail every new run.
+func newTurnsSince(turns []TurnInfo, prevLastTurnID string, prevTurnCount int) []TurnInfo {
 	if len(turns) == 0 {
-		return 0
+		return nil
 	}
 	if prevLastTurnID != "" {
 		for i := len(turns) - 1; i >= 0; i-- {
 			if turns[i].TurnID == prevLastTurnID {
-				return len(turns) - 1 - i
+				return turns[i+1:]
 			}
 		}
 	}
-	if len(turns) > prevTurnCount {
-		return len(turns) - prevTurnCount
+	if len(turns) > prevTurnCount && prevTurnCount >= 0 {
+		return turns[prevTurnCount:]
 	}
-	return 0
+	return nil
 }
 
 func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionID string, prevTurnCount int, prevLastTurnID string, timeoutMin, maxTurns int) (string, string, string) {
@@ -1104,6 +1122,7 @@ func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionI
 			return RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟），已尝试中止当前会话", timeoutMin)
 		}
 		if parentCtx.Err() != nil {
+			e.abortRemoteSession(sessionID)
 			return RunSkipped, FailureCancelled, "任务已取消或插件已停用"
 		}
 
@@ -1114,6 +1133,7 @@ func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionI
 				return RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟），已尝试中止当前会话", timeoutMin)
 			}
 			if parentCtx.Err() != nil {
+				e.abortRemoteSession(sessionID)
 				return RunSkipped, FailureCancelled, "任务已取消或插件已停用"
 			}
 			return RunFailed, FailureExecution, "读取会话执行状态失败：" + err.Error()
@@ -1131,7 +1151,7 @@ func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionI
 					return RunFailed, FailureMaxTurns, fmt.Sprintf("已超过单次最大回合数限制（%d 回合），已尝试中止本次运行", maxTurns)
 				}
 			}
-			for _, turn := range turns {
+			for _, turn := range newTurnsSince(turns, prevLastTurnID, prevTurnCount) {
 				if turn.HasApproval {
 					detail := "会话出现待批准操作，无人值守模式不会自动批准，请打开会话处理"
 					if turn.ApprovalTitle != "" {
@@ -1173,10 +1193,25 @@ func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionI
 				_ = e.exec.AbortSession(context.Background(), sessionID)
 				return RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟），已尝试中止当前会话", timeoutMin)
 			}
+			// StopPlugin, DeleteTask and safe mode cancel the run context. The
+			// prompt is already sent, so the remote session must be told to stop
+			// with an independent context: this one is already cancelled.
+			e.abortRemoteSession(sessionID)
 			return RunSkipped, FailureCancelled, "任务已取消或插件已停用"
 		case <-time.After(e.pollInterval):
 		}
 	}
+}
+
+// abortRemoteSession stops a session after the run was cancelled. It uses a
+// short independent context because the run context is already done.
+func (e *Engine) abortRemoteSession(sessionID string) {
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = e.exec.AbortSession(ctx, sessionID)
 }
 
 func (e *Engine) finishRun(task Task, run RunRecord, status, failureKind, message, sessionID string) {

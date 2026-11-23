@@ -245,7 +245,11 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 		}
 		if keyStore != nil {
 			vault.UseKeyStore(keyStore)
-			if autoErr := vault.AutoUnlock(context.Background()); autoErr != nil {
+			// A locked screen or a Keychain prompt must not stall core startup.
+			unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			autoErr := vault.AutoUnlock(unlockCtx)
+			unlockCancel()
+			if autoErr != nil {
 				log.Printf("credential vault auto-unlock failed: %v", autoErr)
 			}
 		}
@@ -284,10 +288,10 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 		gw := gateway.New(providerClient, ledger, cfg.Dispatch, gatewayToken)
 		gw.Register(mux)
 		mux.HandleFunc("GET /enhance/v1/gateway", func(w http.ResponseWriter, r *http.Request) {
-			httpx.JSON(w, 200, map[string]any{"enabled": true, "baseUrl": app.gatewayBase, "tokenMasked": gateway.MaskToken(gatewayToken), "tokenAvailable": true, "streaming": true, "reasoningContent": true, "toolCalls": true, "multiAccount": false, "writesUserConfig": false})
+			httpx.JSON(w, 200, map[string]any{"enabled": true, "baseUrl": gatewayURLForRequest(app, r, guard), "tokenMasked": gateway.MaskToken(gatewayToken), "tokenAvailable": true, "streaming": true, "reasoningContent": true, "toolCalls": true, "multiAccount": false, "writesUserConfig": false})
 		})
 		mux.HandleFunc("GET /enhance/v1/gateway/preview", func(w http.ResponseWriter, r *http.Request) {
-			httpx.JSON(w, 200, gw.PreviewConfig(app.gatewayBase))
+			httpx.JSON(w, 200, gw.PreviewConfig(gatewayHostBase(app, r, guard)))
 		})
 		app.gateway = gw
 		app.modules = append(app.modules, Module{"gateway", "READY", "本机 OpenAI 兼容网关，单账号穿透"})
@@ -493,6 +497,47 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 	app.Handler = recoverer(app.wrapWindowsBridge(guard, guard.Wrap(mux)))
 	return app, nil
 }
+
+// gatewayHostBase returns the http://host[:port] the gateway is reachable on.
+// A configured base wins; otherwise the request's Host (or the guard's own host)
+// is used so a core started without an explicit base still advertises a usable
+// URL instead of an empty string.
+func gatewayHostBase(app *App, r *http.Request, guard *security.Guard) string {
+	if trimmed := strings.TrimRight(strings.TrimSpace(app.gatewayBase), "/"); trimmed != "" {
+		return trimmed
+	}
+	host := ""
+	if r != nil {
+		host = strings.TrimSpace(r.Host)
+	}
+	if host == "" && guard != nil {
+		host = strings.TrimSpace(guard.Host())
+	}
+	if host == "" {
+		return ""
+	}
+	return "http://" + host
+}
+
+// gatewayURLForRequest is the full OpenAI-compatible base, including /v1.
+func gatewayURLForRequest(app *App, r *http.Request, guard *security.Guard) string {
+	base := gatewayHostBase(app, r, guard)
+	if base == "" {
+		return ""
+	}
+	if strings.HasSuffix(base, "/v1") {
+		return base
+	}
+	return base + "/v1"
+}
+
+// StopEventPolling releases pending event long-polls before HTTP shutdown.
+func (a *App) StopEventPolling() {
+	if a != nil && a.native != nil {
+		a.native.Events().Close()
+	}
+}
+
 func (a *App) Close() error {
 	if a.updater != nil {
 		a.updater.Close()

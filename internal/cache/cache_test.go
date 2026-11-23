@@ -1484,3 +1484,46 @@ func TestLostBackgroundTaskClearsOpenBackground(t *testing.T) {
 		t.Fatalf("after resumed task terminated: open=%d, want 0", signals.OpenBackground)
 	}
 }
+
+// TestSummaryHitRateExcludesSilentModelsInputOther checks the aggregate rule: a
+// model that never reports cache fields must not have its uncached input counted
+// as a cache miss, because that would print a fabricated 0% hit rate.
+func TestSummaryHitRateExcludesSilentModelsInputOther(t *testing.T) {
+	home := t.TempDir()
+	base := time.Now().Add(-5 * time.Minute).UTC().Truncate(time.Millisecond)
+	reportedUsage := sampleUsage(1000, 0, 9000, 0)
+	silentUsage := sampleUsage(4000, 0, 0, 0)
+	writeWire(t, home, "session_mixed", "main",
+		plainLine(usageRecord("synthetic/reported", reportedUsage, "turn", base)),
+		plainLine(stepEnd("uuid-r1", "0", 1, reportedUsage, 500, 1200, "end_turn", base)),
+		plainLine(usageRecord("synthetic/silent", silentUsage, "turn", base.Add(time.Second))),
+		plainLine(stepEnd("uuid-s1", "0", 1, silentUsage, 500, 1200, "end_turn", base.Add(time.Second))),
+	)
+	store := newTestStore(t, home)
+	if _, err := store.Scan(context.Background(), base.Add(time.Minute), true); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.Summary(context.Background(), base.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the reporting model's 1000 uncached input tokens belong in the
+	// denominator; 9000 read / (1000 + 9000) = 0.9.
+	if summary.Today.HitRate == nil {
+		t.Fatalf("today hit rate is nil: %+v", summary.Today)
+	}
+	if got := *summary.Today.HitRate; got < 0.8999 || got > 0.9001 {
+		t.Fatalf("hit rate = %.4f, want 0.9 (silent model input must be excluded)", got)
+	}
+	if summary.Today.InputOther != 1000 {
+		t.Fatalf("today inputOther = %d, want 1000 (silent model excluded)", summary.Today.InputOther)
+	}
+
+	history, err := store.History(context.Background(), base.Add(2*time.Minute), "24h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history.Totals.HitRate == nil || *history.Totals.HitRate < 0.8999 || *history.Totals.HitRate > 0.9001 {
+		t.Fatalf("history hit rate = %v, want 0.9", history.Totals.HitRate)
+	}
+}

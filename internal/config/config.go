@@ -93,8 +93,8 @@ func (s *Store) Put(v Settings) error {
 }
 
 func (s *Store) Dispatch(fn func() error) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	// Deliberately lock-free: fn may stream a model response for many minutes, and
+	// holding the settings lock across it would block Put and safe-mode changes.
 	if s.Safe() {
 		return ErrSafeMode
 	}

@@ -9,9 +9,24 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 const securityCLI = "/usr/bin/security"
+
+// keychainTimeout bounds one `security` invocation. A locked screen or a
+// Keychain prompt would otherwise block the caller (and core startup) forever.
+const keychainTimeout = 5 * time.Second
+
+func keychainContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		return context.WithTimeout(context.Background(), keychainTimeout)
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, keychainTimeout)
+}
 
 type DarwinKeyStore struct{ account string }
 
@@ -41,6 +56,8 @@ func (k *DarwinKeyStore) Load(ctx context.Context) (string, bool, error) {
 // loadRaw reads the stored value without interpreting it, so Save can compare
 // what it wrote without decoding.
 func (k *DarwinKeyStore) loadRaw(ctx context.Context) (string, bool, error) {
+	ctx, cancel := keychainContext(ctx)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, securityCLI, "find-generic-password", "-s", osKeyStoreService, "-a", k.account, "-w")
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
@@ -63,6 +80,8 @@ func (k *DarwinKeyStore) loadRaw(ctx context.Context) (string, bool, error) {
 // command fails, so the value is read back and compared before reporting
 // success.
 func (k *DarwinKeyStore) Save(ctx context.Context, secret string) error {
+	ctx, cancel := keychainContext(ctx)
+	defer cancel()
 	stored := encodeKeyStoreSecret(secret)
 	command := fmt.Sprintf("add-generic-password -U -s %s -a %s -w %s\n",
 		quoteKeychainArg(osKeyStoreService), quoteKeychainArg(k.account), quoteKeychainArg(stored))
@@ -82,6 +101,8 @@ func (k *DarwinKeyStore) Save(ctx context.Context, secret string) error {
 }
 
 func (k *DarwinKeyStore) Delete(ctx context.Context) error {
+	ctx, cancel := keychainContext(ctx)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, securityCLI, "delete-generic-password", "-s", osKeyStoreService, "-a", k.account)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr

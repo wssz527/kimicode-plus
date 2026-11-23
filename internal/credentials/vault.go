@@ -24,9 +24,13 @@ var errVaultPassword = errors.New("cannot unlock vault")
 
 var refPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,199}$`)
 
+// unlockMu serializes the expensive unlock/reset paths (600k PBKDF2 rounds and
+// OS key store calls). It is separate from mu so Status and Unlocked never wait
+// behind a slow Keychain prompt, which is what used to stall /health.
 type Vault struct {
 	db        *sql.DB
-	mu        sync.Mutex
+	mu        sync.RWMutex
+	unlockMu  sync.Mutex
 	key       []byte
 	keyStore  OSKeyStore
 	onReset   func(context.Context) error
@@ -85,20 +89,28 @@ func open(key, data []byte, ref string) ([]byte, error) {
 func validVaultSecret(secret string) bool { return len(secret) >= 12 && len(secret) <= 1024 }
 
 func (v *Vault) Unlock(ctx context.Context, password string) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.unlockMu.Lock()
+	defer v.unlockMu.Unlock()
 	if err := v.unlockLocked(ctx, password); err != nil {
 		return err
 	}
 	// A manual password is the only way into a vault that predates OS key
 	// management, so remembering it here is what retires the password prompt.
 	// A key store failure must not turn a successful unlock into an error.
-	if v.keyStore != nil && v.keyStore.Available() {
-		if err := v.keyStore.Save(ctx, password); err == nil {
+	if store := v.keyStoreRef(); store != nil && store.Available() {
+		if err := store.Save(ctx, password); err == nil {
+			v.mu.Lock()
 			v.osManaged = true
+			v.mu.Unlock()
 		}
 	}
 	return nil
+}
+
+func (v *Vault) keyStoreRef() OSKeyStore {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.keyStore
 }
 
 func (v *Vault) unlockLocked(ctx context.Context, password string) error {
@@ -117,6 +129,9 @@ func (v *Vault) unlockLocked(ctx context.Context, password string) error {
 			return err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	key, err := pbkdf2.Key(sha256.New, password, salt, 600000, 32)
 	if err != nil {
 		return err
@@ -133,11 +148,19 @@ func (v *Vault) unlockLocked(ctx context.Context, password string) error {
 		clear(key)
 		return errVaultPassword
 	}
+	v.mu.Lock()
 	clear(v.key)
 	v.key = key
+	v.mu.Unlock()
 	return nil
 }
-func (v *Vault) Lock() { v.mu.Lock(); defer v.mu.Unlock(); clear(v.key); v.key = nil }
+
+func (v *Vault) Lock() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	clear(v.key)
+	v.key = nil
+}
 
 func (v *Vault) UseKeyStore(store OSKeyStore) {
 	v.mu.Lock()
@@ -151,7 +174,7 @@ func (v *Vault) UseOnReset(callback func(context.Context) error) {
 	v.onReset = callback
 }
 
-func (v *Vault) metaExistsLocked(ctx context.Context) (bool, error) {
+func (v *Vault) metaExists(ctx context.Context) (bool, error) {
 	var one int
 	err := v.db.QueryRowContext(ctx, `SELECT 1 FROM vault_meta WHERE id=1`).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -167,32 +190,35 @@ func (v *Vault) metaExistsLocked(ctx context.Context) (bool, error) {
 // every start: without a usable key store, or when the stored key does not open
 // an existing vault, the vault stays locked and waits for a manual password.
 func (v *Vault) AutoUnlock(ctx context.Context) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.key) > 0 {
+	v.unlockMu.Lock()
+	defer v.unlockMu.Unlock()
+	if v.Unlocked() {
 		return nil
 	}
-	if v.keyStore == nil || !v.keyStore.Available() {
+	store := v.keyStoreRef()
+	if store == nil || !store.Available() {
 		return nil
 	}
-	initialized, err := v.metaExistsLocked(ctx)
+	initialized, err := v.metaExists(ctx)
 	if err != nil {
 		return err
 	}
-	secret, found, loadErr := v.keyStore.Load(ctx)
+	secret, found, loadErr := store.Load(ctx)
 	if !initialized {
 		if loadErr != nil || !found || !validVaultSecret(secret) {
 			if secret, err = randomVaultSecret(); err != nil {
 				return err
 			}
-			if err = v.keyStore.Save(ctx, secret); err != nil {
+			if err = store.Save(ctx, secret); err != nil {
 				return err
 			}
 		}
 		if err = v.unlockLocked(ctx, secret); err != nil {
 			return err
 		}
+		v.mu.Lock()
 		v.osManaged = true
+		v.mu.Unlock()
 		return nil
 	}
 	if loadErr != nil || !found || !validVaultSecret(secret) {
@@ -204,7 +230,9 @@ func (v *Vault) AutoUnlock(ctx context.Context) error {
 		}
 		return err
 	}
+	v.mu.Lock()
 	v.osManaged = true
+	v.mu.Unlock()
 	return nil
 }
 
@@ -212,8 +240,8 @@ func (v *Vault) AutoUnlock(ctx context.Context) error {
 // recovery path for a forgotten manual password. With an OS key store the new
 // vault is unlocked again in the same call.
 func (v *Vault) Reset(ctx context.Context) (err error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.unlockMu.Lock()
+	defer v.unlockMu.Unlock()
 	tx, err := v.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -232,33 +260,41 @@ func (v *Vault) Reset(ctx context.Context) (err error) {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	v.mu.RLock()
+	onReset := v.onReset
+	v.mu.RUnlock()
 	// Once encrypted rows are gone, dependent account records must not survive
 	// even if recreating the OS-managed key later fails.
 	defer func() {
-		if v.onReset != nil {
-			err = errors.Join(err, v.onReset(ctx))
+		if onReset != nil {
+			err = errors.Join(err, onReset(ctx))
 		}
 	}()
+	v.mu.Lock()
 	clear(v.key)
 	v.key = nil
 	v.osManaged = false
-	if v.keyStore != nil {
-		_ = v.keyStore.Delete(ctx)
+	store := v.keyStore
+	v.mu.Unlock()
+	if store != nil {
+		_ = store.Delete(ctx)
 	}
-	if v.keyStore == nil || !v.keyStore.Available() {
+	if store == nil || !store.Available() {
 		return nil
 	}
 	secret, err := randomVaultSecret()
 	if err != nil {
 		return err
 	}
-	if err := v.keyStore.Save(ctx, secret); err != nil {
+	if err := store.Save(ctx, secret); err != nil {
 		return err
 	}
 	if err := v.unlockLocked(ctx, secret); err != nil {
 		return err
 	}
+	v.mu.Lock()
 	v.osManaged = true
+	v.mu.Unlock()
 	return nil
 }
 
@@ -271,8 +307,11 @@ func (v *Vault) Status(ctx context.Context) VaultStatus {
 }
 
 func (v *Vault) status(ctx context.Context) (VaultStatus, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.mu.RLock()
+	unlocked := len(v.key) > 0
+	osManaged := v.osManaged
+	store := v.keyStore
+	v.mu.RUnlock()
 	refs := []string{}
 	rows, err := v.db.QueryContext(ctx, `SELECT ref FROM vault_entries ORDER BY ref`)
 	if err != nil {
@@ -289,31 +328,44 @@ func (v *Vault) status(ctx context.Context) (VaultStatus, error) {
 	if err = rows.Err(); err != nil {
 		return VaultStatus{}, err
 	}
-	initialized, err := v.metaExistsLocked(ctx)
+	initialized, err := v.metaExists(ctx)
 	if err != nil {
 		return VaultStatus{}, err
 	}
 	backend := "NONE"
-	if v.keyStore != nil {
-		backend = v.keyStore.BackendName()
+	if store != nil {
+		backend = store.BackendName()
 	}
 	return VaultStatus{
-		Unlocked:            len(v.key) > 0,
+		Unlocked:            unlocked,
 		Refs:                refs,
 		Backend:             "AES256_GCM_PBKDF2",
-		OSKeychain:          v.osManaged,
-		OSKeychainAvailable: v.keyStore != nil && v.keyStore.Available(),
+		OSKeychain:          osManaged,
+		OSKeychainAvailable: store != nil && store.Available(),
 		OSKeychainBackend:   backend,
-		LegacyPasswordVault: initialized && len(v.key) == 0 && !v.osManaged,
+		LegacyPasswordVault: initialized && !unlocked && !osManaged,
 	}, nil
 }
 
 // Unlocked reports whether this process currently holds the vault key. It says
 // nothing about which entries exist, so it is safe to show a plugin.
 func (v *Vault) Unlocked() bool {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	return len(v.key) > 0
+}
+
+// keyCopy returns a private copy of the vault key so sealing and opening never
+// hold mu across a caller's database work or a Keychain round trip.
+func (v *Vault) keyCopy() []byte {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if len(v.key) == 0 {
+		return nil
+	}
+	key := make([]byte, len(v.key))
+	copy(key, v.key)
+	return key
 }
 
 // Exists reports whether an entry is stored, without decrypting it and without
@@ -321,8 +373,6 @@ func (v *Vault) Unlocked() bool {
 // locked vault must still be able to tell a plugin that its credential is
 // present but unusable until the user unlocks.
 func (v *Vault) Exists(ctx context.Context, ref string) (bool, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
 	var one int
 	err := v.db.QueryRowContext(ctx, `SELECT 1 FROM vault_entries WHERE ref=?`, ref).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -340,15 +390,15 @@ func (v *Vault) PutNew(ctx context.Context, ref string, value []byte) error {
 	return v.put(ctx, ref, value, false)
 }
 func (v *Vault) put(ctx context.Context, ref string, value []byte, replace bool) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.key) == 0 {
+	key := v.keyCopy()
+	if len(key) == 0 {
 		return ErrLocked
 	}
+	defer clear(key)
 	if !refPattern.MatchString(ref) || len(value) == 0 || len(value) > 32768 {
 		return errors.New("invalid credential")
 	}
-	data, err := seal(v.key, value, ref)
+	data, err := seal(key, value, ref)
 	if err != nil {
 		return err
 	}
@@ -363,11 +413,11 @@ func (v *Vault) put(ctx context.Context, ref string, value []byte, replace bool)
 	return err
 }
 func (v *Vault) Get(ctx context.Context, ref string) ([]byte, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.key) == 0 {
+	key := v.keyCopy()
+	if len(key) == 0 {
 		return nil, ErrLocked
 	}
+	defer clear(key)
 	var data []byte
 	err := v.db.QueryRowContext(ctx, `SELECT value FROM vault_entries WHERE ref=?`, ref).Scan(&data)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -376,12 +426,10 @@ func (v *Vault) Get(ctx context.Context, ref string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return open(v.key, data, ref)
+	return open(key, data, ref)
 }
 func (v *Vault) Delete(ctx context.Context, ref string) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.key) == 0 {
+	if !v.Unlocked() {
 		return ErrLocked
 	}
 	_, err := v.db.ExecContext(ctx, `DELETE FROM vault_entries WHERE ref=?`, ref)

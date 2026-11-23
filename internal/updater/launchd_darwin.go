@@ -248,12 +248,24 @@ func (job supervisorJob) stopLaunchdCore() error {
 	}
 	_ = job.launchdKill("SIGTERM")
 	_ = job.launchdBootout()
-	for deadline := time.Now().Add(launchdStopTimeout); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+	deadline := time.Now().Add(launchdStopTimeout)
+	escalated := false
+	for time.Now().Before(deadline) {
 		servicePID, serviceErr := job.launchdServicePID()
 		processStopped := pid <= 0 || !launchdProcessAlive(pid)
 		if (serviceErr != nil || servicePID <= 0) && processStopped {
 			return nil
 		}
+		// A candidate core that deadlocks on a database lock ignores SIGTERM.
+		// Escalate once to SIGKILL so rollback is never blocked forever.
+		if !escalated && time.Until(deadline) < launchdStopTimeout/2 {
+			escalated = true
+			_ = job.launchdKill("SIGKILL")
+			if pid > 1 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	return errors.New("等待登录项核心退出超时")
 }

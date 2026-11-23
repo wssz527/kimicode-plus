@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -612,6 +613,176 @@ func TestEngineBoundSessionDoesNotEarlyCompleteOnPriorAssistantMsg(t *testing.T)
 	runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
 	if runs[0].Status != RunAwaitingApproval {
 		t.Fatalf("expected awaiting_approval instead of early completion on prior assistant turn, got %+v", runs[0])
+	}
+}
+
+func TestEngineBoundSessionIgnoresHistoricalApproval(t *testing.T) {
+	db := openTestDB(t)
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newFakeExecutor()
+	base.sessions["s_hist"] = SessionInfo{ID: "s_hist", Title: "历史审批会话", CWD: t.TempDir(), Busy: false, PendingInteraction: "none"}
+	base.turns["s_hist"] = []TurnInfo{{TurnID: "turn_old", HasApproval: true, ApprovalTitle: "WriteFile", HasAssistantMsg: true}}
+
+	var polls atomic.Int32
+	exec := &delayedTurnExecutor{
+		fakeExecutor: base,
+		onGetSession: func(id string) {
+			if id != "s_hist" || len(base.sentPrompts) == 0 {
+				return
+			}
+			switch n := polls.Add(1); {
+			case n >= 4:
+				base.mu.Lock()
+				base.sessions[id] = SessionInfo{ID: id, Title: "历史审批会话", Busy: false, PendingInteraction: "none"}
+				base.turns[id] = []TurnInfo{
+					{TurnID: "turn_old", HasApproval: true, ApprovalTitle: "WriteFile", HasAssistantMsg: true},
+					{TurnID: "turn_new", HasAssistantMsg: true},
+				}
+				base.mu.Unlock()
+			case n >= 2:
+				base.mu.Lock()
+				base.sessions[id] = SessionInfo{ID: id, Title: "历史审批会话", Busy: true, PendingInteraction: "none"}
+				base.turns[id] = []TurnInfo{
+					{TurnID: "turn_old", HasApproval: true, ApprovalTitle: "WriteFile", HasAssistantMsg: true},
+					{TurnID: "turn_new", HasAssistantMsg: true},
+				}
+				base.mu.Unlock()
+			}
+		},
+	}
+
+	engine, err := NewEngine(store, exec, WithPollInterval(10*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	task, err := engine.SaveTask(context.Background(), "kimicode-plus.scheduler", SaveTaskInput{
+		Name: "历史审批不误杀", Prompt: "go", Mode: ModeBoundSession, SessionID: "s_hist",
+		PermissionMode: "manual", Schedule: ScheduleRule{Kind: "daily", Time: "09:00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.RunNow(context.Background(), "kimicode-plus.scheduler", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool {
+		runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+		return len(runs) == 1 && runs[0].Status != RunQueued && runs[0].Status != RunRunning
+	})
+	runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+	if runs[0].Status != RunCompleted {
+		t.Fatalf("historical approval killed the run: %+v", runs[0])
+	}
+}
+
+func TestEngineCancelledRunAbortsRemoteSession(t *testing.T) {
+	db := openTestDB(t)
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := newFakeExecutor()
+	exec.sessions["s_cancel"] = SessionInfo{ID: "s_cancel", Title: "取消会话", CWD: t.TempDir(), Busy: false, PendingInteraction: "none"}
+	exec.onPrompt = func(_ context.Context, sid, _, _, _, _ string) {
+		exec.mu.Lock()
+		exec.sessions[sid] = SessionInfo{ID: sid, Title: "取消会话", Busy: true, PendingInteraction: "none"}
+		exec.mu.Unlock()
+	}
+
+	engine, err := NewEngine(store, exec, WithPollInterval(200*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	task, err := engine.SaveTask(context.Background(), "kimicode-plus.scheduler", SaveTaskInput{
+		Name: "取消中止", Prompt: "work", Mode: ModeBoundSession, SessionID: "s_cancel",
+		PermissionMode: "manual", Schedule: ScheduleRule{Kind: "daily", Time: "09:00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.RunNow(context.Background(), "kimicode-plus.scheduler", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool {
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		return len(exec.sentPrompts) == 1
+	})
+	if err := engine.StopPlugin(context.Background(), "kimicode-plus.scheduler"); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool {
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		for _, id := range exec.abortedIDs {
+			if id == "s_cancel" {
+				return true
+			}
+		}
+		return false
+	})
+	runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+	if len(runs) != 1 || runs[0].Status != RunSkipped {
+		t.Fatalf("expected cancelled run, got %+v", runs)
+	}
+}
+
+func TestEngineRunNowRejectsWhenPaused(t *testing.T) {
+	db := openTestDB(t)
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := newFakeExecutor()
+	exec.sessions["s_pause"] = SessionInfo{ID: "s_pause", Title: "暂停会话", CWD: t.TempDir(), PendingInteraction: "none"}
+	engine, err := NewEngine(store, exec, WithPollInterval(10*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	task, err := engine.SaveTask(context.Background(), "kimicode-plus.scheduler", SaveTaskInput{
+		Name: "暂停拒绝", Prompt: "x", Mode: ModeBoundSession, SessionID: "s_pause",
+		PermissionMode: "manual", Schedule: ScheduleRule{Kind: "daily", Time: "09:00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resume := engine.Pause()
+	defer resume()
+	if _, err := engine.RunNow(context.Background(), "kimicode-plus.scheduler", task.ID); err == nil {
+		t.Fatal("RunNow started while the engine was paused")
+	}
+	resume()
+	if _, err := engine.RunNow(context.Background(), "kimicode-plus.scheduler", task.ID); err != nil {
+		t.Fatalf("RunNow after resume: %v", err)
+	}
+}
+
+func TestCheckGitWorktreeFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	if status := CheckGitWorktree(context.Background(), root); status.IsGitRepo || !status.Clean {
+		t.Fatalf("plain directory reported as repo: %+v", status)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "dirty.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	original := gitExecutables
+	gitExecutables = []string{"/nonexistent/git-for-test"}
+	defer func() { gitExecutables = original }()
+	status := CheckGitWorktree(context.Background(), root)
+	if !status.IsGitRepo || status.Clean || status.Error == "" {
+		t.Fatalf("git failure with a .git marker must fail closed: %+v", status)
 	}
 }
 

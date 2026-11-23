@@ -242,7 +242,13 @@ func (s *Store) sinceTotals(ctx context.Context, from time.Time) (rowTotals, spe
 func (s *Store) totalsWhere(ctx context.Context, clause string, args ...any) (rowTotals, speedAggregate, error) {
 	totals := rowTotals{}
 	speed := speedAggregate{}
-	query := `SELECT COUNT(*),COALESCE(SUM(input_cache_read),0),COALESCE(SUM(input_cache_creation),0),COALESCE(SUM(input_other),0),COALESCE(SUM(output),0) FROM cache_steps`
+	// input_other is only counted for models that reported at least one cache
+	// field. Counting it for a model that never reports cache usage would make
+	// its hit rate look like 0% instead of "not reported", and would disagree
+	// with the per-model rows and the retention buckets.
+	query := `SELECT COUNT(*),COALESCE(SUM(input_cache_read),0),COALESCE(SUM(input_cache_creation),0),` +
+		`COALESCE(SUM(CASE WHEN model IN (` + reportedModelsClause() + `) THEN input_other ELSE 0 END),0),` +
+		`COALESCE(SUM(output),0) FROM cache_steps`
 	if clause != "" {
 		query += ` WHERE ` + clause
 	}
@@ -262,6 +268,12 @@ func (s *Store) totalsWhere(ctx context.Context, clause string, args ...any) (ro
 		speed.add(Step{Output: output, DecodeMS: decode})
 	}
 	return totals, speed, rows.Err()
+}
+
+// reportedModelsClause names the models that have produced at least one non-zero
+// input_cache_read/creation value. Their input_other belongs in the denominator.
+func reportedModelsClause() string {
+	return `SELECT model FROM cache_steps GROUP BY model HAVING SUM(input_cache_read) > 0 OR SUM(input_cache_creation) > 0`
 }
 
 // speedClause narrows a clause to the rows that can produce a usable sample,
@@ -342,31 +354,48 @@ func (s *Store) modelBreakdown(ctx context.Context, from time.Time) ([]ModelBrea
 	if err = rows.Err(); err != nil {
 		return nil, err
 	}
+	speeds, err := s.modelSpeeds(ctx, from)
+	if err != nil {
+		return nil, err
+	}
 	for index := range models {
-		speed, speedErr := s.modelSpeed(ctx, models[index].Model, from)
-		if speedErr != nil {
-			return nil, speedErr
+		if speed, ok := speeds[models[index].Model]; ok {
+			models[index].Speed = speed
+		} else {
+			models[index].Speed = Speed{State: NoSamples}
 		}
-		models[index].Speed = speed
 	}
 	return models, nil
 }
 
+// modelSpeeds aggregates every model's decoding speed in one grouped query.
+// Reading it per model cost one query per row of the summary.
+func (s *Store) modelSpeeds(ctx context.Context, from time.Time) (map[string]Speed, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT model,SUM(output),SUM(decode_ms),COUNT(*) FROM cache_steps WHERE time>=? AND output>? AND decode_ms>? GROUP BY model`, storage.SortableTime(from), minSpeedOutput, minSpeedDecodeMS)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	speeds := map[string]Speed{}
+	for rows.Next() {
+		var model string
+		var aggregate speedAggregate
+		if err = rows.Scan(&model, &aggregate.output, &aggregate.decodeMS, &aggregate.samples); err != nil {
+			return nil, err
+		}
+		speeds[model] = aggregate.speed()
+	}
+	return speeds, rows.Err()
+}
+
 func (s *Store) modelSpeed(ctx context.Context, model string, from time.Time) (Speed, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT output,decode_ms FROM cache_steps WHERE model=? AND time>=? AND output>? AND decode_ms>?`, model, storage.SortableTime(from), minSpeedOutput, minSpeedDecodeMS)
+	var aggregate speedAggregate
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(output),0),COALESCE(SUM(decode_ms),0),COUNT(*) FROM cache_steps WHERE model=? AND time>=? AND output>? AND decode_ms>?`, model, storage.SortableTime(from), minSpeedOutput, minSpeedDecodeMS).
+		Scan(&aggregate.output, &aggregate.decodeMS, &aggregate.samples)
 	if err != nil {
 		return Speed{State: NoSamples}, err
 	}
-	defer rows.Close()
-	speed := speedAggregate{}
-	for rows.Next() {
-		var output, decode int64
-		if err = rows.Scan(&output, &decode); err != nil {
-			return Speed{State: NoSamples}, err
-		}
-		speed.add(Step{Output: output, DecodeMS: decode})
-	}
-	return speed.speed(), rows.Err()
+	return aggregate.speed(), nil
 }
 
 // Sessions lists recently active sessions newest first.
@@ -461,6 +490,26 @@ func (s *Store) recentTotals(ctx context.Context, sessionID string, count int) (
 	return totals, speed, rows.Err()
 }
 
+// reportedModels returns the set of models that ever reported a cache field.
+// Aggregates exclude input_other from every other model, so a provider that does
+// not report cache usage cannot look like a 0% hit rate.
+func (s *Store) reportedModels(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT model FROM cache_steps GROUP BY model HAVING SUM(input_cache_read) > 0 OR SUM(input_cache_creation) > 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	reported := map[string]bool{}
+	for rows.Next() {
+		var model string
+		if err = rows.Scan(&model); err != nil {
+			return nil, err
+		}
+		reported[model] = true
+	}
+	return reported, rows.Err()
+}
+
 // History aggregates by hour or day over one of the three accepted ranges.
 func (s *Store) History(ctx context.Context, now time.Time, span string) (History, error) {
 	if err := s.ready(); err != nil {
@@ -499,7 +548,11 @@ func (s *Store) History(ctx context.Context, now time.Time, span string) (Histor
 		}
 		cursor = cursor.Add(step)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT time,agent,input_cache_read,input_cache_creation,input_other,output,decode_ms FROM cache_steps WHERE time>=? ORDER BY time ASC`, storage.SortableTime(from))
+	reported, err := s.reportedModels(ctx)
+	if err != nil {
+		return History{}, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT time,agent,model,input_cache_read,input_cache_creation,input_other,output,decode_ms FROM cache_steps WHERE time>=? ORDER BY time ASC`, storage.SortableTime(from))
 	if err != nil {
 		return History{}, err
 	}
@@ -511,9 +564,9 @@ func (s *Store) History(ctx context.Context, now time.Time, span string) (Histor
 	}
 	byBucket := map[string]*acc{}
 	for rows.Next() {
-		var at, agent string
+		var at, agent, model string
 		var read, creation, other, output, decode int64
-		if err = rows.Scan(&at, &agent, &read, &creation, &other, &output, &decode); err != nil {
+		if err = rows.Scan(&at, &agent, &model, &read, &creation, &other, &output, &decode); err != nil {
 			return History{}, err
 		}
 		parsed := parseTime(at)
@@ -529,16 +582,22 @@ func (s *Store) History(ctx context.Context, now time.Time, span string) (Histor
 			entry = &acc{}
 			byBucket[label] = entry
 		}
+		// A model that never reports cache fields contributes no cache signal,
+		// so its uncached input must not be counted as a cache miss.
+		countedOther := other
+		if !reported[model] {
+			countedOther = 0
+		}
 		entry.totals.steps++
 		entry.totals.read += read
 		entry.totals.creation += creation
-		entry.totals.other += other
+		entry.totals.other += countedOther
 		entry.totals.output += output
 		if agent != "" && agent != "main" {
 			entry.sub.steps++
 			entry.sub.read += read
 			entry.sub.creation += creation
-			entry.sub.other += other
+			entry.sub.other += countedOther
 			entry.sub.output += output
 		}
 		entry.speed.add(Step{Output: output, DecodeMS: decode})
@@ -582,7 +641,13 @@ func (s *Store) Retention(ctx context.Context, now time.Time) (Retention, error)
 	if err := s.ready(); err != nil {
 		return Retention{}, err
 	}
+	// The overall buckets use the same rule as the per-model rows: only models
+	// that actually report cache fields contribute samples and uncached input.
 	aggregates := make([]rowTotals, len(retentionBounds))
+	reportedModelsForRetention, err := s.reportedModels(ctx)
+	if err != nil {
+		return Retention{}, err
+	}
 	byModel := make(map[string]*modelRetentionAggregate)
 	rows, err := s.db.QueryContext(ctx, `SELECT session_id,time,model,input_cache_read,input_cache_creation,input_other FROM cache_steps WHERE agent='main' ORDER BY session_id,time ASC`)
 	if err != nil {
@@ -618,7 +683,14 @@ func (s *Store) Retention(ctx context.Context, now time.Time) (Retention, error)
 				if gap < bound.min || (bound.max > 0 && gap >= bound.max) {
 					continue
 				}
-				addRetentionSample(&aggregates[index], read, creation, other)
+				// A model that never reports cache fields contributes no cache
+				// signal: its step still counts as a transition, but its uncached
+				// input must not be counted as a cache miss in the denominator.
+				sampleOther := other
+				if !reportedModelsForRetention[model] {
+					sampleOther = 0
+				}
+				addRetentionSample(&aggregates[index], read, creation, sampleOther)
 				if aggregate != nil && model == previousModel {
 					addRetentionSample(&aggregate.buckets[index], read, creation, other)
 					aggregate.samples++

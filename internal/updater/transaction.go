@@ -201,9 +201,6 @@ func restoreDatabases(dataDir, backupDir string) error {
 		if !entry.Type().IsRegular() || !databaseFile(name) {
 			continue
 		}
-		if err := removeUpdateFile(filepath.Join(dataDir, name)); err != nil {
-			return fmt.Errorf("无法替换数据库 %s：%w", name, err)
-		}
 		if err := atomicCopy(filepath.Join(backupDir, name), filepath.Join(dataDir, name), 0o600); err != nil {
 			return fmt.Errorf("无法还原数据库 %s：%w", name, err)
 		}

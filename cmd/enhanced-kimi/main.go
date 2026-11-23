@@ -296,6 +296,12 @@ func runCore(updateAPIBaseURL string, updateHTTPClient *http.Client) error {
 	}
 	shutdown, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
+	// Stop event long-polling before shutting the server down: a pending Poll
+	// otherwise holds its request for the full client timeout (8-10s), which is
+	// exactly the delay that used to make every exit and updater restart wait.
+	if app != nil {
+		app.StopEventPolling()
+	}
 	if err = httpServer.Shutdown(shutdown); err != nil {
 		_ = httpServer.Close()
 		if !restarting {

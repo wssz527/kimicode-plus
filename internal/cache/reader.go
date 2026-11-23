@@ -188,8 +188,9 @@ type parser struct {
 	// lifecycle, because no event is written when a wait begins: task.waitDelivered is
 	// the delivery of a wait that has already finished.
 	blocked bool
-	// pendingBlockingCalls counts issued calls of a blocking tool awaiting a result.
-	pendingBlockingCalls int
+	// pendingBlockingCalls holds the ToolCallID of every issued blocking call whose
+	// result has not arrived, so a result for a different call cannot clear the flag.
+	pendingBlockingCalls map[string]struct{}
 	// lastUserPrompt is the time of the newest turn.prompt written by the user.
 	lastUserPrompt int64
 	// backgroundSubagents holds the subagent IDs spawned with run_in_background that
@@ -205,10 +206,11 @@ type taskState struct {
 
 func newParser(agent string) *parser {
 	return &parser{
-		agent:               agent,
-		tasks:               map[string]taskState{},
-		taskAgents:          map[string]string{},
-		backgroundSubagents: map[string]bool{},
+		agent:                agent,
+		tasks:                map[string]taskState{},
+		taskAgents:           map[string]string{},
+		backgroundSubagents:  map[string]bool{},
+		pendingBlockingCalls: map[string]struct{}{},
 	}
 }
 
@@ -239,14 +241,16 @@ func (p *parser) consume(line []byte) error {
 		switch wire.Event.Type {
 		case "tool.call":
 			if isBlockingTool(wire.Event.Name) && wire.Event.ToolCallID != "" {
-				p.pendingBlockingCalls++
+				p.pendingBlockingCalls[wire.Event.ToolCallID] = struct{}{}
 				p.blocked = true
 			}
 			return nil
 		case "tool.result":
-			if wire.Event.ToolCallID != "" && p.pendingBlockingCalls > 0 {
-				p.pendingBlockingCalls--
-				p.blocked = p.pendingBlockingCalls > 0
+			if wire.Event.ToolCallID != "" {
+				if _, ok := p.pendingBlockingCalls[wire.Event.ToolCallID]; ok {
+					delete(p.pendingBlockingCalls, wire.Event.ToolCallID)
+				}
+				p.blocked = len(p.pendingBlockingCalls) > 0
 			}
 			return nil
 		}
@@ -330,7 +334,7 @@ func (p *parser) consume(line []byte) error {
 		}
 		p.closeTask(wire.Info.TaskID, wire.Info.AgentID)
 		p.blocked = false
-		p.pendingBlockingCalls = 0
+		p.pendingBlockingCalls = map[string]struct{}{}
 	case "task.waitDelivered":
 		// NOT a blocking-start marker. Verified against a real record: the sequence is
 		// WaitFor tool.call -> tool.result -> task.waitDelivered -> tool.result ->
@@ -348,7 +352,7 @@ func (p *parser) consume(line []byte) error {
 				p.closeTask(wire.Origin.TaskID, "")
 				if strings.EqualFold(strings.TrimSpace(wire.Origin.Status), "lost") {
 					p.blocked = false
-					p.pendingBlockingCalls = 0
+					p.pendingBlockingCalls = map[string]struct{}{}
 				}
 			}
 		}

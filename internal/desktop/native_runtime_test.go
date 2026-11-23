@@ -130,6 +130,35 @@ func TestEventBusScopesAndUnknownCursor(t *testing.T) {
 	}
 }
 
+func TestEventBusCloseReleasesPendingPoll(t *testing.T) {
+	bus := NewEventBus()
+	done := make(chan EventPage, 1)
+	go func() {
+		done <- bus.Poll(context.Background(), 0, []string{"accounts"}, 10*time.Second)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	started := time.Now()
+	bus.Close()
+	select {
+	case page := <-done:
+		if len(page.Events) != 0 {
+			t.Fatalf("closed poll invented events: %+v", page)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("close took %s, want an immediate return", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not release a pending poll")
+	}
+	// A poll issued after Close must return immediately too.
+	page := bus.Poll(context.Background(), 0, nil, 10*time.Second)
+	if len(page.Events) != 0 {
+		t.Fatalf("poll after close: %+v", page)
+	}
+	// Close is idempotent.
+	bus.Close()
+}
+
 func TestSessionViewPreservesMessagesAndPlanApproval(t *testing.T) {
 	cache := cachedSession{
 		session: NativeSession{ID: "s1", Title: "one"},
@@ -243,5 +272,20 @@ func TestPromptPreservesPermissionAndLocalAttachments(t *testing.T) {
 	}
 	if requests != 2 {
 		t.Fatalf("invalid input sent %d requests", requests)
+	}
+}
+
+func TestReplyRejectsUnknownDecision(t *testing.T) {
+	service := &NativeService{bus: NewEventBus()}
+	for _, decision := range []string{"approve", "APPROVED", "ok", ""} {
+		_, err := service.reply(context.Background(), map[string]any{
+			"id": "s1", "interactionId": "i1", "value": map[string]any{"decision": decision},
+		})
+		if err == nil {
+			t.Fatalf("decision %q was accepted", decision)
+		}
+		if service.kap != nil {
+			t.Fatal("a rejected decision must not reach the official client")
+		}
 	}
 }

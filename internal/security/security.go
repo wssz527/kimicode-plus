@@ -233,9 +233,20 @@ func (g *Guard) Pair(w http.ResponseWriter, r *http.Request) {
 			delete(g.grants, token)
 		}
 	}
+	// A full table is not a reason to refuse a new pairing: the oldest session
+	// is evicted instead. Refusing with 429 left the user unable to pair again
+	// without restarting the core, even when every entry was an abandoned tab.
 	if len(g.grants) >= 64 {
-		httpx.Fail(w, 429, "SESSION_LIMIT", "授权会话过多，请重启本增强服务后重新配对")
-		return
+		oldestToken := ""
+		var oldestExpiry time.Time
+		for token, v := range g.grants {
+			if oldestToken == "" || v.expires.Before(oldestExpiry) {
+				oldestToken, oldestExpiry = token, v.expires
+			}
+		}
+		if oldestToken != "" {
+			delete(g.grants, oldestToken)
+		}
 	}
 	token := Random()
 	g.grants[token] = grant{scopes, now.Add(12 * time.Hour)}

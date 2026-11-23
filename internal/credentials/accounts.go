@@ -36,8 +36,6 @@ func (a *KimiAccountVault) Exists(ctx context.Context, ref string) (bool, error)
 		return false, errors.New("invalid kimi account credential ref")
 	}
 	v := a.vault
-	v.mu.Lock()
-	defer v.mu.Unlock()
 	var one int
 	err := v.db.QueryRowContext(ctx, `SELECT 1 FROM vault_kimi_accounts WHERE ref=?`, ref).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -54,9 +52,7 @@ func (a *KimiAccountVault) Put(ctx context.Context, ref string, value []byte) er
 		return ErrUnavailable
 	}
 	v := a.vault
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.key) == 0 {
+	if !v.Unlocked() {
 		return ErrLocked
 	}
 	if !validKimiAccountRef(ref) || len(value) == 0 {
@@ -65,7 +61,9 @@ func (a *KimiAccountVault) Put(ctx context.Context, ref string, value []byte) er
 	if len(value) > KimiAccountValueLimit {
 		return ErrTooLarge
 	}
-	data, err := seal(v.key, value, ref)
+	key := v.keyCopy()
+	defer clear(key)
+	data, err := seal(key, value, ref)
 	if err != nil {
 		return err
 	}
@@ -81,9 +79,7 @@ func (a *KimiAccountVault) Get(ctx context.Context, ref string) ([]byte, error) 
 		return nil, errors.New("invalid kimi account credential ref")
 	}
 	v := a.vault
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.key) == 0 {
+	if !v.Unlocked() {
 		return nil, ErrLocked
 	}
 	var data []byte
@@ -94,7 +90,9 @@ func (a *KimiAccountVault) Get(ctx context.Context, ref string) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	return open(v.key, data, ref)
+	key := v.keyCopy()
+	defer clear(key)
+	return open(key, data, ref)
 }
 
 func (a *KimiAccountVault) Delete(ctx context.Context, ref string) error {
@@ -105,9 +103,7 @@ func (a *KimiAccountVault) Delete(ctx context.Context, ref string) error {
 		return errors.New("invalid kimi account credential ref")
 	}
 	v := a.vault
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.key) == 0 {
+	if !v.Unlocked() {
 		return ErrLocked
 	}
 	_, err := v.db.ExecContext(ctx, `DELETE FROM vault_kimi_accounts WHERE ref=?`, ref)

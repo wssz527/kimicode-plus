@@ -101,7 +101,7 @@ func (p *PlannerService) executeTool(ctx context.Context, root string, state *pl
 		path, err = plannerPath(root, input.Path, true)
 	}
 	if err == nil {
-		err = os.WriteFile(path, []byte(input.Content), 0644)
+		err = plannerWriteFile(path, []byte(input.Content))
 	}
 	if err != nil {
 		return "写入失败：" + err.Error(), nil
@@ -130,7 +130,7 @@ func (p *PlannerService) approveTool(state *plannerState, approvalID string, all
 }
 
 func plannerPath(root, requested string, allowMissing bool) (string, error) {
-	root, err := filepath.EvalSymlinks(root)
+	resolvedRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return "", errors.New("工作区不可用")
 	}
@@ -143,25 +143,27 @@ func plannerPath(root, requested string, allowMissing bool) (string, error) {
 	}
 	candidate := requested
 	if !filepath.IsAbs(candidate) {
-		candidate = filepath.Join(root, candidate)
+		candidate = filepath.Join(resolvedRoot, candidate)
 	}
 	candidate = filepath.Clean(candidate)
-	relative, err := filepath.Rel(root, candidate)
+	relative, err := filepath.Rel(resolvedRoot, candidate)
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
 		return "", errors.New("路径超出当前工作区")
+	}
+	if err := plannerRejectSymlinkSegments(resolvedRoot, candidate); err != nil {
+		return "", err
 	}
 	resolved, err := filepath.EvalSymlinks(candidate)
 	if err != nil {
 		if !allowMissing || !errors.Is(err, fs.ErrNotExist) {
 			return "", errors.New("路径不存在或无法访问")
 		}
-		resolved, err = filepath.EvalSymlinks(filepath.Dir(candidate))
+		resolved, err = plannerResolveMissing(resolvedRoot, candidate)
 		if err != nil {
-			return "", errors.New("父目录不存在或无法访问")
+			return "", err
 		}
-		resolved = filepath.Join(resolved, filepath.Base(candidate))
 	}
-	relative, err = filepath.Rel(root, resolved)
+	relative, err = filepath.Rel(resolvedRoot, resolved)
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
 		return "", errors.New("路径经符号链接超出当前工作区")
 	}
@@ -169,6 +171,81 @@ func plannerPath(root, requested string, allowMissing bool) (string, error) {
 		return "", errors.New("只允许普通文件或目录")
 	}
 	return resolved, nil
+}
+
+// plannerRejectSymlinkSegments walks every existing path segment between the
+// workspace root and candidate. A symlink anywhere on that path could otherwise
+// redirect a missing target outside the workspace after it is created.
+func plannerRejectSymlinkSegments(root, candidate string) error {
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return errors.New("路径超出当前工作区")
+	}
+	current := root
+	if relative == "." {
+		return nil
+	}
+	for _, segment := range strings.Split(relative, string(filepath.Separator)) {
+		current = filepath.Join(current, segment)
+		info, statErr := os.Lstat(current)
+		if errors.Is(statErr, fs.ErrNotExist) {
+			return nil
+		}
+		if statErr != nil {
+			return errors.New("路径不存在或无法访问")
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("路径包含符号链接，已拒绝")
+		}
+	}
+	return nil
+}
+
+// plannerResolveMissing resolves the nearest existing ancestor and appends the
+// still-missing segments, so docs/sub/plan.md can be created without requiring
+// every parent to exist before approval.
+func plannerResolveMissing(root, candidate string) (string, error) {
+	missing := []string{}
+	current := candidate
+	for {
+		info, err := os.Lstat(current)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return "", errors.New("路径包含符号链接，已拒绝")
+			}
+			break
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", errors.New("路径不存在或无法访问")
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", errors.New("父目录不存在或无法访问")
+		}
+		missing = append([]string{filepath.Base(current)}, missing...)
+		current = parent
+	}
+	resolved, err := filepath.EvalSymlinks(current)
+	if err != nil {
+		return "", errors.New("父目录不存在或无法访问")
+	}
+	relative, err := filepath.Rel(root, resolved)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return "", errors.New("路径经符号链接超出当前工作区")
+	}
+	parts := append([]string{resolved}, missing...)
+	return filepath.Join(parts...), nil
+}
+
+func plannerWriteFile(path string, data []byte) error {
+	info, err := os.Lstat(path)
+	if err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("目标路径是符号链接，已拒绝")
+	}
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
 }
 
 func plannerReadOnlyTool(root, name, path, pattern string) (string, error) {

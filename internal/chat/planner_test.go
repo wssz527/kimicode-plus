@@ -134,6 +134,67 @@ func TestPlannerStreamsAndApprovesEveryWrite(t *testing.T) {
 	}
 }
 
+func TestPlannerCreatesNestedDirectoriesAndRejectsSymlinks(t *testing.T) {
+	generator := plannerGeneratorFunc(func(ctx context.Context, model string, messages []provider.Message, tools []map[string]any, session string, emit func(provider.StreamEvent) error) error {
+		var last provider.Message
+		for _, message := range messages {
+			if message.Role == "tool" {
+				last = message
+			}
+		}
+		if !strings.Contains(last.Content, "已按用户批准写入") {
+			if err := emit(provider.StreamEvent{Text: "准备写入", Finish: "tool_calls", ToolCalls: []provider.ToolCallDelta{plannerCall("write_file", `{"path":"docs/sub/plan.md","content":"nested"}`)}}); err != nil {
+				return err
+			}
+			return nil
+		}
+		return emit(provider.StreamEvent{Text: "已完成", Finish: "stop"})
+	})
+	planner, _, root := newTestPlanner(t, generator)
+	id := createPlannerThread(t, planner, PlannerOptions{Tools: true})
+	sendPlanner(t, planner, id)
+	pending := waitPlanner(t, planner, id, func(thread PlannerThread) bool { return thread.Approval != nil })
+	if _, err := os.Stat(filepath.Join(root, "docs")); !os.IsNotExist(err) {
+		t.Fatal("nested directories were created before approval")
+	}
+	if _, err := planner.PlannerAction(context.Background(), "planner.approve", []byte(`{"id":"`+id+`","approvalId":"`+pending.Approval.ID+`","allow":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	waitPlanner(t, planner, id, func(thread PlannerThread) bool { return thread.Status == "idle" })
+	if data, err := os.ReadFile(filepath.Join(root, "docs", "sub", "plan.md")); err != nil || string(data) != "nested" {
+		t.Fatalf("nested write missing: %q %v", data, err)
+	}
+
+	outside := t.TempDir()
+	dangling := filepath.Join(root, "dangling")
+	if err := os.Symlink(filepath.Join(outside, "missing.txt"), dangling); err == nil {
+		if _, err := plannerPath(root, "dangling", true); err == nil {
+			t.Fatal("accepted a dangling symlink")
+		}
+		if _, err := plannerPath(root, "dangling/plan.md", true); err == nil {
+			t.Fatal("accepted a path through a dangling symlink")
+		}
+	}
+	internalLink := filepath.Join(root, "internal-link")
+	if err := os.Symlink(root, internalLink); err == nil {
+		if _, err := plannerPath(root, "internal-link/plan.md", true); err == nil {
+			t.Fatal("accepted a path through an internal symlink")
+		}
+	}
+	target := filepath.Join(outside, "outside.txt")
+	if err := os.WriteFile(target, []byte("private"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "write-link.md")); err == nil {
+		if err := plannerWriteFile(filepath.Join(root, "write-link.md"), []byte("overwritten")); err == nil {
+			t.Fatal("write followed a symlink")
+		}
+		if data, _ := os.ReadFile(target); string(data) != "private" {
+			t.Fatalf("outside file was modified: %q", data)
+		}
+	}
+}
+
 func TestPlannerReadonlyRefusesWrite(t *testing.T) {
 	var calls atomic.Int32
 	generator := plannerGeneratorFunc(func(ctx context.Context, model string, messages []provider.Message, tools []map[string]any, session string, emit func(provider.StreamEvent) error) error {

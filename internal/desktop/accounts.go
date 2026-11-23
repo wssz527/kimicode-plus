@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"enhancedkimi/internal/credentials"
+	"enhancedkimi/internal/platform"
 	"enhancedkimi/internal/quota"
 	"enhancedkimi/internal/security"
 	"enhancedkimi/internal/storage"
@@ -169,9 +170,12 @@ type accountRow struct {
 
 type pendingSwitchState struct {
 	info        AccountPendingSwitch
+	seq         uint64
 	expectedPID int
 	cancel      context.CancelFunc
 }
+
+var errAccountSwitchSuperseded = errors.New("账号切换请求已取消或已被新的切换取代")
 
 func (s *NativeService) UseVault(vault *credentials.Vault) {
 	s.mu.Lock()
@@ -314,7 +318,7 @@ func writeFileAtomic0600(target string, data []byte) error {
 		return writeErr
 	}
 	_ = os.Chmod(tmp, 0o600)
-	if err := os.Rename(tmp, target); err != nil {
+	if err := platform.RetryFileOperation(func() error { return os.Rename(tmp, target) }); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
@@ -550,6 +554,18 @@ func (s *NativeService) restoreAccountRecord(ctx context.Context, snapshot *acco
 		row.UserID, row.Label, row.Nickname, row.Avatar, row.Plan, row.Region, row.OAuthKey, row.OAuthHost, row.BaseURL, row.Status, row.StatusReason, row.QuotaJSON, row.ModelsJSON, row.LastSeenAt, row.CreatedAt, row.UpdatedAt, row.ID)
 	restoreErrs = append(restoreErrs, err)
 	return errors.Join(restoreErrs...)
+}
+
+func (s *NativeService) deleteAccountRecord(ctx context.Context, id string) error {
+	var deleteErrs []error
+	if vault := s.currentAccountVault(); vault != nil {
+		if err := vault.Delete(ctx, accountVaultRef(id)); err != nil && !errors.Is(err, credentials.ErrNotFound) {
+			deleteErrs = append(deleteErrs, err)
+		}
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM kimi_accounts WHERE id=?`, id)
+	deleteErrs = append(deleteErrs, err)
+	return errors.Join(deleteErrs...)
 }
 
 // readManagedProviderObject reads the raw managed:kimi-code provider object so a
@@ -1347,12 +1363,20 @@ func (s *NativeService) accountsSwitch(ctx context.Context, input map[string]any
 	if expectedPID <= 0 {
 		expectedPID = s.currentHostPID()
 	}
-	return s.executeAccountSwitch(ctx, targetID, waitUntilIdle, force, expectedPID)
+	return s.executeAccountSwitch(ctx, targetID, waitUntilIdle, force, expectedPID, 0)
 }
 
-func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID string, waitUntilIdle, force bool, expectedPID int) (AccountSwitchResult, error) {
+func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID string, waitUntilIdle, force bool, expectedPID int, queuedSeq uint64) (AccountSwitchResult, error) {
 	s.switchMu.Lock()
 	defer s.switchMu.Unlock()
+
+	queuedCancel, err := s.beginQueuedSwitch(ctx, queuedSeq, targetID)
+	if err != nil {
+		return AccountSwitchResult{}, err
+	}
+	if queuedCancel != nil {
+		defer queuedCancel()
+	}
 
 	vault := s.currentAccountVault()
 	if vault == nil {
@@ -1419,8 +1443,12 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 		}
 	}
 
-	// Clear any previous pending switch now that we are switching.
-	s.cancelPendingSwitchLocked()
+	// Clear any previous pending switch now that we are switching. A queued
+	// switch already cleared its own slot in beginQueuedSwitch, and canceling
+	// its watch context here would abort the switch that is now running.
+	if queuedSeq == 0 {
+		s.cancelPendingSwitchLocked()
+	}
 
 	// Step 2: Pause keepalive (N4) and scheduler (N5) during the switch.
 	resumeAutomation := s.pauseForAccountSwitch()
@@ -1486,6 +1514,7 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 		return nil
 	}
 	var currentRecordSnapshot *accountRecordSnapshot
+	autoSavedCurrentID := ""
 	targetCredentialWritten := false
 	configPatchAttempted := false
 	var previousProvider map[string]any
@@ -1505,6 +1534,11 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 		defer rbCancel()
 		if err := s.restoreAccountRecord(rbCtx, currentRecordSnapshot); err != nil {
 			recordErr = fmt.Errorf("恢复当前账号凭据库记录失败：%w", err)
+		}
+		if autoSavedCurrentID != "" {
+			if err := s.deleteAccountRecord(rbCtx, autoSavedCurrentID); err != nil {
+				recordErr = errors.Join(recordErr, fmt.Errorf("清理切换前临时保存的当前账号失败：%w", err))
+			}
 		}
 		if configPatchAttempted {
 			var restoreProvider any
@@ -1544,6 +1578,17 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 					if _, upsertErr := s.upsertAccountWithSecret(ctx, currentProfile, currentBytes, currentOAuthKey, currentOAuthHost, currentBaseURL, existingRow.Label); upsertErr != nil {
 						return rollback(fmt.Errorf("切换前更新当前账号凭据快照失败：%w", upsertErr))
 					}
+				} else {
+					// The user signed in to a new account but never pressed save.
+					// Overwriting the target credential path would silently lose
+					// this account's OAuth token, so persist it first; rollback
+					// removes the record when the switch fails.
+					label := firstNonEmpty(strings.TrimSpace(currentProfile.Nickname), strings.TrimSpace(currentProfile.Email), currentProfile.UserID)
+					summary, upsertErr := s.upsertAccountWithSecret(ctx, currentProfile, currentBytes, currentOAuthKey, currentOAuthHost, currentBaseURL, label)
+					if upsertErr != nil {
+						return rollback(fmt.Errorf("切换前保存当前未保存账号失败：%w", upsertErr))
+					}
+					autoSavedCurrentID = summary.ID
 				}
 			}
 		}
@@ -1726,7 +1771,9 @@ func (s *NativeService) queuePendingAccountSwitch(target accountRow, busyIDs []s
 		QueuedAt:       storage.SortableTime(time.Now().UTC()),
 	}
 	s.accountMu.Lock()
-	s.pendingSwitch = &pendingSwitchState{info: info, expectedPID: expectedPID, cancel: cancel}
+	s.switchSeq++
+	seq := s.switchSeq
+	s.pendingSwitch = &pendingSwitchState{info: info, seq: seq, expectedPID: expectedPID, cancel: cancel}
 	s.accountMu.Unlock()
 	s.bus.Publish("accounts", map[string]any{"type": "account.switch_queued", "pendingSwitch": info})
 
@@ -1760,10 +1807,13 @@ func (s *NativeService) queuePendingAccountSwitch(target accountRow, busyIDs []s
 					continue
 				}
 				checkCancel()
-				execCtx, execCancel := context.WithTimeout(s.ctx, 20*time.Second)
-				result, switchErr := s.executeAccountSwitch(execCtx, target.ID, false, false, expectedPID)
+				execCtx, execCancel := context.WithTimeout(watchCtx, 20*time.Second)
+				result, switchErr := s.executeAccountSwitch(execCtx, target.ID, false, false, expectedPID, seq)
 				execCancel()
 				if switchErr != nil {
+					if errors.Is(switchErr, errAccountSwitchSuperseded) {
+						return
+					}
 					var native *NativeError
 					if errors.As(switchErr, &native) && native.Code == "ACCOUNT_SWITCH_BUSY" {
 						continue
@@ -1792,6 +1842,29 @@ func (s *NativeService) cancelPendingSwitchLocked() {
 		s.pendingSwitch.cancel()
 		s.pendingSwitch = nil
 	}
+}
+
+// beginQueuedSwitch re-validates a queued switch after switchMu is held: the
+// request may have been cancelled or replaced by a different target while the
+// watcher was waiting, and an old goroutine must never switch back to its own
+// account. It clears the pending slot and returns that request's cancel func so
+// the caller can release the watch context when the switch is over.
+func (s *NativeService) beginQueuedSwitch(ctx context.Context, seq uint64, targetID string) (context.CancelFunc, error) {
+	if seq == 0 {
+		return nil, nil
+	}
+	s.accountMu.Lock()
+	defer s.accountMu.Unlock()
+	if s.pendingSwitch == nil || s.pendingSwitch.seq != seq || s.pendingSwitch.info.TargetID != targetID || ctx.Err() != nil {
+		if s.pendingSwitch != nil && s.pendingSwitch.seq == seq {
+			s.pendingSwitch.cancel()
+			s.pendingSwitch = nil
+		}
+		return nil, errAccountSwitchSuperseded
+	}
+	cancel := s.pendingSwitch.cancel
+	s.pendingSwitch = nil
+	return cancel, nil
 }
 
 func (s *NativeService) cancelPendingSwitchIfTarget(targetID string) {

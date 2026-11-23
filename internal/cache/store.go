@@ -236,37 +236,16 @@ func (s *Store) scanSession(ctx context.Context, session sessionDir, now time.Ti
 		}
 	}
 	if len(steps) > 0 {
-		if err := s.insertSteps(ctx, session.ID, steps); err != nil {
-			return err
-		}
 		result.Steps += len(steps)
 	}
-	if err := s.upsertSession(ctx, session, agentCount, now); err != nil {
-		return err
-	}
-	return s.upsertLive(ctx, session.ID, openBackground, blocked, lastUserPrompt, now)
+	return s.persistSession(ctx, session, agentCount, steps, openBackground, blocked, lastUserPrompt, now, result)
 }
 
-func (s *Store) insertSteps(ctx context.Context, sessionID string, steps []Step) error {
-	return storage.Transaction(ctx, s.db, func(tx *sql.Tx) error {
-		statement, err := tx.PrepareContext(ctx, `INSERT INTO cache_steps(session_id,agent,step_uuid,model,time,turn_id,step_index,finish_reason,input_other,input_cache_read,input_cache_creation,output,first_token_ms,decode_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id,agent,step_uuid) DO NOTHING`)
-		if err != nil {
-			return err
-		}
-		defer statement.Close()
-		for _, step := range steps {
-			if step.At.IsZero() {
-				continue
-			}
-			if _, err = statement.ExecContext(ctx, sessionID, step.Agent, step.StepUUID, step.Model, storage.SortableTime(step.At), step.TurnID, step.StepIndex, step.Finish, step.InputOther, step.InputCacheRead, step.InputCacheCreation, step.Output, step.FirstTokenMS, step.DecodeMS); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-func (s *Store) upsertSession(ctx context.Context, session sessionDir, agents int, now time.Time) error {
+// persistSession writes one session's new steps, metadata and live signals in a
+// single transaction. A session with no new steps and unchanged metadata/live
+// state is skipped entirely: the scan runs every few seconds and rewriting the
+// same row each pass only churns the database.
+func (s *Store) persistSession(ctx context.Context, session sessionDir, agents int, steps []Step, openBackground int, blocked bool, lastUserPrompt int64, now time.Time, result *ScanResult) error {
 	created, updated := "", ""
 	if session.Meta.CreatedAt > 0 {
 		created = storage.SortableTime(millis(session.Meta.CreatedAt))
@@ -274,17 +253,83 @@ func (s *Store) upsertSession(ctx context.Context, session sessionDir, agents in
 	if session.Meta.UpdatedAt > 0 {
 		updated = storage.SortableTime(millis(session.Meta.UpdatedAt))
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO cache_sessions(session_id,cwd,title,created_at,updated_at,agent_count,scanned_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET cwd=excluded.cwd,title=excluded.title,created_at=excluded.created_at,updated_at=excluded.updated_at,agent_count=excluded.agent_count,scanned_at=excluded.scanned_at`,
-		session.ID, session.Meta.CWD, session.Meta.Title, created, updated, agents, storage.SortableTime(now))
-	return err
-}
-
-func (s *Store) upsertLive(ctx context.Context, sessionID string, openBackground int, blocked bool, lastUserPrompt int64, now time.Time) error {
 	prompt := ""
 	if lastUserPrompt > 0 {
 		prompt = storage.SortableTime(millis(lastUserPrompt))
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO cache_live(session_id,open_background,blocked,last_user_prompt,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET open_background=excluded.open_background,blocked=excluded.blocked,last_user_prompt=excluded.last_user_prompt,updated_at=excluded.updated_at`,
+	changed, err := s.sessionMetadataChanged(ctx, session, created, updated, agents, openBackground, blocked, prompt)
+	if err != nil {
+		return err
+	}
+	if len(steps) == 0 && !changed {
+		return nil
+	}
+	if len(steps) > 0 && !changed {
+		return s.insertSteps(ctx, session.ID, steps)
+	}
+	return storage.Transaction(ctx, s.db, func(tx *sql.Tx) error {
+		if len(steps) > 0 {
+			if err := insertStepsTx(ctx, tx, session.ID, steps); err != nil {
+				return err
+			}
+		}
+		if err := upsertSessionTx(ctx, tx, session, agents, created, updated, now); err != nil {
+			return err
+		}
+		return upsertLiveTx(ctx, tx, session.ID, openBackground, blocked, prompt, now)
+	})
+}
+
+func (s *Store) sessionMetadataChanged(ctx context.Context, session sessionDir, created, updated string, agents, openBackground int, blocked bool, prompt string) (bool, error) {
+	var existingCWD, existingTitle, existingCreated, existingUpdated, existingPrompt sql.NullString
+	var existingAgents, existingOpen, existingBlocked sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT s.cwd,s.title,s.created_at,s.updated_at,s.agent_count,l.open_background,l.blocked,l.last_user_prompt FROM cache_sessions s LEFT JOIN cache_live l ON l.session_id=s.session_id WHERE s.session_id=?`, session.ID).
+		Scan(&existingCWD, &existingTitle, &existingCreated, &existingUpdated, &existingAgents, &existingOpen, &existingBlocked, &existingPrompt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !existingCWD.Valid || !existingTitle.Valid || !existingCreated.Valid || !existingUpdated.Valid ||
+		!existingAgents.Valid || !existingOpen.Valid || !existingBlocked.Valid || !existingPrompt.Valid ||
+		existingCWD.String != session.Meta.CWD || existingTitle.String != session.Meta.Title ||
+		existingCreated.String != created || existingUpdated.String != updated ||
+		int(existingAgents.Int64) != agents || int(existingOpen.Int64) != openBackground ||
+		int(existingBlocked.Int64) != boolInt(blocked) || existingPrompt.String != prompt, nil
+}
+
+func (s *Store) insertSteps(ctx context.Context, sessionID string, steps []Step) error {
+	return storage.Transaction(ctx, s.db, func(tx *sql.Tx) error {
+		return insertStepsTx(ctx, tx, sessionID, steps)
+	})
+}
+
+func insertStepsTx(ctx context.Context, tx *sql.Tx, sessionID string, steps []Step) error {
+	statement, err := tx.PrepareContext(ctx, `INSERT INTO cache_steps(session_id,agent,step_uuid,model,time,turn_id,step_index,finish_reason,input_other,input_cache_read,input_cache_creation,output,first_token_ms,decode_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id,agent,step_uuid) DO NOTHING`)
+	if err != nil {
+		return err
+	}
+	defer statement.Close()
+	for _, step := range steps {
+		if step.At.IsZero() {
+			continue
+		}
+		if _, err = statement.ExecContext(ctx, sessionID, step.Agent, step.StepUUID, step.Model, storage.SortableTime(step.At), step.TurnID, step.StepIndex, step.Finish, step.InputOther, step.InputCacheRead, step.InputCacheCreation, step.Output, step.FirstTokenMS, step.DecodeMS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func upsertSessionTx(ctx context.Context, tx *sql.Tx, session sessionDir, agents int, created, updated string, now time.Time) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO cache_sessions(session_id,cwd,title,created_at,updated_at,agent_count,scanned_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET cwd=excluded.cwd,title=excluded.title,created_at=excluded.created_at,updated_at=excluded.updated_at,agent_count=excluded.agent_count,scanned_at=excluded.scanned_at`,
+		session.ID, session.Meta.CWD, session.Meta.Title, created, updated, agents, storage.SortableTime(now))
+	return err
+}
+
+func upsertLiveTx(ctx context.Context, tx *sql.Tx, sessionID string, openBackground int, blocked bool, prompt string, now time.Time) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO cache_live(session_id,open_background,blocked,last_user_prompt,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET open_background=excluded.open_background,blocked=excluded.blocked,last_user_prompt=excluded.last_user_prompt,updated_at=excluded.updated_at`,
 		sessionID, openBackground, boolInt(blocked), prompt, storage.SortableTime(now))
 	return err
 }

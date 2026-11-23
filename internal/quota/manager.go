@@ -326,8 +326,6 @@ func carryForward(reading, previous *Reading) *Reading {
 func (m *Manager) refreshOne(ctx context.Context, provider Provider) RefreshResult {
 	class := ClassifyProvider(provider.Type, provider.BaseURL)
 	sourceID := "provider:" + provider.ID
-	previousTag := m.identities[provider.ID]
-	previous := m.readings[identityKey(provider.ID, previousTag)]
 
 	switch class.Kind {
 	case ProviderManaged:
@@ -338,43 +336,47 @@ func (m *Manager) refreshOne(ctx context.Context, provider Provider) RefreshResu
 	adapter, _ := AdapterByID(class.Adapter)
 
 	attemptedAt := m.now()
+	previousTag := m.previousIdentity(provider.ID)
+	previous := m.reading(provider.ID, previousTag)
 	if !provider.HasAPIKey {
-		m.credentialState[provider.ID] = "missing"
+		m.putCredentialState(provider.ID, "missing")
 		reading := carryForward(emptyReading(attemptedAt, "credential_missing"), previous)
-		m.readings[identityKey(provider.ID, previousTag)] = reading
+		m.putReading(provider.ID, previousTag, reading)
 		return RefreshResult{SourceID: sourceID, Status: "not_configured", ErrorReason: optString("credential_missing")}
 	}
 	secret := ""
 	if m.credentials != nil {
+		// Resolving a credential may hit the keychain or the official client.
+		// It runs with mu released so State() stays responsive.
 		value, err := m.credentials(ctx, provider.ID)
 		if err != nil {
 			// The resolver failing is not the same as the user having no key; the
 			// reading keeps its previous identity so a transient read failure does
 			// not look like a different account.
 			reading := carryForward(emptyReading(attemptedAt, "credential_unavailable"), previous)
-			m.readings[identityKey(provider.ID, previousTag)] = reading
+			m.putReading(provider.ID, previousTag, reading)
 			return RefreshResult{SourceID: sourceID, Status: "stale", ErrorReason: optString("credential_unavailable")}
 		}
 		secret = strings.TrimSpace(value)
 	}
 	if secret == "" || len(secret) > 4096 || isControl(secret) {
-		m.credentialState[provider.ID] = "missing"
+		m.putCredentialState(provider.ID, "missing")
 		reading := carryForward(emptyReading(attemptedAt, "credential_missing"), previous)
-		m.readings[identityKey(provider.ID, previousTag)] = reading
+		m.putReading(provider.ID, previousTag, reading)
 		return RefreshResult{SourceID: sourceID, Status: "not_configured", ErrorReason: optString("credential_missing")}
 	}
 	tag := AccountTag(secret)
 	// A different account is a different source of truth: the new reading starts
 	// empty, and the old account's figures are not shown as this one's.
 	if previousTag != tag {
-		m.identities[provider.ID] = tag
-		previous = m.readings[identityKey(provider.ID, tag)]
+		m.setIdentity(provider.ID, tag)
+		previous = m.reading(provider.ID, tag)
 	}
 	if m.throttleMS > 0 && previous != nil && previous.LastAttemptAt != nil &&
 		attemptedAt-*previous.LastAttemptAt < m.throttleMS {
 		return RefreshResult{SourceID: sourceID, Status: "throttled", Skipped: optString("throttled")}
 	}
-	m.credentialState[provider.ID] = "present"
+	m.putCredentialState(provider.ID, "present")
 	target := targetOf(adapter, secret)
 	document, code, status := m.fetch(ctx, target)
 	if code != "" {
@@ -399,13 +401,46 @@ func (m *Manager) refreshOne(ctx context.Context, provider Provider) RefreshResu
 			PeriodStart: record.PeriodStart, ResetAt: record.ResetAt})
 	}
 	successAt := attemptedAt
+	plan := PlanNameOf(document)
+	m.mu.Lock()
 	m.readings[identityKey(provider.ID, tag)] = &Reading{LastAttemptAt: &attemptedAt, LastAttemptOK: true,
 		LastSuccessAt: &successAt, Available: parsed.Available, Parts: nonNilParts(parsed.Parts), Records: records}
-	if plan := PlanNameOf(document); plan != "" {
+	if plan != "" {
 		m.plans[provider.ID] = plan
 	}
 	m.backoff = 0
+	m.mu.Unlock()
 	return RefreshResult{SourceID: sourceID, Status: "ok"}
+}
+
+func (m *Manager) previousIdentity(providerID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.identities[providerID]
+}
+
+func (m *Manager) reading(providerID, tag string) *Reading {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.readings[identityKey(providerID, tag)]
+}
+
+func (m *Manager) putReading(providerID, tag string, reading *Reading) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.readings[identityKey(providerID, tag)] = reading
+}
+
+func (m *Manager) setIdentity(providerID, tag string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.identities[providerID] = tag
+}
+
+func (m *Manager) putCredentialState(providerID, state string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.credentialState[providerID] = state
 }
 
 func nonNilParts(parts []Part) []Part {
@@ -417,7 +452,7 @@ func nonNilParts(parts []Part) []Part {
 
 func (m *Manager) failSource(provider Provider, tag string, attemptedAt int64, previous *Reading, code string, status *int) RefreshResult {
 	reading := carryForward(emptyReading(attemptedAt, code), previous)
-	m.readings[identityKey(provider.ID, tag)] = reading
+	m.putReading(provider.ID, tag, reading)
 	// A failed read keeps what was last read. It is never written as 0 and never
 	// as "no limit".
 	result := RefreshResult{SourceID: "provider:" + provider.ID, ErrorReason: optString(code), HTTPStatus: status}
@@ -432,17 +467,21 @@ func (m *Manager) failSource(provider Provider, tag string, attemptedAt int64, p
 // Refresh is the only method that makes a request. A second call while a refresh
 // is running waits for that one and then runs its own selection, rather than
 // being answered with another call's results.
+//
+// mu is never held across a credential resolution or an upstream HTTP request:
+// those can take seconds, and State() must stay available for the settings page
+// and the automation tick while a refresh is in flight.
 func (m *Manager) Refresh(ctx context.Context, providers []Provider) State {
 	m.refreshMu.Lock()
 	defer m.refreshMu.Unlock()
 	if len(providers) > maxSources {
 		providers = providers[:maxSources]
 	}
-	m.mu.Lock()
 	for _, provider := range providers {
 		_ = m.refreshOne(ctx, provider)
 	}
 	stamp := m.now()
+	m.mu.Lock()
 	m.refreshedAt = &stamp
 	m.mu.Unlock()
 

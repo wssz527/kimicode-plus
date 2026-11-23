@@ -130,10 +130,17 @@ func (g *Gateway) streamCompletion(w http.ResponseWriter, r *http.Request, confi
 		if event.Finish != "" {
 			finish = event.Finish
 		}
-		return writeEvent(w, map[string]any{
+		chunk := map[string]any{
 			"id": streamID, "object": "chat.completion.chunk", "created": created, "model": model,
 			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}},
-		})
+		}
+		// An upstream may attach usage to the same chunk that carries
+		// finish_reason. Dropping it would leave the client without token counts
+		// even though the provider reported them.
+		if len(event.Usage) > 0 && string(event.Usage) != "null" {
+			chunk["usage"] = usageOrNull(event.Usage)
+		}
+		return writeEvent(w, chunk)
 	}
 	var streamErr error
 	dispatchErr := g.dispatch(func() error {

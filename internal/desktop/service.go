@@ -109,6 +109,7 @@ type NativeService struct {
 	accountVault              *credentials.KimiAccountVault
 	accountMu                 sync.Mutex
 	switchMu                  sync.Mutex
+	switchSeq                 uint64
 	switchPauseCount          int
 	pendingSwitch             *pendingSwitchState
 	addFlow                   *AccountAddFlow
@@ -214,6 +215,9 @@ func NewNativeService(db *sql.DB, kap *KAPClient, cwd string, safe func() bool) 
 
 func (s *NativeService) Close() {
 	s.cancel()
+	// Release in-flight event long-polls first: they wait up to the client
+	// timeout, and shutdown must not sit on that deadline.
+	s.bus.Close()
 	s.wg.Wait()
 	s.kap.mu.Lock()
 	if s.kap.socket != nil {
@@ -261,7 +265,12 @@ func (s *NativeService) Register(mux *http.ServeMux) {
 			var native *NativeError
 			if errors.As(err, &native) {
 				code = native.Code
-				status = 409
+				// Keep an upstream status the native layer already decided
+				// (400-599); only a missing/impossible one becomes 409.
+				status = native.Status
+				if status < 400 || status > 599 {
+					status = 409
+				}
 			}
 			httpx.Fail(w, status, code, err.Error())
 			return
@@ -362,6 +371,11 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		wait, _ := input["waitMs"].(float64)
 		if wait < 0 || wait > 10000 {
 			wait = 10000
+		}
+		// The core is shutting down: answer immediately instead of blocking the
+		// caller until its own timeout, so exit and updater restarts are quick.
+		if s.ctx != nil && s.ctx.Err() != nil {
+			return EventPage{Events: []Event{}, Next: int64(after)}, nil
 		}
 		scopes := []string{}
 		rawScopes, _ := input["scopes"].([]any)
@@ -651,7 +665,7 @@ func (s *NativeService) bootstrap(ctx context.Context) (map[string]any, error) {
 }
 
 func (s *NativeService) nativeTurns(ctx context.Context, id string, count int) ([]NativeTurn, error) {
-	raw, err := s.kap.Request(ctx, http.MethodGet, fmt.Sprintf("/sessions/%s/agents/main/turns?page_size=%d", id, count), nil)
+	raw, err := s.kap.Request(ctx, http.MethodGet, fmt.Sprintf("/sessions/%s/agents/main/turns?page_size=%d", url.PathEscape(id), count), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1232,11 +1246,19 @@ func (s *NativeService) reply(ctx context.Context, input map[string]any) (any, e
 	}
 	value := input["value"]
 	var body map[string]any
-	if decision, ok := value.(string); ok && (decision == "approved" || decision == "rejected" || decision == "cancelled") {
-		body = map[string]any{"kind": "approval", "decision": decision}
+	if decision, ok := value.(string); ok {
+		normalized, err := approvalDecision(decision)
+		if err != nil {
+			return nil, err
+		}
+		body = map[string]any{"kind": "approval", "decision": normalized}
 	} else if object, ok := value.(map[string]any); ok {
 		if decision, ok := object["decision"].(string); ok {
-			body = map[string]any{"kind": "approval", "decision": decision}
+			normalized, err := approvalDecision(decision)
+			if err != nil {
+				return nil, err
+			}
+			body = map[string]any{"kind": "approval", "decision": normalized}
 			if label, ok := object["selectedLabel"].(string); ok {
 				body["selected_label"] = label
 			}
@@ -1255,8 +1277,20 @@ func (s *NativeService) reply(ctx context.Context, input map[string]any) (any, e
 		return nil, errors.New("审批或提问回复格式无效")
 	}
 	s.touchSession(id)
-	raw, err := s.kap.Request(ctx, http.MethodPost, "/sessions/"+id+"/interactions/"+interaction, body)
+	raw, err := s.kap.Request(ctx, http.MethodPost, "/sessions/"+url.PathEscape(id)+"/interactions/"+url.PathEscape(interaction), body)
 	return rawAsAny(raw), err
+}
+
+// approvalDecision accepts only the three documented decisions. An unknown
+// string must never fall through to "approved": that would turn a typo or a
+// stale client into an automatic approval.
+func approvalDecision(value string) (string, error) {
+	switch strings.TrimSpace(value) {
+	case "approved", "rejected", "cancelled":
+		return strings.TrimSpace(value), nil
+	default:
+		return "", fmt.Errorf("未知的审批决定 %q，只接受 approved、rejected 或 cancelled", value)
+	}
 }
 
 func (s *NativeService) handoff(ctx context.Context, input map[string]any) (map[string]any, error) {

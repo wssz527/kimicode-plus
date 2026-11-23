@@ -24,9 +24,7 @@ func (b *BrowserVault) CollectExpired(ctx context.Context) error {
 
 func (b *BrowserVault) Put(ctx context.Context, ref string, value []byte) error {
 	v := b.vault
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.key) == 0 {
+	if !v.Unlocked() {
 		return ErrLocked
 	}
 	if !refPattern.MatchString(ref) || len(value) == 0 {
@@ -35,7 +33,9 @@ func (b *BrowserVault) Put(ctx context.Context, ref string, value []byte) error 
 	if len(value) > BrowserValueLimit {
 		return ErrTooLarge
 	}
-	data, err := seal(v.key, value, ref)
+	key := v.keyCopy()
+	defer clear(key)
+	data, err := seal(key, value, ref)
 	if err != nil {
 		return err
 	}
@@ -49,9 +49,7 @@ func (b *BrowserVault) Put(ctx context.Context, ref string, value []byte) error 
 
 func (b *BrowserVault) Get(ctx context.Context, ref string) ([]byte, error) {
 	v := b.vault
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.key) == 0 {
+	if !v.Unlocked() {
 		return nil, ErrLocked
 	}
 	var data []byte
@@ -62,14 +60,14 @@ func (b *BrowserVault) Get(ctx context.Context, ref string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return open(v.key, data, ref)
+	key := v.keyCopy()
+	defer clear(key)
+	return open(key, data, ref)
 }
 
 func (b *BrowserVault) Delete(ctx context.Context, ref string) error {
 	v := b.vault
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.key) == 0 {
+	if !v.Unlocked() {
 		return ErrLocked
 	}
 	_, err := v.db.ExecContext(ctx, `DELETE FROM vault_browser_entries WHERE ref=?`, ref)
