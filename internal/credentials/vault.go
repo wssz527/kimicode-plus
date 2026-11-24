@@ -27,10 +27,16 @@ var refPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,199}$`)
 // unlockMu serializes the expensive unlock/reset paths (600k PBKDF2 rounds and
 // OS key store calls). It is separate from mu so Status and Unlocked never wait
 // behind a slow Keychain prompt, which is what used to stall /health.
+//
+// cipherMu makes key replacement and ciphertext I/O mutually exclusive: every
+// seal/open holds it for reading, Reset holds it for writing across the whole
+// delete-and-rekey transaction. Without that, a write that copied the old key
+// could land in the freshly emptied vault and become undecryptable.
 type Vault struct {
 	db        *sql.DB
 	mu        sync.RWMutex
 	unlockMu  sync.Mutex
+	cipherMu  sync.RWMutex
 	key       []byte
 	keyStore  OSKeyStore
 	onReset   func(context.Context) error
@@ -242,6 +248,19 @@ func (v *Vault) AutoUnlock(ctx context.Context) error {
 func (v *Vault) Reset(ctx context.Context) (err error) {
 	v.unlockMu.Lock()
 	defer v.unlockMu.Unlock()
+	// Hold the cipher write lock for the whole reset: it both invalidates the key
+	// before any row is deleted and blocks in-flight seal/open calls from writing
+	// with the old key into the new vault. Clearing the key later than the commit
+	// left exactly that window open.
+	v.cipherMu.Lock()
+	v.mu.Lock()
+	clear(v.key)
+	v.key = nil
+	v.osManaged = false
+	store := v.keyStore
+	v.mu.Unlock()
+	defer v.cipherMu.Unlock()
+
 	tx, err := v.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -270,12 +289,6 @@ func (v *Vault) Reset(ctx context.Context) (err error) {
 			err = errors.Join(err, onReset(ctx))
 		}
 	}()
-	v.mu.Lock()
-	clear(v.key)
-	v.key = nil
-	v.osManaged = false
-	store := v.keyStore
-	v.mu.Unlock()
 	if store != nil {
 		_ = store.Delete(ctx)
 	}
@@ -356,7 +369,9 @@ func (v *Vault) Unlocked() bool {
 }
 
 // keyCopy returns a private copy of the vault key so sealing and opening never
-// hold mu across a caller's database work or a Keychain round trip.
+// hold mu across a caller's database work or a Keychain round trip. A nil copy
+// means the vault is locked; callers must treat that as ErrLocked rather than
+// passing an empty key to AES.
 func (v *Vault) keyCopy() []byte {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -366,6 +381,20 @@ func (v *Vault) keyCopy() []byte {
 	key := make([]byte, len(v.key))
 	copy(key, v.key)
 	return key
+}
+
+// withCipherKey runs fn with a snapshot of the current key while holding the
+// cipher read lock, so a concurrent Reset cannot swap the key between copying it
+// and writing the ciphertext. fn is not called when the vault is locked.
+func (v *Vault) withCipherKey(fn func(key []byte) error) error {
+	v.cipherMu.RLock()
+	defer v.cipherMu.RUnlock()
+	key := v.keyCopy()
+	if len(key) == 0 {
+		return ErrLocked
+	}
+	defer clear(key)
+	return fn(key)
 }
 
 // Exists reports whether an entry is stored, without decrypting it and without
@@ -390,34 +419,31 @@ func (v *Vault) PutNew(ctx context.Context, ref string, value []byte) error {
 	return v.put(ctx, ref, value, false)
 }
 func (v *Vault) put(ctx context.Context, ref string, value []byte, replace bool) error {
-	key := v.keyCopy()
-	if len(key) == 0 {
-		return ErrLocked
-	}
-	defer clear(key)
 	if !refPattern.MatchString(ref) || len(value) == 0 || len(value) > 32768 {
 		return errors.New("invalid credential")
 	}
-	data, err := seal(key, value, ref)
-	if err != nil {
+	return v.withCipherKey(func(key []byte) error {
+		data, err := seal(key, value, ref)
+		if err != nil {
+			return err
+		}
+		if replace {
+			_, err = v.db.ExecContext(ctx, `INSERT INTO vault_entries VALUES(?,?) ON CONFLICT(ref) DO UPDATE SET value=excluded.value`, ref, data)
+			return err
+		}
+		_, err = v.db.ExecContext(ctx, `INSERT INTO vault_entries VALUES(?,?)`, ref, data)
+		if err != nil && strings.Contains(err.Error(), "UNIQUE") {
+			return ErrAlreadyExists
+		}
 		return err
-	}
-	if replace {
-		_, err = v.db.ExecContext(ctx, `INSERT INTO vault_entries VALUES(?,?) ON CONFLICT(ref) DO UPDATE SET value=excluded.value`, ref, data)
-		return err
-	}
-	_, err = v.db.ExecContext(ctx, `INSERT INTO vault_entries VALUES(?,?)`, ref, data)
-	if err != nil && strings.Contains(err.Error(), "UNIQUE") {
-		return ErrAlreadyExists
-	}
-	return err
+	})
 }
 func (v *Vault) Get(ctx context.Context, ref string) ([]byte, error) {
-	key := v.keyCopy()
-	if len(key) == 0 {
+	// A locked vault reports the lock before anything else: "not found" would
+	// tell a caller its secret is gone when it is only unreadable right now.
+	if !v.Unlocked() {
 		return nil, ErrLocked
 	}
-	defer clear(key)
 	var data []byte
 	err := v.db.QueryRowContext(ctx, `SELECT value FROM vault_entries WHERE ref=?`, ref).Scan(&data)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -426,7 +452,16 @@ func (v *Vault) Get(ctx context.Context, ref string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return open(key, data, ref)
+	var opened []byte
+	err = v.withCipherKey(func(key []byte) error {
+		var openErr error
+		opened, openErr = open(key, data, ref)
+		return openErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return opened, nil
 }
 func (v *Vault) Delete(ctx context.Context, ref string) error {
 	if !v.Unlocked() {

@@ -17,16 +17,41 @@ import (
 // dirty worktree.
 var gitExecutables = []string{"git", "/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"}
 
-func gitCommand(ctx context.Context, args ...string) (*exec.Cmd, error) {
+// executablePath is the test seam for LookPath and the executable-bit check.
+var executablePath = func(name string) (string, error) { return exec.LookPath(name) }
+
+// resolveGitExecutable returns the first usable git binary. A bare command name
+// must be resolved through PATH before it is accepted; without that, the first
+// entry would always win and every absolute fallback below it would be dead
+// code, so a GUI-launched core with a minimal PATH would never find git.
+func resolveGitExecutable() (string, error) {
 	for _, binary := range gitExecutables {
 		if strings.ContainsRune(binary, filepath.Separator) {
-			if info, err := os.Stat(binary); err != nil || !info.Mode().IsRegular() {
+			info, err := os.Stat(binary)
+			if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 				continue
 			}
+			return binary, nil
 		}
-		return exec.CommandContext(ctx, binary, args...), nil
+		resolved, err := executablePath(binary)
+		if err != nil || resolved == "" {
+			continue
+		}
+		return resolved, nil
 	}
-	return nil, errors.New("git executable not found")
+	return "", errors.New("git executable not found")
+}
+
+func gitCommand(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	binary, err := resolveGitExecutable()
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, binary, args...)
+	// Force the untranslated message so the "not a repository" check below does
+	// not depend on the user's system language.
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+	return cmd, nil
 }
 
 // hasGitMarker walks up from dir looking for a .git directory or file. It decides

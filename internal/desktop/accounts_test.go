@@ -1381,3 +1381,159 @@ func TestKeepAliveIgnoresStaleOpenBackgroundWhenKAPReportsIdle(t *testing.T) {
 		t.Fatalf("stale cache_live leaked into the keepalive decision: %+v (ok=%v)", candidate, ok)
 	}
 }
+
+// A queued switch that sees a session become busy again must keep waiting in the
+// same queue entry instead of silently dropping the request. The window is
+// reproduced directly: the queue is set up, then the switch runs while busy.
+func TestQueuedAccountSwitchRetriesAfterBecomingBusyAgain(t *testing.T) {
+	service, fake, _ := newAccountTestService(t)
+	_, accB := saveTwoTestAccounts(t, service, fake)
+
+	fake.mu.Lock()
+	fake.sessions[0]["activity"] = "turn"
+	fake.sessions[0]["busy"] = true
+	fake.sessions[0]["main_turn_active"] = true
+	fake.mu.Unlock()
+
+	watchCtx, cancelWatch := context.WithCancel(service.ctx)
+	defer cancelWatch()
+	service.accountMu.Lock()
+	service.switchSeq = 41
+	seq := service.switchSeq
+	service.pendingSwitch = &pendingSwitchState{
+		info:   AccountPendingSwitch{TargetID: accB.ID},
+		seq:    seq,
+		cancel: cancelWatch,
+	}
+	service.accountMu.Unlock()
+
+	// A busy attempt must not consume the queue entry or cancel its watch context.
+	attemptCtx, attemptCancel := context.WithTimeout(watchCtx, 5*time.Second)
+	_, err := service.executeAccountSwitch(attemptCtx, accB.ID, false, false, 0, seq)
+	attemptCancel()
+	var native *NativeError
+	if !errors.As(err, &native) || native.Code != "ACCOUNT_SWITCH_BUSY" {
+		t.Fatalf("expected ACCOUNT_SWITCH_BUSY, got %v", err)
+	}
+	if watchCtx.Err() != nil {
+		t.Fatal("a busy retry cancelled the queue watch context")
+	}
+	service.accountMu.Lock()
+	pendingIntact := service.pendingSwitch != nil && service.pendingSwitch.seq == seq
+	service.accountMu.Unlock()
+	if !pendingIntact {
+		t.Fatal("a busy retry consumed the pending switch")
+	}
+
+	// Once idle, the same queue entry can still perform the switch.
+	fake.mu.Lock()
+	fake.sessions[0]["activity"] = "idle"
+	fake.sessions[0]["busy"] = false
+	fake.sessions[0]["main_turn_active"] = false
+	fake.mu.Unlock()
+
+	retryCtx, retryCancel := context.WithTimeout(watchCtx, 10*time.Second)
+	result, err := service.executeAccountSwitch(retryCtx, accB.ID, false, false, 0, seq)
+	retryCancel()
+	if err != nil {
+		t.Fatalf("retry after idle: %v", err)
+	}
+	if !result.Switched {
+		t.Fatalf("retry did not switch: %+v", result)
+	}
+	if got := fake.readDiskToken(t).AccessToken; got != "tok-acc-b-secret-1" {
+		t.Fatalf("disk token after retry = %s", got)
+	}
+	service.accountMu.Lock()
+	cleared := service.pendingSwitch == nil
+	service.accountMu.Unlock()
+	if !cleared {
+		t.Fatal("successful switch did not clear the pending slot")
+	}
+}
+
+func TestPendingSwitchMatchingIsScopedToSeq(t *testing.T) {
+	service, _, _ := newAccountTestService(t)
+	_, cancelFirst := context.WithCancel(service.ctx)
+	defer cancelFirst()
+	_, cancelSecond := context.WithCancel(service.ctx)
+	defer cancelSecond()
+
+	service.accountMu.Lock()
+	service.switchSeq = 7
+	service.pendingSwitch = &pendingSwitchState{
+		info:   AccountPendingSwitch{TargetID: "acc_target"},
+		seq:    7,
+		cancel: cancelSecond,
+	}
+	service.accountMu.Unlock()
+
+	// A stale watcher for the same target must not touch the newer request.
+	service.cancelPendingSwitchIfSeq(6)
+	service.accountMu.Lock()
+	stillPending := service.pendingSwitch != nil && service.pendingSwitch.seq == 7
+	service.accountMu.Unlock()
+	if !stillPending {
+		t.Fatal("a stale sequence cancelled a newer request for the same target")
+	}
+
+	// A stale read-only validation must be rejected without consuming the slot.
+	if err := service.validateQueuedSwitch(context.Background(), 6, "acc_target"); !errors.Is(err, errAccountSwitchSuperseded) {
+		t.Fatalf("stale validation error = %v", err)
+	}
+	service.accountMu.Lock()
+	stillPending = service.pendingSwitch != nil && service.pendingSwitch.seq == 7
+	service.accountMu.Unlock()
+	if !stillPending {
+		t.Fatal("a rejected validation consumed the pending slot")
+	}
+
+	// A cancelled watch context must not be able to start the switch.
+	cancelFirst()
+	supersededCtx, supersededCancel := context.WithCancel(service.ctx)
+	supersededCancel()
+	if err := service.validateQueuedSwitch(supersededCtx, 7, "acc_target"); !errors.Is(err, errAccountSwitchSuperseded) {
+		t.Fatalf("cancelled watch error = %v", err)
+	}
+
+	// Owning sequence consumes exactly its own entry.
+	if _, err := service.consumeQueuedSwitch(context.Background(), 7, "acc_target"); err != nil {
+		t.Fatalf("consume own sequence: %v", err)
+	}
+	service.accountMu.Lock()
+	cleared := service.pendingSwitch == nil
+	service.accountMu.Unlock()
+	if !cleared {
+		t.Fatal("owning sequence did not clear the pending slot")
+	}
+}
+
+// Rollback must not delete the metadata row when the ciphertext could not be
+// removed, or the secret becomes an orphan nothing can reach.
+func TestDeleteAccountRecordKeepsRowWhenVaultDeleteFails(t *testing.T) {
+	ctx := context.Background()
+	service, fake, vault := newAccountTestService(t)
+	accA, _ := saveTwoTestAccounts(t, service, fake)
+
+	vault.Lock()
+	err := service.deleteAccountRecord(ctx, accA.ID)
+	if err == nil {
+		t.Fatal("delete succeeded while the vault was locked")
+	}
+	if _, rowErr := service.loadAccountRow(ctx, accA.ID); rowErr != nil {
+		t.Fatalf("metadata row was deleted without removing the secret: %v", rowErr)
+	}
+
+	if unlockErr := vault.Unlock(ctx, "test-passphrase-1234"); unlockErr != nil {
+		t.Fatal(unlockErr)
+	}
+	if err := service.deleteAccountRecord(ctx, accA.ID); err != nil {
+		t.Fatalf("delete after unlock: %v", err)
+	}
+	if _, rowErr := service.loadAccountRow(ctx, accA.ID); !errors.Is(rowErr, sql.ErrNoRows) {
+		t.Fatalf("metadata row survived a successful delete: %v", rowErr)
+	}
+	if exists, existsErr := vault.KimiAccountStore().Exists(ctx, accountVaultRef(accA.ID)); existsErr != nil || exists {
+		t.Fatalf("ciphertext survived delete: exists=%v err=%v", exists, existsErr)
+	}
+}

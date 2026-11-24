@@ -238,14 +238,14 @@ func (s *Store) scanSession(ctx context.Context, session sessionDir, now time.Ti
 	if len(steps) > 0 {
 		result.Steps += len(steps)
 	}
-	return s.persistSession(ctx, session, agentCount, steps, openBackground, blocked, lastUserPrompt, now, result)
+	return s.persistSession(ctx, session, agentCount, steps, openBackground, blocked, lastUserPrompt, now)
 }
 
 // persistSession writes one session's new steps, metadata and live signals in a
 // single transaction. A session with no new steps and unchanged metadata/live
 // state is skipped entirely: the scan runs every few seconds and rewriting the
 // same row each pass only churns the database.
-func (s *Store) persistSession(ctx context.Context, session sessionDir, agents int, steps []Step, openBackground int, blocked bool, lastUserPrompt int64, now time.Time, result *ScanResult) error {
+func (s *Store) persistSession(ctx context.Context, session sessionDir, agents int, steps []Step, openBackground int, blocked bool, lastUserPrompt int64, now time.Time) error {
 	created, updated := "", ""
 	if session.Meta.CreatedAt > 0 {
 		created = storage.SortableTime(millis(session.Meta.CreatedAt))

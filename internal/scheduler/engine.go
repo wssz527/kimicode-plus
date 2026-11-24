@@ -1044,8 +1044,16 @@ func (e *Engine) executeRun(ctx context.Context, task Task, run RunRecord) {
 	}
 	if err := e.exec.SendPrompt(execCtx, targetSessionID, expandedPrompt, task.Model, task.Effort, task.PermissionMode); err != nil {
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			_ = e.exec.AbortSession(context.Background(), targetSessionID)
+			e.abortRemoteSession(targetSessionID)
 			e.finishRun(task, run, RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟），已尝试中止当前会话", timeoutMin), targetSessionID)
+			return
+		}
+		// StopPlugin, DeleteTask and safe mode cancel the run while the prompt is
+		// still being delivered. That is a cancellation, not an execution failure,
+		// and the remote session has to be told to stop as well.
+		if execCtx.Err() != nil || ctx.Err() != nil {
+			e.abortRemoteSession(targetSessionID)
+			e.finishRun(task, run, RunSkipped, FailureCancelled, "任务已取消或插件已停用", targetSessionID)
 			return
 		}
 		e.finishRun(task, run, RunFailed, FailureExecution, "发送提示词失败："+err.Error(), targetSessionID)
@@ -1118,7 +1126,7 @@ func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionI
 	idlePolls := 0
 	for {
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			_ = e.exec.AbortSession(context.Background(), sessionID)
+			e.abortRemoteSession(sessionID)
 			return RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟），已尝试中止当前会话", timeoutMin)
 		}
 		if parentCtx.Err() != nil {
@@ -1129,7 +1137,7 @@ func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionI
 		sess, err := e.exec.GetSession(execCtx, sessionID)
 		if err != nil {
 			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-				_ = e.exec.AbortSession(context.Background(), sessionID)
+				e.abortRemoteSession(sessionID)
 				return RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟），已尝试中止当前会话", timeoutMin)
 			}
 			if parentCtx.Err() != nil {
@@ -1147,7 +1155,7 @@ func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionI
 			if maxTurns > 0 {
 				added := countNewTurns(turns, prevLastTurnID, prevTurnCount)
 				if added > maxTurns {
-					_ = e.exec.AbortSession(context.Background(), sessionID)
+					e.abortRemoteSession(sessionID)
 					return RunFailed, FailureMaxTurns, fmt.Sprintf("已超过单次最大回合数限制（%d 回合），已尝试中止本次运行", maxTurns)
 				}
 			}
@@ -1190,7 +1198,7 @@ func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionI
 		select {
 		case <-execCtx.Done():
 			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-				_ = e.exec.AbortSession(context.Background(), sessionID)
+				e.abortRemoteSession(sessionID)
 				return RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟），已尝试中止当前会话", timeoutMin)
 			}
 			// StopPlugin, DeleteTask and safe mode cancel the run context. The

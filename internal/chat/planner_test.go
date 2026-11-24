@@ -186,7 +186,7 @@ func TestPlannerCreatesNestedDirectoriesAndRejectsSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(target, filepath.Join(root, "write-link.md")); err == nil {
-		if err := plannerWriteFile(filepath.Join(root, "write-link.md"), []byte("overwritten")); err == nil {
+		if err := plannerWriteWithinRoot(root, "write-link.md", []byte("overwritten")); err == nil {
 			t.Fatal("write followed a symlink")
 		}
 		if data, _ := os.ReadFile(target); string(data) != "private" {

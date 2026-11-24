@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -763,6 +764,41 @@ func TestEngineRunNowRejectsWhenPaused(t *testing.T) {
 	resume()
 	if _, err := engine.RunNow(context.Background(), "kimicode-plus.scheduler", task.ID); err != nil {
 		t.Fatalf("RunNow after resume: %v", err)
+	}
+}
+
+func TestResolveGitExecutableFallsThroughToAbsolutePath(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git is not installed on this machine")
+	}
+	originalBins := gitExecutables
+	originalPath := executablePath
+	defer func() {
+		gitExecutables = originalBins
+		executablePath = originalPath
+	}()
+	// The bare name no longer resolves, exactly like a GUI-launched core whose
+	// PATH lacks git. The absolute fallback must still be reached.
+	executablePath = func(name string) (string, error) {
+		return "", exec.ErrNotFound
+	}
+	gitExecutables = []string{"git", realGit}
+	resolved, resolveErr := resolveGitExecutable()
+	if resolveErr != nil {
+		t.Fatalf("absolute fallback was not reached: %v", resolveErr)
+	}
+	if resolved != realGit {
+		t.Fatalf("resolved %q, want %q", resolved, realGit)
+	}
+	// A non-executable absolute path must be rejected rather than returned.
+	plain := filepath.Join(t.TempDir(), "not-executable-git")
+	if err := os.WriteFile(plain, []byte("#!/bin/sh\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitExecutables = []string{plain}
+	if _, err := resolveGitExecutable(); err == nil {
+		t.Fatal("accepted a non-executable git candidate")
 	}
 }
 

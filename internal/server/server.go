@@ -459,6 +459,17 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 			}
 			return
 		}
+		if v.SafeMode {
+			// No further dispatch is admitted from here on. Give the work that was
+			// already admitted a bounded chance to finish before reporting safe, so
+			// "unsafe" really means drained; a straggler is never cancelled.
+			drainCtx, drainCancel := context.WithTimeout(r.Context(), 5*time.Second)
+			drainErr := cfg.WaitIdle(drainCtx)
+			drainCancel()
+			if drainErr != nil && errors.Is(drainErr, context.DeadlineExceeded) {
+				log.Printf("safe mode enabled while dispatches were still running")
+			}
+		}
 		if cfg.Safe() && app.pluginSafe != nil {
 			app.pluginSafe()
 		}
@@ -504,7 +515,9 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 // URL instead of an empty string.
 func gatewayHostBase(app *App, r *http.Request, guard *security.Guard) string {
 	if trimmed := strings.TrimRight(strings.TrimSpace(app.gatewayBase), "/"); trimmed != "" {
-		return trimmed
+		// PreviewConfig appends /v1 itself, so a base that already ends in /v1
+		// would otherwise render as /v1/v1.
+		return strings.TrimSuffix(trimmed, "/v1")
 	}
 	host := ""
 	if r != nil {

@@ -51,24 +51,21 @@ func (a *KimiAccountVault) Put(ctx context.Context, ref string, value []byte) er
 	if a == nil || a.vault == nil {
 		return ErrUnavailable
 	}
-	v := a.vault
-	if !v.Unlocked() {
-		return ErrLocked
-	}
 	if !validKimiAccountRef(ref) || len(value) == 0 {
 		return errors.New("invalid kimi account credential")
 	}
 	if len(value) > KimiAccountValueLimit {
 		return ErrTooLarge
 	}
-	key := v.keyCopy()
-	defer clear(key)
-	data, err := seal(key, value, ref)
-	if err != nil {
+	v := a.vault
+	return v.withCipherKey(func(key []byte) error {
+		data, err := seal(key, value, ref)
+		if err != nil {
+			return err
+		}
+		_, err = v.db.ExecContext(ctx, `INSERT INTO vault_kimi_accounts(ref,value) VALUES(?,?) ON CONFLICT(ref) DO UPDATE SET value=excluded.value`, ref, data)
 		return err
-	}
-	_, err = v.db.ExecContext(ctx, `INSERT INTO vault_kimi_accounts(ref,value) VALUES(?,?) ON CONFLICT(ref) DO UPDATE SET value=excluded.value`, ref, data)
-	return err
+	})
 }
 
 func (a *KimiAccountVault) Get(ctx context.Context, ref string) ([]byte, error) {
@@ -90,9 +87,16 @@ func (a *KimiAccountVault) Get(ctx context.Context, ref string) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	key := v.keyCopy()
-	defer clear(key)
-	return open(key, data, ref)
+	var opened []byte
+	err = v.withCipherKey(func(key []byte) error {
+		var openErr error
+		opened, openErr = open(key, data, ref)
+		return openErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return opened, nil
 }
 
 func (a *KimiAccountVault) Delete(ctx context.Context, ref string) error {

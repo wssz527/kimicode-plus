@@ -38,8 +38,6 @@ func (b *EventBus) Close() {
 	b.once.Do(func() {
 		b.mu.Lock()
 		close(b.closed)
-		close(b.notify)
-		b.notify = make(chan struct{})
 		b.mu.Unlock()
 	})
 }
@@ -88,6 +86,11 @@ func (b *EventBus) Poll(ctx context.Context, after int64, scopes []string, wait 
 		b.mu.Unlock()
 		if len(page.Events) > 0 || page.Reset || wait <= 0 {
 			return page
+		}
+		select {
+		case <-closed:
+			return page
+		default:
 		}
 		timer := time.NewTimer(wait)
 		select {

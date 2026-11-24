@@ -270,10 +270,14 @@ func (s *Store) totalsWhere(ctx context.Context, clause string, args ...any) (ro
 	return totals, speed, rows.Err()
 }
 
+// reportedModelFilter keeps the synthetic UNKNOWN identity out of the reporting
+// set on both the SQL and Go sides.
+const reportedModelFilter = `model != '' AND model != '` + ModelUnknown + `'`
+
 // reportedModelsClause names the models that have produced at least one non-zero
 // input_cache_read/creation value. Their input_other belongs in the denominator.
 func reportedModelsClause() string {
-	return `SELECT model FROM cache_steps GROUP BY model HAVING SUM(input_cache_read) > 0 OR SUM(input_cache_creation) > 0`
+	return `SELECT model FROM cache_steps WHERE ` + reportedModelFilter + ` GROUP BY model HAVING SUM(input_cache_read) > 0 OR SUM(input_cache_creation) > 0`
 }
 
 // speedClause narrows a clause to the rows that can produce a usable sample,
@@ -467,8 +471,14 @@ func (s *Store) fillSession(ctx context.Context, row *SessionRow, now time.Time)
 
 // recentTotals aggregates the newest N main-agent steps only, so "最近 5 步命中率"
 // means the recent shape of the conversation rather than its whole history.
+// A model that never reports cache fields contributes no uncached input, matching
+// the same rule applied to the day/hour aggregates.
 func (s *Store) recentTotals(ctx context.Context, sessionID string, count int) (rowTotals, speedAggregate, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT input_cache_read,input_cache_creation,input_other,output,decode_ms FROM cache_steps WHERE session_id=? AND agent='main' ORDER BY time DESC,rowid DESC LIMIT ?`, sessionID, count)
+	reported, err := s.reportedModels(ctx)
+	if err != nil {
+		return rowTotals{}, speedAggregate{}, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT model,input_cache_read,input_cache_creation,input_other,output,decode_ms FROM cache_steps WHERE session_id=? AND agent='main' ORDER BY time DESC,rowid DESC LIMIT ?`, sessionID, count)
 	if err != nil {
 		return rowTotals{}, speedAggregate{}, err
 	}
@@ -476,9 +486,13 @@ func (s *Store) recentTotals(ctx context.Context, sessionID string, count int) (
 	totals := rowTotals{}
 	speed := speedAggregate{}
 	for rows.Next() {
+		var model string
 		var read, creation, other, output, decode int64
-		if err = rows.Scan(&read, &creation, &other, &output, &decode); err != nil {
+		if err = rows.Scan(&model, &read, &creation, &other, &output, &decode); err != nil {
 			return totals, speed, err
+		}
+		if !reported[model] {
+			other = 0
 		}
 		totals.steps++
 		totals.read += read
@@ -492,9 +506,11 @@ func (s *Store) recentTotals(ctx context.Context, sessionID string, count int) (
 
 // reportedModels returns the set of models that ever reported a cache field.
 // Aggregates exclude input_other from every other model, so a provider that does
-// not report cache usage cannot look like a 0% hit rate.
+// not report cache usage cannot look like a 0% hit rate. The synthetic UNKNOWN
+// model is never treated as reporting: one unattributed row with a non-zero read
+// must not turn every later unattributed row into a real cache miss.
 func (s *Store) reportedModels(ctx context.Context) (map[string]bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT model FROM cache_steps GROUP BY model HAVING SUM(input_cache_read) > 0 OR SUM(input_cache_creation) > 0`)
+	rows, err := s.db.QueryContext(ctx, `SELECT model FROM cache_steps WHERE `+reportedModelFilter+` GROUP BY model HAVING SUM(input_cache_read) > 0 OR SUM(input_cache_creation) > 0`)
 	if err != nil {
 		return nil, err
 	}
@@ -683,14 +699,13 @@ func (s *Store) Retention(ctx context.Context, now time.Time) (Retention, error)
 				if gap < bound.min || (bound.max > 0 && gap >= bound.max) {
 					continue
 				}
-				// A model that never reports cache fields contributes no cache
-				// signal: its step still counts as a transition, but its uncached
-				// input must not be counted as a cache miss in the denominator.
-				sampleOther := other
-				if !reportedModelsForRetention[model] {
-					sampleOther = 0
+				// Bucket samples follow the same rule as the per-model rows: only a
+				// model that reports cache fields is a real cache sample. Counting an
+				// unreported model here would inflate the sample count the UI shows
+				// next to the hit rate while contributing nothing to the rate itself.
+				if reportedModelsForRetention[model] {
+					addRetentionSample(&aggregates[index], read, creation, other)
 				}
-				addRetentionSample(&aggregates[index], read, creation, sampleOther)
 				if aggregate != nil && model == previousModel {
 					addRetentionSample(&aggregate.buckets[index], read, creation, other)
 					aggregate.samples++

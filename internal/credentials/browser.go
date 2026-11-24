@@ -24,27 +24,24 @@ func (b *BrowserVault) CollectExpired(ctx context.Context) error {
 
 func (b *BrowserVault) Put(ctx context.Context, ref string, value []byte) error {
 	v := b.vault
-	if !v.Unlocked() {
-		return ErrLocked
-	}
 	if !refPattern.MatchString(ref) || len(value) == 0 {
 		return errors.New("invalid browser data")
 	}
 	if len(value) > BrowserValueLimit {
 		return ErrTooLarge
 	}
-	key := v.keyCopy()
-	defer clear(key)
-	data, err := seal(key, value, ref)
-	if err != nil {
+	return v.withCipherKey(func(key []byte) error {
+		data, err := seal(key, value, ref)
+		if err != nil {
+			return err
+		}
+		expires := int64(0)
+		if strings.HasPrefix(ref, "migration/") {
+			expires = time.Now().Add(BrowserPreviewTTL).Unix()
+		}
+		_, err = v.db.ExecContext(ctx, `INSERT INTO vault_browser_entries(ref,value,expires_at) VALUES(?,?,?) ON CONFLICT(ref) DO UPDATE SET value=excluded.value,expires_at=excluded.expires_at`, ref, data, expires)
 		return err
-	}
-	expires := int64(0)
-	if strings.HasPrefix(ref, "migration/") {
-		expires = time.Now().Add(BrowserPreviewTTL).Unix()
-	}
-	_, err = v.db.ExecContext(ctx, `INSERT INTO vault_browser_entries(ref,value,expires_at) VALUES(?,?,?) ON CONFLICT(ref) DO UPDATE SET value=excluded.value,expires_at=excluded.expires_at`, ref, data, expires)
-	return err
+	})
 }
 
 func (b *BrowserVault) Get(ctx context.Context, ref string) ([]byte, error) {
@@ -60,9 +57,16 @@ func (b *BrowserVault) Get(ctx context.Context, ref string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	key := v.keyCopy()
-	defer clear(key)
-	return open(key, data, ref)
+	var opened []byte
+	err = v.withCipherKey(func(key []byte) error {
+		var openErr error
+		opened, openErr = open(key, data, ref)
+		return openErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return opened, nil
 }
 
 func (b *BrowserVault) Delete(ctx context.Context, ref string) error {

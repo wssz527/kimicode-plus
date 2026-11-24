@@ -556,16 +556,20 @@ func (s *NativeService) restoreAccountRecord(ctx context.Context, snapshot *acco
 	return errors.Join(restoreErrs...)
 }
 
+// deleteAccountRecord removes one saved account. The vault ciphertext goes first
+// and its failure aborts the whole operation: deleting the metadata row while the
+// encrypted secret survives would leave an orphaned ciphertext that no UI or
+// delete path can reach any more.
 func (s *NativeService) deleteAccountRecord(ctx context.Context, id string) error {
-	var deleteErrs []error
-	if vault := s.currentAccountVault(); vault != nil {
-		if err := vault.Delete(ctx, accountVaultRef(id)); err != nil && !errors.Is(err, credentials.ErrNotFound) {
-			deleteErrs = append(deleteErrs, err)
-		}
+	vault := s.currentAccountVault()
+	if vault == nil {
+		return errors.New("加密凭据库不可用")
+	}
+	if err := vault.Delete(ctx, accountVaultRef(id)); err != nil && !errors.Is(err, credentials.ErrNotFound) {
+		return fmt.Errorf("删除账号凭据失败：%w", err)
 	}
 	_, err := s.db.ExecContext(ctx, `DELETE FROM kimi_accounts WHERE id=?`, id)
-	deleteErrs = append(deleteErrs, err)
-	return errors.Join(deleteErrs...)
+	return err
 }
 
 // readManagedProviderObject reads the raw managed:kimi-code provider object so a
@@ -823,6 +827,15 @@ func (s *NativeService) upsertAccountWithSecret(ctx context.Context, profile *Ac
 	if err := vault.Put(ctx, accountVaultRef(id), secretPayload); err != nil {
 		return AccountSummary{}, errors.New("加密保存账号凭据失败")
 	}
+	// The ciphertext is already written, so any later failure must remove it
+	// again: an orphaned vault entry is unreachable once no metadata row names it.
+	cleanupVault := func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if delErr := vault.Delete(cleanupCtx, accountVaultRef(id)); delErr != nil && !errors.Is(delErr, credentials.ErrNotFound) {
+			return
+		}
+	}
 	modelsJSON := existing.ModelsJSON
 	if managedModels := s.snapshotManagedModels(ctx); len(managedModels) > 0 {
 		if encoded, encErr := json.Marshal(managedModels); encErr == nil {
@@ -851,11 +864,21 @@ func (s *NativeService) upsertAccountWithSecret(ctx context.Context, profile *Ac
 		accountStatusReady,
 	)
 	if err != nil {
+		cleanupVault()
 		return AccountSummary{}, err
 	}
 	row, err := s.loadAccountRow(ctx, id)
 	if err != nil {
-		return AccountSummary{}, err
+		// The row exists now; a failed read-back must not look like a failed save,
+		// or the caller cannot roll back the record it just created.
+		row = accountRow{
+			ID: id, UserID: profile.UserID, Label: label, Nickname: profile.Nickname,
+			Avatar: profile.Avatar, Plan: profile.Plan, Region: profile.Region,
+			OAuthKey: sanitizeOAuthKey(oauthKey), OAuthHost: strings.TrimSpace(oauthHost),
+			BaseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"), Status: accountStatusReady,
+			QuotaJSON: existing.QuotaJSON, ModelsJSON: modelsJSON,
+			LastSeenAt: now, CreatedAt: createdAt, UpdatedAt: now,
+		}
 	}
 	summary := s.accountRowToSummary(ctx, row, profile.UserID)
 	s.bus.Publish("accounts", map[string]any{"type": "account.saved", "accountId": summary.ID})
@@ -1370,12 +1393,11 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 	s.switchMu.Lock()
 	defer s.switchMu.Unlock()
 
-	queuedCancel, err := s.beginQueuedSwitch(ctx, queuedSeq, targetID)
-	if err != nil {
+	// A queued switch must survive an ACCOUNT_SWITCH_BUSY retry: validate the
+	// slot without consuming it here, and only take ownership once Step 1 has
+	// confirmed the switch can really run.
+	if err := s.validateQueuedSwitch(ctx, queuedSeq, targetID); err != nil {
 		return AccountSwitchResult{}, err
-	}
-	if queuedCancel != nil {
-		defer queuedCancel()
 	}
 
 	vault := s.currentAccountVault()
@@ -1443,9 +1465,16 @@ func (s *NativeService) executeAccountSwitch(ctx context.Context, targetID strin
 		}
 	}
 
-	// Clear any previous pending switch now that we are switching. A queued
-	// switch already cleared its own slot in beginQueuedSwitch, and canceling
-	// its watch context here would abort the switch that is now running.
+	// The switch is now certain to proceed: atomically consume the queued slot so
+	// no second invocation can run it, and release its watch context when this
+	// switch finishes. A manual switch still clears any stale pending entry.
+	queuedCancel, err := s.consumeQueuedSwitch(ctx, queuedSeq, targetID)
+	if err != nil {
+		return AccountSwitchResult{}, err
+	}
+	if queuedCancel != nil {
+		defer queuedCancel()
+	}
 	if queuedSeq == 0 {
 		s.cancelPendingSwitchLocked()
 	}
@@ -1798,11 +1827,7 @@ func (s *NativeService) queuePendingAccountSwitch(target accountRow, busyIDs []s
 					for _, b := range busy {
 						ids = append(ids, b.ID)
 					}
-					s.accountMu.Lock()
-					if s.pendingSwitch != nil && s.pendingSwitch.info.TargetID == target.ID {
-						s.pendingSwitch.info.BusySessionIDs = ids
-					}
-					s.accountMu.Unlock()
+					s.updatePendingSwitchBusy(seq, ids)
 					checkCancel()
 					continue
 				}
@@ -1816,9 +1841,17 @@ func (s *NativeService) queuePendingAccountSwitch(target accountRow, busyIDs []s
 					}
 					var native *NativeError
 					if errors.As(switchErr, &native) && native.Code == "ACCOUNT_SWITCH_BUSY" {
+						// A session became busy again between the idle poll and the
+						// switch itself. The pending slot is still owned by this
+						// watcher, so keep waiting instead of dropping the switch.
+						s.bus.Publish("accounts", map[string]any{
+							"type":      "account.switch_waiting",
+							"accountId": target.ID,
+							"error":     switchErr.Error(),
+						})
 						continue
 					}
-					s.cancelPendingSwitchIfTarget(target.ID)
+					s.cancelPendingSwitchIfSeq(seq)
 					s.bus.Publish("accounts", map[string]any{
 						"type":      "account.switch_failed",
 						"accountId": target.ID,
@@ -1844,19 +1877,39 @@ func (s *NativeService) cancelPendingSwitchLocked() {
 	}
 }
 
-// beginQueuedSwitch re-validates a queued switch after switchMu is held: the
-// request may have been cancelled or replaced by a different target while the
-// watcher was waiting, and an old goroutine must never switch back to its own
-// account. It clears the pending slot and returns that request's cancel func so
-// the caller can release the watch context when the switch is over.
-func (s *NativeService) beginQueuedSwitch(ctx context.Context, seq uint64, targetID string) (context.CancelFunc, error) {
+// queuedSwitchMatches reports whether seq still names the live pending switch for
+// targetID and the watcher has not been cancelled. Callers must hold accountMu.
+func (s *NativeService) queuedSwitchMatchesLocked(ctx context.Context, seq uint64, targetID string) bool {
+	return seq != 0 && s.pendingSwitch != nil && s.pendingSwitch.seq == seq &&
+		s.pendingSwitch.info.TargetID == targetID && ctx.Err() == nil
+}
+
+// validateQueuedSwitch is the read-only entry check for a queued switch. It must
+// not consume the pending slot: a run that ends in ACCOUNT_SWITCH_BUSY has to
+// leave the slot and its watch context intact so the watcher can retry.
+func (s *NativeService) validateQueuedSwitch(ctx context.Context, seq uint64, targetID string) error {
+	if seq == 0 {
+		return nil
+	}
+	s.accountMu.Lock()
+	defer s.accountMu.Unlock()
+	if !s.queuedSwitchMatchesLocked(ctx, seq, targetID) {
+		return errAccountSwitchSuperseded
+	}
+	return nil
+}
+
+// consumeQueuedSwitch takes ownership of a queued switch after the busy check has
+// passed. It clears the slot atomically and returns that request's cancel func,
+// which the caller defers so the watch context ends with the switch itself.
+func (s *NativeService) consumeQueuedSwitch(ctx context.Context, seq uint64, targetID string) (context.CancelFunc, error) {
 	if seq == 0 {
 		return nil, nil
 	}
 	s.accountMu.Lock()
 	defer s.accountMu.Unlock()
-	if s.pendingSwitch == nil || s.pendingSwitch.seq != seq || s.pendingSwitch.info.TargetID != targetID || ctx.Err() != nil {
-		if s.pendingSwitch != nil && s.pendingSwitch.seq == seq {
+	if !s.queuedSwitchMatchesLocked(ctx, seq, targetID) {
+		if s.pendingSwitch != nil && s.pendingSwitch.seq == seq && s.pendingSwitch.info.TargetID == targetID {
 			s.pendingSwitch.cancel()
 			s.pendingSwitch = nil
 		}
@@ -1865,6 +1918,29 @@ func (s *NativeService) beginQueuedSwitch(ctx context.Context, seq uint64, targe
 	cancel := s.pendingSwitch.cancel
 	s.pendingSwitch = nil
 	return cancel, nil
+}
+
+// updatePendingSwitchBusy refreshes the reported busy sessions of the queued
+// switch identified by seq. Matching on seq keeps a stale watcher from writing
+// into a newer request for the same account.
+func (s *NativeService) updatePendingSwitchBusy(seq uint64, ids []string) {
+	s.accountMu.Lock()
+	defer s.accountMu.Unlock()
+	if s.pendingSwitch != nil && s.pendingSwitch.seq == seq {
+		s.pendingSwitch.info.BusySessionIDs = ids
+	}
+}
+
+// cancelPendingSwitchIfSeq cancels the pending switch only when it is still the
+// request that owns seq, so an old watcher cannot cancel a newer request for the
+// same target.
+func (s *NativeService) cancelPendingSwitchIfSeq(seq uint64) {
+	s.accountMu.Lock()
+	defer s.accountMu.Unlock()
+	if s.pendingSwitch != nil && s.pendingSwitch.seq == seq {
+		s.pendingSwitch.cancel()
+		s.pendingSwitch = nil
+	}
 }
 
 func (s *NativeService) cancelPendingSwitchIfTarget(targetID string) {

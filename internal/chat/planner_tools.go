@@ -93,17 +93,11 @@ func (p *PlannerService) executeTool(ctx context.Context, root string, state *pl
 	if !allowed {
 		return "用户拒绝了这次写入，未执行。", nil
 	}
-	path, err := plannerPath(root, input.Path, true)
-	if err == nil {
-		err = os.MkdirAll(filepath.Dir(path), 0755)
-	}
-	if err == nil {
-		path, err = plannerPath(root, input.Path, true)
-	}
-	if err == nil {
-		err = plannerWriteFile(path, []byte(input.Content))
-	}
-	if err != nil {
+	// Re-validate and then write through an os.Root: the kernel-level root
+	// constraint is the actual guarantee, so a symlink created between the check
+	// and the write still cannot escape the workspace. Nothing below races a
+	// concurrent attacker; it only removes the check-then-use gap.
+	if err := plannerWriteWithinRoot(root, input.Path, []byte(input.Content)); err != nil {
 		return "写入失败：" + err.Error(), nil
 	}
 	return fmt.Sprintf("已按用户批准写入 %s（%d 字节）。", input.Path, len(input.Content)), ctx.Err()
@@ -237,15 +231,45 @@ func plannerResolveMissing(root, candidate string) (string, error) {
 	return filepath.Join(parts...), nil
 }
 
-func plannerWriteFile(path string, data []byte) error {
-	info, err := os.Lstat(path)
-	if err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("目标路径是符号链接，已拒绝")
+// plannerWriteWithinRoot performs the approved write through an os.Root. Every
+// path keeps being validated by plannerPath first (clear error messages, symlink
+// rejection), but the write itself is bound to the workspace root by the kernel,
+// so the check and the write cannot disagree.
+func plannerWriteWithinRoot(root, requested string, data []byte) error {
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return errors.New("工作区不可用")
 	}
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	path, err := plannerPath(resolvedRoot, requested, true)
+	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	relative, err := filepath.Rel(resolvedRoot, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return errors.New("路径超出当前工作区")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	// Re-validate after creating the parent directories: mkdir is the only step
+	// that could have observed a new component.
+	path, err = plannerPath(resolvedRoot, requested, true)
+	if err != nil {
+		return err
+	}
+	relative, err = filepath.Rel(resolvedRoot, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return errors.New("路径超出当前工作区")
+	}
+	workspace, err := os.OpenRoot(resolvedRoot)
+	if err != nil {
+		return errors.New("工作区不可用")
+	}
+	defer workspace.Close()
+	if info, err := workspace.Lstat(relative); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("目标路径是符号链接，已拒绝")
+	}
+	return workspace.WriteFile(relative, data, 0644)
 }
 
 func plannerReadOnlyTool(root, name, path, pattern string) (string, error) {
@@ -389,9 +413,16 @@ func plannerContext(root string) (string, error) {
 		content, readErr := plannerRead(root, name)
 		if readErr == nil {
 			builder.WriteString("\n\n" + boundedPlannerText(content, 16<<10))
-		} else if !errors.Is(readErr, fs.ErrNotExist) && !strings.Contains(readErr.Error(), "路径不存在") {
-			return "", readErr
+			continue
 		}
+		// A repository-relative symlink (AGENTS.md -> CLAUDE.md) is refused by the
+		// planner policy. That refusal must skip the document, not abort the whole
+		// planning context: a missing convenience file is not a load failure.
+		if errors.Is(readErr, fs.ErrNotExist) || strings.Contains(readErr.Error(), "路径不存在") ||
+			strings.Contains(readErr.Error(), "符号链接") {
+			continue
+		}
+		return "", readErr
 	}
 	return builder.String(), nil
 }
