@@ -187,6 +187,46 @@ function adapterSource(site, spec) {
     }
     return keptLines.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
   };
+  // serializeText walks a detached clone itself instead of reading innerText.
+  // A clone is not rendered, and the spec has innerText fall back to textContent
+  // for such a node, which silently joins every paragraph into one long line and
+  // defeats the per-line noise filter. Block boundaries become newlines here.
+  const BLOCK_TAGS = new Set(['ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DD', 'DIV', 'DL', 'DT', 'FIELDSET', 'FIGCAPTION', 'FIGURE', 'FOOTER', 'FORM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HEADER', 'HR', 'LI', 'MAIN', 'NAV', 'OL', 'P', 'PRE', 'SECTION', 'TABLE', 'TBODY', 'TD', 'TFOOT', 'TH', 'THEAD', 'TR', 'UL']);
+  const serializeText = (root) => {
+    const parts = [];
+    const pushBreak = () => {
+      if (parts.length && parts[parts.length - 1] !== '\\n') parts.push('\\n');
+    };
+    const walk = (node) => {
+      if (!node) return;
+      const nodeType = node.nodeType;
+      const textNode = nodeType === 3 || (nodeType === undefined && (!node.tagName || node.tagName === '#TEXT'));
+      if (textNode) {
+        parts.push(String(node.nodeValue ?? node.textContent ?? ''));
+        return;
+      }
+      if (nodeType !== undefined && nodeType !== 1) return;
+      const tag = String(node.tagName || '').toUpperCase();
+      if (tag === 'BR') {
+        parts.push('\\n');
+        return;
+      }
+      const block = BLOCK_TAGS.has(tag);
+      if (block) pushBreak();
+      const children = node.childNodes ? Array.from(node.childNodes) : (Array.isArray(node.children) ? node.children : []);
+      if (tag === 'PRE') {
+        const text = typeof node.textContent === 'string' ? node.textContent : '';
+        if (text) parts.push(text);
+      } else if (children.length) {
+        for (const child of children) walk(child);
+      } else if (typeof node.textContent === 'string') {
+        parts.push(node.textContent);
+      }
+      if (block) pushBreak();
+    };
+    walk(root);
+    return parts.join('');
+  };
   const bodyText = (node) => {
     let target = node;
     if (node && typeof node.cloneNode === 'function') {
@@ -204,7 +244,7 @@ function adapterSource(site, spec) {
     }
     const raw = typeof target.innerText === 'string' && target.innerText
       ? target.innerText
-      : (typeof target.textContent === 'string' ? target.textContent : '');
+      : serializeText(target);
     return cleanLines(raw);
   };
   const nodes = [];
@@ -220,6 +260,19 @@ function adapterSource(site, spec) {
   }
   // 外层容器常常包住真正的消息节点，只保留最内层，避免一条消息出现两次。
   const kept = nodes.filter(node => !nodes.some(other => other !== node && node.contains && node.contains(other)));
+  // querySelectorAll returns document order per selector, but concatenating
+  // several selectors groups all 提问 before all 回答. Re-sort by real document
+  // position so multi-turn conversations keep their turn order.
+  const documentOrder = (a, b) => {
+    if (a === b) return 0;
+    try {
+      const position = a.compareDocumentPosition(b);
+      if (position & 4) return -1;
+      if (position & 2) return 1;
+    } catch (error) {}
+    return 0;
+  };
+  kept.sort(documentOrder);
   const roleOf = (node) => {
     const hints = [];
     const push = (value) => { if (value) hints.push(String(value).toLowerCase()); };
@@ -227,22 +280,31 @@ function adapterSource(site, spec) {
     push(attr(node, 'data-role'));
     push(attr(node, 'data-author'));
     push(attr(node, 'data-testid'));
-    for (const selector of ['user-query', 'model-response', '[data-message-author-role]', '[data-role]', '[data-testid]']) {
+    // 元宝 marks the speaker on the turn itself.
+    push(attr(node, 'data-conv-speaker'));
+    for (const selector of ['user-query', 'model-response', '[data-message-author-role]', '[data-role]', '[data-testid]', '[data-conv-speaker]']) {
       try {
         const found = node.closest ? node.closest(selector) : null;
         if (found) {
           push(attr(found, 'data-message-author-role'));
           push(attr(found, 'data-role'));
           push(attr(found, 'data-testid'));
+          push(attr(found, 'data-conv-speaker'));
           if (found.tagName) push(String(found.tagName));
+          if (typeof found.className === 'string') push(found.className);
         }
       } catch (error) {}
     }
     if (node.tagName) push(String(node.tagName));
     if (typeof node.className === 'string') push(node.className);
     const joined = hints.join(' ');
+    // 豆包 testids and 千问 camelCase class names are explicit role markers.
+    if (/(^|[^a-z])send_message([^a-z]|$)/.test(joined)) return 'user';
+    if (/(^|[^a-z])receive_message([^a-z]|$)/.test(joined)) return 'assistant';
+    if (/(^|[^a-z])questionitem([^a-z]|$)/.test(joined)) return 'user';
+    if (/(^|[^a-z])answeritem([^a-z]|$)/.test(joined)) return 'assistant';
     if (/(^|[^a-z])(user|human|query)([^a-z]|$)/.test(joined)) return 'user';
-    if (/(assistant|model|bot|claude|gpt|ai)([^a-z]|$)/.test(joined)) return 'assistant';
+    if (/(assistant|model|bot|claude|gpt|ai|assistant)([^a-z]|$)/.test(joined)) return 'assistant';
     return 'unknown';
   };
   const messages = [];
@@ -321,6 +383,45 @@ export const GENERIC_PAGE_ADAPTER_SOURCE = `(args) => {
     }
   } catch (error) {}
 
+  // A detached clone has no layout, so innerText degrades to textContent and
+  // every paragraph would be joined into one line. Walk the clone instead and
+  // turn block boundaries into newlines so the line-based noise filter works.
+  const BLOCK_TAGS = new Set(['ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DD', 'DIV', 'DL', 'DT', 'FIELDSET', 'FIGCAPTION', 'FIGURE', 'FOOTER', 'FORM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HEADER', 'HR', 'LI', 'MAIN', 'NAV', 'OL', 'P', 'PRE', 'SECTION', 'TABLE', 'TBODY', 'TD', 'TFOOT', 'TH', 'THEAD', 'TR', 'UL']);
+  const serializeText = (root) => {
+    const parts = [];
+    const pushBreak = () => {
+      if (parts.length && parts[parts.length - 1] !== '\\n') parts.push('\\n');
+    };
+    const walk = (node) => {
+      if (!node) return;
+      const nodeType = node.nodeType;
+      const textNode = nodeType === 3 || (nodeType === undefined && (!node.tagName || node.tagName === '#TEXT'));
+      if (textNode) {
+        parts.push(String(node.nodeValue ?? node.textContent ?? ''));
+        return;
+      }
+      if (nodeType !== undefined && nodeType !== 1) return;
+      const tag = String(node.tagName || '').toUpperCase();
+      if (tag === 'BR') {
+        parts.push('\\n');
+        return;
+      }
+      const block = BLOCK_TAGS.has(tag);
+      if (block) pushBreak();
+      const children = node.childNodes ? Array.from(node.childNodes) : (Array.isArray(node.children) ? node.children : []);
+      if (tag === 'PRE') {
+        const text = typeof node.textContent === 'string' ? node.textContent : '';
+        if (text) parts.push(text);
+      } else if (children.length) {
+        for (const child of children) walk(child);
+      } else if (typeof node.textContent === 'string') {
+        parts.push(node.textContent);
+      }
+      if (block) pushBreak();
+    };
+    walk(root);
+    return parts.join('');
+  };
   const readNode = (node) => {
     let target = node;
     if (node && typeof node.cloneNode === 'function') {
@@ -336,7 +437,7 @@ export const GENERIC_PAGE_ADAPTER_SOURCE = `(args) => {
     }
     const raw = typeof target.innerText === 'string' && target.innerText
       ? target.innerText
-      : (typeof target.textContent === 'string' ? target.textContent : '');
+      : serializeText(target);
     return cleanText(raw);
   };
 
@@ -361,6 +462,17 @@ export const GENERIC_PAGE_ADAPTER_SOURCE = `(args) => {
     }
   }
   const innerTurns = candidates.filter(node => !candidates.some(other => other !== node && node.contains && node.contains(other)));
+  // Several turn selectors are concatenated, so their results are grouped by
+  // selector rather than by turn. Restore document order before reading them.
+  innerTurns.sort((a, b) => {
+    if (a === b) return 0;
+    try {
+      const position = a.compareDocumentPosition ? a.compareDocumentPosition(b) : 0;
+      if (position & 4) return -1;
+      if (position & 2) return 1;
+    } catch (error) {}
+    return 0;
+  });
   if (innerTurns.length > 0) {
     const messages = [];
     let total = 0;
@@ -553,7 +665,15 @@ export function addSite(list, entry) {
   if (!url) return { ok: false, error: "站点地址只能是完整的 http 或 https 地址", sites: current };
   if (current.some(site => site.url === url)) return { ok: false, error: "这个站点已经在列表里", sites: current };
   const label = String(entry?.label || "").trim().slice(0, 24) || new URL(url).hostname.slice(0, 24);
-  const id = matchSite(url) || "site-" + (current.length + 1) + "-" + url.length;
+  // The site id is only a handle: two custom URLs on the same site must not share
+  // one, or removing either row would remove both.
+  const base = matchSite(url) || "site-" + (current.length + 1) + "-" + url.length;
+  let id = base;
+  let suffix = 2;
+  while (current.some(site => site.id === id)) {
+    id = base + "-" + suffix;
+    suffix += 1;
+  }
   return { ok: true, sites: [...current, { id, label, url }] };
 }
 
@@ -784,6 +904,11 @@ export async function runWebSummarization(apis, { model, text, site = "", onProg
         resolveDone(reply);
         return true;
       }
+      // A thread that is idle with no assistant text has finished without
+      // producing a plan. Waiting for another event would hang the panel until
+      // the user cancels, so this is reported as a failure the user can act on.
+      rejectDone(new Error(snapshot.error || "模型归纳已结束但没有返回内容，请改用直接提取或更换模型"));
+      return true;
     }
     return false;
   };
@@ -795,6 +920,17 @@ export async function runWebSummarization(apis, { model, text, site = "", onProg
   }
 
   let pollTimer = null;
+  // A long-running thread keeps the panel in "归纳中" forever without a bound.
+  // 180 seconds is generous for a distillation pass and short enough that a wedged
+  // run surfaces as an error the user can retry.
+  const overallTimer = setTimeout(() => {
+    if (stopped) return;
+    rejectDone(new Error("模型归纳超过 180 秒仍未完成，请改用直接提取或稍后重试"));
+    stopped = true;
+    if (pollTimer) clearTimeout(pollTimer);
+    if (typeof plannerApi.stop === "function") plannerApi.stop(thread.id).catch(() => {});
+  }, 180000);
+  if (overallTimer && typeof overallTimer.unref === "function") overallTimer.unref();
   const startPolling = () => {
     if (typeof plannerApi.get !== "function") return;
     const tick = async () => {
@@ -829,6 +965,7 @@ export async function runWebSummarization(apis, { model, text, site = "", onProg
     return await donePromise;
   } finally {
     stopped = true;
+    clearTimeout(overallTimer);
     if (pollTimer) clearTimeout(pollTimer);
     sub?.dispose?.();
     if (typeof plannerApi.remove === "function") {
@@ -910,7 +1047,9 @@ export function fillPlan({ before = "", text = "", choice = "" } = {}) {
     const separator = existing.endsWith("\n") ? "\n" : "\n\n";
     return { ok: true, text: existing.replace(/[ \t]+$/g, "") + separator + incoming, append: true, mode: "append" };
   }
-  if (choice === "replace") return { ok: true, text: incoming, append: true, mode: "replace" };
+  // `append: false` is what the host uses to clear the composer first. Marking a
+  // replace as append would leave the old draft in front of the new text.
+  if (choice === "replace") return { ok: true, text: incoming, append: false, mode: "replace" };
   return { ok: false, needsChoice: true, error: "网页输入框已有内容，请选择追加或覆盖" };
 }
 
@@ -1237,10 +1376,16 @@ export async function stopPlan(api, threadId) {
 export function createBrowserSync(options) {
   let visible = false;
   let disposed = false;
+  let queued = Promise.resolve();
   const view = options.view;
   const getRect = options.getRect;
   const isCovered = options.isCovered || (() => false);
-  async function apply() {
+
+  // show and hide are two async native calls against one OS-level layer. Running
+  // them concurrently lets a hide land after a show (or the reverse), which is
+  // how the view ended up covering a panel it had already been told to leave.
+  // Every apply waits for the previous one, and the last state wins.
+  async function run() {
     if (disposed) return { visible: false };
     const rect = getRect();
     const covered = Boolean(isCovered());
@@ -1248,18 +1393,33 @@ export function createBrowserSync(options) {
     if (usable) {
       await view.show({ x: rect.x, y: rect.y, width: rect.width, height: rect.height });
       visible = true;
+      // The layer needs a moment to appear; a menu or sheet may have opened while
+      // the native call was in flight, and it must not be left underneath.
+      if (disposed || isCovered()) {
+        await view.hide().catch(() => {});
+        visible = false;
+      }
     } else if (visible) {
       await view.hide();
       visible = false;
     }
     return { visible };
   }
+
+  function apply() {
+    const next = queued.then(run, run);
+    // Keep the chain alive after a rejection without swallowing the caller's.
+    queued = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
   return {
     apply,
     get visible() { return visible; },
     async dispose() {
       if (disposed) return;
       disposed = true;
+      await queued.catch(() => {});
       if (visible) {
         visible = false;
         await view.hide().catch(() => {});
@@ -2444,6 +2604,13 @@ export async function activate(ctx) {
   }
 
   // --- handoff -------------------------------------------------------------
+  /** Re-opens the message picker with the previous selection intact. */
+  function returnToPicker() {
+    if (!state.extraction?.messages?.length) return;
+    state.pickOpen = true;
+    renderPicker();
+  }
+
   function openPreview(text, from, extra = {}) {
     const preserved = extra.preserveFields && state.preview ? state.preview : null;
     state.pickOpen = false;
@@ -2471,7 +2638,17 @@ export async function activate(ctx) {
     };
     renderPreview();
     applyChrome();
-    void loadModels().then(() => renderPreview()).catch(() => {});
+    // Model loading is async. Re-rendering the whole preview when it returns
+    // rewrites the textarea value and moves the caret away from whatever the
+    // user has typed meanwhile; only the controls that depend on models are
+    // refreshed.
+    void loadModels()
+      .then(() => {
+        if (!state.preview || state.preview.draftId !== draftId) return;
+        renderPreviewStructure(state.preview, { keepText: true });
+        syncPreviewControls(state.preview);
+      })
+      .catch(() => {});
     void populatePreviewTargets(draftId);
     void populatePreviewModels(draftId);
   }
@@ -2581,6 +2758,10 @@ export async function activate(ctx) {
       if (!state.preview || (commitDraftId && state.preview.draftId !== commitDraftId)) return;
       state.committed = { sessionId, created: result?.created !== false };
       state.preview = { ...state.preview, committing: false, confirmed: null, confirmedPayload: null };
+      // The plan has been delivered, so the web draft that produced it is spent.
+      // Keeping it would offer to hand the same content over a second time.
+      setDraft("web", "");
+      queueDrafts();
       void refreshOpenButton();
     } catch (error) {
       if (!state.preview || (commitDraftId && state.preview.draftId !== commitDraftId)) return;
@@ -2693,7 +2874,10 @@ export async function activate(ctx) {
       name.title = site.url;
       const remove = button("移除", "ekd-danger");
       remove.addEventListener("click", () => {
-        state.sites = removeSite(state.sites, site.id);
+        // A list saved before ids were made unique can hold several rows with the
+        // same id; the URL identifies exactly the row the user clicked.
+        const duplicated = state.sites.filter(item => item.id === site.id).length > 1;
+        state.sites = removeSite(state.sites, duplicated ? site.url : site.id);
         void persist(STORAGE_KEYS.sites, state.sites);
         renderToolbar();
         renderSiteEditors();
@@ -3025,9 +3209,11 @@ export async function activate(ctx) {
     el.previewModel.value = selectedModel || "";
   }
 
-  function renderPreviewStructure(preview) {
+  function renderPreviewStructure(preview, options = {}) {
     if (!preview || !el.previewPane) return;
-    if (el.previewText) el.previewText.value = preview.text;
+    // keepText leaves the textarea value alone, so an async model refresh cannot
+    // move the caret away from whatever the user is typing.
+    if (el.previewText && !options.keepText) el.previewText.value = preview.text;
     if (el.previewMode) el.previewMode.value = preview.mode;
     if (el.previewTarget) el.previewTarget.value = preview.target;
     if (el.previewCwd) el.previewCwd.value = preview.cwd;
@@ -3512,9 +3698,14 @@ export async function activate(ctx) {
     spacer.style.flex = "1 1 auto";
     const back = button("返回");
     back.addEventListener("click", () => {
+      const fromPicker = Boolean(state.preview?.from === "web" && state.extraction?.messages?.length);
       state.previewSeq = (Number(state.previewSeq) || 0) + 1;
       state.preview = null;
       state.committed = null;
+      // Coming back from a preview that was built on a multi-select list should
+      // land on that list again, not on an empty web pane that forgets the
+      // selection the user just made.
+      if (fromPicker) returnToPicker();
       applyChrome();
     });
     head.append(spacer, back);
@@ -3831,6 +4022,12 @@ export async function activate(ctx) {
       panelStateChanged();
       return () => {
         releasePanelObservers();
+        // The panel is going away, so the layout grant it held has to go with it
+        // and the web layer must not stay on screen over an empty slot.
+        sidebarRelease?.dispose();
+        sidebarRelease = null;
+        sync?.dispose().catch(() => {});
+        sync = null;
         root?.remove();
         host.remove();
         root = null;
@@ -3864,7 +4061,10 @@ export async function activate(ctx) {
     viewLauncher.clear();
     state.view = null;
     root?.remove();
-    if (mountHost) mountHost.remove();
+    // mountHost belongs to the host's right-panel container; removing it would
+    // take a host node the plugin does not own. Only the wrapper created here is
+    // ours to remove.
+    shadow?.host?.remove?.();
     root = null;
     shadow = null;
     mountHost = null;

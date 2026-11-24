@@ -60,6 +60,7 @@ function harness(): Harness {
     const inner = new FakeElement("div", "think-body-inner");
     const pre = new FakeElement("pre", "think-text");
     pre.textContent = text;
+    pre.childNodes.push(Object.assign(new FakeElement("#TEXT"), { nodeValue: text }) as unknown as FakeElement);
     inner.append(pre);
     body.append(inner);
     block.append(head, body);
@@ -323,6 +324,7 @@ test("host content added next to a decorator's node still wakes it", () => {
   // A batch that also carries a host node must not be discarded because one of
   // its records was the decorator's own.
   const host = new FakeElement("span", "host-appended");
+  host.textContent = "host text";
   body.append(host);
   h.observer.emit([{ type: "childList", target: body, addedNodes: [host] }]);
   h.flush();
@@ -394,5 +396,41 @@ test("a collapsed thinking block reports closed and no decoration is lost", () =
     info = next;
   }, scope);
   assert.equal(info!.open, false);
+  h.hub.dispose();
+});
+
+test("an unrelated DOM change does not re-dispatch an unchanged block", () => {
+  const h = harness();
+  const block = h.think("stable text", { id: "stable" });
+  const scope = new Scope();
+  let updates = 0;
+  h.hub.register("thinking", () => ({
+    dispose: () => {},
+    update: () => {
+      updates += 1;
+    },
+  }), scope);
+  // A sibling message renders and re-renders: the sweep visits the thinking
+  // block again, but nothing about it changed.
+  const sibling = h.think("other block", { id: "sibling" });
+  h.observer.emit([{ type: "childList", target: sibling }]);
+  h.flush();
+  assert.equal(updates, 0, "an unchanged block was re-triggered by unrelated mutations");
+
+  // A real text change still dispatches exactly one update. The text lives in a
+  // child text node, which is how a browser renders `pre.textContent = ...`.
+  const pre = block.querySelector("pre") as FakeElement;
+  pre.textContent = "stable text and more";
+  pre.childNodes[0] = Object.assign(new FakeElement("#TEXT"), { nodeValue: "stable text and more" }) as unknown as FakeElement;
+  h.observer.emit([{ type: "childList", target: pre }]);
+  h.flush();
+  assert.equal(updates, 1, "a real text change was suppressed");
+
+  // Opening the block is a state change and dispatches too.
+  const body = block.querySelector(".think-body") as FakeElement;
+  body.classList.remove("open");
+  h.observer.emit([{ type: "attributes", target: body, attributeName: "class" }]);
+  h.flush();
+  assert.equal(updates, 2, "an open-state change was suppressed");
   h.hub.dispose();
 });

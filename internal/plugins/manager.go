@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -217,9 +218,12 @@ type Manager struct {
 
 	officialDigests OfficialDigests
 	officialKeys    map[string]ed25519.PublicKey
-	updater         *pluginUpdater
-	views           map[string]map[string]*browserView
-	commands        map[string]command
+	// officialSet holds the embedded allowlist loaded once; the atomic pointer
+	// lets a test-supplied loader be invalidated without recreating the manager.
+	officialSet atomic.Pointer[officialDigestSet]
+	updater     *pluginUpdater
+	views       map[string]map[string]*browserView
+	commands    map[string]command
 	// sessionWatches counts, per plugin, how many of its own handles watch each
 	// session. The plugin layer forwards only the first and last reference, so
 	// the official stream follows the plugin's real interest rather than the

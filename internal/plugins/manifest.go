@@ -82,17 +82,21 @@ func normalizeUpstreamURL(repo string) string {
 // Manifest is plugin.json. Unknown fields are refused by the parser: a typo in
 // a capability name must fail loudly rather than silently drop a permission.
 type Manifest struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	Version      string    `json:"version"`
-	APIVersion   int       `json:"apiVersion"`
-	Description  string    `json:"description,omitempty"`
-	Author       string    `json:"author,omitempty"`
-	License      string    `json:"license,omitempty"`
-	HostVersions []string  `json:"hostVersions"`
-	Entry        Entry     `json:"entry"`
-	Capabilities []string  `json:"capabilities"`
-	Upstream     *Upstream `json:"upstream,omitempty"`
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Version      string   `json:"version"`
+	APIVersion   int      `json:"apiVersion"`
+	Description  string   `json:"description,omitempty"`
+	Author       string   `json:"author,omitempty"`
+	License      string   `json:"license,omitempty"`
+	HostVersions []string `json:"hostVersions"`
+	Entry        Entry    `json:"entry"`
+	Capabilities []string `json:"capabilities"`
+	// MinCoreVersion optionally pins the KimiCode+ core a plugin release needs.
+	// The release CLI falls back to its --min-core flag when a plugin leaves it
+	// empty, so the four official plugins are not forced onto one version.
+	MinCoreVersion string    `json:"minCoreVersion,omitempty"`
+	Upstream       *Upstream `json:"upstream,omitempty"`
 }
 
 // ParseManifest decodes a manifest strictly. Trailing content after the object
@@ -153,6 +157,9 @@ func (m Manifest) Validate() error {
 	}
 	if _, err := m.CapabilityGrants(); err != nil {
 		return err
+	}
+	if m.MinCoreVersion != "" && !coreSemverPattern.MatchString(strings.TrimSpace(m.MinCoreVersion)) {
+		return errors.New("minCoreVersion 必须是 vX.Y.Z 形式")
 	}
 	if len(m.Description) > 500 {
 		return errors.New("description 不超过 500 个字符")

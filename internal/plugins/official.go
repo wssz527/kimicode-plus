@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net/http"
 	"sort"
+	"sync"
 )
 
 // OfficialDigests is the build-time allowlist of embedded plugin content. The
@@ -52,6 +53,14 @@ func DirDigest(dir string) (string, error) {
 type servedModule struct {
 	name string
 	data []byte
+}
+
+// officialDigestSet is the one-time-loaded embedded allowlist. It is held
+// behind an atomic pointer rather than directly on the Manager so a test that
+// swaps the injected loader can invalidate it without recreating the manager.
+type officialDigestSet struct {
+	once    sync.Once
+	digests map[string]string
 }
 
 func directoryDigest(dir string, module *servedModule) (string, error) {
@@ -106,6 +115,13 @@ func directoryDigest(dir string, module *servedModule) (string, error) {
 
 // officialForEntry checks the installed copy against either the compiled
 // bundled allowlist or a verified Ed25519-signed official plugin manifest.
+//
+// The verdict is always recomputed from the bytes on disk: the allowlist cache
+// only avoids re-reading the embedded bundle, which is compiled into the binary
+// and cannot change at runtime. Caching the verdict itself would let a modified
+// file inherit its predecessor's privileges, because the metadata a cache could
+// compare (names, sizes, mtimes) is under the same attacker's control as the
+// content it stands for.
 func (m *Manager) officialForEntry(item entry, module *servedModule) bool {
 	if item.source != SourceBundled {
 		return false
@@ -119,12 +135,44 @@ func (m *Manager) officialForEntry(item entry, module *servedModule) bool {
 	return false
 }
 
+// officialAllowlist loads the embedded digest allowlist once. The pointer is
+// swapped by invalidateOfficialDigestCache, which is what keeps a hot update or
+// a test-supplied loader from being pinned to the first answer forever.
+func (m *Manager) officialAllowlist() map[string]string {
+	if m.officialDigests == nil {
+		return nil
+	}
+	set := m.officialSet.Load()
+	if set == nil {
+		fresh := &officialDigestSet{}
+		if !m.officialSet.CompareAndSwap(nil, fresh) {
+			set = m.officialSet.Load()
+		} else {
+			set = fresh
+		}
+	}
+	if set == nil {
+		return nil
+	}
+	set.once.Do(func() {
+		allowlist, err := m.officialDigests()
+		if err == nil {
+			set.digests = allowlist
+		}
+	})
+	return set.digests
+}
+
+func (m *Manager) invalidateOfficialDigestCache() {
+	m.officialSet.Store(&officialDigestSet{})
+}
+
 func (m *Manager) officialDigest(manifest Manifest, source string) string {
-	if source != SourceBundled || m.officialDigests == nil {
+	if source != SourceBundled {
 		return ""
 	}
-	allowlist, err := m.officialDigests()
-	if err != nil {
+	allowlist := m.officialAllowlist()
+	if allowlist == nil {
 		return ""
 	}
 	return allowlist[manifest.ID]

@@ -90,6 +90,35 @@ interface BlockState {
   revision: number;
   release: () => void;
   onUpdate?: (info: BlockInfo) => void;
+  /** Last text content the decorated block was reported with. */
+  text: string;
+}
+
+/** Reads the block's current text without normalizing whitespace.
+ *
+ * A recursive walk is used instead of `textContent` because some hosts (and the
+ * test DOM) expose `textContent` as a per-node field rather than an aggregated
+ * subtree value; relying on it would compare two empty strings and suppress
+ * every real update.
+ */
+function blockText(block: HTMLElement): string {
+  const parts: string[] = [];
+  const walk = (node: unknown): void => {
+    if (!node || typeof node !== "object") return;
+    const element = node as { childNodes?: ArrayLike<unknown>; nodeValue?: unknown; textContent?: unknown };
+    const children = element.childNodes;
+    if (children && children.length) {
+      for (let index = 0; index < children.length; index += 1) walk(children[index]);
+      return;
+    }
+    if (typeof element.nodeValue === "string") {
+      parts.push(element.nodeValue);
+      return;
+    }
+    if (typeof element.textContent === "string") parts.push(element.textContent);
+  };
+  walk(block);
+  return parts.join("");
 }
 
 export class DecorationHub implements Disposable {
@@ -167,17 +196,33 @@ export class DecorationHub implements Disposable {
           continue;
         }
         const state = spec.state(block);
+        const text = blockText(block);
+        // Only a real content change is worth an update. An unrelated DOM
+        // mutation elsewhere in the document re-runs the sweep for every
+        // decorated block, and re-dispatching the same open/streaming/text
+        // would make a decorator re-render (and re-parse a translation) for
+        // nothing.
+        if (
+          !existing.onUpdate ||
+          (state.open === existing.info.open && state.streaming === existing.info.streaming && text === existing.text)
+        ) {
+          existing.text = text;
+          existing.info = {
+            ...existing.info,
+            open: state.open,
+            streaming: state.streaming,
+            revision: existing.revision,
+          };
+          continue;
+        }
         const info: BlockInfo = {
           ...existing.info,
           open: state.open,
           streaming: state.streaming,
           revision: existing.revision,
         };
-        if (!existing.onUpdate) {
-          existing.info = info;
-          continue;
-        }
         existing.info = info;
+        existing.text = text;
         try {
           existing.onUpdate(info);
         } catch (error) {
@@ -212,7 +257,7 @@ export class DecorationHub implements Disposable {
         ? (result as DecorationHandle).update?.bind(result)
         : undefined;
     const release = cleanupRunner(result);
-    registration.blocks.set(block, { info, revision: 0, release, onUpdate });
+    registration.blocks.set(block, { info, revision: 0, release, onUpdate, text: blockText(block) });
   }
 
   private releaseBlock(registration: Registration, block: HTMLElement): void {

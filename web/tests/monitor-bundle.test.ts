@@ -103,17 +103,52 @@ test("the bundled renderer imports the way the host loader imports it", async ()
   assert.equal(typeof settingsModule.renderSettings, "function");
 });
 
-test("the host shims and the Rive runtime exist before any panel code runs", async () => {
+test("importing the renderer has no side effect and activate installs the host shims", async () => {
   installDOM();
+  delete runtime.chrome;
   await import(url);
-  // 上游在模块求值期调用 chrome.runtime.getURL，并把结果存成常量：
-  // 替身必须已经在位，资产必须是内联 data URL 而不是扩展目录路径。
-  assert.equal(typeof runtime.chrome?.runtime?.getURL, "function");
-  assert.match(runtime.chrome.runtime.getURL("rive/kimi_avatar_web-PnsTWI-X.riv"), /^data:application\/octet-stream;base64,/);
-  assert.match(runtime.chrome.runtime.getURL("rive/rive.wasm"), /^data:application\/wasm;base64,/);
+  // 模块求值只注册入口：宿主替身与 localStorage 覆盖都发生在 activate() 里，
+  // 这样停用插件能把页面完全还原，重复激活也不会叠加副作用。
+  assert.equal(runtime.chrome as unknown, undefined, "importing the renderer installed the chrome shim");
   // Rive UMD 在 ESM 严格模式下要靠 globalThis 当 root，否则 root["rive"] 赋值抛 TypeError
   assert.equal(typeof runtime.rive?.Rive, "function");
   assert.equal(typeof runtime.rive?.RuntimeLoader, "function");
+  // activate 之后替身必须在位，且资产是内联 data URL 而非扩展目录路径。
+  const module = await import(url);
+  const releases: Array<() => void> = [];
+  const ctx = {
+    plugin: { id: "kimicode-plus.monitor", version: "1.1.1", surface: "host" },
+    storage: {
+      list: async () => [],
+      get: async () => undefined,
+      set: async () => {},
+      delete: async () => {},
+    },
+    core: { request: async () => null },
+    events: { on: () => ({ dispose() {} }) },
+    // The panel's real DOM assembly needs a browser (innerHTML parsing); this
+    // smoke test only proves the entry activates and installs its shims.
+    ui: { mount: () => ({ dispose() {} }) },
+    log: () => {},
+    onDispose: (fn: () => void) => { releases.push(fn); },
+    activeSessionId: () => "",
+  };
+  const active = await module.activate(ctx);
+  assert.equal(active?.status, "active");
+  const shim = runtime.chrome as { runtime?: { getURL?: (path: string) => string } } | undefined;
+  assert.equal(typeof shim?.runtime?.getURL, "function");
+  assert.match(String(shim?.runtime?.getURL?.("rive/kimi_avatar_web-PnsTWI-X.riv")), /^data:application\/octet-stream;base64,/);
+  assert.match(String(shim?.runtime?.getURL?.("rive/rive.wasm")), /^data:application\/wasm;base64,/);
+  // activate starts real timers and observers; tear them down so node --test exits,
+  // and prove dispose restores the page (the shim must be gone again).
+  for (const release of releases.reverse()) {
+    try {
+      release();
+    } catch {
+      // teardown best effort in the stub environment
+    }
+  }
+  assert.equal(runtime.chrome as unknown, undefined, "dispose left the chrome shim installed");
 });
 
 test("inlined assets stay inside the host asset limit", () => {

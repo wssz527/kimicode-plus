@@ -17,8 +17,11 @@ import { create as createRoamPet } from '../pet/sprites.js';
 
 // 资产取自 kimi.com 前端公开 CDN（对话头像），运行时 @rive-app/canvas-lite 本地打包。
 // 沿用 2.0.0 的命名动画方式：动作直接播放，颜色独立由 CSS 表达。
-const PET_RIV_URL = chrome.runtime.getURL('rive/kimi_avatar_web-PnsTWI-X.riv');
-const PET_WASM_URL = chrome.runtime.getURL('rive/rive.wasm');
+// 资产在构建期内联成 data URL，由 initPet 注入。这里不能读
+// chrome.runtime.getURL：模块求值时宿主替身尚未安装，而且插件的激活与释放
+// 必须成对发生。
+const PET_RIV_ASSET = 'rive/kimi_avatar_web-PnsTWI-X.riv';
+const PET_WASM_ASSET = 'rive/rive.wasm';
 const PET_IDLE_ANIM = 'paopao';
 const PET_LOADING_ANIM = 'loading';
 const PET_DONE_ANIM = 'stars';
@@ -76,7 +79,8 @@ let roamPetScale = 1;
 // 装配时注入的生命周期依赖（content.js）
 let deps = {
   isDisposed: () => false,
-  getSessionId: () => ''
+  getSessionId: () => '',
+  assets: {}
 };
 
 export function initPet(nextDeps) {
@@ -277,10 +281,10 @@ export function petStart() {
   }
   if (!panel.els?.petCanvas) return;
   // wasm 强制走本地，禁用 CDN 回退（扩展不允许远程代码）
-  api.RuntimeLoader.setWasmUrl(PET_WASM_URL);
+  api.RuntimeLoader.setWasmUrl(deps.assets?.[PET_WASM_ASSET] || '');
   api.RuntimeLoader.setWasmFallbackUrl(null);
   const instance = new api.Rive({
-    src: PET_RIV_URL,
+    src: deps.assets?.[PET_RIV_ASSET] || '',
     canvas: panel.els.petCanvas,
     autoplay: false,
     fit: api.Fit?.Contain,
@@ -361,6 +365,11 @@ export function disposePet() {
   if (petClockTimer) clearInterval(petClockTimer);
   petClockTimer = null;
   petClearIdleAmbient();
+  // The bound-canvas marker outlives the element it describes. A later mount
+  // creates a new canvas; without this the click listener would never be bound
+  // again because the marker still pointed at the old one.
+  petClickBoundCanvas = null;
+  petCanvasEl = null;
   if (petRive) {
     try {
       petRive.cleanup();

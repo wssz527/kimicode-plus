@@ -207,7 +207,15 @@ export function setAgentStatus(status) {
   }
 }
 
-export function renderAll() {
+/**
+ * One painted frame per burst of events. A replay of 600 steps used to call the
+ * whole render pipeline 600 times, each reading layout for every sparkline. The
+ * batch collapses them into a single frame and keeps the latest state.
+ */
+let renderFrame = 0;
+function renderAllNow() {
+  renderFrame = 0;
+  if (hooks.isDisposed()) return;
   updateTokenDisplay();
   updateCacheDisplay();
   updatePerfDisplay();
@@ -216,6 +224,25 @@ export function renderAll() {
   renderAgents();
   renderExternal();
   renderStatSlots();
+}
+
+export function renderAll() {
+  if (typeof requestAnimationFrame !== "function") {
+    renderAllNow();
+    return;
+  }
+  if (renderFrame) return;
+  renderFrame = requestAnimationFrame(renderAllNow);
+}
+
+/** Cancels a queued frame; used by dispose so no paint lands after teardown. */
+export function cancelRenderAll() {
+  if (!renderFrame || typeof cancelAnimationFrame !== "function") {
+    renderFrame = 0;
+    return;
+  }
+  cancelAnimationFrame(renderFrame);
+  renderFrame = 0;
 }
 
 /* ---------- 会话折线（整宽统计模块） ---------- */
@@ -232,7 +259,6 @@ export function renderSparks() {
   if (!panel.els?.sparks) return;
   for (const [id, def] of Object.entries(SPARK_DEFS)) {
     const svg = panel.els.sparks[id];
-    sparkRectCache.delete(svg);
     renderSpark(svg, def.values(), def.fmt, def.marks?.());
   }
 }
@@ -240,11 +266,14 @@ export function renderSparks() {
 // 侧栏拖拽改变面板宽度后，圆点反缩放参数（渲染时按当时宽度计算）会过期；
 // 监听面板尺寸变化重绘折线，任何宽度下圆点保持正圆
 let sparkResizeRaf = 0;
-const sparkRectCache = new WeakMap();
+let sparkRectCache = new WeakMap();
 export const sparkResizeObserver = new ResizeObserver(() => {
   if (sparkResizeRaf) return;
   sparkResizeRaf = requestAnimationFrame(() => {
     sparkResizeRaf = 0;
+    // Only a real size change invalidates the measured rect. Measuring on every
+    // repaint forced a synchronous layout per sparkline per event.
+    sparkRectCache = new WeakMap();
     renderSparks();
   });
 });
@@ -863,6 +892,7 @@ export function setResetTooltip(prefix, text) {
 
 // 页面销毁时清理渲染层持有的定时器与观察器（content.js dispose 调用）
 export function disposeRender() {
+  cancelRenderAll();
   if (pendingStatusTimer) clearTimeout(pendingStatusTimer);
   pendingStatusTimer = null;
   pendingDisplayStatus = null;

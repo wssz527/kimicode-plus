@@ -36,7 +36,7 @@ interface PlannerModule {
   buildHandoffText(messages: unknown, selected: unknown, meta?: unknown): string;
   planOptions(preset: string, custom?: unknown): { context: boolean; skills: boolean; tools: boolean; readOnly: boolean };
   handoffInput(input: unknown): Record<string, string>;
-  fillPlan(input: unknown): { ok: boolean; text?: string; needsChoice?: boolean; error?: string; mode?: string };
+  fillPlan(input: unknown): { ok: boolean; text?: string; needsChoice?: boolean; error?: string; mode?: string; append?: boolean };
   verifyDraftFill(expected: unknown, readBack: unknown): { ok: boolean; wanted: string; got: string };
   sessionSummary(view: unknown, options?: unknown): { title: string; text: string; truncated: boolean };
   sessionDiff(diffAnswer: unknown, view: unknown, options?: unknown): { ok: boolean; title: string; text: string; source?: string; truncated: boolean; error?: string };
@@ -2046,4 +2046,196 @@ test("runWebSummarization distills web content in a temporary pure thread, clean
   await assert.rejects(pendingSummary, /已取消模型归纳/);
   assert.deepEqual(stoppedIds, ["tmp-cancel-1"]);
   assert.ok(deletedIds.includes("tmp-cancel-1"));
+});
+
+// A synthetic node with children and document order, so the extracted list can
+// be checked for real turn order instead of selector grouping.
+interface OrderedNode {
+  nodeType: number;
+  tagName?: string;
+  nodeValue?: string;
+  childNodes?: OrderedNode[];
+  className?: string;
+  attrs: Record<string, string>;
+  getAttribute(name: string): string | null;
+  closest(): null;
+  contains(other: OrderedNode): boolean;
+  cloneNode(): OrderedNode;
+  querySelectorAll(): OrderedNode[];
+  remove(): void;
+  compareDocumentPosition(other: OrderedNode): number;
+  textContent: string;
+  innerText?: string;
+}
+
+function orderedHarness() {
+  const all: OrderedNode[] = [];
+  const make = (tagName: string, attrs: Record<string, string> = {}, children: OrderedNode[] = []): OrderedNode => {
+    const node: OrderedNode = {
+      nodeType: 1,
+      tagName,
+      attrs,
+      className: attrs.class || "",
+      getAttribute(name) {
+        return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null;
+      },
+      closest() {
+        return null;
+      },
+      contains(other) {
+        return children.includes(other) || children.some(child => child.contains(other));
+      },
+      cloneNode() {
+        return make(tagName, { ...attrs }, children.map(child => child.cloneNode()));
+      },
+      querySelectorAll() {
+        return [];
+      },
+      remove() {},
+      compareDocumentPosition(other) {
+        const left = all.indexOf(node);
+        const right = all.indexOf(other);
+        if (left === right) return 0;
+        return left < right ? 4 : 2;
+      },
+      get childNodes() {
+        return children;
+      },
+      get textContent() {
+        return children.map(child => child.textContent).join("");
+      },
+    };
+    all.push(node);
+    return node;
+  };
+  const text = (value: string): OrderedNode => {
+    const node: OrderedNode = {
+      nodeType: 3,
+      nodeValue: value,
+      attrs: {},
+      getAttribute: () => null,
+      closest: () => null,
+      contains: () => false,
+      cloneNode: () => text(value),
+      querySelectorAll: () => [],
+      remove() {},
+      compareDocumentPosition: () => 0,
+      textContent: value,
+    };
+    return node;
+  };
+  const paragraph = (value: string) => make("P", {}, [text(value)]);
+  return { make, text, paragraph, all };
+}
+
+test("multi-turn extraction keeps real document order instead of grouping by selector", async () => {
+  const dom = orderedHarness();
+  const questionOne = dom.make("USER-QUERY", {}, [dom.paragraph("第一问")]);
+  const answerOne = dom.make("MODEL-RESPONSE", {}, [dom.paragraph("第一答")]);
+  const questionTwo = dom.make("USER-QUERY", {}, [dom.paragraph("第二问")]);
+  const answerTwo = dom.make("MODEL-RESPONSE", {}, [dom.paragraph("第二答")]);
+  const answer = await runAdapter(SITE_ADAPTERS.gemini, {
+    "user-query": [questionOne, questionTwo],
+    "model-response": [answerOne, answerTwo],
+  } as unknown as Record<string, FakeNode[]>);
+  assert.deepEqual(
+    answer.messages.map(message => [message.role, message.text]),
+    [["user", "第一问"], ["assistant", "第一答"], ["user", "第二问"], ["assistant", "第二答"]],
+  );
+});
+
+test("a detached clone keeps paragraph breaks and the noise line is removed", async () => {
+  const dom = orderedHarness();
+  const turn = dom.make("DIV", {}, [
+    dom.paragraph("第一段需求"),
+    dom.make("DIV", {}, [dom.text("第二段约束")]),
+    dom.make("UL", {}, [dom.make("LI", {}, [dom.text("一条清单")])]),
+    dom.make("DIV", {}, [dom.text("复制")]),
+  ]);
+  const selectors = { '[data-testid="send_message"]': [turn] };
+  const previous = (globalThis as { document?: unknown }).document;
+  (globalThis as { document?: unknown }).document = {
+    querySelectorAll(selector: string) {
+      return selectors[selector as keyof typeof selectors] ?? [];
+    },
+  };
+  try {
+    const fn = new Function(`return (${SITE_ADAPTERS.doubao});`)() as (value: unknown) => { messages: Message[] };
+    const answer = fn({});
+    assert.equal(answer.messages.length, 1);
+    // Every block boundary produced a newline, and the standalone 复制 line was
+    // removed instead of being glued to the paragraph before it. Consecutive
+    // block boundaries collapse to one break, which is what cleanLines keeps.
+    assert.equal(answer.messages[0].text, "第一段需求\n第二段约束\n一条清单");
+  } finally {
+    (globalThis as { document?: unknown }).document = previous;
+  }
+});
+
+test("domestic site role markers drive the planning and latest-reply filters", async () => {
+  const roleOf = async (site: string, selector: string, attrs: Record<string, string>, className = "", tagName = "DIV") => {
+    const node = fakeNode(tagName, attrs, "内容", { className });
+    const answer = await runAdapter(SITE_ADAPTERS[site], { [selector]: [node] });
+    return answer.messages[0]?.role;
+  };
+  // 元宝 marks the speaker in data-conv-speaker.
+  assert.equal(await roleOf("yuanbao", "[data-conv-speaker]", { "data-conv-speaker": "user" }), "user");
+  assert.equal(await roleOf("yuanbao", "[data-conv-speaker]", { "data-conv-speaker": "assistant" }), "assistant");
+  // 豆包 encodes the role in its testid.
+  assert.equal(await roleOf("doubao", '[data-testid="send_message"]', { "data-testid": "send_message" }), "user");
+  assert.equal(await roleOf("doubao", '[data-testid="receive_message"]', { "data-testid": "receive_message" }), "assistant");
+  // 千问 uses camelCase class names.
+  assert.equal(await roleOf("qwen", '[class*="questionItem"]', {}, "questionItem-abc"), "user");
+  assert.equal(await roleOf("qwen", '[class*="answerItem"]', {}, "answerItem-abc"), "assistant");
+});
+
+test("two custom URLs on the same site stay independent and removable", () => {
+  const first = addSite([], { url: "https://chat.deepseek.com/a", label: "DeepSeek A" });
+  const second = addSite(first.sites, { url: "https://chat.deepseek.com/b", label: "DeepSeek B" });
+  assert.equal(second.ok, true);
+  assert.equal(second.sites.length, 2);
+  assert.notEqual(second.sites[0].id, second.sites[1].id, "two rows on one site share an id");
+  const remaining = removeSite(second.sites, second.sites[0].id);
+  assert.equal(remaining.length, 1);
+  assert.equal(remaining[0].url, "https://chat.deepseek.com/b");
+  assert.equal(removeSite(second.sites, "https://chat.deepseek.com/a").length, 1);
+});
+
+test("a replace fill clears the composer instead of appending to it", () => {
+  const plan = fillPlan({ before: "旧草稿", text: "新规划", choice: "replace" });
+  assert.equal(plan.ok, true);
+  assert.equal(plan.append, false, "a replace must not be flagged as an append");
+  assert.equal(fillPlan({ before: "旧草稿", text: "新规划", choice: "append" }).append, true);
+});
+
+test("browser sync serializes show and hide and re-hides a layer a sheet covered", async () => {
+  const calls: string[] = [];
+  let covered = false;
+  const pending: { release: () => void } = { release: () => {} };
+  const sync = createBrowserSync({
+    getRect: () => ({ x: 0, y: 0, width: 320, height: 480 }),
+    isCovered: () => covered,
+    view: {
+      async show() {
+        calls.push("show");
+        await new Promise<void>(resolve => { pending.release = resolve; });
+      },
+      async hide() {
+        calls.push("hide");
+      },
+    },
+  });
+  const first = sync.apply();
+  // Let apply reach the native show call before the sheet opens, so the re-check
+  // is what runs the hide rather than the initial coverage test.
+  await new Promise(resolve => setTimeout(resolve, 0));
+  covered = true;
+  pending.release();
+  await first;
+  assert.deepEqual(calls, ["show", "hide"], "a covered layer stayed visible");
+  assert.equal(sync.visible, false);
+  // Sequential calls never overlap: hide is never issued before show resolves.
+  await sync.apply();
+  assert.deepEqual(calls, ["show", "hide"]);
+  await sync.dispose();
 });

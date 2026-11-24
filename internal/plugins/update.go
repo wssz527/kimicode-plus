@@ -379,6 +379,8 @@ func (m *Manager) evaluateUpdate(item entry, remote OfficialPluginEntry, host st
 		res.CannotApplyReason = "安全模式下无法更新插件，请先关闭安全模式"
 	case m.pluginsDir() == "":
 		res.CannotApplyReason = "没有可用的数据目录，无法更新插件"
+	case !hostOK:
+		res.CannotApplyReason = fmt.Sprintf("该插件版本未声明支持当前 KimiCode+ 宿主版本（%s），无法在线更新", host)
 	case remote.APIVersion > APIVersion:
 		res.CannotApplyReason = "该插件需要更新版本的插件接口，请先更新 KimiCode+ 核心"
 	case remote.MinCoreVersion != "" && m.updater != nil && m.updater.coreVersion != "":
@@ -914,6 +916,7 @@ func (m *Manager) commitOfficialUpdate(ctx context.Context, pkg stagedPackage, s
 	}
 
 	m.entries[id] = nextItem
+	snapshot := *nextItem
 	host := m.host
 	m.mu.Unlock()
 
@@ -927,10 +930,22 @@ func (m *Manager) commitOfficialUpdate(ctx context.Context, pkg stagedPackage, s
 		if enableErr == nil {
 			return reEnabled, nil
 		}
-		_ = recordActivity(ctx, m.db, id, ActivityError, "更新后重新启用失败："+redact.Text(enableErr.Error()), m.now())
+		// The files were replaced successfully, so this is not a total failure.
+		// The entry keeps the reason instead of reporting a plain success, so the
+		// page can tell the user the new version is installed but not running.
+		message := fmt.Sprintf("已在线更新到 %s，但重新启用失败：%s", manifest.Version, redact.Text(enableErr.Error()))
+		_ = recordActivity(ctx, m.db, id, ActivityError, message, m.now())
+		m.mu.Lock()
+		if cur := m.entries[id]; cur != nil {
+			cur.errText = message
+			cur.updated = m.now()
+			snapshot = *cur
+		}
+		host = m.host
+		m.mu.Unlock()
 	}
 	m.notifyChange()
-	return m.present(*nextItem, host), nil
+	return m.present(snapshot, host), nil
 }
 
 func computeUpdatedGrants(existing Grants, manifest Manifest, grantAdded bool) (Grants, error) {

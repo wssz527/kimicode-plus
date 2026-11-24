@@ -28,11 +28,12 @@ import {
   CONFIG_STORAGE_KEY,
   MINI_STORAGE_KEY
 } from "../vendor/content/widget-structure.js";
-import { initRender, renderAll, disposeRender } from "../vendor/content/render.js";
+import { cancelRenderAll, initRender, renderAll, disposeRender } from "../vendor/content/render.js";
 import { initPet, petUpdateStatus, disposePet } from "../vendor/content/pet-panel.js";
 import { disposeBridge, getSessionId, installBridge, installStatusTicker, markBridgeReady } from "../vendor/panel-app/bridge.js";
 import { syncLocaleFromPage } from "../vendor/i18n.js";
 import { startDatasource } from "./datasource.js";
+import { ASSETS } from "./shim-assets.js";
 
 /** 面板默认布局，与上游 panel-app.js 的 PANEL_WIDGET_CONFIG 一致：
  *  Mini 区是宠物 + 两个额度条，完整区是外部账户与四个数值，其余进隐藏区。
@@ -118,6 +119,10 @@ export async function activate(ctx) {
     return handle;
   };
   ctx.onDispose(() => {
+    disposed = true;
+    cancelRenderAll();
+    if (tidyScan) clearTimeout(tidyScan);
+    tidyScan = null;
     for (const handle of disposables.reverse()) {
       try {
         if (typeof handle === "function") handle();
@@ -141,9 +146,11 @@ export async function activate(ctx) {
   const syncTidy = () => applyTidy(panel.widgetConfig.modules.pet?.sidebarTidy === true);
 
   let datasource = null;
+  let disposed = false;
+  const isDisposed = () => disposed;
 
   initWidgetStructure({
-    isDisposed: () => false,
+    isDisposed,
     // 标题行点击：本地数值与折线样本清空重计，随后由数据源补齐
     manualRefresh: () => {
       resetMetrics();
@@ -164,13 +171,15 @@ export async function activate(ctx) {
     onConfigChange: () => syncTidy()
   });
 
-  initPet({ isDisposed: () => false, getSessionId });
+  initPet({ isDisposed, getSessionId, assets: ASSETS });
   initRender({
-    isDisposed: () => false,
+    isDisposed,
     petUpdateStatus,
     // 桌面漫游宠物不启用
     roamPetSetStatus: () => {},
-    refreshBalance: () => datasource?.refreshBalance()
+    refreshBalance: () => datasource?.refreshBalance(),
+    // 额度到点重置后立刻补拉一次，而不是等下一个 60 秒周期
+    onQuotaReset: () => void datasource?.refresh(true)
   });
 
   installBridge();
@@ -207,13 +216,28 @@ export async function activate(ctx) {
 
   // 官方侧栏会随会话切换重建，类挂在 html 上不会丢；但 ≡ 菜单改动配置后
   // 需要重新评估安全闸，所以每次结构渲染后再同步一次。
-  const tidyWatch = new MutationObserver(() => {
-    const wanted = panel.widgetConfig.modules.pet?.sidebarTidy === true;
-    const applied = document.documentElement.classList.contains("ksb-sidebar-tidy");
-    if (wanted !== applied) syncTidy();
-  });
+  // The host re-renders the sidebar constantly. Evaluating the safety gate on
+  // every mutation batch measured layout over and over, so the check is
+  // coalesced into one pass after the DOM settles and skipped while the feature
+  // is off.
+  let tidyScan = null;
+  const scheduleTidyScan = () => {
+    if (tidyScan || disposed) return;
+    tidyScan = setTimeout(() => {
+      tidyScan = null;
+      if (disposed) return;
+      const wanted = panel.widgetConfig.modules.pet?.sidebarTidy === true;
+      const applied = document.documentElement.classList.contains("ksb-sidebar-tidy");
+      if (wanted !== applied) syncTidy();
+    }, 250);
+  };
+  const tidyWatch = new MutationObserver(scheduleTidyScan);
   tidyWatch.observe(document.documentElement, { childList: true, subtree: true });
-  track(() => tidyWatch.disconnect());
+  track(() => {
+    if (tidyScan) clearTimeout(tidyScan);
+    tidyScan = null;
+    tidyWatch.disconnect();
+  });
 
   const onSettingsStorage = (event) => {
     const key = event?.detail?.key;
@@ -257,6 +281,24 @@ export async function activate(ctx) {
   const onActiveSession = () => { void datasource?.syncSession(); };
   globalThis.addEventListener?.("ekd:active-session", onActiveSession);
   track(() => globalThis.removeEventListener?.("ekd:active-session", onActiveSession));
+
+  // A different account has different quota, wallet and providers. The previous
+  // numbers belong to someone else, so they are dropped before the forced
+  // refresh instead of being shown until the next tick.
+  const onAccountSwitched = () => {
+    if (disposed) return;
+    panel.lastWallet = null;
+    panel.lastWalletFetchedAt = "";
+    panel.lastQuotaPct = { "5h": null, week: null, month: null };
+    panel.quotaResetAt = { "5h": null, week: null, month: null };
+    panel.externalProviders = [];
+    panel.externalUnsupported = [];
+    resetMetrics();
+    renderAll();
+    void datasource?.resetForAccountSwitch();
+  };
+  globalThis.addEventListener?.("ekd:account-switched", onAccountSwitched);
+  track(() => globalThis.removeEventListener?.("ekd:account-switched", onAccountSwitched));
   void datasource.start();
 
   return { status: "active" };

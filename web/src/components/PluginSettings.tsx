@@ -40,7 +40,7 @@ const CAPABILITY_LABELS: Record<string, { title: string; detail: string }> = {
   storage: { title: "使用增强插件私有存储", detail: "只有该增强插件可读写的本地键值存储。" },
 };
 
-function capabilityLabel(name: string): { title: string; detail: string } {
+export function capabilityLabel(name: string): { title: string; detail: string } {
   if (name === "net:https") {
     return { title: "访问任意公网 HTTPS 服务", detail: "经核心代理访问用户配置的公网 HTTPS 地址；仅限加密连接，仍拦截本机与内网地址。" };
   }
@@ -123,7 +123,11 @@ function PluginUpstreamInfo({ upstream }: { upstream: PluginUpstream & { upstrea
 function PluginLegalFiles({ plugin }: { plugin: PluginRecord }) {
   const [open, setOpen] = useState<"license" | "notice" | null>(null);
   const regionId = useId();
-  const legal = useResource(`plugins/legal/${plugin.id}/${plugin.installedAt ?? ""}`, () => api.pluginLegal(plugin.id), { enabled: open !== null });
+  // The version and update timestamp are part of the cache identity: after a hot
+  // update the same plugin id and install time describe different files, and an
+  // expanded LICENSE must show the new text instead of the previous one.
+  const revision = `${plugin.version}/${plugin.updatedAt ?? ""}`;
+  const legal = useResource(`plugins/legal/${plugin.id}/${plugin.installedAt ?? ""}/${revision}`, () => api.pluginLegal(plugin.id), { enabled: open !== null });
   const notice = open === "notice";
   const text = notice ? legal.data?.noticeText : legal.data?.licenseText;
   const truncated = notice ? legal.data?.noticeTruncated : legal.data?.licenseTruncated;
@@ -697,9 +701,17 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
         confirmCapabilities: update.needsConsent ? true : undefined,
         confirmPrivileged: hasAddedPriv ? true : undefined,
       });
-      await syncHost();
+      // The files are already replaced, so the sync failure is a warning, not a
+      // rollback: reporting both "updated" and "failed" would contradict itself.
+      const syncMessage = await syncPluginHost();
       setConfirmUpdatePrivileged(false);
-      setFlash(`已将「${updated.name || updated.id}」热更新到 v${updated.version}，无需重启 Kimi Code。`);
+      if (syncMessage) {
+        const message = `已热更新到 v${updated.version}，但界面同步失败：${syncMessage}`;
+        if (selected === plugin.id) setUpdateCheckError(message);
+        else setQuickError(message);
+      } else {
+        setFlash(`已将「${updated.name || updated.id}」热更新到 v${updated.version}，无需重启 Kimi Code。`);
+      }
       plugins.reload();
       const refreshed = await api.plugins.updates().catch(() => null);
       if (refreshed) setUpdateSnapshot(refreshed);
@@ -1334,7 +1346,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                 ) : null}
               </dl>
               <PluginUpstreamInfo upstream={current} />
-              <PluginLegalFiles key={`${current.id}/${current.installedAt ?? ""}`} plugin={current} />
+              <PluginLegalFiles key={`${current.id}/${current.installedAt ?? ""}/${current.version}/${current.updatedAt ?? ""}`} plugin={current} />
             </div>
           </details>
 
@@ -1372,11 +1384,9 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
           <ActionButton
             variant="danger"
             icon="trash"
-            onClick={() => {
-              if (hasScheduler) setConfirmUninstall(true);
-              else void run(current.id, "uninstall");
-            }}
+            onClick={() => setConfirmUninstall(true)}
             busy={action.busy || syncing}
+            disabled={isUpdatingThis}
           >
             卸载
           </ActionButton>
@@ -1384,16 +1394,32 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
         {confirmUninstall ? (
           <div className="plugin-confirm" role="dialog" aria-modal="true" aria-label="确认卸载增强插件">
             <p>
-              卸载「{current.name || current.id}」时，是否同时删除该增强插件创建的定时任务和运行记录？
+              <strong>卸载「{current.name || current.id}」会删除增强插件文件及其私有存储，此操作不可撤销。</strong>
+            </p>
+            <p className="panel-note">
+              预装增强插件卸载后不会自动恢复，需要时可在列表里手动恢复内置副本。
+              {hasScheduler ? "该增强插件创建的定时任务也可选择一并删除。" : ""}
             </p>
             <div className="inline-actions">
-              <ActionButton variant="danger" icon="trash" onClick={() => void run(current.id, "uninstall", { deleteData: true })} busy={action.busy || syncing}>
-                卸载并删除任务数据
+              <ActionButton
+                variant="danger"
+                icon="trash"
+                onClick={() => void run(current.id, "uninstall", { deleteData: true })}
+                busy={action.busy || syncing}
+                disabled={isUpdatingThis}
+              >
+                {hasScheduler ? "卸载并删除任务数据" : "确认卸载并删除私有存储"}
               </ActionButton>
-              <ActionButton onClick={() => void run(current.id, "uninstall", { deleteData: false })} busy={action.busy || syncing}>
-                仅卸载，保留任务数据
-              </ActionButton>
-              <ActionButton variant="quiet" onClick={() => setConfirmUninstall(false)}>
+              {hasScheduler ? (
+                <ActionButton
+                  onClick={() => void run(current.id, "uninstall", { deleteData: false })}
+                  busy={action.busy || syncing}
+                  disabled={isUpdatingThis}
+                >
+                  仅卸载，保留任务数据
+                </ActionButton>
+              ) : null}
+              <ActionButton variant="quiet" onClick={() => setConfirmUninstall(false)} disabled={action.busy || syncing}>
                 取消
               </ActionButton>
             </div>

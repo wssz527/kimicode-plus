@@ -312,18 +312,9 @@
   }
 }
 
-.capability-choice {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  cursor: pointer;
-}
-
-.capability-choice input {
-  margin-top: 3px;
-  flex: none;
-}
-
+/* `.capability-choice` itself and its input margin are defined in app.css,
+   which the host bundle also loads before this file. Only the span layout is
+   local, because it narrows the base rule. */
 .capability-choice > span {
   display: flex;
   flex-direction: column;

@@ -926,3 +926,66 @@ test("quota.balances flows through datasource -> bridge -> render.js into DOM (5
     runtime.clearInterval = origClearInterval;
   }
 });
+
+test("an account switch drops quota and usage responses that were already in flight", async () => {
+  const dsSource = readFileSync("../plugins/monitor-src/src/datasource.js", "utf8");
+  const dsUrl = `data:text/javascript;base64,${Buffer.from(dsSource).toString("base64")}`;
+  const { startDatasource } = await import(dsUrl);
+
+  const pushed: any[] = [];
+  let account = "first";
+  let releaseFirst: (() => void) | null = null;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = () => resolve(); });
+  let requestCount = 0;
+
+  const summaryFor = (usedRatio: number) => ({
+    quota: {
+      state: "AVAILABLE",
+      value: {
+        quota: {
+          usages: {
+            "5h": { usedRatio, resetAt: account === "first" ? "2026-11-24T10:00:00Z" : "2026-11-24T22:00:00Z" },
+            week: { usedRatio, resetAt: "" },
+          },
+        },
+      },
+    },
+  });
+
+  const ctx = {
+    log() {},
+    core: {
+      request: async (action: string) => {
+        requestCount += 1;
+        if (action === "cache.summary") {
+          // The first account's page is held open until the switch has happened.
+          const isFirst = account === "first";
+          if (isFirst) await firstGate;
+          return summaryFor(isFirst ? 0.9 : 0.1);
+        }
+        return null;
+      },
+    },
+    events: { on: () => ({ dispose() {} }) },
+  };
+
+  const ds = startDatasource(ctx, (msg: any) => pushed.push(msg), () => "sess-1", () => false);
+  try {
+    const pending = ds.start();
+    // The switch runs while the first page is still pending; accountGeneration
+    // moves on, so that page must not reach the panel.
+    account = "second";
+    const afterSwitch = ds.resetForAccountSwitch();
+    (releaseFirst as (() => void) | null)?.();
+    await pending;
+    await afterSwitch;
+
+    const quotas = pushed.filter((m) => m.type === "quota");
+    assert.equal(quotas.length, 1, `expected only the new account's quota, got ${JSON.stringify(quotas)}`);
+    assert.equal(quotas[0]?.quota?.limit5h?.usedRatio, 0.1, "the previous account's quota leaked into the panel");
+    assert.equal(quotas[0]?.quota?.limit5h?.resetAt, "2026-11-24T22:00:00Z", "the quota shown must belong to the new account");
+    assert.ok(requestCount >= 2, "the switch must trigger a fresh read instead of reusing the old page");
+  } finally {
+    ds.dispose();
+  }
+});
