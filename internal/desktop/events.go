@@ -23,10 +23,23 @@ type EventBus struct {
 	next   int64
 	events []Event
 	notify chan struct{}
+	closed chan struct{}
+	once   sync.Once
 }
 
 func NewEventBus() *EventBus {
-	return &EventBus{notify: make(chan struct{})}
+	return &EventBus{notify: make(chan struct{}), closed: make(chan struct{})}
+}
+
+// Close releases every pending Poll. Event long-polling waits up to the client
+// timeout (8-10s), so shutdown must end those waits instead of letting the
+// process sit idle until the deadline expires.
+func (b *EventBus) Close() {
+	b.once.Do(func() {
+		b.mu.Lock()
+		close(b.closed)
+		b.mu.Unlock()
+	})
 }
 
 // Publish appends one event and returns its sequence. Existing callers use it as
@@ -69,13 +82,22 @@ func (b *EventBus) Poll(ctx context.Context, after int64, scopes []string, wait 
 			page.Next = event.Sequence
 		}
 		notify := b.notify
+		closed := b.closed
 		b.mu.Unlock()
 		if len(page.Events) > 0 || page.Reset || wait <= 0 {
 			return page
 		}
+		select {
+		case <-closed:
+			return page
+		default:
+		}
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
+			return page
+		case <-closed:
 			timer.Stop()
 			return page
 		case <-notify:

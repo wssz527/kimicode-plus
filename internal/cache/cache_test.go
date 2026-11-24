@@ -768,14 +768,15 @@ func TestRetentionByModelFiltersAndSorts(t *testing.T) {
 			t.Fatalf("%s lastSeen = %v, want %v", model, lastSeen, want)
 		}
 	}
-	// The overall buckets keep every main-agent transition, including the models that
-	// were filtered out of the per-model list.
+	// The overall buckets follow the same rule as the per-model rows: a model that
+	// never reports cache fields is not a cache sample. The fixture has 16
+	// transitions; the silent model contributes 3 of them, so 13 remain.
 	samples := 0
 	for _, bucket := range retention.IdleBuckets {
 		samples += bucket.Samples
 	}
-	if samples != 16 {
-		t.Fatalf("overall retention samples = %d, want 16 across all models", samples)
+	if samples != 13 {
+		t.Fatalf("overall retention samples = %d, want 13 (unreported models excluded)", samples)
 	}
 }
 
@@ -1482,5 +1483,97 @@ func TestLostBackgroundTaskClearsOpenBackground(t *testing.T) {
 	}
 	if signals.OpenBackground != 0 {
 		t.Fatalf("after resumed task terminated: open=%d, want 0", signals.OpenBackground)
+	}
+}
+
+// TestSummaryHitRateExcludesSilentModelsInputOther checks the aggregate rule: a
+// model that never reports cache fields must not have its uncached input counted
+// as a cache miss, because that would print a fabricated 0% hit rate.
+func TestSummaryHitRateExcludesSilentModelsInputOther(t *testing.T) {
+	home := t.TempDir()
+	base := time.Now().Add(-5 * time.Minute).UTC().Truncate(time.Millisecond)
+	reportedUsage := sampleUsage(1000, 0, 9000, 0)
+	silentUsage := sampleUsage(4000, 0, 0, 0)
+	writeWire(t, home, "session_mixed", "main",
+		plainLine(usageRecord("synthetic/reported", reportedUsage, "turn", base)),
+		plainLine(stepEnd("uuid-r1", "0", 1, reportedUsage, 500, 1200, "end_turn", base)),
+		plainLine(usageRecord("synthetic/silent", silentUsage, "turn", base.Add(time.Second))),
+		plainLine(stepEnd("uuid-s1", "0", 1, silentUsage, 500, 1200, "end_turn", base.Add(time.Second))),
+	)
+	store := newTestStore(t, home)
+	if _, err := store.Scan(context.Background(), base.Add(time.Minute), true); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.Summary(context.Background(), base.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the reporting model's 1000 uncached input tokens belong in the
+	// denominator; 9000 read / (1000 + 9000) = 0.9.
+	if summary.Today.HitRate == nil {
+		t.Fatalf("today hit rate is nil: %+v", summary.Today)
+	}
+	if got := *summary.Today.HitRate; got < 0.8999 || got > 0.9001 {
+		t.Fatalf("hit rate = %.4f, want 0.9 (silent model input must be excluded)", got)
+	}
+	if summary.Today.InputOther != 1000 {
+		t.Fatalf("today inputOther = %d, want 1000 (silent model excluded)", summary.Today.InputOther)
+	}
+
+	history, err := store.History(context.Background(), base.Add(2*time.Minute), "24h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history.Totals.HitRate == nil || *history.Totals.HitRate < 0.8999 || *history.Totals.HitRate > 0.9001 {
+		t.Fatalf("history hit rate = %v, want 0.9", history.Totals.HitRate)
+	}
+}
+
+// A session that mixed a reporting model with an unreported one must not have the
+// unreported model's uncached input counted in the "recent 5 steps" rate, and the
+// synthetic UNKNOWN identity must never be treated as reporting.
+func TestRecentTotalsAndUnknownModelExcluded(t *testing.T) {
+	home := t.TempDir()
+	base := time.Now().Add(-5 * time.Minute).UTC().Truncate(time.Millisecond)
+	reported := sampleUsage(1000, 10, 9000, 0)
+	silent := sampleUsage(4000, 10, 0, 0)
+	writeWire(t, home, "session_recent_mixed", "main",
+		plainLine(usageRecord("synthetic/reported", reported, "turn", base)),
+		plainLine(stepEnd("uuid-rm1", "0", 1, reported, 500, 1200, "end_turn", base)),
+		plainLine(usageRecord("synthetic/silent", silent, "turn", base.Add(time.Second))),
+		plainLine(stepEnd("uuid-rm2", "0", 2, silent, 500, 1200, "end_turn", base.Add(time.Second))),
+	)
+	store := newTestStore(t, home)
+	ctx := context.Background()
+	if _, err := store.Scan(ctx, base.Add(time.Minute), true); err != nil {
+		t.Fatal(err)
+	}
+	// Force one unattributed row with a cache read so the UNKNOWN identity would
+	// look like a reporting model if it were not excluded.
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO cache_steps(session_id,agent,step_uuid,model,time,input_cache_read,input_other,output,decode_ms) VALUES('session_recent_mixed','main','uuid-unk','`+ModelUnknown+`',?,50,2000,10,1200)`, storage.SortableTime(base.Add(2*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := store.Sessions(ctx, base.Add(3*time.Minute), 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row *SessionRow
+	for i := range rows {
+		if rows[i].SessionID == "session_recent_mixed" {
+			row = &rows[i]
+		}
+	}
+	if row == nil {
+		t.Fatal("session missing from the list")
+	}
+	// 9000 read / (9000 + 1000) = 0.9: the silent model's 4000 and the UNKNOWN
+	// row's 2000 must both be excluded from the denominator.
+	if row.Recent.HitRate == nil || *row.Recent.HitRate < 0.89 || *row.Recent.HitRate > 0.91 {
+		value := -1.0
+		if row.Recent.HitRate != nil {
+			value = *row.Recent.HitRate
+		}
+		t.Fatalf("recent hit rate = %v (recent totals %+v), want about 0.9", value, row.Recent)
 	}
 }

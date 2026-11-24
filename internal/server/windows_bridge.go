@@ -245,7 +245,7 @@ func (a *App) handleWindowsBridgeRPC(w http.ResponseWriter, r *http.Request, gua
 		writeBridgeJSON(w, 200, origin, map[string]any{"protocol": 1, "id": req.ID, "error": map[string]any{"code": "NATIVE_RPC", "message": "增强桥请求格式无效"}})
 		return
 	}
-	result, rpcCode, rpcErr := a.dispatchWindowsBridge(r, guard, coreHandler, sess.sessionToken, req.Action, req.Payload)
+	result, rpcCode, rpcErr := a.dispatchWindowsBridge(w, r, guard, coreHandler, sess.sessionToken, req.Action, req.Payload)
 	if rpcErr != nil {
 		if rpcCode == "" {
 			rpcCode = "NATIVE_RPC"
@@ -265,6 +265,7 @@ func (a *App) handleWindowsBridgeRPC(w http.ResponseWriter, r *http.Request, gua
 }
 
 func (a *App) dispatchWindowsBridge(
+	w http.ResponseWriter,
 	orig *http.Request,
 	guard *security.Guard,
 	coreHandler http.Handler,
@@ -347,6 +348,10 @@ func (a *App) dispatchWindowsBridge(
 	case "window.ensureWidth":
 		return map[string]any{}, "", nil
 	case "host.pickDirectory", "host.pickFiles":
+		// The dialog is interactive and can legitimately stay open for minutes.
+		// Without extending the deadline the server's write timeout would answer
+		// the RPC with a broken pipe long before the user picks anything.
+		_ = ExtendWriteDeadline(w, 4*time.Minute)
 		return a.winBridge.pickPaths(orig.Context(), action == "host.pickDirectory", payload)
 	default:
 		innerReq := httptest.NewRequest(http.MethodPost, "http://"+guard.Host()+"/enhance/v1/desktop/actions/"+action, bytes.NewReader(payload)).WithContext(orig.Context())

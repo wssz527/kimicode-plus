@@ -36,8 +36,6 @@ func (a *KimiAccountVault) Exists(ctx context.Context, ref string) (bool, error)
 		return false, errors.New("invalid kimi account credential ref")
 	}
 	v := a.vault
-	v.mu.Lock()
-	defer v.mu.Unlock()
 	var one int
 	err := v.db.QueryRowContext(ctx, `SELECT 1 FROM vault_kimi_accounts WHERE ref=?`, ref).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -53,24 +51,21 @@ func (a *KimiAccountVault) Put(ctx context.Context, ref string, value []byte) er
 	if a == nil || a.vault == nil {
 		return ErrUnavailable
 	}
-	v := a.vault
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.key) == 0 {
-		return ErrLocked
-	}
 	if !validKimiAccountRef(ref) || len(value) == 0 {
 		return errors.New("invalid kimi account credential")
 	}
 	if len(value) > KimiAccountValueLimit {
 		return ErrTooLarge
 	}
-	data, err := seal(v.key, value, ref)
-	if err != nil {
+	v := a.vault
+	return v.withCipherKey(func(key []byte) error {
+		data, err := seal(key, value, ref)
+		if err != nil {
+			return err
+		}
+		_, err = v.db.ExecContext(ctx, `INSERT INTO vault_kimi_accounts(ref,value) VALUES(?,?) ON CONFLICT(ref) DO UPDATE SET value=excluded.value`, ref, data)
 		return err
-	}
-	_, err = v.db.ExecContext(ctx, `INSERT INTO vault_kimi_accounts(ref,value) VALUES(?,?) ON CONFLICT(ref) DO UPDATE SET value=excluded.value`, ref, data)
-	return err
+	})
 }
 
 func (a *KimiAccountVault) Get(ctx context.Context, ref string) ([]byte, error) {
@@ -81,9 +76,7 @@ func (a *KimiAccountVault) Get(ctx context.Context, ref string) ([]byte, error) 
 		return nil, errors.New("invalid kimi account credential ref")
 	}
 	v := a.vault
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.key) == 0 {
+	if !v.Unlocked() {
 		return nil, ErrLocked
 	}
 	var data []byte
@@ -94,7 +87,16 @@ func (a *KimiAccountVault) Get(ctx context.Context, ref string) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	return open(v.key, data, ref)
+	var opened []byte
+	err = v.withCipherKey(func(key []byte) error {
+		var openErr error
+		opened, openErr = open(key, data, ref)
+		return openErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return opened, nil
 }
 
 func (a *KimiAccountVault) Delete(ctx context.Context, ref string) error {
@@ -105,9 +107,7 @@ func (a *KimiAccountVault) Delete(ctx context.Context, ref string) error {
 		return errors.New("invalid kimi account credential ref")
 	}
 	v := a.vault
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if len(v.key) == 0 {
+	if !v.Unlocked() {
 		return ErrLocked
 	}
 	_, err := v.db.ExecContext(ctx, `DELETE FROM vault_kimi_accounts WHERE ref=?`, ref)

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -243,19 +244,29 @@ func (s *NativeService) refreshAutomationSnapshot(ctx context.Context, id string
 
 func (s *NativeService) runCompaction(ctx context.Context, settings AutomationSettings, id string, now time.Time) {
 	snapshot, ok := s.automationSnapshot(id)
-	if !ok || sessionIsArchivedOrDone(snapshot.session) || compactionBlocked(snapshot, s.openBackground(ctx, id)) || s.isIdleKeepAliveProtecting(ctx, settings, id, now) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
+	if !ok || sessionIsArchivedOrDone(snapshot.session) || goalBlocksIdle(snapshot) || compactionBlocked(snapshot, s.openBackground(ctx, id)) || s.isIdleKeepAliveProtecting(ctx, settings, id, now) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
 		return
 	}
-	snapshot, ok, err := s.refreshAutomationSnapshot(ctx, id, now)
-	if err != nil || !ok || sessionIsArchivedOrDone(snapshot.session) || compactionBlocked(snapshot, s.openBackground(ctx, id)) || s.isIdleKeepAliveProtecting(ctx, settings, id, now) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
-		return
-	}
-	usage := snapshot.session.Usage
-	if usage == nil || usage.ContextLimit == nil || *usage.ContextLimit <= 0 || usage.ContextTokens < 0 || float64(usage.ContextTokens)/float64(*usage.ContextLimit)*100 < float64(settings.Compaction.ContextThreshold) {
+	// Check the cheap local signals before refreshing: refreshAutomationSnapshot
+	// makes official requests, and running it for every historical idle session
+	// every tick caused a request storm.
+	if !compactionContextOverThreshold(snapshot.session.Usage, settings.Compaction.ContextThreshold) {
 		return
 	}
 	revision := contextRevision(snapshot)
 	allowed, err := s.automationAllowed(ctx, "compaction", id, revision, now)
+	if err != nil || !allowed {
+		return
+	}
+	snapshot, ok, err = s.refreshAutomationSnapshot(ctx, id, now)
+	if err != nil || !ok || sessionIsArchivedOrDone(snapshot.session) || goalBlocksIdle(snapshot) || compactionBlocked(snapshot, s.openBackground(ctx, id)) || s.isIdleKeepAliveProtecting(ctx, settings, id, now) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
+		return
+	}
+	if !compactionContextOverThreshold(snapshot.session.Usage, settings.Compaction.ContextThreshold) {
+		return
+	}
+	revision = contextRevision(snapshot)
+	allowed, err = s.automationAllowed(ctx, "compaction", id, revision, now)
 	if err != nil || !allowed {
 		return
 	}
@@ -272,7 +283,7 @@ func (s *NativeService) runCompaction(ctx context.Context, settings AutomationSe
 		_ = s.updateAutomation(ctx, intent.ID, "failed", "无法订阅压缩完成事件："+err.Error(), now)
 		return
 	}
-	_, err = s.kap.Request(ctx, http.MethodPost, "/sessions/"+id+":compact", map[string]any{})
+	_, err = s.kap.Request(ctx, http.MethodPost, "/sessions/"+url.PathEscape(id)+":compact", map[string]any{})
 	if err != nil {
 		note := "官方未接受压缩请求：" + err.Error()
 		_ = s.updateAutomation(ctx, intent.ID, "failed", note, now)
@@ -281,6 +292,16 @@ func (s *NativeService) runCompaction(ctx context.Context, settings AutomationSe
 	}
 	_ = s.updateAutomation(ctx, intent.ID, "acknowledged", "官方已接受压缩请求，等待完成事件", now)
 	s.publishAutomationReceipt("compaction", id, "acknowledged", "ACK 不是完成，正在等待官方事件")
+}
+
+// compactionContextOverThreshold answers the local half of the compaction
+// policy: does this session report a context ratio at or above the threshold?
+// It reads only cached session data, so it can be checked before any refresh.
+func compactionContextOverThreshold(usage *NativeUsage, threshold int) bool {
+	if usage == nil || usage.ContextLimit == nil || *usage.ContextLimit <= 0 || usage.ContextTokens < 0 || threshold <= 0 {
+		return false
+	}
+	return float64(usage.ContextTokens)/float64(*usage.ContextLimit)*100 >= float64(threshold)
 }
 
 // compactionBlocked applies the same D8 definition of "running" that keepalive uses.

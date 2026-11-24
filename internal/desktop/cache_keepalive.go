@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"enhancedkimi/internal/cache"
@@ -63,6 +64,14 @@ func (s *NativeService) keepAliveGate(ctx context.Context, id string, settings A
 	}
 	candidate.OpenBackground = live.OpenBackground
 	candidate.Blocked = live.Blocked
+	// An explicit official "idle" outranks the offline counter: after a client
+	// exit or restart a lost background task may never write task.terminated to
+	// disk, and that stale count would otherwise keep a finished session looking
+	// busy forever. The same rule is applied by the account switch busy check.
+	if strings.EqualFold(strings.TrimSpace(snapshot.session.Status), "idle") {
+		candidate.OpenBackground = 0
+		candidate.Blocked = false
+	}
 	// D8 defines "running" by the lifecycle of an unreturned background subagent, not
 	// by the official busy/main_turn_active flags. Once the main agent has handed work
 	// to a background subagent it commonly reports busy=false and main_turn_active=false
@@ -75,14 +84,14 @@ func (s *NativeService) keepAliveGate(ctx context.Context, id string, settings A
 	}
 	// No background subagent means nothing is being waited on. A live turn alone is not
 	// enough: the main agent is producing requests then, so there is no cache to keep.
-	if live.OpenBackground <= 0 {
+	if candidate.OpenBackground <= 0 {
 		return candidate, false
 	}
 	// A blocking wait cannot be kept alive: during task.waitDelivered the main agent
 	// produces no model request and steered messages are queued, so a keepalive
 	// message would only be delivered after the wait ends. The observed evidence is
 	// in work/replan-20261116/keepalive-findings.md section 4.2.
-	candidate.BlockedWait = live.Blocked
+	candidate.BlockedWait = candidate.Blocked
 
 	// The clock is the main agent's own last model request, never session activity.
 	// Subagent progress keeps the session busy but must not reset this clock, or the
@@ -176,6 +185,10 @@ func (s *NativeService) runKeepAliveOnce(ctx context.Context, settings Automatio
 	live, liveErr := store.Live(ctx, id)
 	if liveErr != nil || live.OpenBackground <= 0 {
 		_ = s.updateAutomation(ctx, intent.ID, "cancelled", "发送前后台子代理已返回，候选已失效", now)
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(latest.session.Status), "idle") {
+		_ = s.updateAutomation(ctx, intent.ID, "cancelled", "发送前官方已报告会话空闲，候选已失效", now)
 		return
 	}
 	if err = s.WatchSessionInternal(id); err != nil {

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -911,5 +912,87 @@ func TestCredentialStatusAndResetAPIRoutes(t *testing.T) {
 	}
 	if store.deleteCount() == 0 {
 		t.Fatal("reset did not clear the stale key store entry")
+	}
+}
+
+// A concurrent write may never observe the key that Reset is retiring: the new
+// vault must contain either nothing or data sealed with the new key.
+func TestConcurrentWriteNeverUsesRetiredKey(t *testing.T) {
+	ctx := context.Background()
+	db := vaultDB(t)
+	store := newFakeKeyStore()
+	v := keyStoreVault(t, db, store)
+	if err := v.AutoUnlock(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !v.Unlocked() {
+		t.Fatal("vault did not auto-unlock")
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			ref := "provider/w" + strconv.Itoa(i%4)
+			// ErrLocked is the honest answer while a reset is in flight; any other
+			// error would mean an empty key reached the cipher.
+			if err := v.Put(ctx, ref, []byte("value")); err != nil && !errors.Is(err, ErrLocked) {
+				t.Errorf("concurrent Put failed with %v", err)
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < 3; i++ {
+		if err := v.Reset(ctx); err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("reset %d: %v", i, err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+
+	if !v.Unlocked() {
+		t.Fatal("vault should be unlocked by the OS key store after reset")
+	}
+	// Every surviving entry must decrypt with the current key.
+	status := v.Status(ctx)
+	for _, ref := range status.Refs {
+		if _, err := v.Get(ctx, ref); err != nil {
+			t.Fatalf("entry %s is undecryptable after reset: %v", ref, err)
+		}
+	}
+}
+
+func TestCipherCallsReturnErrLockedInsteadOfEmptyKey(t *testing.T) {
+	ctx := context.Background()
+	db := vaultDB(t)
+	v := openVault(t, db, "locked-behaviour-password")
+	accounts := v.KimiAccountStore()
+	browser := v.BrowserStore()
+	ref := KimiAccountRefPrefix + "acc_test"
+
+	// A locked vault must answer ErrLocked from every entry point, never the
+	// crypto layer's invalid-key error.
+	v.Lock()
+	if err := accounts.Put(ctx, ref, []byte("secret")); !errors.Is(err, ErrLocked) {
+		t.Fatalf("account Put on locked vault = %v", err)
+	}
+	if _, err := accounts.Get(ctx, ref); !errors.Is(err, ErrLocked) {
+		t.Fatalf("account Get on locked vault = %v", err)
+	}
+	if err := browser.Put(ctx, "session/1", []byte("secret")); !errors.Is(err, ErrLocked) {
+		t.Fatalf("browser Put on locked vault = %v", err)
+	}
+	if _, err := browser.Get(ctx, "session/1"); !errors.Is(err, ErrLocked) {
+		t.Fatalf("browser Get on locked vault = %v", err)
 	}
 }

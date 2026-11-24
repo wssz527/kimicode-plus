@@ -3,6 +3,7 @@ package desktop
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -1183,6 +1184,111 @@ func TestAccountSwitchIgnoresStaleOpenBackgroundWhenKAPReportsIdle(t *testing.T)
 	}
 }
 
+func TestAccountSwitchSavesUnsavedCurrentAccountBeforeOverwriting(t *testing.T) {
+	ctx := context.Background()
+	service, fake, _ := newAccountTestService(t)
+	accA, accB := saveTwoTestAccounts(t, service, fake)
+
+	fake.mu.Lock()
+	fake.tokens["{{SECRET_n3wunsaved}}"] = AccountProfile{UserID: "uid-new", Nickname: "新登录账号", Email: "new@example.com", Plan: "Moderato"}
+	fake.mu.Unlock()
+	if err := fake.writeDiskTokenFor(fake.oauthKey, "{{SECRET_n3wunsaved}}", "ref-new-unsaved", time.Now().Add(time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(map[string]any{"id": accB.ID})
+	raw, err := service.Action(ctx, "accounts.switch", payload)
+	if err != nil {
+		t.Fatalf("accounts.switch: %v", err)
+	}
+	if sw := raw.(AccountSwitchResult); !sw.Switched {
+		t.Fatalf("expected switch to succeed: %+v", sw)
+	}
+
+	saved, err := service.loadAccountRowByUserID(ctx, "uid-new")
+	if err != nil {
+		t.Fatalf("unsaved current account was not persisted: %v", err)
+	}
+	if saved.Label != "新登录账号" {
+		t.Fatalf("expected nickname fallback label, got %q", saved.Label)
+	}
+	vault := service.currentAccountVault()
+	secret, err := vault.Get(ctx, accountVaultRef(saved.ID))
+	if err != nil {
+		t.Fatalf("read saved secret: %v", err)
+	}
+	var stored storedKimiAccountSecret
+	if err := json.Unmarshal(secret, &stored); err != nil {
+		t.Fatal(err)
+	}
+	fields, err := parseRawTokenFields(stored.RawCredential)
+	if err != nil || fields.AccessToken != "{{SECRET_n3wunsaved}}" {
+		t.Fatalf("unsaved account token was not preserved: %+v %v", fields, err)
+	}
+	if saved.ID == accA.ID || saved.ID == accB.ID {
+		t.Fatalf("unexpected id reuse: %s", saved.ID)
+	}
+}
+
+func TestAccountSwitchRollbackRemovesAutoSavedCurrentAccount(t *testing.T) {
+	ctx := context.Background()
+	service, fake, _ := newAccountTestService(t)
+	_, accB := saveTwoTestAccounts(t, service, fake)
+
+	fake.mu.Lock()
+	fake.tokens["{{SECRET_n3wunsaved}}"] = AccountProfile{UserID: "uid-new", Nickname: "新登录账号", Plan: "Moderato"}
+	fake.mu.Unlock()
+	if err := fake.writeDiskTokenFor(fake.oauthKey, "{{SECRET_n3wunsaved}}", "ref-new-unsaved", time.Now().Add(time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	service.writeAccountFileHook = func(string, []byte) error { return errors.New("simulated disk full") }
+
+	payload, _ := json.Marshal(map[string]any{"id": accB.ID})
+	if _, err := service.Action(ctx, "accounts.switch", payload); err == nil {
+		t.Fatal("expected write failure")
+	}
+	if _, err := service.loadAccountRowByUserID(ctx, "uid-new"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("auto-saved account survived rollback: %v", err)
+	}
+}
+
+func TestQueuedAccountSwitchCancelledBeforeRunDoesNotSwitch(t *testing.T) {
+	ctx := context.Background()
+	service, fake, _ := newAccountTestService(t)
+	_, accB := saveTwoTestAccounts(t, service, fake)
+
+	fake.mu.Lock()
+	fake.sessions[0]["activity"] = "turn"
+	fake.sessions[0]["busy"] = true
+	fake.sessions[0]["main_turn_active"] = true
+	fake.mu.Unlock()
+
+	queuePayload, _ := json.Marshal(map[string]any{"id": accB.ID, "waitUntilIdle": true})
+	rawQueued, err := service.Action(ctx, "accounts.switch", queuePayload)
+	if err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+	if queued := rawQueued.(AccountSwitchResult); !queued.Queued {
+		t.Fatalf("expected queued result: %+v", queued)
+	}
+	if _, err := service.Action(ctx, "accounts.cancelPending", nil); err != nil {
+		t.Fatalf("cancelPending: %v", err)
+	}
+	fake.mu.Lock()
+	fake.sessions[0]["activity"] = "idle"
+	fake.sessions[0]["busy"] = false
+	fake.sessions[0]["main_turn_active"] = false
+	fake.mu.Unlock()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := fake.readDiskToken(t).AccessToken; got != "tok-acc-a-secret-1" {
+			t.Fatalf("cancelled queued switch still switched accounts: %s", got)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func TestAccountSwitchForceWhileBusySucceedsAndCancelsPending(t *testing.T) {
 	ctx := context.Background()
 	service, fake, _ := newAccountTestService(t)
@@ -1245,5 +1351,189 @@ func TestAccountSwitchForceWhileBusySucceedsAndCancelsPending(t *testing.T) {
 	}
 	if state := stateRaw.(AccountsState); state.PendingSwitch != nil {
 		t.Fatalf("expected pendingSwitch cleared after force switch, got %+v", state.PendingSwitch)
+	}
+}
+
+func TestKeepAliveIgnoresStaleOpenBackgroundWhenKAPReportsIdle(t *testing.T) {
+	ctx := context.Background()
+	service, fake, _ := newAccountTestService(t)
+	if _, err := service.cacheStore(); err != nil {
+		t.Fatalf("cacheStore: %v", err)
+	}
+
+	if _, err := service.db.ExecContext(ctx, `INSERT INTO cache_live(session_id,open_background,blocked,last_user_prompt,updated_at) VALUES('sess-1',2,1,'',?) ON CONFLICT(session_id) DO UPDATE SET open_background=2,blocked=1`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("seed stale cache_live: %v", err)
+	}
+
+	fake.mu.Lock()
+	fake.sessions[0]["activity"] = "idle"
+	fake.sessions[0]["busy"] = false
+	fake.sessions[0]["main_turn_active"] = false
+	fake.sessions[0]["pending_interaction"] = "none"
+	fake.mu.Unlock()
+
+	if _, err := service.Action(ctx, "bootstrap", nil); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	settings := AutomationSettings{KeepAlive: KeepAliveSettings{Enabled: true, Minutes: 1}}
+	candidate, ok := service.keepAliveGate(ctx, "sess-1", settings, time.Now().UTC())
+	if candidate.OpenBackground != 0 || candidate.Blocked {
+		t.Fatalf("stale cache_live leaked into the keepalive decision: %+v (ok=%v)", candidate, ok)
+	}
+}
+
+// A queued switch that sees a session become busy again must keep waiting in the
+// same queue entry instead of silently dropping the request. The window is
+// reproduced directly: the queue is set up, then the switch runs while busy.
+func TestQueuedAccountSwitchRetriesAfterBecomingBusyAgain(t *testing.T) {
+	service, fake, _ := newAccountTestService(t)
+	_, accB := saveTwoTestAccounts(t, service, fake)
+
+	fake.mu.Lock()
+	fake.sessions[0]["activity"] = "turn"
+	fake.sessions[0]["busy"] = true
+	fake.sessions[0]["main_turn_active"] = true
+	fake.mu.Unlock()
+
+	watchCtx, cancelWatch := context.WithCancel(service.ctx)
+	defer cancelWatch()
+	service.accountMu.Lock()
+	service.switchSeq = 41
+	seq := service.switchSeq
+	service.pendingSwitch = &pendingSwitchState{
+		info:   AccountPendingSwitch{TargetID: accB.ID},
+		seq:    seq,
+		cancel: cancelWatch,
+	}
+	service.accountMu.Unlock()
+
+	// A busy attempt must not consume the queue entry or cancel its watch context.
+	attemptCtx, attemptCancel := context.WithTimeout(watchCtx, 5*time.Second)
+	_, err := service.executeAccountSwitch(attemptCtx, accB.ID, false, false, 0, seq)
+	attemptCancel()
+	var native *NativeError
+	if !errors.As(err, &native) || native.Code != "ACCOUNT_SWITCH_BUSY" {
+		t.Fatalf("expected ACCOUNT_SWITCH_BUSY, got %v", err)
+	}
+	if watchCtx.Err() != nil {
+		t.Fatal("a busy retry cancelled the queue watch context")
+	}
+	service.accountMu.Lock()
+	pendingIntact := service.pendingSwitch != nil && service.pendingSwitch.seq == seq
+	service.accountMu.Unlock()
+	if !pendingIntact {
+		t.Fatal("a busy retry consumed the pending switch")
+	}
+
+	// Once idle, the same queue entry can still perform the switch.
+	fake.mu.Lock()
+	fake.sessions[0]["activity"] = "idle"
+	fake.sessions[0]["busy"] = false
+	fake.sessions[0]["main_turn_active"] = false
+	fake.mu.Unlock()
+
+	retryCtx, retryCancel := context.WithTimeout(watchCtx, 10*time.Second)
+	result, err := service.executeAccountSwitch(retryCtx, accB.ID, false, false, 0, seq)
+	retryCancel()
+	if err != nil {
+		t.Fatalf("retry after idle: %v", err)
+	}
+	if !result.Switched {
+		t.Fatalf("retry did not switch: %+v", result)
+	}
+	if got := fake.readDiskToken(t).AccessToken; got != "tok-acc-b-secret-1" {
+		t.Fatalf("disk token after retry = %s", got)
+	}
+	service.accountMu.Lock()
+	cleared := service.pendingSwitch == nil
+	service.accountMu.Unlock()
+	if !cleared {
+		t.Fatal("successful switch did not clear the pending slot")
+	}
+}
+
+func TestPendingSwitchMatchingIsScopedToSeq(t *testing.T) {
+	service, _, _ := newAccountTestService(t)
+	_, cancelFirst := context.WithCancel(service.ctx)
+	defer cancelFirst()
+	_, cancelSecond := context.WithCancel(service.ctx)
+	defer cancelSecond()
+
+	service.accountMu.Lock()
+	service.switchSeq = 7
+	service.pendingSwitch = &pendingSwitchState{
+		info:   AccountPendingSwitch{TargetID: "acc_target"},
+		seq:    7,
+		cancel: cancelSecond,
+	}
+	service.accountMu.Unlock()
+
+	// A stale watcher for the same target must not touch the newer request.
+	service.cancelPendingSwitchIfSeq(6)
+	service.accountMu.Lock()
+	stillPending := service.pendingSwitch != nil && service.pendingSwitch.seq == 7
+	service.accountMu.Unlock()
+	if !stillPending {
+		t.Fatal("a stale sequence cancelled a newer request for the same target")
+	}
+
+	// A stale read-only validation must be rejected without consuming the slot.
+	if err := service.validateQueuedSwitch(context.Background(), 6, "acc_target"); !errors.Is(err, errAccountSwitchSuperseded) {
+		t.Fatalf("stale validation error = %v", err)
+	}
+	service.accountMu.Lock()
+	stillPending = service.pendingSwitch != nil && service.pendingSwitch.seq == 7
+	service.accountMu.Unlock()
+	if !stillPending {
+		t.Fatal("a rejected validation consumed the pending slot")
+	}
+
+	// A cancelled watch context must not be able to start the switch.
+	cancelFirst()
+	supersededCtx, supersededCancel := context.WithCancel(service.ctx)
+	supersededCancel()
+	if err := service.validateQueuedSwitch(supersededCtx, 7, "acc_target"); !errors.Is(err, errAccountSwitchSuperseded) {
+		t.Fatalf("cancelled watch error = %v", err)
+	}
+
+	// Owning sequence consumes exactly its own entry.
+	if _, err := service.consumeQueuedSwitch(context.Background(), 7, "acc_target"); err != nil {
+		t.Fatalf("consume own sequence: %v", err)
+	}
+	service.accountMu.Lock()
+	cleared := service.pendingSwitch == nil
+	service.accountMu.Unlock()
+	if !cleared {
+		t.Fatal("owning sequence did not clear the pending slot")
+	}
+}
+
+// Rollback must not delete the metadata row when the ciphertext could not be
+// removed, or the secret becomes an orphan nothing can reach.
+func TestDeleteAccountRecordKeepsRowWhenVaultDeleteFails(t *testing.T) {
+	ctx := context.Background()
+	service, fake, vault := newAccountTestService(t)
+	accA, _ := saveTwoTestAccounts(t, service, fake)
+
+	vault.Lock()
+	err := service.deleteAccountRecord(ctx, accA.ID)
+	if err == nil {
+		t.Fatal("delete succeeded while the vault was locked")
+	}
+	if _, rowErr := service.loadAccountRow(ctx, accA.ID); rowErr != nil {
+		t.Fatalf("metadata row was deleted without removing the secret: %v", rowErr)
+	}
+
+	if unlockErr := vault.Unlock(ctx, "test-passphrase-1234"); unlockErr != nil {
+		t.Fatal(unlockErr)
+	}
+	if err := service.deleteAccountRecord(ctx, accA.ID); err != nil {
+		t.Fatalf("delete after unlock: %v", err)
+	}
+	if _, rowErr := service.loadAccountRow(ctx, accA.ID); !errors.Is(rowErr, sql.ErrNoRows) {
+		t.Fatalf("metadata row survived a successful delete: %v", rowErr)
+	}
+	if exists, existsErr := vault.KimiAccountStore().Exists(ctx, accountVaultRef(accA.ID)); existsErr != nil || exists {
+		t.Fatalf("ciphertext survived delete: exists=%v err=%v", exists, existsErr)
 	}
 }

@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"syscall"
 	"unsafe"
+
+	"enhancedkimi/internal/platform"
 )
 
 const dpapiFileName = "vault.key.dpapi"
@@ -170,5 +172,5 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	return os.Rename(temp, path)
+	return platform.RetryFileOperation(func() error { return os.Rename(temp, path) })
 }

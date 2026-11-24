@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // launchdController drives launchd through launchctl and reports the job's
@@ -221,6 +223,52 @@ var launchdProcessAlive = func(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
+// processExecutableName is the test seam for the PID identity check.
+var processExecutableName = processNameForPID
+
+// processNameForPID reads the kernel's recorded command name for one process.
+// It never signals anything; a wrong or recycled PID simply yields "" and the
+// caller declines to act on it.
+func processNameForPID(pid int) string {
+	if pid <= 1 {
+		return ""
+	}
+	info, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil || info == nil {
+		return ""
+	}
+	name := info.Proc.P_comm[:]
+	end := 0
+	for end < len(name) && name[end] != 0 {
+		end++
+	}
+	return string(name[:end])
+}
+
+// sameProcessExecutable reports whether pid still belongs to the core binary this
+// supervisor started. A PID recorded earlier may have been recycled by an
+// unrelated process before the escalation runs, and killing that process would be
+// worse than leaving the candidate stuck.
+func sameProcessExecutable(pid int, executable string) bool {
+	base := filepath.Base(strings.TrimSpace(executable))
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return false
+	}
+	name := processExecutableName(pid)
+	if name == "" {
+		return false
+	}
+	// macOS truncates P_comm to 16 bytes, so compare the prefix instead of the
+	// whole name when the binary name is longer than the kernel field.
+	if len(name) > 16 {
+		name = name[:16]
+	}
+	if len(base) > 16 {
+		base = base[:16]
+	}
+	return name == base
+}
+
 func runtimeCorePID(dataDir string) int {
 	data, err := os.ReadFile(filepath.Join(dataDir, "runtime.json"))
 	if err != nil {
@@ -248,12 +296,26 @@ func (job supervisorJob) stopLaunchdCore() error {
 	}
 	_ = job.launchdKill("SIGTERM")
 	_ = job.launchdBootout()
-	for deadline := time.Now().Add(launchdStopTimeout); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+	deadline := time.Now().Add(launchdStopTimeout)
+	escalated := false
+	for time.Now().Before(deadline) {
 		servicePID, serviceErr := job.launchdServicePID()
 		processStopped := pid <= 0 || !launchdProcessAlive(pid)
 		if (serviceErr != nil || servicePID <= 0) && processStopped {
 			return nil
 		}
+		// A candidate core that deadlocks on a database lock ignores SIGTERM.
+		// Escalate once to SIGKILL so rollback is never blocked forever. The
+		// launchd-level kill applies to the job; the direct syscall is only used
+		// while pid still names our own binary, so a recycled PID is never hit.
+		if !escalated && time.Until(deadline) < launchdStopTimeout/2 {
+			escalated = true
+			_ = job.launchdKill("SIGKILL")
+			if pid > 1 && sameProcessExecutable(pid, job.Executable) {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	return errors.New("等待登录项核心退出超时")
 }

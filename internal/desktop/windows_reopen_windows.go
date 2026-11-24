@@ -170,7 +170,10 @@ func confirmReopenIdle(ctx context.Context, home string, pid int) error {
 	if err != nil || VerifyWindowsDebugPortOwner(listeners, port, pid) != nil {
 		return unknown
 	}
-	probe, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// The whole scan gets a generous budget, but each page gets its own shorter
+	// timeout: a single stalled request must not consume the budget that the
+	// remaining pages need. A large account can have well over 100 sessions.
+	probe, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	kap := NewKAPClient(home)
 	kap.base, kap.token = base, token
@@ -179,7 +182,9 @@ func confirmReopenIdle(ctx context.Context, home string, pid int) error {
 	scan := newReopenSessionsScan()
 	query := url.Values{"page_size": {strconv.Itoa(reopenSessionPageSize)}}
 	for {
-		raw, err := kap.send(probe, http.MethodGet, "/sessions?"+query.Encode(), nil)
+		pageCtx, pageCancel := context.WithTimeout(probe, 10*time.Second)
+		raw, err := kap.send(pageCtx, http.MethodGet, "/sessions?"+query.Encode(), nil)
+		pageCancel()
 		if err != nil {
 			return unknown
 		}

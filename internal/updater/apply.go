@@ -16,6 +16,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"enhancedkimi/internal/platform"
 )
 
 type downloadCandidate struct {
@@ -340,5 +342,7 @@ func atomicCopy(source, destination string, mode os.FileMode) error {
 	if err = writeCopy(file, source, mode); err != nil {
 		return err
 	}
-	return os.Rename(file.Name(), destination)
+	// Windows refuses a rename while another process holds the target open, so a
+	// rollback retries instead of failing on a transient sharing violation.
+	return platform.RetryFileOperation(func() error { return os.Rename(file.Name(), destination) })
 }
