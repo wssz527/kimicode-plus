@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, BRIDGE_RECONNECT_TEXT, isBridgeCredentialError } from "../api";
 
 export interface Resource<T> {
@@ -50,11 +50,15 @@ export function useResource<T>(
 
   const stale = activeKey !== key;
 
+  // A stable identity keeps consumers from re-running effects that depend on
+  // `reload` (pollers, timers) on every render of this hook.
+  const reload = useCallback(() => setRevision((value) => value + 1), []);
+
   return {
     data,
     error,
     loading: loading || stale,
-    reload: () => setRevision((value) => value + 1),
+    reload,
     revision,
   };
 }

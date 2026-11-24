@@ -172,7 +172,7 @@ export interface LayoutHost {
 }
 
 export interface BrowserHost {
-  open(pluginId: string, viewId: string, url: string): Promise<void>;
+  open(pluginId: string, viewId: string, url: string): Promise<void | (() => Promise<void>)>;
   navigate(pluginId: string, viewId: string, url: string): Promise<void>;
   history(pluginId: string, viewId: string, action: "back" | "forward" | "reload"): Promise<boolean>;
   external(pluginId: string, viewId: string): Promise<void>;

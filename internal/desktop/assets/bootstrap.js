@@ -46,7 +46,15 @@ async function installNativeBootstrap(options) {
       body: JSON.stringify({ pairingToken, permissions }), signal: AbortSignal.timeout(5000), redirect: 'error',
     });
     const pair = await response.json();
-    if (!response.ok || !pair.sessionToken) throw new Error(pair?.error?.message || '增强核心配对失败');
+    if (!response.ok || !pair.sessionToken) {
+      const error = new Error(pair?.error?.message || '增强核心配对失败');
+      // The status decides whether a retry is meaningful: a restarted core
+      // answers 401 to the token it no longer knows, and the caller must re-read
+      // runtime.json rather than keep presenting that token.
+      error.status = response.status;
+      error.code = pair?.error?.code || '';
+      throw error;
+    }
     const expiresAtMs = Date.parse(pair.expiresAt);
     return { sessionToken: pair.sessionToken, expiresAtMs: Number.isFinite(expiresAtMs) ? expiresAtMs : Date.now() + 12 * 60 * 60 * 1000 };
   }
@@ -76,13 +84,44 @@ async function installNativeBootstrap(options) {
   // alive past that, so the runtime record is the only input: it carries the
   // token of the core that is running now, whether that is the same instance or
   // a replacement after a restart.
+  //
+  // One loop, one attempt type: each try re-reads runtime.json and then pairs.
+  // Reading once and retrying the pair would keep presenting the *old*
+  // pairingToken after a restarted core wrote a new one, and the core answers
+  // 401 to a token it never issued.
   function refreshCoreSession() {
     pairing ??= (async () => {
       if (!options.runtimePath || state.cleaned) return false;
-      const runtime = JSON.parse(await req('node:fs/promises').readFile(options.runtimePath, 'utf8'));
-      if (runtime.url !== options.coreURL || typeof runtime.pairingToken !== 'string' || runtime.pairingToken.length < 32) return false;
-      const refreshed = await pairCore(runtime.pairingToken);
-      if (state.cleaned) return false;
+      const attempts = 4;
+      const backoff = attempt => new Promise(resolve => setTimeout(resolve, 250 * 2 ** attempt));
+      let runtime = null;
+      let refreshed = null;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        if (state.cleaned) return false;
+        runtime = null;
+        try {
+          const record = JSON.parse(await req('node:fs/promises').readFile(options.runtimePath, 'utf8'));
+          if (record?.url === options.coreURL && typeof record.pairingToken === 'string' && record.pairingToken.length >= 32) {
+            runtime = record;
+          }
+        } catch {
+          runtime = null;
+        }
+        if (runtime) {
+          try {
+            refreshed = await pairCore(runtime.pairingToken);
+            break;
+          } catch (error) {
+            const status = Number(error?.status) || 0;
+            const transient = status === 401 || status === 403
+              || error?.name === 'TimeoutError'
+              || /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up|增强核心配对失败/i.test(String(error?.message || error));
+            if (!transient || attempt === attempts - 1) throw error;
+          }
+        }
+        if (attempt < attempts - 1) await backoff(attempt);
+      }
+      if (!runtime || !refreshed || state.cleaned) return false;
       const restarted = pairedWith !== runtime.pairingToken;
       coreToken = refreshed.sessionToken;
       coreTokenExpiresAtMs = refreshed.expiresAtMs;

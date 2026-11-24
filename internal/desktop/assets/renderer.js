@@ -51,12 +51,27 @@ async function installNativeRenderer(options) {
     let response;
     let body;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      response = await nativeFetch(options.endpoint + '/ekd/native/v1', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-EKD-Bridge': options.bridgeKey },
-        body: nativeStringify({ protocol: 1, id, action, payload }),
-      });
-      body = await response.json().catch(() => null);
+      try {
+        response = await nativeFetch(options.endpoint + '/ekd/native/v1', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-EKD-Bridge': options.bridgeKey },
+          body: nativeStringify({ protocol: 1, id, action, payload }),
+        });
+        body = await response.json().catch(() => null);
+      } catch (error) {
+        // A restarted core refuses the connection for a moment; that is the same
+        // retryable window as a rotated bridge key, not a terminal failure.
+        if (attempt === 1) {
+          const wrapped = new Error(bridgeCredentialMessage);
+          wrapped.code = 'BRIDGE_SESSION_EXPIRED';
+          wrapped.status = 0;
+          wrapped.retryable = true;
+          wrapped.cause = error;
+          throw wrapped;
+        }
+        await new Promise(resolve => setTimeout(resolve, 250));
+        continue;
+      }
       const code = body?.error?.code || (!response.ok ? `HTTP_${response.status}` : '');
       const refused = (!response.ok || body?.error) && bridgeRejectedBeforeDispatch(code);
       if (!refused || attempt === 1) break;
@@ -117,6 +132,14 @@ async function installNativeRenderer(options) {
           const res = await window.kimiDesktop.showOpenDialog(dialogOptions);
           return res?.canceled ? [] : (res?.filePaths || []).map(p => ({ path: p, name: String(p).split(/[\\/]/).pop() || p }));
         }
+        if (action === 'host.openBrowser') {
+          // Compatibility mode has no Electron main bridge, so a popover link or
+          // a release page must open in the OS browser instead of failing.
+          const url = typeof payload?.url === 'string' ? payload.url : '';
+          if (!/^https?:\/\//i.test(url)) throw new Error('只允许有效的 http 或 https 地址');
+          const opened = typeof window.open === 'function' ? window.open(url, '_blank', 'noopener,noreferrer') : null;
+          return { browserId: opened ? 'external' : '' };
+        }
       }
       return bridgeRequest(action, payload);
     },
@@ -146,6 +169,8 @@ async function installNativeRenderer(options) {
     sidebarRefs: 0,
     sidebarCollapsed: null,
     observer: null,
+    ensureFrame: null,
+    ensureCancel: null,
     sessionContainer: null,
     sessionHostElement: null,
     sessionHandle: null,
@@ -168,8 +193,10 @@ async function installNativeRenderer(options) {
     updateOutside: null,
     updateKeydown: null,
     updatePillDigest: '',
+    updatePainted: null,
     unsubscribeUpdate: null,
     officialSections: new Map(),
+    officialAuthRefresh: null,
     officialPluginsTabActive: false,
     officialPluginsTabPending: false,
     officialPluginsPanel: null,
@@ -588,6 +615,13 @@ async function installNativeRenderer(options) {
     return state.accountsFetchPromise;
   }
   async function refreshOfficialAuth() {
+    if (state.officialAuthRefresh) return state.officialAuthRefresh;
+    state.officialAuthRefresh = doRefreshOfficialAuth().finally(() => {
+      state.officialAuthRefresh = null;
+    });
+    return state.officialAuthRefresh;
+  }
+  async function doRefreshOfficialAuth() {
     try {
       const pinia = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia?._s;
       const authStore = pinia?.get('kimi.auth');
@@ -722,6 +756,8 @@ async function installNativeRenderer(options) {
     }
     unmountHandle(state.keepAliveMenuHandle);
     state.keepAliveMenuHandle = null;
+    state.keepAliveMenuResize?.disconnect();
+    state.keepAliveMenuResize = null;
     state.keepAliveMenuEl?.remove();
     state.keepAliveMenuEl = null;
     state.keepAliveMenuSessionId = '';
@@ -729,7 +765,8 @@ async function installNativeRenderer(options) {
   function positionKeepAliveMenu(menuEl, anchorEl) {
     const rect = anchorEl.getBoundingClientRect();
     const menuWidth = 296;
-    const estHeight = 320;
+    const measured = menuEl.getBoundingClientRect().height || menuEl.offsetHeight || 0;
+    const estHeight = measured > 0 ? measured : 320;
     let left = rect.right - menuWidth;
     if (left < 12) left = Math.min(rect.left, Math.max(12, window.innerWidth - menuWidth - 12));
     if (left + menuWidth > window.innerWidth - 12) left = Math.max(12, window.innerWidth - menuWidth - 12);
@@ -737,8 +774,20 @@ async function installNativeRenderer(options) {
     if (top + estHeight > window.innerHeight - 12 && rect.top - estHeight - 6 > 12) {
       top = rect.top - estHeight - 6;
     }
+    if (top + estHeight > window.innerHeight - 12) top = Math.max(12, window.innerHeight - estHeight - 12);
     menuEl.style.left = `${Math.round(left)}px`;
     menuEl.style.top = `${Math.round(Math.max(12, top))}px`;
+  }
+  function watchKeepAliveMenuSize(menuEl, anchorEl) {
+    // Expanding a sub-item can push the footer button past the window edge, so
+    // the popover re-measures itself instead of trusting the first estimate.
+    if (typeof ResizeObserver !== 'function') return null;
+    const observer = new ResizeObserver(() => {
+      if (!menuEl.isConnected) return;
+      positionKeepAliveMenu(menuEl, anchorEl);
+    });
+    observer.observe(menuEl);
+    return observer;
   }
   function openKeepAliveMenu(anchorEl, sessionId) {
     if (!sessionId || state.removed) return;
@@ -754,6 +803,7 @@ async function installNativeRenderer(options) {
     document.body.append(hostEl);
     state.keepAliveMenuEl = hostEl;
     state.keepAliveMenuSessionId = sessionId;
+    state.keepAliveMenuResize = watchKeepAliveMenuSize(hostEl, anchorEl);
     state.keepAliveMenuHandle = mount(hostEl, 'session-keepalive-menu', makeHost(closeKeepAliveMenu), {
       sessionId,
       onCloseModal: closeKeepAliveMenu,
@@ -1111,16 +1161,41 @@ async function installNativeRenderer(options) {
   const UPDATE_DISMISS_KEY = 'ekd:update-dismissed';
   const UPDATE_VISIBLE_STATES = new Set(['available', 'downloading', 'verifying', 'restarting', 'rolled_back']);
   const UPDATE_ICON = '<svg class="upd-pill-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"></path><path d="m7 10 5 5 5-5"></path><path d="M5 20h14"></path></svg>';
+  function dismissedVersions() {
+    try {
+      const raw = window.localStorage.getItem(UPDATE_DISMISS_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return new Set(Array.isArray(parsed) ? parsed.filter(item => typeof item === 'string' && item) : []);
+    } catch {
+      return new Set();
+    }
+  }
   function readUpdateDismissed() {
-    try { return window.sessionStorage.getItem(UPDATE_DISMISS_KEY) || ''; } catch { return ''; }
+    // The most recently ignored version drives the pill; the stored set keeps
+    // older dismissals so a check that has not refreshed yet cannot resurface them.
+    let latest = '';
+    try {
+      latest = window.sessionStorage.getItem(UPDATE_DISMISS_KEY) || '';
+    } catch {}
+    return latest;
   }
   function writeUpdateDismissed(version) {
     try {
+      const versions = dismissedVersions();
+      if (version) versions.add(version);
+      else versions.clear();
+      window.localStorage.setItem(UPDATE_DISMISS_KEY, JSON.stringify([...versions]));
       if (version) window.sessionStorage.setItem(UPDATE_DISMISS_KEY, version);
       else window.sessionStorage.removeItem(UPDATE_DISMISS_KEY);
     } catch {
-      // Session storage can be unavailable; dismissal is best effort.
+      // Storage can be unavailable; dismissal is best effort.
     }
+  }
+  function updateDismissed(status) {
+    const version = status?.latestVersion;
+    if (!version) return false;
+    if (readUpdateDismissed() === version) return true;
+    return dismissedVersions().has(version);
   }
   function updatePercent(status) {
     const total = Number(status?.totalBytes) || 0;
@@ -1141,8 +1216,7 @@ async function installNativeRenderer(options) {
   function updatePillVisible(status) {
     if (!status || !UPDATE_VISIBLE_STATES.has(status.state)) return false;
     if (status.state !== 'available') return true;
-    const dismissed = readUpdateDismissed();
-    return !(dismissed && status.latestVersion && dismissed === status.latestVersion);
+    return !updateDismissed(status);
   }
   function closeUpdatePopover() {
     if (state.updateOutside) {
@@ -1156,6 +1230,7 @@ async function installNativeRenderer(options) {
     window.removeEventListener('resize', positionUpdatePopover);
     state.updatePopover?.remove();
     state.updatePopover = null;
+    state.updatePainted = null;
   }
   function positionUpdatePopover() {
     const popover = state.updatePopover;
@@ -1221,10 +1296,43 @@ async function installNativeRenderer(options) {
       container.append(p);
     }
   }
+    function openExternal(url) {
+    const safe = /^https?:\/\//i.test(String(url || '')) ? String(url) : '';
+    if (!safe) return;
+    void transport.request('host.openBrowser', { url: safe, mode: 'exec' })
+      .catch(() => {
+        // No Electron main bridge (compatibility mode) or the browser window
+        // refused; handing the URL to the OS browser is the honest fallback.
+        if (typeof window.open === 'function') window.open(safe, '_blank', 'noopener,noreferrer');
+      });
+  }
   function paintUpdatePopover() {
     const popover = state.updatePopover;
     const status = state.updateStatus;
     if (!popover) return;
+    // The popover is rebuilt only when its shape changes. A download progress
+    // tick updates the number, the bar width and the message in place, so the
+    // scroll position of the release notes is preserved.
+    const previous = state.updatePainted;
+    const shape = status
+      ? [status.state, status.error || '', status.note || '', status.cannotApplyReason || '', status.releaseNotes || '', status.releaseUrl || '', status.latestVersion || '', status.canApply ? '1' : '0'].join('|')
+      : '';
+    if (previous && previous.popover === popover && previous.shape === shape) {
+      const percent = updatePercent(status);
+      const fill = previous.fill;
+      if (fill) fill.style.width = `${percent}%`;
+      if (previous.progress) previous.progress.textContent = `正在下载更新… ${percent}%`;
+      // The heading carries the same percentage, so patching only the body would
+      // leave a stale number above a moving bar.
+      if (previous.title) {
+        previous.title.textContent = status.state === 'available'
+          ? `发现新版本 v${status.latestVersion || ''}`
+          : `KimiCode+ ${updatePillLabel(status)}`;
+      }
+      return;
+    }
+    const painted = { popover, shape, fill: null, progress: null, title: null };
+    state.updatePainted = painted;
     popover.replaceChildren();
     if (!status) return;
     const head = document.createElement('div');
@@ -1234,6 +1342,7 @@ async function installNativeRenderer(options) {
     title.textContent = status.state === 'available'
       ? `发现新版本 v${status.latestVersion || ''}`
       : `KimiCode+ ${updatePillLabel(status)}`;
+    painted.title = title;
     const meta = document.createElement('span');
     meta.className = 'ekd-upd-meta';
     meta.textContent = status.currentVersion ? `KimiCode+ · 当前 v${status.currentVersion}` : 'KimiCode+';
@@ -1267,6 +1376,8 @@ async function installNativeRenderer(options) {
       progress.className = 'ekd-upd-message';
       progress.textContent = `正在下载更新… ${percent}%`;
       body.append(progress);
+      painted.fill = fill;
+      painted.progress = progress;
     } else if (message) {
       const note = document.createElement('p');
       note.className = 'ekd-upd-message';
@@ -1293,7 +1404,7 @@ async function installNativeRenderer(options) {
     const releaseUrl = typeof status.releaseUrl === 'string' ? status.releaseUrl : '';
     if (/^https:\/\//i.test(releaseUrl)) {
       appendUpdateAction(links, '查看发布页', 'ekd-upd-link', () => {
-        void transport.request('host.openBrowser', { url: releaseUrl, mode: 'exec' }).catch(() => {});
+        openExternal(releaseUrl);
       });
     }
     appendUpdateAction(links, '更新设置', 'ekd-upd-link', () => {
@@ -1467,7 +1578,8 @@ async function installNativeRenderer(options) {
         try {
           const result = await transport.request('sessions.list');
           if (settled) return;
-          const available = result.items.filter(session => !exclude.includes(session.id));
+          const listed = Array.isArray(result?.items) ? result.items : [];
+          const available = listed.filter(session => session && typeof session.id === 'string' && !exclude.includes(session.id));
           if (!available.length && retries > 0) {
             retryTimer = setTimeout(() => void loadSessions(retries - 1), 500);
             return;
@@ -1547,6 +1659,12 @@ async function installNativeRenderer(options) {
   }
   const nativeStyle = document.createElement('style');
   nativeStyle.textContent = `
+    /* light-dark() resolves from the element's color-scheme property, not from
+       the host's data attribute. A standalone window is about:blank, so nothing
+       else declares it there and every light-dark() fallback painted white in
+       dark mode. */
+    html[data-color-scheme="dark"]{color-scheme:dark}
+    html[data-color-scheme="light"]{color-scheme:light}
     [data-ekd-containment=sessions]>:not(.ekd-session-host),[data-ekd-containment=settings]>:not(.ekd-settings-mount){display:none!important}
     .ekd-session-host{display:flex;flex:1;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden;padding-top:44px;box-sizing:border-box;-webkit-app-region:no-drag}
     header.chat-header~.chat-layout .ekd-session-host,header.chat-header~.ekd-session-host{padding-top:0}
@@ -1559,7 +1677,7 @@ async function installNativeRenderer(options) {
     .ekdp-main-split[data-ekdp-mode="split"]>.ekdp-main-pane{padding-top:44px;box-sizing:border-box;-webkit-app-region:no-drag}
     header.chat-header~.chat-layout .ekdp-main-split>.ekdp-main-pane,header.chat-header~.ekdp-main-split>.ekdp-main-pane{padding-top:0}
     .ekdp-main-native{display:flex;flex:1 1 auto;flex-direction:column;min-width:0;min-height:0}
-    .ekdp-main-pane{display:flex;flex:0 0 auto;flex-direction:column;min-width:0;min-height:0;background:var(--color-bg,#121212)}
+    .ekdp-main-pane{display:flex;flex:0 0 auto;flex-direction:column;min-width:0;min-height:0;background:var(--color-bg,light-dark(#fff,#121212))}
     .ekdp-main-splitter{flex:0 0 5px;cursor:col-resize;background:var(--color-line,#8884);opacity:.55;touch-action:none}
     .ekdp-main-splitter:hover,.ekdp-main-splitter:focus-visible,.ekdp-main-splitter.dragging{opacity:1;outline:none;background:var(--blue,#5b8def)}
     /* The official settings body is a fixed-height box that does not scroll. The
@@ -1582,7 +1700,7 @@ async function installNativeRenderer(options) {
     .ui-seg[data-ekd-plugins-active="true"] .ui-seg__item:not([data-ekd-plugins-tab]){background:transparent!important;box-shadow:none!important;color:var(--color-text-muted,var(--color-text-faint,inherit))!important}
     .ui-seg[data-ekd-plugins-active="true"] .ui-seg__indicator{opacity:0!important;pointer-events:none}
     .ekd-native-entry{position:relative}
-    .ekd-session-picker{width:min(520px,calc(100vw - 40px));max-height:min(680px,calc(100vh - 60px));padding:0;border:1px solid var(--color-line,#8884);border-radius:8px;background:var(--color-bg,#121212);color:var(--color-text,#eee);font:13px/1.5 var(--font-ui,system-ui);box-shadow:0 16px 50px rgba(0,0,0,.24)}
+    .ekd-session-picker{width:min(520px,calc(100vw - 40px));max-height:min(680px,calc(100vh - 60px));padding:0;border:1px solid var(--color-line,#8884);border-radius:8px;background:var(--color-surface-raised,var(--color-surface,var(--color-bg,light-dark(#fff,#121212))));color:var(--color-text,light-dark(#1a1c20,#eee));font:13px/1.5 var(--font-ui,system-ui);box-shadow:0 16px 50px rgba(0,0,0,.24)}
     .ekd-session-picker::backdrop{background:rgba(0,0,0,.36)}
     .ekd-picker-head{display:flex;gap:16px;padding:18px 18px 12px;border-bottom:1px solid var(--color-line,#8883)}
     .ekd-picker-head strong{font-size:15px}.ekd-picker-head p{margin:4px 0 0;color:var(--color-text-secondary,#aaa);font-size:12px}
@@ -1841,7 +1959,10 @@ async function installNativeRenderer(options) {
       syncOfficialSettingsSections(evaluation);
     }
     if (evaluation.byId['dom.settings_providers']?.status === 'disabled') {
+      state.providerEnhance?.setEnabled?.(false);
       state.providerEnhance?.clearDecorations?.();
+    } else {
+      state.providerEnhance?.setEnabled?.(true);
     }
     syncAccountMenu(evaluation);
     syncSessionInfoKeepAlive();
@@ -1896,6 +2017,26 @@ async function installNativeRenderer(options) {
       state.settingsObserver?.disconnect();
       return;
     }
+    // Every observed DOM change used to run a full contract evaluation in the
+    // same microtask, so a typing session could queue dozens of passes. One
+    // animation frame consolidates them into a single sync.
+    if (state.ensureFrame !== null) return;
+    const run = () => {
+      state.ensureFrame = null;
+      if (state.removed || isStale()) return;
+      runEnsure();
+    };
+    state.ensureFrame = typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame(run)
+      : setTimeout(run, 16);
+    state.ensureCancel = typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame : clearTimeout;
+  }
+  function runEnsure() {
+    if (state.removed || isStale()) {
+      state.observer?.disconnect();
+      state.settingsObserver?.disconnect();
+      return;
+    }
     reclaimLegacyZombie();
     state.observer?.disconnect();
     state.settingsObserver?.disconnect();
@@ -1919,6 +2060,10 @@ async function installNativeRenderer(options) {
   state.remove = () => (removePromise ??= (async () => {
     if (state.removed) return;
     state.removed = true;
+    if (state.ensureFrame !== null) {
+      state.ensureCancel?.(state.ensureFrame);
+      state.ensureFrame = null;
+    }
     while (legacyZombieTimers.length > 0) clearTimeout(legacyZombieTimers.pop());
     state.observer?.disconnect();
     state.settingsObserver?.disconnect();
@@ -2023,18 +2168,25 @@ async function installNativeRenderer(options) {
   };
   document.addEventListener('click', settingsTabClick, true);
   document.addEventListener('scroll', settingsScroll, true);
+  function applyStandaloneTheme(theme) {
+    const scheme = theme === 'light' ? 'light' : 'dark';
+    document.documentElement.dataset.colorScheme = scheme;
+    // A standalone window has no host stylesheet declaring color-scheme, so the
+    // light-dark() fallbacks resolve from this inline declaration.
+    document.documentElement.style.colorScheme = scheme;
+  }
   if (options.surface === 'plugin') {
-    document.documentElement.dataset.colorScheme = options.theme || 'dark';
+    applyStandaloneTheme(options.theme);
     document.title = 'KimiCode+ 增强插件';
-    document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:var(--color-bg,#121212);color:var(--color-text,#eee)';
+    document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:var(--color-surface,var(--color-bg,light-dark(#fff,#121212)));color:var(--color-text,light-dark(#1a1c20,#eee))';
     state.popoutRoot = document.createElement('div');
     state.popoutRoot.style.cssText = 'height:100vh;min-height:0;overflow:hidden';
     document.body.replaceChildren(state.popoutRoot);
     window.__ekdNativeUI = publishNativeUI();
   } else if (options.surface === 'settings') {
-    document.documentElement.dataset.colorScheme = options.theme || 'dark';
+    applyStandaloneTheme(options.theme);
     document.title = 'KimiCode+ 设置';
-    document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:var(--color-bg,#121212);color:var(--color-text,#eee)';
+    document.body.style.cssText = 'margin:0;height:100vh;overflow:hidden;background:var(--color-surface,var(--color-bg,light-dark(#fff,#121212)));color:var(--color-text,light-dark(#1a1c20,#eee))';
     const element = document.createElement('div');
     element.style.cssText = 'height:100vh;min-height:0';
     document.body.replaceChildren(element);
@@ -2146,6 +2298,9 @@ async function installNativeRenderer(options) {
   const accountEventHost = makeHost(() => {});
   state.unsubscribeAccounts = accountEventHost.subscribe('accounts', event => {
     if (event?.type === 'account.switched' && event?.refreshAuth) {
+      // The section also dispatches this event for the sidebar; both paths merge
+      // into one official-store refresh instead of racing each other.
+      window.dispatchEvent(new CustomEvent('ekd:account-switched', { detail: event }));
       void refreshOfficialAuth();
     } else {
       void refreshAccountsCache(true);
@@ -2191,7 +2346,17 @@ async function installNativeRenderer(options) {
   });
   void refreshAccountsCache(true);
   ensure();
-  state.observer = new MutationObserver(ensure);
+  state.observer = new MutationObserver(records => {
+    // Only structural changes can move a contract target. Attribute churn (class
+    // toggles such as `scrolling`, inline style during scrolling) is covered by
+    // the settings observer where it actually matters, so it is not watched on
+    // the whole document.
+    if (Array.isArray(records) && records.length > 0 && records.every(record => record.type === 'attributes')) {
+      const meaningful = records.some(record => (record.attributeName || '') !== 'class' && (record.attributeName || '') !== 'style');
+      if (!meaningful) return;
+    }
+    ensure();
+  });
   state.observer.observe(document.body, { childList: true, subtree: true });
   // Plugin host wiring. The runtime implementation lives in the host bundle
   // (exported from host-entry); this file only supplies mount points and drives
@@ -2567,6 +2732,7 @@ async function installNativeRenderer(options) {
   // A plugin's own token is the only identity the browser bridge carries; the
   // host process asks the core whose it is. A closed plugin has already lost its
   // token, so close sends the token the runtime still holds in scope.
+  //
   function pluginToken(id) {
     return state.pluginTokens.get(id) || '';
   }
@@ -2589,7 +2755,11 @@ async function installNativeRenderer(options) {
   };
   window.__ekdPluginBrowserNavigated = publishedBrowserNav;
   const pluginBrowserHost = {
-    open: (pluginId, viewId, url) => transport.request("browser.view.open", { token: pluginToken(pluginId), viewId, url }),
+    open: async (pluginId, viewId, url) => {
+      const token = pluginToken(pluginId);
+      await transport.request("browser.view.open", { token, viewId, url });
+      return () => transport.request("browser.view.close", { token, viewId });
+    },
     navigate: (pluginId, viewId, url) => transport.request("browser.view.navigate", { token: pluginToken(pluginId), viewId, url }),
     history: async (pluginId, viewId, operation) => Boolean((await transport.request("browser.view.history", { token: pluginToken(pluginId), viewId, operation }))?.changed),
     external: (pluginId, viewId) => transport.request("browser.view.external", { token: pluginToken(pluginId), viewId }).then(() => {}),
@@ -2724,8 +2894,10 @@ async function installNativeRenderer(options) {
   let syncPromise = null;
   let syncPending = false;
 
-  async function loadPluginAsset(id, entryPath, requiredExport = 'activate') {
-    const key = id + '/' + entryPath + '/' + requiredExport;
+  async function loadPluginAsset(id, entryPath, requiredExport = 'activate', revision = '') {
+    // The revision is part of the key: a hot update changes version/updatedAt,
+    // so the old bundle can never be served for the new one.
+    const key = id + '/' + entryPath + '/' + requiredExport + (revision ? '/' + revision : '');
     if (state.pluginAssets.has(key)) return state.pluginAssets.get(key);
     const asset = await coreGet('/plugins/' + encodeURIComponent(id) + '/assets/' + entryPath.split('/').map(encodeURIComponent).join('/'));
     const loaded = await module.loadPluginModule(asset?.source || '', requiredExport);
@@ -2818,7 +2990,7 @@ async function installNativeRenderer(options) {
         if (state.removed || isStale() || !state.plugins) return;
         if (!token) continue;
         state.pluginTokens.set(plugin.id, token);
-        const entry = await loadPluginAsset(plugin.id, module.pluginEntryPath(plugin.entry?.renderer || 'renderer.js'));
+        const entry = await loadPluginAsset(plugin.id, module.pluginEntryPath(plugin.entry?.renderer || 'renderer.js'), 'activate', pluginRevision(plugin));
         if (state.removed || isStale() || !state.plugins) return;
         const runtime = state.plugins;
         await runtime.activate(entry, {
@@ -2841,6 +3013,11 @@ async function installNativeRenderer(options) {
         noteActivationFault(plugin.id, error);
         state.pluginTokens.delete(plugin.id);
         state.pluginRevisions.delete(plugin.id);
+        // A faulted plugin's cached bundle must not be reused on the retry: the
+        // core may hand out a repaired entry under the same path.
+        for (const key of [...state.pluginAssets.keys()]) {
+          if (key.startsWith(plugin.id + '/')) state.pluginAssets.delete(key);
+        }
       }
     }
   }
@@ -2849,13 +3026,18 @@ async function installNativeRenderer(options) {
   // module and the container, and closing the page releases both. The runtime
   // never mounts a plugin's settings page on its own, because the host's own
   // settings body belongs to the official client.
+  //
+  // This copy exists because the activation block below keeps its own inline
+  // `pluginRevision` (the desktop contract probe slices that block and runs it
+  // standalone). Both spell the same identity: version, updatedAt, capabilities.
+  const pluginRevisionOf = plugin => `${plugin?.version || ''}|${plugin?.updatedAt || ''}|${Array.isArray(plugin?.capabilities) ? plugin.capabilities.join(',') : ''}`;
   async function mountPluginSettings(id, element) {
     if (state.removed) throw new Error('插件宿主已卸载');
     const plugin = (state.pluginList || []).find(item => item.id === id);
     const active = state.plugins?.get(id);
     if (!active) throw new Error('插件未运行，无法打开设置页');
     if (!plugin?.entry?.settings) throw new Error('这个插件没有设置页');
-    const settingsModule = await loadPluginAsset(id, module.pluginEntryPath(plugin.entry.settings), 'renderSettings');
+    const settingsModule = await loadPluginAsset(id, module.pluginEntryPath(plugin.entry.settings), 'renderSettings', pluginRevisionOf(plugin));
     const release = await active.mountSettings(settingsModule, element);
     state.pluginSettings.set(id, release);
     return () => {

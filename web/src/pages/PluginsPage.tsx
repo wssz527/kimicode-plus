@@ -1,5 +1,7 @@
 import { PageHeader } from "../components/ui";
 import { PluginSettings } from "../components/PluginSettings";
+import "../styles/plugin-surfaces.css";
+import "../styles/native-settings-surface.css";
 
 /**
  * The standalone workbench page. Plugin management itself lives in

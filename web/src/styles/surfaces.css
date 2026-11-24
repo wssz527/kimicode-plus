@@ -66,3 +66,50 @@
 @media (prefers-reduced-motion: reduce) {
   .ekd-surface *, .ekd-surface *::before, .ekd-surface *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+/* 首次接入引导：三步说明只解释当前状态与下一步，不承担品牌装饰。 */
+.pairing-steps {
+  display: grid;
+  gap: 8px;
+  margin: 2px 0 4px;
+  padding: 0;
+  list-style: none;
+}
+
+.pairing-steps li {
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--color-accent, var(--accent));
+  border-radius: 0 var(--radius-sm, 6px) var(--radius-sm, 6px) 0;
+  background: var(--surface-sunken, var(--color-surface-sunken, transparent));
+}
+
+.pairing-steps strong {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink-strong, inherit);
+}
+
+.pairing-steps span {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink-muted, inherit);
+}
+
+.pairing-steps code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--surface-raised, var(--color-surface, transparent));
+  border: 1px solid var(--line, var(--color-line));
+}
+
+/* 被拦截的 Markdown 链接：保留原文可读，只弱化并可加下划线提示不可点击。 */
+.wb-link-blocked {
+  color: var(--ink-muted, var(--color-text-secondary, inherit));
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: help;
+}

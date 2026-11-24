@@ -560,6 +560,11 @@ export function createEventChannel(transport: NativeTransport, retryMs = 1500): 
   let inFlightScopes: ReadonlySet<string> | null = null;
   let disposed = false;
   let wake: (() => void) | null = null;
+  let wakeTimer: ReturnType<typeof setTimeout> | null = null;
+  // A broken hop must not turn into permanent 1.5s error spam: back off up to a
+  // 10s ceiling and reset as soon as a page arrives again.
+  let failures = 0;
+  const retryCeilingMs = 10_000;
 
   function notifyError(cause: unknown) {
     const message = cause instanceof Error ? cause.message : String(cause);
@@ -586,6 +591,7 @@ export function createEventChannel(transport: NativeTransport, retryMs = 1500): 
             waitMs: initial ? 0 : 8000,
           });
           if (disposed || gen !== activeGen) return;
+          failures = 0;
           primed = true;
           cursor = page.next;
           if (page.reset && page.events.length) cursor = page.events[page.events.length - 1]!.sequence;
@@ -598,8 +604,20 @@ export function createEventChannel(transport: NativeTransport, retryMs = 1500): 
         } catch (cause) {
           if (disposed || gen !== activeGen) return;
           notifyError(cause);
-          await new Promise<void>(resolve => { wake = resolve; setTimeout(resolve, retryMs); });
-          if (gen === activeGen) wake = null;
+          const delay = Math.min(retryCeilingMs, retryMs * 2 ** Math.min(failures, 4));
+          failures += 1;
+          await new Promise<void>(resolve => {
+            const release = () => {
+              if (wakeTimer !== null) {
+                clearTimeout(wakeTimer);
+                wakeTimer = null;
+              }
+              if (wake === release) wake = null;
+              resolve();
+            };
+            wake = release;
+            wakeTimer = setTimeout(release, delay);
+          });
         }
       }
     } finally {
@@ -651,7 +669,12 @@ export function createEventChannel(transport: NativeTransport, retryMs = 1500): 
       activeGen += 1;
       inFlightScopes = null;
       listeners.clear();
+      if (wakeTimer !== null) {
+        clearTimeout(wakeTimer);
+        wakeTimer = null;
+      }
       wake?.();
+      wake = null;
     },
   };
 }
@@ -879,7 +902,25 @@ export function createCoreTransport(host: NativeHost) {
     else if (init.body) throw new Error("当前宿主桥只支持文本或二进制请求体");
     const headers: Record<string, string> = {};
     new Headers(init.headers).forEach((value, key) => { headers[key] = value; });
-    const result = await host.request<CoreFetchResult>("core.fetch", { path, method: init.method ?? "GET", headers, bodyBase64: body });
+    const signal = init.signal;
+    let onAbort: (() => void) | null = null;
+    let result: CoreFetchResult;
+    try {
+      result = await new Promise<CoreFetchResult>((resolve, reject) => {
+        if (signal?.aborted) {
+          reject(new DOMException("请求已取消", "AbortError"));
+          return;
+        }
+        void host
+          .request<CoreFetchResult>("core.fetch", { path, method: init.method ?? "GET", headers, bodyBase64: body })
+          .then(resolve, reject);
+        if (!signal) return;
+        onAbort = () => reject(new DOMException("请求已取消", "AbortError"));
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+    } finally {
+      if (onAbort && signal) signal.removeEventListener("abort", onAbort);
+    }
     const bytes = result.bodyBase64 ? Uint8Array.from(atob(result.bodyBase64), char => char.charCodeAt(0)) : new Uint8Array();
     const nullBody = result.status === 204 || result.status === 205 || result.status === 304;
     return new Response(nullBody || bytes.length === 0 ? null : bytes, { status: result.status, headers: result.headers });

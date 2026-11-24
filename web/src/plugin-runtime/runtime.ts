@@ -296,8 +296,9 @@ export function createPluginRuntime(options: RuntimeOptions) {
             throw new PluginError(400, "PLUGIN_BROWSER_VIEW", "viewId 只允许字母、数字、下划线和连字符");
           }
           const created = await bridge.call<{ viewId: string; url: string }>("browser.open", { viewId, url, instanceId });
+          let closeView: void | (() => Promise<void>);
           try {
-            await host.open(pluginId, created.viewId, created.url);
+            closeView = await host.open(pluginId, created.viewId, created.url);
           } catch (error) {
             await bridge.call("browser.close", { viewId: created.viewId, instanceId }).catch(() => {});
             throw error;
@@ -321,7 +322,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
             closed = true;
             navListeners.clear();
             unlistenNav?.();
-            void host.close(pluginId, created.viewId).catch(() => {});
+            void (closeView ? closeView() : host.close(pluginId, created.viewId)).catch(() => {});
           };
           owner.add(release);
           return {

@@ -10,6 +10,43 @@ type Attachment = { path: string; name: string };
 type PermissionMode = "" | "manual" | "auto" | "yolo";
 type SessionRecoveryHint = { enabled: boolean; nextAt?: string; note?: string };
 
+type ApprovalOption = { label: string; value: string };
+
+const DEFAULT_APPROVAL_OPTIONS: ApprovalOption[] = [
+  { label: "允许", value: "approved" },
+  { label: "拒绝", value: "rejected" },
+];
+
+// Both spellings reach this pane: the core sends `approved`/`rejected` while an
+// older reply path used `allow`/`deny`.
+const APPROVAL_DECISIONS: Record<string, string> = {
+  approved: "approved",
+  allow: "approved",
+  rejected: "rejected",
+  deny: "rejected",
+  denied: "rejected",
+  cancelled: "cancelled",
+  cancel: "cancelled",
+};
+
+/** Values that read as a refusal, whatever spelling the core used. */
+export const DENIED_APPROVAL_VALUES = new Set(["rejected", "deny", "denied", "cancelled", "cancel"]);
+
+/** What a reply click sends. A value we do not recognize is never guessed into
+ * an approval; only a label the server itself listed keeps its own copy. */
+export function approvalDecision(value: string, fromServer: boolean): string | { decision: string; selectedLabel: string } | null {
+  if (typeof value !== "string" || value === "") return null;
+  const decision = APPROVAL_DECISIONS[value];
+  if (decision) return decision;
+  return fromServer ? { decision: "approved", selectedLabel: value } : null;
+}
+
+/** The fallback list must not depend on the core sending a non-empty one: an
+ * empty `options` array would otherwise render a card with no buttons. */
+export function approvalOptions(options?: ApprovalOption[] | null): ApprovalOption[] {
+  return options?.length ? options : DEFAULT_APPROVAL_OPTIONS;
+}
+
 type SessionInput = { draft?: string; model?: string; permission?: PermissionMode; attachments?: Attachment[] };
 type SessionInputs = Record<string, SessionInput>;
 const SessionInputContext = createContext<[SessionInputs, Dispatch<SetStateAction<SessionInputs>>] | null>(null);
@@ -190,11 +227,15 @@ export function SessionPane({
     }
   }
 
-  async function reply(interactionId: string, value: string) {
+  async function reply(interactionId: string, value: string, fromServer: boolean) {
     if (!sid) return;
+    const payload = approvalDecision(value, fromServer);
+    if (!payload) {
+      setError("这个审批选项无法识别，请在官方窗口中处理。");
+      return;
+    }
     setReplying(interactionId);
     try {
-      const payload = ["approved", "rejected", "cancelled"].includes(value) ? value : { decision: "approved", selectedLabel: value };
       await host.request("session.reply", { id: sid, interactionId, value: payload });
     } catch (cause) {
       setError(errorText(cause));
@@ -285,18 +326,22 @@ export function SessionPane({
               </div>
               {approval.detail ? <pre className="wb-approval-detail">{approval.detail}</pre> : null}
               <div className="wb-approval-actions">
-                {(approval.options ?? [{ label: "允许", value: "allow" }, { label: "拒绝", value: "deny" }]).map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={`wb-btn ${option.value === "deny" ? "is-quiet" : ""}`}
-                    disabled={replying !== null}
-                    onClick={() => void reply(approval.id, option.value)}
-                  >
-                    {replying === approval.id ? <Spinner size={12} /> : null}
-                    {option.label}
-                  </button>
-                ))}
+                {(approvalOptions(approval.options)).map((option) => {
+                  const fromServer = Boolean(approval.options?.length);
+                  const denied = DENIED_APPROVAL_VALUES.has(option.value);
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      className={`wb-btn ${denied ? "is-quiet" : ""}`}
+                      disabled={replying !== null}
+                      onClick={() => void reply(approval.id, option.value, fromServer)}
+                    >
+                      {replying === approval.id ? <Spinner size={12} /> : null}
+                      {option.label}
+                    </button>
+                  );
+                })}
               </div>
             </div>
           ))}

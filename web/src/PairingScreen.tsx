@@ -57,15 +57,30 @@ export function PairingScreen() {
               <span />
             </span>
             <div className="brand-copy">
-              <strong>Enhanced Kimi</strong>
-              <span>独立增强工作台</span>
+              <strong>KimiCode+</strong>
+              <span>Kimi Code 增强工作台</span>
             </div>
           </div>
-          <h1>连接本地核心</h1>
+          <h1>连接本地增强核心</h1>
           <p className="pairing-intro">
-            从增强程序运行目录的 <code>runtime.json</code> 读取 <code>pairingToken</code>，或使用启动时输出的
-            <code> #pair= </code>地址打开本页。配对成功后，接入的只是本地增强服务，不涉及官方账号或 Cookie。
+            如果是首次接入：先在 Kimi Code 里打开增强程序，它会写好运行目录下的 <code>runtime.json</code>，
+            并随启动打印一个 <code>#pair=</code> 链接。用该链接打开本页即可自动完成配对；也可以手动粘贴
+            <code> pairingToken </code>。配对只建立与本机增强服务的会话，不涉及官方 Kimi 账号、密码或 Cookie。
           </p>
+          <ol className="pairing-steps">
+            <li>
+              <strong>1. 启动增强程序</strong>
+              <span>保持 Kimi Code 与本页在同一台机器上，核心只监听本机回环地址。</span>
+            </li>
+            <li>
+              <strong>2. 取用配对凭据</strong>
+              <span>用启动输出里的 <code>#pair=</code> 链接，或打开 <code>runtime.json</code> 复制 <code>pairingToken</code>。</span>
+            </li>
+            <li>
+              <strong>3. 完成配对</strong>
+              <span>粘贴后进入工作台；凭据只留在当前页面内存，刷新或断开后需重新配对。</span>
+            </li>
+          </ol>
           <form onSubmit={submit} className="pairing-form-fields">
             <label htmlFor="pair-token" className="field-label">
               配对凭据

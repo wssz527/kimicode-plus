@@ -107,7 +107,7 @@ function SessionGridBody({ host, initialExtraIds, onNativeRestore }: SessionGrid
     <div className="session-grid-scroll"><div className="session-grid-panes" ref={gridRef} style={{ gridTemplateColumns: columns.map(weight => `minmax(300px, ${weight}fr)`).join(" ") }}>
       {ids.map((id, index) => {
         const waitingEntry = recovery?.entries.find(item => item.id === `session:${id}` && item.status === "WAITING");
-        return <div className="session-grid-cell" key={index}>{index > 0 ? <div className="session-resizer" role="separator" aria-label={`调整会话 ${index} 与 ${index + 1} 的宽度`} aria-orientation="vertical" tabIndex={0} onPointerDown={event => beginResize(event, index - 1)} onKeyDown={event => {
+        return <div className="session-grid-cell" key={id || `pane-${index}`}>{index > 0 ? <div className="session-resizer" role="separator" aria-label={`调整会话 ${index} 与 ${index + 1} 的宽度`} aria-orientation="vertical" tabIndex={0} onPointerDown={event => beginResize(event, index - 1)} onKeyDown={event => {
           if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
           event.preventDefault();
           const delta = event.key === "ArrowLeft" ? -0.1 : 0.1;

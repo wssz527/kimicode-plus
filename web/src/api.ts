@@ -765,12 +765,29 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
         referrerPolicy: "no-referrer",
       });
     } catch (error) {
+      // A host bridge failure already carries the transport's own code (for
+      // example BRIDGE_SESSION_EXPIRED); flattening it into NETWORK would hide
+      // the reconnect hint the surfaces show for a rotated credential.
+      const candidate = error as { code?: unknown; status?: unknown; message?: unknown } | null | undefined;
+      if (candidate && typeof candidate === "object" && typeof candidate.code === "string" && candidate.code) {
+        const status = typeof candidate.status === "number" ? candidate.status : 0;
+        const message = typeof candidate.message === "string" && candidate.message
+          ? candidate.message
+          : friendlyNetworkMessage(error);
+        throw new ApiError(status, candidate.code, message);
+      }
       throw new ApiError(0, "NETWORK", friendlyNetworkMessage(error));
     }
     if (!response.ok) {
       const apiError = await parseError(response);
       if (apiError.status === 401 && !anonymous) {
-        clearSession("会话已过期或未获授权，请重新配对。凭证只保存在当前页面内存中。");
+        // In host bridge mode the transport belongs to the official host, not to
+        // this page's pairing session. Clearing it would drop every later request
+        // the whole surface still needs; only the standalone browser token is
+        // cleared here.
+        if (coreTransport === null) {
+          clearSession("会话已过期或未获授权，请重新配对。凭证只保存在当前页面内存中。");
+        }
       }
       throw apiError;
     }

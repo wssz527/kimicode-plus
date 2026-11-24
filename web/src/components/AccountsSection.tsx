@@ -56,9 +56,9 @@ function VaultResetPanel({
   );
 }
 
-function dispatchAccountSwitched() {
+function dispatchAccountSwitched(detail?: unknown) {
   if (typeof window !== "undefined") {
-    window.dispatchEvent(new CustomEvent("ekd:account-switched"));
+    window.dispatchEvent(new CustomEvent("ekd:account-switched", detail === undefined ? undefined : { detail }));
   }
 }
 
@@ -402,7 +402,10 @@ export function AccountsManagerSection({
     void load(false);
     const unsub = host.subscribe<{ type?: string; refreshAuth?: boolean; error?: string; backupCleanupWarning?: string }>("accounts", (event) => {
       if (event?.type === "account.switched" && event.refreshAuth) {
-        dispatchAccountSwitched();
+        dispatchAccountSwitched(event);
+        // A switch clears whatever error the previous attempt left on screen;
+        // keeping it would blame the account that just became current.
+        setError(null);
         setNotice("已完成账号切换。");
         setBackupWarning(event.backupCleanupWarning || null);
       } else if (event?.type === "account.switch_failed" && event.error) {
@@ -448,6 +451,9 @@ export function AccountsManagerSection({
       void completeAddAccount(host)
         .then((res) => {
           if (res.completed && res.account) {
+            // A recognized sign-in clears whatever failure the previous attempt
+            // left behind, instead of showing both outcomes at once.
+            setError(null);
             setNotice(`已保存账号「${res.account.label}」。`);
             void load(false);
           }
