@@ -4065,8 +4065,6 @@ export async function activate(ctx) {
     // take a host node the plugin does not own. Only the wrapper created here is
     // ours to remove.
     shadow?.host?.remove?.();
-    sidebarRelease?.dispose();
-    sidebarRelease = null;
     root = null;
     shadow = null;
     mountHost = null;

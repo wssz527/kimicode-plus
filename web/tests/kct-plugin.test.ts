@@ -273,12 +273,15 @@ async function bootKct(options: {
     addEventListener() {},
     removeEventListener() {},
   };
+  // A real event target so a test can drive the settings/cache events the panel
+  // dispatches through window.
+  const windowEvents = new EventTarget();
   runtime.window = {
     setTimeout,
     clearTimeout,
-    addEventListener() {},
-    removeEventListener() {},
-    dispatchEvent() {},
+    addEventListener: (...args: any[]) => (windowEvents.addEventListener as any)(...args),
+    removeEventListener: (...args: any[]) => (windowEvents.removeEventListener as any)(...args),
+    dispatchEvent: (event: any) => windowEvents.dispatchEvent(event),
     innerWidth: 1200,
     innerHeight: 800,
     navigator: { language: "zh-CN" },
@@ -389,6 +392,51 @@ test("cache writes are incremental and pruned entries are deleted", async () => 
     assert.ok(indexWrites >= 1, "the cache index was never written");
     const entryWrites = [...boot.stored.entries()].filter(([key]) => key.startsWith("cache.e.v1:")).length;
     assert.equal(entryWrites, 1, `expected one cache entry write, saw ${entryWrites}`);
+    handle.dispose?.();
+  } finally {
+    boot.cleanup();
+  }
+});
+
+test("clearing the cache stops an in-flight translation from repopulating it", async () => {
+  let release: (() => void) | null = null;
+  const releaseBox = { fire: () => (release as (() => void) | null)?.() };
+  let calls = 0;
+  const boot = await bootKct({
+    translate: async () => {
+      calls += 1;
+      await new Promise<void>(resolve => { release = () => resolve(); });
+      return { ok: true, status: 200, body: JSON.stringify([{ translations: [{ text: "需要检查配置。" }] }]) };
+    },
+  });
+  try {
+    const block = new FakeElement("div", "think");
+    const thinkHead = new FakeElement("button", "think-head");
+    const thinkBody = new FakeElement("div", "think-body open");
+    const thinkInner = new FakeElement("div", "think-body-inner");
+    const sourcePre = new FakeElement("pre", "think-text");
+    sourcePre.textContent = "We need to inspect the configuration first.";
+    thinkInner.appendChild(sourcePre);
+    thinkBody.appendChild(thinkInner);
+    block.append(thinkHead, thinkBody);
+    boot.bodyRoot.appendChild(block);
+
+    const handle = boot.decorator!(block, { open: true, streaming: false });
+    // Wait for the debounce to fire so the request is genuinely in flight.
+    await new Promise(resolve => setTimeout(resolve, 400));
+    assert.equal(calls, 1, "the translation request should be running");
+
+    // The user clears the cache while that request is still pending.
+    boot.ctx.storage.delete("cache.index.v1");
+    (globalThis as any).window.dispatchEvent(new (globalThis as any).CustomEvent("ekdp-kct:cache", { detail: { source: "inline" } }));
+
+    releaseBox.fire();
+    await new Promise(resolve => setTimeout(resolve, 1400));
+
+    const entryWrites = [...boot.stored.entries()].filter(([key]) => key.startsWith("cache.e.v1:")).length;
+    assert.equal(entryWrites, 0, `a cleared cache was repopulated by the in-flight translation (${entryWrites} writes)`);
+    // The translation itself still reached the panel.
+    assert.equal(thinkInner.querySelector(".ekdp-kct-translated")?.textContent, "需要检查配置。");
     handle.dispose?.();
   } finally {
     boot.cleanup();

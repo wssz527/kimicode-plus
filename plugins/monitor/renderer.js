@@ -13908,6 +13908,7 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
   let activeTurnSession = "";
   const pushedStepIds = /* @__PURE__ */ new Set();
   let forceNext = false;
+  let accountGeneration = 0;
   const send = (message) => {
     if (!disposed) push(message);
   };
@@ -13940,6 +13941,7 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
     }
   }
   async function refresh(includeBalances = true) {
+    const generation = accountGeneration;
     const forced = forceNext;
     forceNext = false;
     const sessionId = getSessionId2();
@@ -13952,7 +13954,7 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
       sessionId && sessionId !== "panel" ? request("cache.turns", { id: sessionId, limit: TURNS_LIMIT }) : Promise.resolve(null),
       includeBalances && shouldPollBalance() ? request("quota.balances", { refresh: true }) : Promise.resolve(null)
     ]);
-    if (disposed) return null;
+    if (disposed || generation !== accountGeneration) return null;
     if (summary) {
       const nextStatus = statusFromSummary(summary);
       if (forced || activeTurnSession !== sessionId || nextStatus !== "idle") {
@@ -14026,17 +14028,19 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
       void run(true);
     }, REFRESH_MS);
   }
-  async function run(includeBalances = true) {
+  async function run(includeBalances = true, options = {}) {
     if (disposed) return null;
-    if (inFlight) {
+    if (inFlight && !options.supersede) {
       pendingRefresh = true;
       if (includeBalances) pendingIncludeBalances = true;
       return inFlight;
     }
-    inFlight = refresh(includeBalances).catch((error) => {
+    const previous = inFlight;
+    const current = refresh(includeBalances).catch((error) => {
       ctx.log("warn", `面板刷新失败：${error?.message || error}`);
       return null;
     }).finally(() => {
+      if (inFlight !== current) return;
       inFlight = null;
       if (!disposed && pendingRefresh) {
         const nextBalances = pendingIncludeBalances;
@@ -14047,7 +14051,10 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
       }
       schedule2();
     });
-    return inFlight;
+    inFlight = current;
+    void previous?.catch(() => {
+    });
+    return current;
   }
   function scheduleFollowUpLocal() {
     if (disposed) return;
@@ -14070,8 +14077,9 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
     /** 余额模块刚展开：立刻补读一次，不等下一个 60 秒周期。 */
     refreshBalance() {
       if (disposed || !shouldPollBalance()) return;
+      const generation = accountGeneration;
       void request("quota.balances", { refresh: true }).then((balances) => {
-        if (disposed || !balances) return;
+        if (disposed || !balances || generation !== accountGeneration) return;
         const quota = quotaFromBalances(balances);
         if (Object.keys(quota.quota).length) {
           send({ v: 1, type: "quota", quota: quota.quota, walletFetchedAt: quota.walletFetchedAt || void 0 });
@@ -14098,18 +14106,21 @@ function startDatasource(ctx, push, getSessionId2, shouldPollBalance = () => tru
      */
     resetForAccountSwitch() {
       if (disposed) return Promise.resolve(null);
+      accountGeneration += 1;
       pushedStepIds.clear();
       seenSeq = 0;
       currentSession = "";
       activeTurnSession = "";
       forceNext = true;
+      pendingRefresh = false;
+      pendingIncludeBalances = false;
       if (timer) clearTimeout(timer);
       timer = null;
       if (followUpTimer) clearTimeout(followUpTimer);
       followUpTimer = null;
       if (cooldownTimer) clearTimeout(cooldownTimer);
       cooldownTimer = null;
-      return run(true);
+      return run(true, { supersede: true });
     },
     /** 宿主焦点会话切换：立即切会话并补读本地指标，不重复轮询外部余额。 */
     syncSession() {

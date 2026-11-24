@@ -486,6 +486,9 @@ async function createEngine(ctx) {
   const dirtyKeys = new Set();
   // prune 淘汰的键要先从磁盘删掉，否则它们会一直占着存储却再也读不到。
   const deletedKeys = new Set();
+  // 清除缓存会递增它。清除时仍在途的翻译属于上一代缓存，它们完成时不能再把
+  // 刚删掉的条目写回磁盘，也不能把旧设置下的译文当作命中。
+  let cacheGeneration = 0;
 
   async function loadSettings() {
     const stored = await ctx.storage.get(SETTINGS_KEY).catch(() => undefined);
@@ -580,11 +583,14 @@ async function createEngine(ctx) {
   }
 
   function clearMemoryCache() {
+    cacheGeneration += 1;
     cache.clear();
     index.clear();
     dirtyKeys.clear();
     deletedKeys.clear();
     indexDirty = false;
+    if (persistTimer) window.clearTimeout(persistTimer);
+    persistTimer = 0;
   }
 
   await loadSettings();
@@ -644,6 +650,7 @@ async function createEngine(ctx) {
   }
 
   async function translate(source, lang, onProgress, valid) {
+    const generation = cacheGeneration;
     const provider = settings.provider;
     const scope = provider === "custom" ? `${settings.customEndpoint}\u0000${settings.customModel}` : "";
     const prefix = hashKey(`${provider}\u0000${lang}\u0000${scope ? scope + "\u0000" : ""}`);
@@ -758,7 +765,9 @@ async function createEngine(ctx) {
     function apply(item, translated) {
       const safe = preserveFencedCode(item.text, translated);
       out[item.index] = safe;
-      remember(item.key, safe);
+      // The user cleared the cache while this request was running: the text is
+      // still delivered, but it must not repopulate the cache that was deleted.
+      if (generation === cacheGeneration) remember(item.key, safe);
     }
     function settle(item, error) {
       if (item.settled) return;

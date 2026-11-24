@@ -234,6 +234,10 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
   // A forced refresh (manual, or an account switch) must not be swallowed by the
   // "nothing moved" short circuit below.
   let forceNext = false;
+  // Every account switch starts a new generation. A refresh that was already in
+  // flight belongs to the previous account, and its quota, wallet and provider
+  // numbers must not be painted over the cleared panel when it finally lands.
+  let accountGeneration = 0;
 
   const send = (message) => {
     if (!disposed) push(message);
@@ -277,6 +281,7 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
   }
 
   async function refresh(includeBalances = true) {
+    const generation = accountGeneration;
     const forced = forceNext;
     forceNext = false;
     const sessionId = getSessionId();
@@ -289,7 +294,10 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
       sessionId && sessionId !== "panel" ? request("cache.turns", { id: sessionId, limit: TURNS_LIMIT }) : Promise.resolve(null),
       includeBalances && shouldPollBalance() ? request("quota.balances", { refresh: true }) : Promise.resolve(null)
     ]);
-    if (disposed) return null;
+    // The account changed while these requests were running. Everything in this
+    // page belongs to the previous account, including the session it was read
+    // for, so the whole page is dropped rather than partially applied.
+    if (disposed || generation !== accountGeneration) return null;
 
     if (summary) {
       const nextStatus = statusFromSummary(summary);
@@ -367,19 +375,23 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
     }, REFRESH_MS);
   }
 
-  async function run(includeBalances = true) {
+  async function run(includeBalances = true, options = {}) {
     if (disposed) return null;
-    if (inFlight) {
+    if (inFlight && !options.supersede) {
       pendingRefresh = true;
       if (includeBalances) pendingIncludeBalances = true;
       return inFlight;
     }
-    inFlight = refresh(includeBalances)
+    // A superseding run orphans the promise it replaces: that promise still
+    // settles, but its finally must not clear or reschedule this newer one.
+    const previous = inFlight;
+    const current = refresh(includeBalances)
       .catch((error) => {
         ctx.log("warn", `面板刷新失败：${error?.message || error}`);
         return null;
       })
       .finally(() => {
+        if (inFlight !== current) return;
         inFlight = null;
         if (!disposed && pendingRefresh) {
           const nextBalances = pendingIncludeBalances;
@@ -390,7 +402,9 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
         }
         schedule();
       });
-    return inFlight;
+    inFlight = current;
+    void previous?.catch(() => {});
+    return current;
   }
 
   function scheduleFollowUpLocal() {
@@ -416,8 +430,11 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
     /** 余额模块刚展开：立刻补读一次，不等下一个 60 秒周期。 */
     refreshBalance() {
       if (disposed || !shouldPollBalance()) return;
+      const generation = accountGeneration;
       void request("quota.balances", { refresh: true }).then((balances) => {
-        if (disposed || !balances) return;
+        // Same rule as a full refresh: a page read for the previous account is
+        // dropped instead of being written over the panel's cleared numbers.
+        if (disposed || !balances || generation !== accountGeneration) return;
         const quota = quotaFromBalances(balances);
         if (Object.keys(quota.quota).length) {
           send({ v: 1, type: "quota", quota: quota.quota, walletFetchedAt: quota.walletFetchedAt || undefined });
@@ -444,18 +461,27 @@ export function startDatasource(ctx, push, getSessionId, shouldPollBalance = () 
      */
     resetForAccountSwitch() {
       if (disposed) return Promise.resolve(null);
+      // Bumping the generation orphans every response already in flight; the
+      // refresh started below is the only one whose page may be applied.
+      accountGeneration += 1;
       pushedStepIds.clear();
       seenSeq = 0;
       currentSession = "";
       activeTurnSession = "";
       forceNext = true;
+      pendingRefresh = false;
+      pendingIncludeBalances = false;
       if (timer) clearTimeout(timer);
       timer = null;
       if (followUpTimer) clearTimeout(followUpTimer);
       followUpTimer = null;
       if (cooldownTimer) clearTimeout(cooldownTimer);
       cooldownTimer = null;
-      return run(true);
+      // The in-flight promise keeps running and is awaited by its own finally,
+      // but it belongs to the retired generation: a superseding run starts a
+      // fresh refresh instead of queueing behind it, so the panel does not sit
+      // on the cleared state until the previous account's request returns.
+      return run(true, { supersede: true });
     },
     /** 宿主焦点会话切换：立即切会话并补读本地指标，不重复轮询外部余额。 */
     syncSession() {

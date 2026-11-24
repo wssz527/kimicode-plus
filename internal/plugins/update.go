@@ -919,7 +919,6 @@ func (m *Manager) commitOfficialUpdate(ctx context.Context, pkg stagedPackage, s
 	snapshot := *nextItem
 	host := m.host
 	m.mu.Unlock()
-	m.invalidateOfficialCache(id)
 
 	if backup != "" {
 		_ = os.RemoveAll(backup)

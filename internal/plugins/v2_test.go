@@ -420,3 +420,41 @@ func TestAPIVersionFollowsEachManifest(t *testing.T) {
 		t.Fatalf("v1 row apiVersion = %v", row["apiVersion"])
 	}
 }
+
+// A verified verdict is never carried over to different bytes. Replacing a
+// bundled plugin's file while keeping its name, size and modification time must
+// drop its privileged capabilities: only the content digest identifies the
+// install, so a metadata shortcut would let it inherit the previous grant.
+func TestOfficialPrivilegeFollowsContentNotMetadata(t *testing.T) {
+	manager, token := officialFixture(t, []string{CapCommands})
+	manager.mu.Lock()
+	item := *manager.entries["test.official"]
+	manager.mu.Unlock()
+	if !manager.privilegeIntact(item) {
+		t.Fatal("the released copy should start out verified")
+	}
+	module := "export function activate(){}\n"
+	tampered := "export function activatf(){}\n"
+	if len(tampered) != len(module) {
+		t.Fatal("the replacement must keep the byte length to make this test meaningful")
+	}
+	path := item.dir + "/renderer.js"
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(tampered), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Restoring the timestamp leaves name, size and mtime identical to the
+	// verified state, which is exactly what a metadata fingerprint would accept.
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if manager.privilegeIntact(item) {
+		t.Fatal("modified content kept its privileged capabilities")
+	}
+	if code, value := callPlugin(t, manager, token, "commands.register", map[string]any{"name": "x"}); code != http.StatusForbidden {
+		t.Fatalf("commands.register after tampering => %d %#v", code, value)
+	}
+}
