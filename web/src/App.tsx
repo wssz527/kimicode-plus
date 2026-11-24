@@ -1,4 +1,4 @@
-import { useEffect, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { AuthProvider, useAuth } from "./auth";
 import { AppShell } from "./AppShell";
 import { PairingScreen } from "./PairingScreen";
@@ -18,7 +18,7 @@ import "./styles/theme.css";
 import { HomePage } from "./pages/HomePage";
 import { WorkspacePage } from "./pages/WorkspacePage";
 import { BrowserPage } from "./pages/BrowserPage";
-import { diagnosticMode } from "./host";
+import { useDiagnosticMode } from "./host";
 import { NativeSettings } from "./components/NativeSettings";
 
 function Booting() {
@@ -40,6 +40,7 @@ function Booting() {
 
 function RoutedApp() {
   const pathname = usePathname();
+  const diagnostic = useDiagnosticMode();
   switch (pathname) {
     case "/usage":
       return <UsagePage />;
@@ -58,7 +59,7 @@ function RoutedApp() {
     case "/browser":
       return <BrowserPage />;
     case "/":
-      return diagnosticMode() ? <OverviewPage /> : <HomePage />;
+      return diagnostic ? <OverviewPage /> : <HomePage />;
     default:
       return <NotFound pathname={pathname} />;
   }
@@ -92,18 +93,6 @@ export interface AppProps {
 }
 
 export function App({ embed = false }: AppProps = {}) {
-  useEffect(() => {
-    if (embed) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        const target = document.activeElement;
-        if (target instanceof HTMLElement) target.blur();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [embed]);
-
   return (
     <AuthProvider>
       <Gate embed={embed}>

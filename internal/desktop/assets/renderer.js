@@ -40,11 +40,13 @@ async function installNativeRenderer(options) {
   // refused it. Anything else with a semantic code is a real answer from the
   // core (for example PLUGIN_PRIVILEGE_DENIED) and must keep its own message
   // and must never be retried, because the action may already have run.
-  const bridgeRejectedBeforeDispatch = code => !code || code === 'RPC_DENIED' || code === 'RPC_OWNER' || code.startsWith('HTTP_');
+  const bridgeRejectedBeforeDispatch = code => code === 'RPC_DENIED' || code === 'RPC_OWNER';
   function bridgeCredentialFailure(status, code) {
-    return bridgeCredentialCodes.has(code) || ((status === 401 || status === 403) && bridgeRejectedBeforeDispatch(code));
+    return bridgeCredentialCodes.has(code) || ((status === 401 || status === 403) && code === `HTTP_${status}`);
   }
   async function bridgeRequest(action, payload) {
+    const replayable = action === 'update.status' || action === 'events.poll'
+      || (action === 'core.fetch' && payload?.method === 'GET');
     const id = typeof globalThis.crypto?.randomUUID === 'function'
       ? globalThis.crypto.randomUUID()
       : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
@@ -59,13 +61,11 @@ async function installNativeRenderer(options) {
         });
         body = await response.json().catch(() => null);
       } catch (error) {
-        // A restarted core refuses the connection for a moment; that is the same
-        // retryable window as a rotated bridge key, not a terminal failure.
-        if (attempt === 1) {
-          const wrapped = new Error(bridgeCredentialMessage);
-          wrapped.code = 'BRIDGE_SESSION_EXPIRED';
+        if (!replayable || attempt === 1) {
+          const wrapped = new Error(replayable ? bridgeCredentialMessage : '增强核心连接中断，操作结果未知。请先查看当前状态。');
+          wrapped.code = replayable ? 'BRIDGE_SESSION_EXPIRED' : 'BRIDGE_OUTCOME_UNKNOWN';
           wrapped.status = 0;
-          wrapped.retryable = true;
+          wrapped.retryable = replayable;
           wrapped.cause = error;
           throw wrapped;
         }
@@ -2806,7 +2806,7 @@ async function installNativeRenderer(options) {
       : '';
     const parsed = text ? nativeParse(text) : null;
     if (result?.status >= 400) {
-      const code = parsed?.error?.code || 'CORE_ERROR';
+      const code = parsed?.error?.code || `HTTP_${result.status}`;
       const error = new Error(parsed?.error?.message || `核心返回 HTTP ${result.status}`);
       error.code = code;
       error.status = result.status;
@@ -2814,7 +2814,7 @@ async function installNativeRenderer(options) {
       // a bare HTTP status reads as "the local channel rotated". Everything else,
       // including PERMISSION_DENIED and PLUGIN_PRIVILEGE_DENIED, keeps its own
       // meaning and is never retried.
-      if (bridgeCredentialCodes.has(code) || ((result.status === 401 || result.status === 403) && bridgeRejectedBeforeDispatch(code))) {
+      if (bridgeCredentialFailure(result.status, code)) {
         error.message = bridgeCredentialMessage;
         error.code = 'BRIDGE_SESSION_EXPIRED';
         error.retryable = true;

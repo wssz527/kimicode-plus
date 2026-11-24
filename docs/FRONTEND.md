@@ -85,14 +85,15 @@ ENHANCE_DEV_TARGET=http://127.0.0.1:8899 npm run dev       # 覆盖目标
 
 | 页面 | 路径 | 主要接口 |
 | --- | --- | --- |
-| 总览 | `/` | health、tasks、usage/summary、plugins、quotas、gateways |
+| 增强设置 | `/` | health |
+| 诊断总览 | `/?mode=diagnostic` | health、tasks、usage/summary、plugins、quotas、gateways |
 | 用量 | `/usage` | usage、usage/summary、usage/demo、quotas、gateways |
 | 聊天 | `/chat` | chat/sources、chat/threads、chat/threads/{id}/messages、desktop/actions/models.list |
 | 任务交接 | `/handoff` | sessions、tasks/preview、tasks、tasks/{id}/reconcile |
 | 插件 | `/plugins` | plugins、plugins/{id}、credentials（插件详情内嵌） |
 | 设置 | `/settings` | settings、chat/sources、health |
 
-独立管理页的六个主页面全部调用真实 Go API（原独立 `/models` 与 `/credentials` 页面及路由已按修正轮 R2 移除），没有前端写死的业务数据；只有明确标注为 Mock 的部分（合成站点夹具、旧交接来源夹具、Mock 适配器）是本地构造。原生规划、定时任务与 KAP 会话走独立真实路径。用量页面没有本地示例事件。
+独立首页提供核心设置和增强插件入口。用量、聊天、旧任务交接、会话与执行策略及浏览器会话可从诊断工作台访问。页面通过 Go API 读取数据，明确标注的 Mock 流程使用本地夹具。原生规划、定时任务与 KAP 会话使用宿主通道。
 
 导航使用 `useSyncExternalStore` 订阅 `window.location`：内部 `navigate()` 会显式通知订阅者，浏览器前进/后退由 `popstate` 驱动，因此 URL、页面与标题始终同步。没有引入路由库。
 

@@ -1,17 +1,24 @@
-import { ROUTES, navigate } from "../routes";
+import { navigate } from "../routes";
+import { useAuth } from "../auth";
 import { Icon } from "../components/Icon";
-import { PageHeader, Panel } from "../components/ui";
-import { useResource } from "../lib/useResource";
-import { api } from "../api";
-import { useHostContext } from "../host";
-import { useHost } from "../native";
+import { ActionButton, PageHeader } from "../components/ui";
+
 export function HomePage() {
-  const tasks = useResource("home/tasks", () => api.tasks.list(0, 5));
-  const context = useHostContext();
-  const native = useHost();
-  const routes = native ? ROUTES.filter(r => !["/chat", "/handoff", "/workspace", "/browser"].includes(r.path)) : ROUTES;
-  return <div className="page"><PageHeader title="增强设置" description={context ? `继续 ${context.title || context.sessionId} 的工作。` : "管理模型、查看用量和组织任务。本地数据保存在增强核心中。"} />
-    <div className="feature-list">{routes.filter(r => r.path !== "/").map(route => <button className="feature-row" key={route.path} onClick={() => navigate(route.path)}><Icon name={route.icon} size={19} /><span><strong>{route.label}</strong><small>{route.summary}</small></span><span aria-hidden="true">›</span></button>)}</div>
-    <Panel title="最近交接">{tasks.data?.items.length ? <ul className="reference-list">{tasks.data.items.map(t => <li key={t.id}><span>{t.task.goal}</span><small>{t.state}{t.receipt?.synthetic ? " · 模拟回执" : ""}</small></li>)}</ul> : <p className="field-hint">还没有任务交接记录。</p>}</Panel>
+  const { health } = useAuth();
+  return <div className="page">
+    <PageHeader
+      title="增强设置"
+      description="在这里管理本地核心与增强插件。接入 Kimi Code 后，可在客户端设置中使用原生增强。"
+    />
+    {health ? <p className="field-hint">核心版本 {health.version} · 安全模式{health.safeMode ? "已开启" : "已关闭"}</p> : null}
+    <div className="feature-list">
+      <button className="feature-row" type="button" onClick={() => navigate("/settings")}>
+        <Icon name="settings" size={19} /><span><strong>核心设置</strong><small>管理安全模式、模块与 Windows 接入</small></span><span aria-hidden="true">›</span>
+      </button>
+      <button className="feature-row" type="button" onClick={() => navigate("/plugins")}>
+        <Icon name="plugins" size={19} /><span><strong>增强插件</strong><small>查看、更新插件与管理授权</small></span><span aria-hidden="true">›</span>
+      </button>
+    </div>
+    <ActionButton variant="quiet" onClick={() => navigate("/", { diagnostic: true })}>打开诊断工作台</ActionButton>
   </div>;
 }

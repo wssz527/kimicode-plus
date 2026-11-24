@@ -426,7 +426,7 @@ https://github.com/wssz527/kimicode-plus/releases/download/plugins-latest/plugin
 
 1. **验签**：未通过内置公钥校验的清单直接拒绝，不比较版本。
 2. **最低核心版本**：清单条目的 `minCoreVersion` 高于当前核心版本时标记不可应用（`cannotApplyReason`），绝不为装插件而回退客户端。
-3. **宿主兼容**：`hostVersions` 不含当前官方客户端版本时标记 `hostCompatible: false`。
+3. **宿主兼容**：已知官方客户端版本且 `hostVersions` 不包含该版本时，标记 `hostCompatible: false`，在线更新不可应用。
 4. **能力差异**：与已安装版本比较能力清单。新增能力置 `needsConsent: true`，客户端必须带 `confirmCapabilities: true`；其中新增高权限能力还需 `confirmPrivileged: true`。能力集合未扩张时可直接热更新。
 5. **版本锁定**：应用请求里的 `expectedVersion` 与最新版本不一致时拒绝，避免在用户确认后装进另一个更新的包。
 
@@ -441,7 +441,7 @@ go run ./cmd/plugin-release package --out dist/plugins-release \
 go run ./cmd/plugin-release verify --dir dist/plugins-release
 ```
 
-`package` 按 `plugins/embed.go` 的内嵌集合打包并签名，`verify` 用内置公钥反向校验签名、每个压缩包的 SHA-256 与目录内容摘要。`.github/workflows/release-plugins.yml` 在推送 `plugin-*` 标签或手动触发时执行上述两步，先上传各版本化 `*.zip`、最后原子覆盖 `plugins-manifest.json` 到 GitHub `plugins-latest`，再同步到 CNB 镜像。发布前还会校验 `plugins/monitor/` 与 `plugins/monitor-src/` 打包结果一致，避免把旧 `renderer.js` 签出去。
+`package` 按 `plugins/embed.go` 的内嵌集合打包并签名。插件可在 `plugin.json` 中用 `minCoreVersion`（`vX.Y.Z`）指定最低核心版本，省略时使用 `--min-core`。`verify` 用内置公钥反向校验签名、每个压缩包的 SHA-256 与目录内容摘要。`.github/workflows/release-plugins.yml` 在推送 `plugin-*` 标签或手动触发时执行上述两步。工作流先上传各版本化 `*.zip` 到 GitHub `plugins-latest`，再同步 CNB 镜像，最后替换 GitHub 上的 `plugins-manifest.json`。发布前还会校验 `plugins/monitor/` 与 `plugins/monitor-src/` 打包结果一致，避免把旧 `renderer.js` 签出去。
 
 ## 安装包校验
 

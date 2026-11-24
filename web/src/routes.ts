@@ -105,12 +105,19 @@ export function useEmbeddedNavigation(path: string | null) {
   embeddedPath = path;
   notifyPathname();
 }
-export function navigate(path: string): void {
+export function navigate(path: string, options?: { diagnostic: boolean }): void {
   const next = normalizePathname(path);
   if (embeddedPath !== null) { embeddedPath = next; notifyPathname(); return; }
   if (typeof window === "undefined") return;
-  if (normalizePathname(window.location.pathname) === next) return;
-  window.history.pushState(null, "", next + window.location.search);
+  let search = window.location.search;
+  if (options) {
+    const params = new URLSearchParams(search);
+    if (options.diagnostic) params.set("mode", "diagnostic");
+    else params.delete("mode");
+    search = params.size ? `?${params}` : "";
+  }
+  if (normalizePathname(window.location.pathname) === next && window.location.search === search) return;
+  window.history.pushState(null, "", next + search);
   notifyPathname();
 }
 

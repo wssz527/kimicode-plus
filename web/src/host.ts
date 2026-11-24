@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import type { TaskPackage } from "../../adapters/types";
+import { subscribePathname } from "./routes";
 
 export interface HostContext {
   sessionId: string;
@@ -39,3 +40,6 @@ export function useHostContext() {
 }
 export function hostConnection() { return connection; }
 export function diagnosticMode() { return typeof window !== "undefined" && new URLSearchParams(window.location.search).get("mode") === "diagnostic"; }
+export function useDiagnosticMode() {
+  return useSyncExternalStore(subscribePathname, diagnosticMode, diagnosticMode);
+}
