@@ -16,7 +16,7 @@ https://github.com/wssz527/kimicode-plus/releases/latest/download/manifest.json
 1. 将 `internal/server/server.go` 中的 `var Version = "<X.Y.Z>"` 更新为新版本号（语义化版本，不含 `v` 前缀）。
 2. 完成下方全部验证（前端检查与构建、嵌入资产、Go 检查与测试、打包与同步测试、真实二进制验收）。
 3. 提交发布改动，**并将面向用户的更新说明写入该发布 commit 的提交信息**。`.github/workflows/release.yml` 打包时会读取 `git log -1 --format=%B` 写入 `manifest.json` 的 `releaseNotes`，读取 `git log -1 --format=%cI` 写入 `publishedAt`。后续仅在 GitHub/CNB 网页编辑正文不会同步回 `manifest.json`。
-4. 基于该提交打注释标签 `v<X.Y.Z>` 并推送到远端，由 GitHub Actions（`.github/workflows/release.yml`）自动完成构建、交叉编译、打包、发布 GitHub Release，并通过 `scripts/sync_cnb_release.py`（依赖 GitHub 仓库 Secret `CNB_TOKEN`，权限限定为 `wssz527/kimicode-plus` 的 `repo-code` + `repo-release` 读写）自动同步推送到 CNB 镜像仓库 `wssz527/kimicode-plus`。禁止覆盖已有 tag 的 Release。
+4. 基于该提交打注释标签 `v<X.Y.Z>` 并推送到远端。GitHub Actions（`.github/workflows/release.yml`）构建、交叉编译与打包后，将资产上传至 GitHub 草稿。通过 `scripts/sync_cnb_release.py` 同步到 CNB 镜像后公开 GitHub Release。`CNB_TOKEN` 需要 `wssz527/kimicode-plus` 的 `repo-code` 和 `repo-release` 读写权限，默认在构建前检查。手动运行时可显式选择 `skip_cnb_mirror`，镜像会继续提供上一版本。若同标签已有草稿或正式 Release，工作流停止，先核对已有记录。
 
 ### 自动更新生效的硬性要求（缺一不可）
 
@@ -66,7 +66,7 @@ https://github.com/wssz527/kimicode-plus/releases/download/plugins-latest/plugin
 3. 工作流使用 GitHub 仓库 Secret `PLUGIN_SIGNING_PRIVATE_KEY`（与仓库 `plugins/official_keys.go` 内置公钥配对的 Ed25519 私钥，禁止提交到仓库）执行：
    - `go run ./cmd/plugin-release package` 打包并签名生成 `*.zip` 与 `plugins-manifest.json`；
    - `go run ./cmd/plugin-release verify` 用内置公钥反向校验签名与每个压缩包的 SHA-256 及目录内容摘要；
-   - 先上传各版本化 `*.zip`，最后原子覆盖上传 `plugins-manifest.json` 到 GitHub `plugins-latest`（`--latest=false`），再通过 `scripts/sync_cnb_release.py --tag plugins-latest --no-prerelease --make-latest false --force-tag` 同步到 CNB 镜像。
+   - 上传各版本化 `*.zip` 至 GitHub `plugins-latest`（`--latest=false`），通过 `scripts/sync_cnb_release.py --tag plugins-latest --no-prerelease --make-latest false --force-tag` 同步 CNB 后，再替换 GitHub 的 `plugins-manifest.json`。两端的清单均在各自归档上传完成后发布。
 4. 客户端检查更新时校验证书公钥签名、最低核心版本（`minCoreVersion`）和权限变更：能力未扩权可直接一键热更新，新增能力会要求用户明确确认；已验签清单随插件记录持久化，v2 高权限插件更新及重启后均保持官方签名校验有效。
 
 ## 日常开发与验证

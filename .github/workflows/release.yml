@@ -106,21 +106,21 @@ jobs:
             git log -1 --format=%B
             echo '__EKD_RELEASE_NOTES__'
           } >> "$GITHUB_ENV"
-      # `repos/{repo}/releases/tags/{tag}` answers 404 for drafts, so a run
-      # interrupted after the draft upload would look like "no release" and the
-      # next attempt would append a second copy of the notes to the same draft.
-      # `gh release view` sees drafts, so use it for the existence check.
       - name: Refuse to overwrite an existing release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            is_draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || echo unknown)
-            echo "A release already exists for $GITHUB_REF_NAME (draft=$is_draft)." >&2
-            if [ "$is_draft" = "false" ]; then
-              echo 'The published release is never overwritten. Use a new version to publish.' >&2
+          if ! existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq -r --arg tag "$GITHUB_REF_NAME" '.[] | select(.tag_name == $tag) | .draft'); then
+            echo 'Could not verify whether a release or draft already exists.' >&2
+            exit 1
+          fi
+          if [ -n "$existing" ]; then
+            if [ "$existing" = "true" ]; then
+              echo 'A draft already exists. Review it and delete the draft before repeating this workflow.' >&2
             else
-              echo 'It is a draft left by an interrupted run. Delete it first: gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag=false, then re-run this workflow.' >&2
+              echo 'A published release already exists. Use a new version to publish.' >&2
             fi
             exit 1
           fi
@@ -166,7 +166,7 @@ jobs:
           if [ -z "${CNB_TOKEN:-}" ]; then
             echo 'CNB_TOKEN secret is not configured. The domestic CNB mirror would stay on the previous release, so this run fails instead of reporting success.' >&2
             echo 'Configure the secret, sync manually with scripts/sync_cnb_release.py, or re-run with skip_cnb_mirror=true.' >&2
-            echo 'The GitHub release stays a draft until this step succeeds; the tag cannot be published by a plain re-run until that draft is deleted or published.' >&2
+            echo 'The GitHub release remains a draft. Review the draft before deleting it and repeating the workflow.' >&2
             exit 1
           fi
           extra=""
@@ -183,9 +183,8 @@ jobs:
             dist/release/manifest.json \
             dist/THIRD_PARTY_NOTICES.txt
       # Publishing comes last: the draft is only made public once every asset is
-      # uploaded and the CNB mirror carries the same files. A failure before this
-      # point leaves the release in draft, so releases/latest never points at a
-      # partially uploaded release on either source.
+      # uploaded and the required mirror sync succeeds. A failure before this
+      # point leaves the GitHub release in draft.
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

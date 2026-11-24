@@ -126,9 +126,7 @@ jobs:
               --notes 'Signed official KimiCode+ plugin packages. Rolling channel that does not replace core releases/latest.' \
               --latest=false
           fi
-          # Upload versioned archives before replacing plugins-manifest.json so the manifest never references missing zips.
           gh release upload plugins-latest dist/plugins-release/*.zip --repo "$GITHUB_REPOSITORY" --clobber
-          gh release upload plugins-latest dist/plugins-release/plugins-manifest.json --repo "$GITHUB_REPOSITORY" --clobber
       - name: Sync plugins-latest channel to CNB mirror
         env:
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
@@ -152,3 +150,7 @@ jobs:
             --notes "$PLUGIN_RELEASE_NOTES" \
             dist/plugins-release/*.zip \
             dist/plugins-release/plugins-manifest.json
+      - name: Publish the GitHub plugin manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload plugins-latest dist/plugins-release/plugins-manifest.json --repo "$GITHUB_REPOSITORY" --clobber
