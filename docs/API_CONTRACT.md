@@ -14,7 +14,7 @@ Multi-account management is part of the native bridge, not a standalone HTTP sur
 
 - `GET /health`: status, version, module health, safeMode and adapter status.
 - `GET /settings`: revision, safeMode, compactionIdleMinutes (default 25), defaultChatSource (`kimi`), enabled modules.
-- `PUT /settings`: complete settings plus expected revision. Module enable/disable takes effect on core restart. Independent admitted chat/task calls share a read permit and may run concurrently. Settings writes take the exclusive permit, drain admitted effects, and block new admission while waiting; after safe mode is saved, later calls are rejected. Worktree commands and browser migration applies use the same gate. It cannot revoke a sent request. Plugins are stopped; local configuration/history remain usable.
+- `PUT /settings`: complete settings plus expected revision. Module changes take effect on core restart. The admission gate rejects new dispatches as soon as safe mode takes effect. The HTTP request waits up to five seconds for already admitted dispatches before stopping plugins. Previously sent requests can still finish. Worktree commands and browser migration applies use the same gate. Local configuration and history remain available.
 
 ## Self-update
 

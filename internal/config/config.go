@@ -95,9 +95,7 @@ func (s *Store) Put(v Settings) error {
 		return err
 	})
 	if err == nil {
-		// Take the admission gate before publishing the new flag: once this
-		// returns, every later Dispatch sees safe mode, and no dispatch can be
-		// admitted between the database write and the flag store.
+		// Publish the committed mode in the same critical section used for admission.
 		s.gateMu.Lock()
 		s.safe.Store(v.SafeMode)
 		s.gateMu.Unlock()

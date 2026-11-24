@@ -460,9 +460,7 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 			return
 		}
 		if v.SafeMode {
-			// No further dispatch is admitted from here on. Give the work that was
-			// already admitted a bounded chance to finish before reporting safe, so
-			// "unsafe" really means drained; a straggler is never cancelled.
+			// Allow admitted dispatches a bounded time to finish before stopping plugins.
 			drainCtx, drainCancel := context.WithTimeout(r.Context(), 5*time.Second)
 			drainErr := cfg.WaitIdle(drainCtx)
 			drainCancel()
