@@ -139,7 +139,6 @@ class FakeElement {
 
 test("KCT translated node preserves official think-text class, Vue scope attr, and muted fallback CSS", async () => {
   assert.equal(manifest.id, "kimicode-plus.kct");
-  assert.equal(manifest.version, "1.0.5");
 
   const head = new FakeElement("head");
   const bodyRoot = new FakeElement("body");

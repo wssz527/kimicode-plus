@@ -1,7 +1,7 @@
 {
   "id": "kimicode-plus.scheduler",
   "name": "定时任务",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "apiVersion": 2,
   "description": "按时间自动在指定目录新建会话或向已有会话投递提示词，支持错过补跑、已读归档、成本护栏、提示词变量、运行前校验与只读分析模板。",
   "author": "KimiCode+",

@@ -213,23 +213,34 @@ func TestBundledUpgradeRefreshesFilesPreservesStorageAndKeepsOfficialV2Grants(t 
 	}
 	defer db.Close()
 
-	oldPlannerManifest := strings.Replace(string(bundled["kimicode-plus.planner"]["plugin.json"]), `"version": "1.0.5"`, `"version": "1.0.2"`, 1)
-	if oldPlannerManifest == string(bundled["kimicode-plus.planner"]["plugin.json"]) {
-		t.Fatal("expected planner bundled version to be 1.0.5")
+	legacyManifest := func(id, oldVersion string) ([]byte, string) {
+		t.Helper()
+		current, err := bundledManifest(id, bundled[id])
+		if err != nil || !newerVersion(current.Version, oldVersion) {
+			t.Fatalf("expected bundled %s version newer than %s: %v", id, oldVersion, err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(bundled[id]["plugin.json"], &fields); err != nil {
+			t.Fatal(err)
+		}
+		fields["version"], _ = json.Marshal(oldVersion)
+		raw, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw, current.Version
 	}
-	oldMonitorManifest := strings.Replace(string(bundled["kimicode-plus.monitor"]["plugin.json"]), `"version": "1.1.1"`, `"version": "1.0.1"`, 1)
-	if oldMonitorManifest == string(bundled["kimicode-plus.monitor"]["plugin.json"]) {
-		t.Fatal("expected monitor bundled version to be 1.1.1")
-	}
+	oldPlannerManifest, plannerVersion := legacyManifest("kimicode-plus.planner", "1.0.2")
+	oldMonitorManifest, monitorVersion := legacyManifest("kimicode-plus.monitor", "1.0.1")
 
 	legacySet := map[string]map[string][]byte{
 		"kimicode-plus.planner": {
-			"plugin.json": []byte(oldPlannerManifest),
+			"plugin.json": oldPlannerManifest,
 			"renderer.js": []byte("export async function activate() { return 'legacy-1.0.2'; }\n"),
 			"LICENSE":     bundled["kimicode-plus.planner"]["LICENSE"],
 		},
 		"kimicode-plus.monitor": {
-			"plugin.json": []byte(oldMonitorManifest),
+			"plugin.json": oldMonitorManifest,
 			"renderer.js": []byte("export async function activate() { return 'legacy-1.0.1'; }\n"),
 			"settings.js": []byte("export async function activate() {}\n"),
 			"LICENSE":     bundled["kimicode-plus.monitor"]["LICENSE"],
@@ -278,8 +289,8 @@ func TestBundledUpgradeRefreshesFilesPreservesStorageAndKeepsOfficialV2Grants(t 
 	if err != nil {
 		t.Fatalf("enable upgraded planner: %v", err)
 	}
-	if !enabledPlanner.Official || enabledPlanner.Version != "1.0.5" {
-		t.Fatalf("planner = %+v, want official v1.0.5", enabledPlanner)
+	if !enabledPlanner.Official || enabledPlanner.Version != plannerVersion {
+		t.Fatalf("planner = %+v, want official v%s", enabledPlanner, plannerVersion)
 	}
 	capSet := map[string]bool{}
 	for _, capName := range enabledPlanner.Capabilities {
@@ -292,8 +303,8 @@ func TestBundledUpgradeRefreshesFilesPreservesStorageAndKeepsOfficialV2Grants(t 
 	}
 
 	monitorItem, ok := cur.Get("kimicode-plus.monitor")
-	if !ok || !monitorItem.Official || monitorItem.Version != "1.1.1" {
-		t.Fatalf("monitor = %+v (ok=%v), want official v1.1.1", monitorItem, ok)
+	if !ok || !monitorItem.Official || monitorItem.Version != monitorVersion {
+		t.Fatalf("monitor = %+v (ok=%v), want official v%s", monitorItem, ok, monitorVersion)
 	}
 	monitorSettings, readErr := os.ReadFile(filepath.Join(root, "plugins", "kimicode-plus.monitor", "settings.js"))
 	if readErr != nil || string(monitorSettings) != string(bundled["kimicode-plus.monitor"]["settings.js"]) {

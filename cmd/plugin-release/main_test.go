@@ -29,8 +29,11 @@ func TestPackageAndVerifyBundledPlugins(t *testing.T) {
 		t.Fatalf("verifyReleaseDir: %v", err)
 	}
 
-	// Tampering any generated zip must fail verifyReleaseDir.
-	kctZip := filepath.Join(outDir, "kimicode-plus.kct-1.0.5.zip")
+	kct, err := plugins.ParseManifest(bundled["kimicode-plus.kct"]["plugin.json"])
+	if err != nil {
+		t.Fatalf("parse bundled KCT manifest: %v", err)
+	}
+	kctZip := filepath.Join(outDir, kct.ID+"-"+kct.Version+".zip")
 	data, err := os.ReadFile(kctZip)
 	if err != nil {
 		t.Fatalf("read kct zip: %v", err)
