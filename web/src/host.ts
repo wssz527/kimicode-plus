@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
 import type { TaskPackage } from "../../adapters/types";
-import { subscribePathname } from "./routes";
+import { subscribePathname } from "./routes.js";
 
 export interface HostContext {
   sessionId: string;
