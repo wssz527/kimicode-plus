@@ -57,9 +57,10 @@ def cnb_json_request(url, token, method='GET', payload=None, timeout=30):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
-            return resp.status, (json.loads(raw.decode('utf-8')) if raw else {})
+            return resp.status, (json.loads(raw.decode('utf-8')) if raw.strip() else {})
     except urllib.error.HTTPError as err:
-        body = err.read().decode('utf-8', errors='replace')[:500]
+        with err:
+            body = err.read().decode('utf-8', errors='replace')[:500]
         return err.code, {'_raw': body}
 
 
@@ -71,10 +72,15 @@ def upload_file_put(upload_url, file_path, timeout=180):
     }
     with file_path.open('rb') as handle:
         req = urllib.request.Request(upload_url, data=handle, headers=headers, method='PUT')
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp.read()
-            if resp.status < 200 or resp.status >= 300:
-                raise RuntimeError(f'Upload PUT failed for {file_path.name}: HTTP {resp.status}')
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resp.read()
+                if resp.status < 200 or resp.status >= 300:
+                    raise RuntimeError(f'Upload PUT failed for {file_path.name}: HTTP {resp.status}')
+        except urllib.error.HTTPError as err:
+            with err:
+                status = err.code
+            raise RuntimeError(f'Upload PUT failed for {file_path.name}: HTTP {status}') from None
 
 
 def ensure_release(api_base, repo, token, tag, notes, prerelease, make_latest=None):
@@ -82,7 +88,18 @@ def ensure_release(api_base, repo, token, tag, notes, prerelease, make_latest=No
     tag_url = f'{api_base}/{repo}/-/releases/tags/{encoded_tag}'
     status, data = cnb_json_request(tag_url, token, method='GET')
     if status == 200 and data.get('id'):
-        return str(data['id'])
+        release_id = str(data['id'])
+        # Rolling channels such as plugins-latest keep the same release id across
+        # runs; refresh its description so the CNB body never stays at the first
+        # publication's notes while the packages underneath move on.
+        if notes:
+            patch_url = f'{api_base}/{repo}/-/releases/{release_id}'
+            patch_status, patch_data = cnb_json_request(patch_url, token, method='PATCH', payload={'body': notes})
+            if patch_status < 200 or patch_status >= 300:
+                raise RuntimeError(
+                    f'Failed to update CNB release {tag} notes: HTTP {patch_status} {patch_data.get("_raw", "")}'
+                )
+        return release_id
     if status != 404:
         raise RuntimeError(f'Failed to query CNB release {tag}: HTTP {status} {data.get("_raw", "")}')
 

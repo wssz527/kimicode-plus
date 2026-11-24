@@ -33,8 +33,8 @@ jobs:
         working-directory: web
       - shell: bash
         run: mkdir -p internal/webassets/dist/host && cp -R web/dist/. internal/webassets/dist/ && cp -R web/dist-host/. internal/webassets/dist/host/
-      - run: go vet ./cmd/... ./internal/...
-      - run: go test -race ./cmd/... ./internal/...
+      - run: go vet ./cmd/... ./internal/... ./plugins/...
+      - run: go test -race ./cmd/... ./internal/... ./plugins/...
       - shell: bash
         run: CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags='-s -w' -o enhanced-kimi${{ runner.os == 'Windows' && '.exe' || '' }} ./cmd/enhanced-kimi
       - shell: bash
@@ -54,6 +54,7 @@ jobs:
           node-version: '24'
       - run: npm ci && npm run build && npm run build:host
         working-directory: web
+      - run: python3 scripts/test_package.py && python3 scripts/test_sync_cnb_release.py
       - run: mkdir -p internal/webassets/dist/host && cp -R web/dist/. internal/webassets/dist/ && cp -R web/dist-host/. internal/webassets/dist/host/ && sh scripts/crossbuild.sh && python3 scripts/notices.py && python3 scripts/package.py
       - uses: actions/upload-artifact@v4
         with:

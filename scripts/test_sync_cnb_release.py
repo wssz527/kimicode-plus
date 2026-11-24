@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for scripts/sync_cnb_release.py against a local stub HTTP server."""
+import gc
 import http.server
 import json
 from pathlib import Path
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import warnings
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sync_cnb_release as sync
@@ -16,6 +18,7 @@ class FakeCNBServer:
     def __init__(self, existing_release_id=None):
         self.existing_release_id = existing_release_id
         self.created_payloads = []
+        self.updated_bodies = []
         self.upload_order = []
         self.uploaded_bytes = {}
         self.confirmed = []
@@ -24,6 +27,8 @@ class FakeCNBServer:
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
             def log_message(self, format, *args):
                 pass
 
@@ -32,8 +37,14 @@ class FakeCNBServer:
                 self.send_response(code)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(data)))
+                self.send_header('Connection', 'close')
                 self.end_headers()
+                self.close_connection = True
                 self.wfile.write(data)
+
+            def _read_json(self):
+                length = int(self.headers.get('Content-Length') or 0)
+                return json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
 
             def do_GET(self):
                 if self.headers.get('Authorization') != 'Bearer test-token':
@@ -51,8 +62,7 @@ class FakeCNBServer:
                 if self.headers.get('Authorization') != 'Bearer test-token':
                     self._send_json(401, {'error': 'unauthorized'})
                     return
-                length = int(self.headers.get('Content-Length') or 0)
-                body = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+                body = self._read_json()
                 if self.path == '/owner/repo/-/releases':
                     outer.created_payloads.append(body)
                     self._send_json(201, {'id': 'rel-42'})
@@ -72,6 +82,17 @@ class FakeCNBServer:
                     return
                 self._send_json(404, {'error': 'unexpected post'})
 
+            def do_PATCH(self):
+                if self.headers.get('Authorization') != 'Bearer test-token':
+                    self._send_json(401, {'error': 'unauthorized'})
+                    return
+                body = self._read_json()
+                if self.path == '/owner/repo/-/releases/rel-42':
+                    outer.updated_bodies.append(body)
+                    self._send_json(200, {'id': 'rel-42'})
+                    return
+                self._send_json(404, {'error': 'unexpected patch'})
+
             def do_PUT(self):
                 length = int(self.headers.get('Content-Length') or 0)
                 data = self.rfile.read(length)
@@ -79,20 +100,27 @@ class FakeCNBServer:
                 if outer.fail_first_upload and not outer._failed_once:
                     outer._failed_once = True
                     self.send_response(502)
+                    self.send_header('Content-Length', '0')
                     self.end_headers()
+                    self.close_connection = True
                     return
                 outer.upload_order.append(name)
                 outer.uploaded_bytes[name] = data
                 self.send_response(200)
+                self.send_header('Content-Length', '0')
                 self.end_headers()
+                self.close_connection = True
 
         self.httpd = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.httpd.daemon_threads = False
+        self.httpd.block_on_close = True
         self.base_url = f'http://127.0.0.1:{self.httpd.server_address[1]}'
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
 
     def close(self):
         self.httpd.shutdown()
+        self.thread.join(timeout=10)
         self.httpd.server_close()
 
 
@@ -154,10 +182,66 @@ class SyncCNBReleaseTest(unittest.TestCase):
         )
         self.assertEqual(release_id, 'rel-42')
         self.assertEqual(server.created_payloads, [])
+        self.assertEqual(server.updated_bodies, [{'body': 'Retry notes'}])
         self.assertEqual(server.confirmed, uploaded)
+
+    def test_existing_release_notes_are_updated_for_rolling_channel(self):
+        server = FakeCNBServer(existing_release_id='rel-42')
+        self.addCleanup(server.close)
+        release_id, uploaded = sync.sync_release(
+            api_base=server.base_url,
+            web_base=server.base_url,
+            repo='owner/repo',
+            token='test-token',
+            tag='plugins-latest',
+            notes='Plugin channel update 1.1.2',
+            files=self.files,
+            prerelease=False,
+            push_git=False,
+            make_latest=False,
+        )
+        self.assertEqual(release_id, 'rel-42')
+        self.assertEqual(server.created_payloads, [])
+        self.assertEqual(server.updated_bodies, [{'body': 'Plugin channel update 1.1.2'}])
+        self.assertEqual(server.confirmed, uploaded)
+
+    def test_existing_release_without_notes_is_not_patched(self):
+        server = FakeCNBServer(existing_release_id='rel-42')
+        self.addCleanup(server.close)
+        release_id, _ = sync.sync_release(
+            api_base=server.base_url,
+            web_base=server.base_url,
+            repo='owner/repo',
+            token='test-token',
+            tag='v0.2.4',
+            notes='',
+            files=self.files,
+            prerelease=False,
+            push_git=False,
+        )
+        self.assertEqual(release_id, 'rel-42')
+        self.assertEqual(server.updated_bodies, [])
 
     def test_prerelease_detection(self):
         self.assertFalse(sync.is_prerelease('v0.2.4'))
+
+    def test_failed_upload_response_is_closed(self):
+        # A non-2xx PUT arrives as HTTPError, which owns the socket. If it is not
+        # closed there, the failed attempt leaves a connection open until GC and
+        # the suite reports `ResourceWarning: unclosed <socket.socket>`.
+        server = FakeCNBServer()
+        server.fail_first_upload = True
+        self.addCleanup(server.close)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always', ResourceWarning)
+            with self.assertRaises(RuntimeError) as raised:
+                sync.upload_file_put(f'{server.base_url}/upload/asset.bin', self.files[2])
+            gc.collect()
+        self.assertIn('HTTP 502', str(raised.exception))
+        leaked = [w for w in caught if issubclass(w.category, ResourceWarning)]
+        self.assertEqual(leaked, [], f'unclosed sockets: {[str(w.message) for w in leaked]}')
+        # The rejected attempt never counted as an upload.
+        self.assertEqual(server.upload_order, [])
 
     def test_plugin_channel_uploads_plugins_manifest_last_and_keeps_non_latest(self):
         plugin_dir = Path(tempfile.mkdtemp(prefix='cnb-plugins-test-'))

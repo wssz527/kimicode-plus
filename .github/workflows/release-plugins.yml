@@ -15,6 +15,11 @@ on:
         required: false
         type: string
         default: '0.2.8'
+      skip_cnb_mirror:
+        description: 'Skip the CNB domestic mirror sync for this run (leaves it on the previous packages)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -36,10 +41,43 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # Fail before anything reaches the network: once the GitHub plugins-latest
+      # channel is replaced, a missing CNB_TOKEN would leave domestic users on the
+      # previous packages while GitHub already serves the new ones.
+      - name: Require CNB_TOKEN unless the mirror is explicitly skipped
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          SKIP_CNB_MIRROR: ${{ inputs.skip_cnb_mirror || 'false' }}
+        run: |
+          if [ "$SKIP_CNB_MIRROR" = "true" ]; then
+            echo 'skip_cnb_mirror=true: this run will not touch the CNB plugin mirror.'
+            exit 0
+          fi
+          if [ -z "${CNB_TOKEN:-}" ]; then
+            echo 'CNB_TOKEN secret is not configured. Add the secret, or re-run with skip_cnb_mirror=true if the CNB channel is intentionally left on the previous packages.' >&2
+            exit 1
+          fi
       - name: Verify plugin packages and signing CLI
         run: |
           go test ./internal/plugins/... ./plugins/... ./cmd/plugin-release/... -count=1
           python3 scripts/test_sync_cnb_release.py
+      - name: Verify the bundled Monitor plugin matches monitor-src
+        run: |
+          (cd web && npm ci)
+          node plugins/monitor-src/build/bundle.mjs
+          # Untracked output counts as stale too: a new bundle file that was never
+          # committed would otherwise be signed into the release unnoticed.
+          status="$(git status --porcelain plugins/monitor/)"
+          if [ -n "$status" ]; then
+            printf '%s\n' "$status" >&2
+            echo 'plugins/monitor is stale: rebuild and commit monitor-src output before signing a release.' >&2
+            exit 1
+          fi
       - name: Prepare plugin release metadata
         env:
           INPUT_NOTES: ${{ inputs.notes }}
@@ -88,17 +126,20 @@ jobs:
               --notes 'Signed official KimiCode+ plugin packages. Rolling channel that does not replace core releases/latest.' \
               --latest=false
           fi
-          # Upload versioned archives before replacing plugins-manifest.json so the manifest never references missing zips.
           gh release upload plugins-latest dist/plugins-release/*.zip --repo "$GITHUB_REPOSITORY" --clobber
-          gh release upload plugins-latest dist/plugins-release/plugins-manifest.json --repo "$GITHUB_REPOSITORY" --clobber
       - name: Sync plugins-latest channel to CNB mirror
         env:
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
           CNB_REPO: wssz527/kimicode-plus
+          SKIP_CNB_MIRROR: ${{ inputs.skip_cnb_mirror || 'false' }}
         run: |
-          if [ -z "${CNB_TOKEN:-}" ]; then
-            echo 'CNB_TOKEN secret is not configured; skipping CNB plugin mirror sync.'
+          if [ "$SKIP_CNB_MIRROR" = "true" ]; then
+            echo 'skip_cnb_mirror=true: CNB plugin mirror sync explicitly skipped for this run.'
             exit 0
+          fi
+          if [ -z "${CNB_TOKEN:-}" ]; then
+            echo 'CNB_TOKEN secret is not configured; this run must not update the plugin channel without the mirror.' >&2
+            exit 1
           fi
           python3 scripts/sync_cnb_release.py \
             --tag plugins-latest \
@@ -109,3 +150,7 @@ jobs:
             --notes "$PLUGIN_RELEASE_NOTES" \
             dist/plugins-release/*.zip \
             dist/plugins-release/plugins-manifest.json
+      - name: Publish the GitHub plugin manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload plugins-latest dist/plugins-release/plugins-manifest.json --repo "$GITHUB_REPOSITORY" --clobber

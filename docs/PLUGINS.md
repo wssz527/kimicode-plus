@@ -9,6 +9,7 @@ KimiCode+ 支持本地受信增强插件。插件是运行在宿主渲染进程�
 - 安装方式：支持从**本地文件夹或 `.zip` 包**安装（设置页可直接唤起系统目录/文件选择器，或粘贴路径）。不提供第三方在线插件市场。
 - 运行环境：不做不可信沙箱。插件运行在宿主渲染进程中，与 KimiCode+ 共享同一运行环境，**可以读取当前界面内容**，没有独立的系统沙箱，除界面会话内容外还可能触及本机的增强能力与接口。因此只应安装来源完全可信的第三方增强插件；安装界面与权限清单会如实提示，能力清单用于声明与管理插件能调用哪些接口，不能替代对插件代码的信任审查。
 - 完整性保护：预装插件持续对照二进制内嵌的构建期内容摘要；第三方本地插件在安装完成时固化目录内容摘要（`install_digest`），每次调用高权限能力前重新核对磁盘内容，防止安装确认后被静默篡改提权。开发者更新本地代码后，重新执行本地覆盖安装即可刷新摘要并重新确认授权。
+- 官方在线热更新：预装插件还可通过内置公钥验签的 `plugins-manifest.json` 更新。验签通过的清单按插件 ID 与版本记录在插件记录里（`signedOfficialDigest`），高权限调用时与构建期内嵌摘要一样能证明文件来自官方发布，因此热更新后的 v2 高权限插件不需要重新走第三方安装确认。
 - 核心解耦：Monitor、KCT、规划、定时任务都运行在这套标准接口之上，关闭全部插件后核心功能仍完整可用。
 
 ## 包结构
@@ -48,8 +49,7 @@ KimiCode+ 支持本地受信增强插件。插件是运行在宿主渲染进程�
 | `name` | 1–80 个字符。 |
 | `version` | `major.minor.patch`。 |
 | `apiVersion` | 必须为 `1` 或 `2`。其他版本直接拒绝，不做猜测。v2 清单才能声明下节的高权限能力。 |
-| `hostVersions` | 1–32 项。写具体版本（`1.3.5`）或点边界通配（`1.*`、`1.3.*`）。**指官方 Kimi Code 客户端版本**，不是 KimiCode+ 的版本。 |
-| `entry.renderer` | 必需，相对路径，`.js`，必须位于插件目录内。 |
+| `hostVersions` | 1–32 项。写具体版本（`1.4.2`）或点边界通配（`1.*`、`1.4.*`）。**指官方 Kimi Code 客户端版本**，不是 KimiCode+ 的版本。当前人工验证基线为官方 Kimi Code 1.4.2 / Electron 45.1.0（macOS & Windows）；更早的 1.3.5/1.3.7 记录保留在 `docs/VALIDATION.md`。 || `entry.renderer` | 必需，相对路径，`.js`，必须位于插件目录内。 |
 | `entry.settings` | 可选，同上。 |
 | `capabilities` | 0–64 项，见下节。未知名称、重复项、空项都会被拒绝。 |
 | `LICENSE` | 文件必须存在。 |
@@ -83,9 +83,10 @@ KimiCode+ 支持本地受信增强插件。插件是运行在宿主渲染进程�
 
 第三方插件只需在 `plugin.json` 中将 `"apiVersion"` 设为 `2`，即可申请下表中的所有 UI 挂载点与核心能力。授权与完整性机制如下：
 
-- **安装期二次确认**：用户在「增强插件 → 安装本地增强插件」勾选任何 v2 高权限能力时，界面会给出明确风险提示，要求勾选风险确认框（请求体携带 `confirmPrivileged: true`），未确认会被核心拒绝（`400 PLUGIN_PRIVILEGED_CONFIRM_REQUIRED`）。
+- **安装期二次确认**：用户在官方设置「插件 → KimiCode+」分段点击「安装本地增强插件」，勾选任何 v2 高权限能力时，界面会给出明确风险提示，要求勾选风险确认框（请求体携带 `confirmPrivileged: true`），未确认会被核心拒绝（`400 PLUGIN_PRIVILEGED_CONFIRM_REQUIRED`）。
 - **内容摘要保护**：
   - 预装插件：延续构建期 `plugins/registry.go` 计算的 SHA-256 摘要白名单，每次高权限调用都会重新核对磁盘内容。
+  - 官方热更新后的预装插件：内置公钥验签通过的 `plugins-manifest.json` 提供该版本的 `contentDigest`，与构建期白名单同等地通过高权限复核；清单随插件记录持久化，重启后仍有效。签名无效、版本对不上、或内置副本版本更新时，该摘要不被采信，插件退回构建期白名单校验。
   - 第三方本地插件：安装落盘时计算并持久化目录内容摘要（`install_digest`），每次高权限调用前重新核对磁盘内容。若安装后文件在磁盘上被外部静默篡改，摘要失配会立即拒绝高权限调用（`403 PLUGIN_PRIVILEGE_DENIED`）；开发者修改插件源码后，重新执行本地安装即可更新摘要并重新确认授权。
 
 | 能力 | 提供内容 | 对应动作 |
@@ -310,8 +311,8 @@ await ctx.core.request("credentials.delete", { name: "translator" });
 - 停用时按相反顺序释放：先跑 `activate` 返回的清理和各个 `Disposable`，再移除分栏容器、右面板标签与入口按钮，最后撤销身份令牌。已实测停用后页面与启用前逐项一致（分栏、面板、侧栏折叠、入口都不残留）。
 - `ctx.planner.threads()` / `ctx.planner.models()` 是只读发现，不受设置里旧的「规划」附加功能开关影响；该开关只管冻结的内置规划界面。其余 `planner.*` 动作同样走插件自己的授权，不读写那套界面状态。
 - 规划线程归属创建它的插件。`planner.configure/send/retry/stop/approve/delete` 只对**同一插件**创建的线程生效；拿其他插件的线程 ID 调用会返回「规划线程不属于该插件」，内置线程（`pluginOwner` 为空）同样如此。`planner.get`/`threads`/`models` 不受此限制，插件仍能看到列表里的每个线程。
-- `ctx.entry` 注册的是一个"可打开标签类型"，同一份定义注入三处：会话信息的「可打开」分组（`.sit-available`）、右侧面板的可打开列表（`.pt-body .pl`），以及右侧面板标签栏的 `+` 下拉菜单（在 1.3.7 中经主进程 `browser-overlay` IPC 同步并补齐图标）。入口行与官方同行保持一致；`icon` 是画进官方图标槽的单条 SVG path（`viewBox="0 0 24 24"`），不传则保留官方模板图标。
-- 1.3.7 里右侧面板主文档列表只有 `.pt-body .pl`（计划里写的 `.pt-body .sit` 和 `.panel-add-menu` 保留兼容分支）；`+` 下拉本身由独立的 `browser-overlay.html` 渲染，由宿主引导脚本在主进程拦截 `kimi:browser-overlay-open` / `kimi:browser-overlay-rendered` / `kimi:browser-overlay-activate` 同步条目与点击调用。
+- `ctx.entry` 注册的是一个"可打开标签类型"，同一份定义注入三处：会话信息的「可打开」分组（`.sit-available`）、右侧面板的可打开列表（`.pt-body .pl`），以及右侧面板标签栏的 `+` 下拉菜单（当前基线 1.4.2 经主进程 `browser-overlay` IPC 同步并补齐图标）。入口行与官方同行保持一致；`icon` 是画进官方图标槽的单条 SVG path（`viewBox="0 0 24 24"`），不传则保留官方模板图标。
+- 1.4.2 里右侧面板主文档列表只有 `.pt-body .pl`（计划里写的 `.pt-body .sit` 和 `.panel-add-menu` 保留兼容分支）；`+` 下拉本身由独立的 `browser-overlay.html` 渲染，由宿主引导脚本在主进程拦截 `kimi:browser-overlay-open` / `kimi:browser-overlay-rendered` / `kimi:browser-overlay-activate` 同步条目与点击调用。1.3.7 及更早版本的同类行为见 `docs/VALIDATION.md`。
 - 插件可以在空会话里注册右侧面板。在官方面板出现后，用户可以通过会话信息或右侧面板列表打开插件标签。从会话信息打开时，会话信息按官方逻辑自动隐藏。
 - 入口按容器幂等：每处容器最多一行同一个 `action`，官方重渲染后自动补回。运行中启停插件通过核心 `"plugins"` 事件实时推送，三处入口在下一帧内出现或消失，不需要刷新或等待窗口聚焦。
 - 官方的「已打开标签页」分组只渲染官方 `panelTabs`，插件标签不在那个数组里，也没有官方 `type` 注册项，因此无法合法注入；插件标签在右侧面板自己的标签栏里显示与关闭。原因记在 `work/correction-20261118/r1-notes.md`。
@@ -379,9 +380,68 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 | POST | `/enhance/v1/plugins/{id}/enable` | 启用，响应含 `token`。 |
 | POST | `/enhance/v1/plugins/{id}/disable` | 停用并撤销令牌。 |
 | POST | `/enhance/v1/plugins/{id}/uninstall` | 卸载并写墓碑。 |
+| POST | `/enhance/v1/plugins/{id}/restore` | 清除用户卸载留下的墓碑并重新释放二进制内嵌副本，用于「恢复预装插件」。已安装时返回 `409 PLUGIN_ALREADY_INSTALLED`；这不是预装插件时返回 `404 PLUGIN_NOT_BUNDLED`。恢复后仍是停用状态，需再调用 enable。 |
+| POST | `/enhance/v1/plugins/{id}/force-enable` | body 必须为 `{confirm: true}`，否则 `400 PLUGIN_FORCE_CONFIRM_REQUIRED`。仅用于绕过宿主编译版本不在 `hostVersions` 内的门禁（`409 PLUGIN_INCOMPATIBLE`）：用户确认风险后强制启用，不是故障恢复手段。 |
+| GET | `/enhance/v1/plugins/updates` | 官方预装插件在线更新快照：`state`（`idle`/`checking`/`ready`/`error`）、`checkedAt`、`source`、`availableCount` 与按插件 ID 索引的 `items`（当前/最新版本、`updateAvailable`、`canApply`、`cannotApplyReason`、`needsConsent`、`addedCapabilities`、`addedPrivileged`、`minCoreVersion`、`hostCompatible`、`publishedAt`、`releaseNotes`）。 |
+| POST | `/enhance/v1/plugins/updates/check` | body 可省略；重新从 `plugins-latest` 通道拉取并验签清单，按 CNB 优先、GitHub 兜底换源。返回同一份 `UpdateStatus`。 |
+| POST | `/enhance/v1/plugins/{id}/update` | body `{expectedVersion?, confirmCapabilities?, confirmPrivileged?}`。校验内置公钥签名、`minCoreVersion` 与能力差异后热替换插件文件；能力扩权需 `confirmCapabilities: true`，新增高权限能力还需 `confirmPrivileged: true`。`expectedVersion` 与最新版本不符时拒绝，避免装进更新的包。 |
 | GET | `/enhance/v1/plugins/{id}/activity` | 活动记录，分页，已脱敏。 |
 | GET | `/enhance/v1/kct/migration` | 独立版 KCT 的迁移状态，只含公共设置，按 `plugins:read` 授权。 |
 | POST | `/enhance/v1/kct/migration/confirm` | 用户确认后停用独立版加载器并迁移公共设置，按 `plugins:write` 授权。 |
+
+## 官方预装插件独立在线更新
+
+从 `v0.2.8` 起，四个预装插件（`kimicode-plus.monitor`、`kimicode-plus.kct`、`kimicode-plus.planner`、`kimicode-plus.scheduler`）可以脱离主程序单独发版并热更新，不重装核心、不重启 Kimi Code。
+
+### 通道与来源
+
+清单固定从非 latest 的滚动通道标签 `plugins-latest` 读取，与主程序的 `releases/latest` 互不影响：
+
+```text
+https://cnb.cool/wssz527/kimicode-plus/-/releases/download/plugins-latest/plugins-manifest.json
+https://github.com/wssz527/kimicode-plus/releases/download/plugins-latest/plugins-manifest.json
+```
+
+客户端按 CNB 国内镜像优先、GitHub 兜底换源，单源检查超时 8 秒、单包下载超时 60 秒。`releaseTag` 可由 `UpdateOptions.ReleaseTag` 覆盖，仓库与环境变量规则同 `internal/plugins/update.go`。
+
+### 清单与签名
+
+`plugins-manifest.json` 是单文件原子信封，签名覆盖域分隔串加清单原始字节：
+
+```json
+{
+  "format": "kimicode-plus.plugins-manifest.v1",
+  "keyId": "official-ed25519-2026",
+  "signature": "<base64 Ed25519 签名>",
+  "manifest": { "generatedAt": "...", "plugins": [ ... ] }
+}
+```
+
+- 签名内容是 `"kimicode-plus-plugins-manifest-v1\n"` 与 `manifest` 字段的**原始 UTF-8 字节**拼接，不做二次序列化，避免键序造成的验签漂移。
+- 公钥内置在 `plugins/official_keys.go`（`OfficialSigningPublicKeyBase64` → `OfficialPublicKeys()`），私钥只存在于仓库 Secret，不提交。清单上限 2 MiB，`contentDigest`/`archiveSha256` 必须是 64 位小写十六进制。
+- 每个条目含 `id`、`version`、`apiVersion`、`hostVersions`、`minCoreVersion`、`capabilities`、`archive`（`*.zip` 文件名）、`archiveBytes`、`archiveSha256`、`contentDigest`、`publishedAt`、`releaseNotes`。
+- 验签失败、格式不符或超出上限时整份清单作废，不会退化为「只信任其中几条」。
+
+### 检查与应用的判定顺序
+
+1. **验签**：未通过内置公钥校验的清单直接拒绝，不比较版本。
+2. **最低核心版本**：清单条目的 `minCoreVersion` 高于当前核心版本时标记不可应用（`cannotApplyReason`），绝不为装插件而回退客户端。
+3. **宿主兼容**：`hostVersions` 不含当前官方客户端版本时标记 `hostCompatible: false`。
+4. **能力差异**：与已安装版本比较能力清单。新增能力置 `needsConsent: true`，客户端必须带 `confirmCapabilities: true`；其中新增高权限能力还需 `confirmPrivileged: true`。能力集合未扩张时可直接热更新。
+5. **版本锁定**：应用请求里的 `expectedVersion` 与最新版本不一致时拒绝，避免在用户确认后装进另一个更新的包。
+
+热替换把版本化 `*.zip` 下载到本地并校验 `archiveSha256` 与目录内容摘要，替换 `plugins/<id>` 后按插件记录重新落盘；已验签清单随插件记录持久化，重启后仍用于高权限复核（见前文 `signedOfficialDigest`）。
+
+### 发布流程
+
+```sh
+go run ./cmd/plugin-release package --out dist/plugins-release \
+  --key-env PLUGIN_SIGNING_PRIVATE_KEY --min-core 0.2.8 \
+  --published-at <ISO8601> --notes <更新说明>
+go run ./cmd/plugin-release verify --dir dist/plugins-release
+```
+
+`package` 按 `plugins/embed.go` 的内嵌集合打包并签名，`verify` 用内置公钥反向校验签名、每个压缩包的 SHA-256 与目录内容摘要。`.github/workflows/release-plugins.yml` 在推送 `plugin-*` 标签或手动触发时执行上述两步，先上传各版本化 `*.zip`、最后原子覆盖 `plugins-manifest.json` 到 GitHub `plugins-latest`，再同步到 CNB 镜像。发布前还会校验 `plugins/monitor/` 与 `plugins/monitor-src/` 打包结果一致，避免把旧 `renderer.js` 签出去。
 
 ## 安装包校验
 
@@ -415,7 +475,7 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 | 模块与交互 | 长按进入三区编辑（隐藏 / 展开 / 固定区）、区内拖拽排序与半宽/全宽混排、模块 `≡` 菜单、迷你模式与可选侧栏整理（默认关闭），全部经 `ctx.storage` 持久化。余额模块仅在可见时按 60 秒轮询，收起即停。 |
 | 版权与声明 | `plugins/monitor/LICENSE` 与 `NOTICE` 随包交付上游 MIT 全文、Rive 官方形象说明及 Kimi Work+ 余额模块来源，并纳入 `scripts/notices.py`。 |
 
-停用 Monitor 后，核心的“缓存与额度”页数据不受影响，侧栏恢复为纯官方样式、零残留节点与定时器。
+停用 Monitor 后，核心「缓存与用量」页的数据不受影响，侧栏恢复为纯官方样式、零残留节点与定时器。
 
 ### 定时任务（`kimicode-plus.scheduler`）
 
@@ -430,7 +490,7 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 
 `plugins/example-hello/` 不再预装在发布二进制中，只作为第三方开发模板保留在仓库里。它包含最简结构：侧栏一行文字 + 一个设置子页 + 使用私有存储记录启用次数，可直接复制改名开发自己的插件。
 
-如需在 KimiCode+ 中加载它，打开设置里的「KimiCode+ → 增强插件 → 安装本地增强插件」，点击「选择文件夹」选中 `plugins/example-hello/`（或打成 `.zip` 后选包），在权限确认弹层中核对 `ui:sidebar`、`ui:settings`、`storage` 后完成安装，再手动启用。
+如需在 KimiCode+ 中加载它，打开官方设置「插件 → KimiCode+」分段，点击「安装本地增强插件」，再点「选择文件夹」选中 `plugins/example-hello/`（或打成 `.zip` 后选包），在权限确认弹层中核对 `ui:sidebar`、`ui:settings`、`storage` 后完成安装，再手动启用。
 
 ### 扩展挂载示例（v2：左侧栏导航 + 主区页面 + 右侧面板）
 
