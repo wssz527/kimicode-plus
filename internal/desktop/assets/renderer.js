@@ -235,7 +235,6 @@ async function installNativeRenderer(options) {
     pluginRevisions: new Map(),
     pluginTokens: new Map(),
     pluginAssets: new Map(),
-    pluginRetiredTokens: new Map(),
     pluginSettings: new Map(),
     watchedSession: '',
     browserNavListeners: new Map(),
@@ -2734,20 +2733,8 @@ async function installNativeRenderer(options) {
   // host process asks the core whose it is. A closed plugin has already lost its
   // token, so close sends the token the runtime still holds in scope.
   //
-  // Deleting a plugin's token must not leave its pages unclosable: the last
-  // token it held is kept aside, and only `browser.view.close` may fall back to
-  // it. Every other action keeps requiring a live token, so a revoked identity
-  // can never open, navigate or run a command again.
-  const pluginViewTokens = new Map();
-  let closingView = false;
   function pluginToken(id) {
-    const live = state.pluginTokens.get(id) || '';
-    if (live) return live;
-    return closingView ? (state.pluginRetiredTokens?.get(id) || '') : '';
-  }
-  function retirePluginToken(id) {
-    const current = state.pluginTokens.get(id);
-    if (current) (state.pluginRetiredTokens ??= new Map()).set(id, current);
+    return state.pluginTokens.get(id) || '';
   }
   const pluginWindowHost = {
     popout: async pluginId => { await transport.request('plugin.window.open', { token: pluginToken(pluginId), sourceSessionId: activeSession() }); },
@@ -2769,12 +2756,9 @@ async function installNativeRenderer(options) {
   window.__ekdPluginBrowserNavigated = publishedBrowserNav;
   const pluginBrowserHost = {
     open: async (pluginId, viewId, url) => {
-      const result = await transport.request("browser.view.open", { token: pluginToken(pluginId), viewId, url });
-      // Remembered per view so a close still names the token that opened it,
-      // even after a hot update replaced the plugin's live token.
-      const token = state.pluginTokens.get(pluginId);
-      if (token) pluginViewTokens.set(pluginId + '/' + viewId, token);
-      return result;
+      const token = pluginToken(pluginId);
+      await transport.request("browser.view.open", { token, viewId, url });
+      return () => transport.request("browser.view.close", { token, viewId });
     },
     navigate: (pluginId, viewId, url) => transport.request("browser.view.navigate", { token: pluginToken(pluginId), viewId, url }),
     history: async (pluginId, viewId, operation) => Boolean((await transport.request("browser.view.history", { token: pluginToken(pluginId), viewId, operation }))?.changed),
@@ -2795,28 +2779,7 @@ async function installNativeRenderer(options) {
         if (set.size === 0) state.browserNavListeners.delete(key);
       };
     },
-    close: (pluginId, viewId) => {
-      const viewKey = pluginId + '/' + viewId;
-      const active = state.pluginTokens.get(pluginId);
-      const recorded = pluginViewTokens.get(viewKey);
-      // A view opened before a hot update is still that plugin's to destroy, so
-      // close is the one action allowed to name the token it was created with.
-      const promote = Boolean(recorded && recorded !== active);
-      if (promote) state.pluginTokens.set(pluginId, recorded);
-      closingView = true;
-      let request;
-      try {
-        request = transport.request("browser.view.close", { token: pluginToken(pluginId), viewId });
-      } finally {
-        closingView = false;
-        if (promote) {
-          if (active) state.pluginTokens.set(pluginId, active);
-          else state.pluginTokens.delete(pluginId);
-        }
-        pluginViewTokens.delete(viewKey);
-      }
-      return request;
-    },
+    close: (pluginId, viewId) => transport.request("browser.view.close", { token: pluginToken(pluginId), viewId }),
   };
 
   // `core.fetch` carries the request body as base64 (`bodyBase64`) and ignores a
@@ -3014,12 +2977,7 @@ async function installNativeRenderer(options) {
       state.pluginReleases.get(id)?.();
       state.pluginReleases.delete(id);
       state.pluginRevisions.delete(id);
-      // A disabled or upgraded plugin keeps no live token, but the views it
-      // opened were authorized with the one it just lost: close still has to be
-      // able to name it, or Electron leaves the pages behind.
-      const retiredToken = state.pluginTokens.get(id);
       state.pluginTokens.delete(id);
-      if (retiredToken) (state.pluginRetiredTokens ??= new Map()).set(id, retiredToken);
       for (const key of [...state.pluginAssets.keys()]) {
         if (key.startsWith(id + '/')) state.pluginAssets.delete(key);
       }
@@ -3032,7 +2990,6 @@ async function installNativeRenderer(options) {
         if (state.removed || isStale() || !state.plugins) return;
         if (!token) continue;
         state.pluginTokens.set(plugin.id, token);
-        state.pluginRetiredTokens?.delete(plugin.id);
         const entry = await loadPluginAsset(plugin.id, module.pluginEntryPath(plugin.entry?.renderer || 'renderer.js'), 'activate', pluginRevision(plugin));
         if (state.removed || isStale() || !state.plugins) return;
         const runtime = state.plugins;
@@ -3054,9 +3011,7 @@ async function installNativeRenderer(options) {
         // One plugin failing to activate must not stop the others. The plugin
         // that failed is stopped by the core with the reason recorded.
         noteActivationFault(plugin.id, error);
-        const retiredToken = state.pluginTokens.get(plugin.id);
         state.pluginTokens.delete(plugin.id);
-        if (retiredToken) (state.pluginRetiredTokens ??= new Map()).set(plugin.id, retiredToken);
         state.pluginRevisions.delete(plugin.id);
         // A faulted plugin's cached bundle must not be reused on the retry: the
         // core may hand out a repaired entry under the same path.

@@ -34,6 +34,37 @@ const piecesFile = "src/components/workbench/pieces.tsx";
 const nativeSettingsFile = "src/components/NativeSettings.tsx";
 const cacheSettingsFile = "src/components/CacheSettings.tsx";
 
+test("an in-flight plugin view keeps its own close callback when its plugin updates", async () => {
+  const renderer = readFileSync("../internal/desktop/assets/renderer.js", "utf8");
+  const start = renderer.indexOf("const pluginBrowserHost =");
+  const end = renderer.indexOf("// `core.fetch` carries the request body", start);
+  assert.ok(start >= 0 && end > start);
+  const calls: Array<{ action: string; token: string }> = [];
+  const pluginTokens = new Map([["test.planner", "old"]]);
+  let completeOpen = () => {};
+  const opening = new Promise<void>(resolve => { completeOpen = resolve; });
+  const transport = {
+    request(action: string, payload: { token: string }) {
+      calls.push({ action, token: payload.token });
+      return action === "browser.view.open" ? opening : Promise.resolve();
+    },
+  };
+  const host = new Function("transport", "pluginToken", `${renderer.slice(start, end)}\nreturn pluginBrowserHost;`)(
+    transport, (pluginId: string) => pluginTokens.get(pluginId) ?? "",
+  );
+  const pending = host.open("test.planner", "planning", "https://example.com");
+  pluginTokens.set("test.planner", "new");
+  completeOpen();
+  const close = await pending;
+  await close();
+  await host.navigate("test.planner", "planning", "https://example.com/next");
+  assert.deepEqual(calls, [
+    { action: "browser.view.open", token: "old" },
+    { action: "browser.view.close", token: "old" },
+    { action: "browser.view.navigate", token: "new" },
+  ]);
+});
+
 // ---------------------------------------------------------------- 同屏审批
 
 type Option = { label: string; value: string };

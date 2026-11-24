@@ -98,8 +98,14 @@ func TestRendererSendsPluginTokensForViews(t *testing.T) {
 			t.Fatalf("the plugin browser host no longer reaches %s", action)
 		}
 	}
-	if strings.Count(host, "token: pluginToken(pluginId)") != 8 {
-		t.Fatal("every plugin view action must carry the caller's own token")
+	if strings.Count(host, "token: pluginToken(pluginId)") != 7 {
+		t.Fatal("view actions must carry the caller's own token")
+	}
+	open := strings.Index(host, `await transport.request("browser.view.open", { token, viewId, url });`)
+	capture := strings.Index(host, "const token = pluginToken(pluginId);")
+	closeView := strings.Index(host, `return () => transport.request("browser.view.close", { token, viewId });`)
+	if capture < 0 || capture >= open || closeView <= open {
+		t.Fatal("a view must retain its creator token across an in-flight open and a plugin update")
 	}
 }
 
