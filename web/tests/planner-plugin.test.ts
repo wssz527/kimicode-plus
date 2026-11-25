@@ -343,6 +343,10 @@ test("only the selected messages are exported, and the export says where it came
   assert.equal(buildHandoffText(messages, new Set()), "");
   // A Set is what the picker builds; an array is accepted for tests and scripts.
   assert.equal(buildHandoffText(messages, ["a"]).includes("第一条"), true);
+  const plan = "## 关键决策\n- 保留兼容接口\n\n## 验证步骤\n1. `go test`";
+  const summarized = buildHandoffText([{ id: "p1", role: "assistant", text: plan }], ["p1"], { sessionTitle: "迁移缓存" });
+  assert.match(summarized, /## 决策与验证摘要\n\n### 关键决策\n- 保留兼容接口\n\n### 验证步骤\n- `go test`/);
+  assert.ok(summarized.endsWith(plan));
 });
 
 test("the three presets map exactly onto PlannerOptions", () => {
@@ -478,9 +482,10 @@ test("handoff payloads never carry new-session fields to an existing session", (
   assert.equal("cwd" in existing, false);
   assert.equal("title" in existing, false);
 
-  // An unknown mode is not forwarded as-is: normal is the core's own default.
-  assert.equal(handoffInput({ text: "x", mode: "yolo" }).mode, "normal");
-  assert.equal(handoffInput({ text: "x" }).mode, "normal");
+  assert.equal(handoffInput({ text: "x", mode: "yolo" }).mode, "plan");
+  assert.equal(handoffInput({ text: "x" }).mode, "plan");
+  assert.equal(handoffInput({ text: "x", targetId: "s1" }).mode, "inherit");
+  assert.equal(handoffInput({ text: "x", targetId: "s1", mode: "inherit" }).mode, "inherit");
   // Blank optional fields are omitted rather than sent as empty strings.
   assert.equal("model" in handoffInput({ text: "x", model: "   " }), false);
 });
@@ -488,7 +493,7 @@ test("handoff payloads never carry new-session fields to an existing session", (
 test("handoff confirmation stays bound to previewed payload and latest request generation", async () => {
   const ts = (await import("typescript")).default;
   const root = ts.createSourceFile("renderer.js", rendererSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-  const wanted = new Set(["handoffInput", "sameHandoffPayload", "errorText", "previewValues", "previewHandoff", "commitHandoff"]);
+  const wanted = new Set(["defaultHandoffMode", "handoffInput", "sameHandoffPayload", "errorText", "previewValues", "previewHandoff", "commitHandoff"]);
   const functions: string[] = [];
   function visit(node: import("typescript").Node) {
     if (ts.isFunctionDeclaration(node) && node.name && wanted.has(node.name.text)) {
@@ -673,6 +678,7 @@ test("mounted planner panel invalidates preview confirmation across all 6 fields
     hidden = false;
     disabled = false;
     checked = false;
+    open = false;
     type = "";
     placeholder = "";
     title = "";
@@ -752,6 +758,18 @@ test("mounted planner panel invalidates preview confirmation across all 6 fields
         this.children.push(n);
         n.setConnected(this.isConnected);
       }
+    }
+    get firstElementChild(): MiniNode | null { return this.children[0] || null; }
+    get nextElementSibling(): MiniNode | null {
+      const parent = this.parentElement;
+      return parent ? parent.children[parent.children.indexOf(this) + 1] || null : null;
+    }
+    insertBefore(child: MiniNode, before: MiniNode | null) {
+      child.remove();
+      child.parentElement = this;
+      if (before) this.children.splice(this.children.indexOf(before), 0, child);
+      else this.children.push(child);
+      child.setConnected(this.isConnected);
     }
     replaceChildren(...nodes: MiniNode[]) {
       for (const c of this.children) { c.parentElement = null; c.setConnected(false); }
@@ -1017,6 +1035,45 @@ test("mounted planner panel invalidates preview confirmation across all 6 fields
     await new Promise(r => setTimeout(r, 10));
     assert.equal(host.plannerCalls.filter(call => call.action === "threads").length, 1);
     assert.ok(shadow.querySelectorAll("button").some(button => button.textContent === "未命名规划"));
+
+    const saved = {
+      id: "saved", title: "历史规划", model: "older-model", status: "idle", revision: 11,
+      options: { context: false, skills: true, tools: true, readOnly: true }, preset: "custom", workspace: "/saved/workspace",
+      messages: [{ id: "m1", role: "assistant", text: "## 决策\n- 检查代码", reasoning: "正在检查" }],
+    };
+    const history = (host.ctx as { planner: { get(id: string): Promise<unknown>; threads(): Promise<unknown>; send(id: string, text: string, source?: string): Promise<unknown> } }).planner;
+    history.threads = async () => [saved];
+    history.get = async () => saved;
+    history.send = async (id, text, source) => {
+      host.plannerCalls.push({ action: "send", args: [id, text, source] });
+      return { ...saved, revision: 13 };
+    };
+    const currentFeed = host.events.find(event => event.name === "planner:t1")!;
+    currentFeed.listener({ id: "t1", revision: 2, status: "idle", messages: [] });
+    shadow.querySelector('button[aria-label="更多"]')!.click();
+    shadow.querySelector('button[aria-label="更多"]')!.click();
+    await new Promise(r => setTimeout(r, 10));
+    (host.ctx as { activeSessionId?: () => string }).activeSessionId = () => "origin-session";
+    shadow.querySelectorAll("button").find(button => button.textContent === "历史规划")!.click();
+    await new Promise(r => setTimeout(r, 10));
+    (host.ctx as { activeSessionId?: () => string }).activeSessionId = () => "different-session";
+    assert.equal(shadow.querySelector('select[aria-label="规划模型"]')!.value, "older-model");
+    assert.equal(shadow.querySelector('select[aria-label="规划预设"]')!.value, "custom");
+    const thought = shadow.querySelector(".ekd-reasoning")!;
+    thought.open = true;
+    const heading = shadow.querySelector("h3");
+    host.events.find(event => event.name === "planner:saved")!.listener({ ...saved, revision: 12, messages: [{ ...saved.messages[0], text: "## 决策\n- 检查代码\n\n## 验证\n1. `go test`", reasoning: "检查完毕" }] });
+    assert.equal(shadow.querySelector(".ekd-reasoning"), thought);
+    assert.equal(thought.open, true);
+    assert.match(thought.textContent, /检查完毕/);
+    assert.equal(shadow.querySelector("h3"), heading);
+    assert.match(shadow.querySelector("ol")!.textContent, /go test/);
+    localDraft.value = "继续规划";
+    localDraft.dispatchEvent({ type: "input" });
+    sendBtn.click();
+    await new Promise(r => setTimeout(r, 10));
+    assert.deepEqual(host.plannerCalls.filter(call => call.action === "send").at(-1)!.args, ["saved", "继续规划", "origin-session"]);
+    assert.equal(host.plannerCalls.some(call => call.action === "configure"), false, "opening a thread must not configure it");
   } finally {
     if (prevDoc === undefined) delete (globalThis as { document?: unknown }).document;
     else (globalThis as { document?: unknown }).document = prevDoc;
@@ -1939,7 +1996,7 @@ test("generic page adapter and chooseExtraction strip nav/sidebar/buttons and se
   assert.equal(isPlanningMessage(chosen.messages[2]!), true);
 
   const selected = selectPlanningIds(chosen.messages);
-  assert.deepEqual([...selected], [chosen.messages[2]!.id], "only substantive assistant planning messages are checked by default");
+  assert.deepEqual([...selected], [chosen.messages[0]!.id, chosen.messages[2]!.id], "checks the original user request together with the planning reply");
 });
 
 test("runWebSummarization distills web content in a temporary pure thread, cleans up, and supports cancellation", async () => {
@@ -1964,7 +2021,8 @@ test("runWebSummarization distills web content in a temporary pure thread, clean
         },
         async send(threadId: string, text: string) {
           assert.equal(threadId, "tmp-sum-1");
-          assert.ok(text.includes("结构化规划方案"));
+          assert.match(text, /结构化规划方案/);
+          assert.match(text, /冲突、缺失信息和推测明确列为待确认项/);
           return {
             id: "tmp-sum-1",
             status: "idle",
@@ -2010,6 +2068,9 @@ test("runWebSummarization distills web content in a temporary pure thread, clean
   // Cancellation path
   let cancelFn = null as (() => Promise<void>) | null;
   let notifyEvent = null as ((ev: unknown) => void) | null;
+  let finishSend!: () => void;
+  const sendGate = new Promise<void>(resolve => { finishSend = resolve; });
+  let sent = false;
   const pendingSummary = runWebSummarization(
     {
       onCancelReady(fn: () => Promise<void>) {
@@ -2020,9 +2081,12 @@ test("runWebSummarization distills web content in a temporary pure thread, clean
           return { id: "tmp-cancel-1" };
         },
         async send() {
+          await sendGate;
+          sent = true;
           return { id: "tmp-cancel-1", status: "running", messages: [] };
         },
         async stop(id: string) {
+          assert.equal(sent, true, "the send must settle before cancellation");
           stoppedIds.push(id);
           notifyEvent?.({ id, status: "stopped", messages: [] });
         },
@@ -2042,8 +2106,12 @@ test("runWebSummarization distills web content in a temporary pure thread, clean
 
   await new Promise(r => setTimeout(r, 10));
   if (!cancelFn) throw new Error("cancel callback should be registered");
-  await cancelFn();
-  await assert.rejects(pendingSummary, /已取消模型归纳/);
+  const rejected = assert.rejects(pendingSummary, /已取消模型归纳/);
+  const canceled = cancelFn();
+  assert.equal(stoppedIds.length, 0);
+  finishSend();
+  await canceled;
+  await rejected;
   assert.deepEqual(stoppedIds, ["tmp-cancel-1"]);
   assert.ok(deletedIds.includes("tmp-cancel-1"));
 });

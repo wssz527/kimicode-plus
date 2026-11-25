@@ -103,15 +103,18 @@ export interface PlannerThread {
   model: string;
   status: string;
   revision: number;
-  messages: Array<{ id: string; role: string; text: string; at?: string }>;
+  messages: Array<{ id: string; role: string; text: string; at?: string; reasoning?: string; truncated?: boolean; failed?: boolean }>;
+  options?: Record<string, boolean>;
+  preset?: string;
   workspace?: string;
   approval?: { id: string; title: string; detail?: string };
   error?: string;
+  canContinue?: boolean;
 }
 
 export interface HandoffPreview {
   targetId: string;
-  mode: "normal" | "plan" | "tower";
+  mode: "inherit" | "normal" | "plan" | "tower";
   text: string;
   bytes: number;
   newSession: boolean;
@@ -337,9 +340,9 @@ export interface PluginContext {
   planner?: {
     threads(): Promise<PlannerThread[]>;
     models(): Promise<Array<{ id: string; name: string; providerId?: string }>>;
-    create(input: { title?: string; model: string; options?: Record<string, boolean> }): Promise<PlannerThread>;
+    create(input: { title?: string; model: string; preset?: string; sourceSessionId?: string; options?: Record<string, boolean> }): Promise<PlannerThread>;
     get(id: string): Promise<PlannerThread>;
-    configure(id: string, input: { model: string; options?: Record<string, boolean> }): Promise<PlannerThread>;
+    configure(id: string, input: { model: string; preset?: string; options?: Record<string, boolean> }): Promise<PlannerThread>;
     rename(id: string, title: string): Promise<PlannerThread>;
     send(id: string, text: string, sourceSessionId?: string): Promise<PlannerThread>;
     retry(id: string, revision: number): Promise<PlannerThread>;

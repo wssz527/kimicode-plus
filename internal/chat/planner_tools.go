@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"enhancedkimi/internal/provider"
 	"enhancedkimi/internal/security"
@@ -22,6 +25,7 @@ func plannerToolDefinitions(options PlannerOptions) []map[string]any {
 		return nil
 	}
 	definitions := []map[string]any{
+		plannerTool("git_status", "只读查看当前工作区的 Git 暂存、未暂存和未跟踪文件状态", map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}),
 		plannerTool("list_files", "列出工作区内某个目录的文件和子目录", map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string", "description": "相对工作区的目录，默认 ."}}, "additionalProperties": false}),
 		plannerTool("read_file", "读取工作区内的文本文件，最大 64 KiB", map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}, "required": []string{"path"}, "additionalProperties": false}),
 		plannerTool("search_files", "按正则表达式搜索工作区文本，返回文件、行号和内容", map[string]any{"type": "object", "properties": map[string]any{"pattern": map[string]any{"type": "string"}, "path": map[string]any{"type": "string"}}, "required": []string{"pattern"}, "additionalProperties": false}),
@@ -49,14 +53,17 @@ func (p *PlannerService) executeTool(ctx context.Context, root string, state *pl
 	if len(arguments) > 512<<10 || json.Unmarshal([]byte(arguments), &input) != nil {
 		return "工具参数不是有效的 JSON 对象，请修正后重试。", nil
 	}
+	if !options.Tools {
+		return "当前规划未开放工具，调用已被拒绝。", nil
+	}
 	if call.Function.Name != "write_file" {
-		result, err := plannerReadOnlyTool(root, call.Function.Name, input.Path, input.Pattern)
+		result, err := plannerReadOnlyTool(ctx, root, call.Function.Name, input.Path, input.Pattern)
 		if err != nil {
 			return "工具未执行：" + err.Error(), nil
 		}
 		return result, ctx.Err()
 	}
-	if options.ReadOnly || !options.Tools {
+	if options.ReadOnly {
 		return "当前规划预设是只读模式，写入已被拒绝。", nil
 	}
 	if len(input.Content) > 256<<10 {
@@ -92,6 +99,9 @@ func (p *PlannerService) executeTool(ctx context.Context, root string, state *pl
 	state.mu.Unlock()
 	if !allowed {
 		return "用户拒绝了这次写入，未执行。", nil
+	}
+	if err := ctx.Err(); err != nil {
+		return "工具调用已取消，未执行。", err
 	}
 	// Re-validate and then write through an os.Root: the kernel-level root
 	// constraint is the actual guarantee, so a symlink created between the check
@@ -272,8 +282,10 @@ func plannerWriteWithinRoot(root, requested string, data []byte) error {
 	return workspace.WriteFile(relative, data, 0644)
 }
 
-func plannerReadOnlyTool(root, name, path, pattern string) (string, error) {
+func plannerReadOnlyTool(ctx context.Context, root, name, path, pattern string) (string, error) {
 	switch name {
+	case "git_status":
+		return plannerGitStatus(ctx, root)
 	case "list_files":
 		return plannerList(root, path)
 	case "read_file":
@@ -283,6 +295,61 @@ func plannerReadOnlyTool(root, name, path, pattern string) (string, error) {
 	default:
 		return "", errors.New("不支持的工具 " + name)
 	}
+}
+
+type plannerGitOutput struct {
+	bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (output *plannerGitOutput) Write(data []byte) (int, error) {
+	n := min(len(data), output.limit-output.Len())
+	_, _ = output.Buffer.Write(data[:n])
+	output.truncated = output.truncated || n < len(data)
+	return len(data), nil
+}
+
+func plannerGitStatus(ctx context.Context, root string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	env := []string{"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_TERMINAL_PROMPT=0"}
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(strings.ToUpper(entry), "GIT_") {
+			env = append(env, entry)
+		}
+	}
+	run := func(limit int, args ...string) (string, bool, error) {
+		args = append([]string{"--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = root
+		cmd.Env = env
+		out := plannerGitOutput{limit: limit}
+		cmd.Stdout = &out
+		err := cmd.Run()
+		return out.String(), out.truncated, err
+	}
+	keys, truncated, err := run(64<<10, "config", "--null", "--name-only", "--list")
+	if err != nil || truncated {
+		return "", errors.New("无法确认工作区的 Git 配置")
+	}
+	for key := range strings.SplitSeq(keys, "\x00") {
+		key = strings.ToLower(key)
+		if key == "core.worktree" || strings.HasPrefix(key, "filter.") && (strings.HasSuffix(key, ".clean") || strings.HasSuffix(key, ".process")) {
+			return "", errors.New("工作区设置了自定义工作树或可执行 Git 过滤器，请手动核对 Git 状态")
+		}
+	}
+	status, truncated, err := run(12<<10, "status", "--porcelain=v1", "--untracked-files=normal", "--ignore-submodules=all", "--", ".")
+	if err != nil {
+		return "", errors.New("当前目录不是 Git 工作区，或无法读取 Git 状态")
+	}
+	if truncated {
+		status = boundedPlannerText(status+"\n", len(status))
+	}
+	if status == "" {
+		return "当前目录没有 Git 改动（未检查子模块）", nil
+	}
+	return status, nil
 }
 
 func plannerList(root, requested string) (string, error) {
@@ -397,6 +464,9 @@ func plannerSearch(root, requested, expression string) (string, error) {
 func boundedPlannerText(text string, limit int) string {
 	if len(text) <= limit {
 		return text
+	}
+	for limit > 0 && !utf8.RuneStart(text[limit]) {
+		limit--
 	}
 	return text[:limit] + "\n…（内容已截断）"
 }

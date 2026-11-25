@@ -1567,6 +1567,21 @@ func approvalDecision(value string) (string, error) {
 
 func (s *NativeService) handoff(ctx context.Context, input map[string]any) (map[string]any, error) {
 	id := stringInput(input, "targetId")
+	switch stringInput(input, "mode") {
+	case "":
+		if id == "" {
+			input["mode"] = "plan"
+		} else {
+			input["mode"] = "inherit"
+		}
+	case "inherit":
+		if id == "" {
+			return nil, errors.New("仅已有会话可以保留原模式")
+		}
+	case "normal", "plan", "tower":
+	default:
+		return nil, errors.New("交接模式无效")
+	}
 	// The new session's working directory, model and title are chosen by the
 	// caller. They only apply when this handoff creates the session: handing off
 	// into an existing conversation must not silently move it to another

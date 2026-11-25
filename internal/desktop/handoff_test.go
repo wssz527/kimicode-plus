@@ -72,7 +72,7 @@ func handoffService(t *testing.T) (*NativeService, *handoffCalls) {
 func TestHandoffCreatesASessionWithTheChosenDirectoryAndModel(t *testing.T) {
 	service, calls := handoffService(t)
 	dir := t.TempDir()
-	payload, err := json.Marshal(map[string]string{"text": "carry on", "mode": "plan", "cwd": dir, "model": "kimi-k2", "title": "继续实现"})
+	payload, err := json.Marshal(map[string]string{"text": "carry on", "cwd": dir, "model": "kimi-k2", "title": "继续实现"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,8 +115,13 @@ func TestHandoffToAnExistingSessionNeverCarriesAModel(t *testing.T) {
 		t.Fatalf("an existing target created a session: %#v", calls.created)
 	}
 	prompt := calls.prompts[0]
-	if _, present := prompt["model"]; present {
-		t.Fatalf("the existing session's model was switched: %#v", prompt)
+	for _, field := range []string{"model", "plan_mode", "tower_mode"} {
+		if _, present := prompt[field]; present {
+			t.Fatalf("existing session sent a %s override: %#v", field, prompt)
+		}
+	}
+	if _, err := service.Action(context.Background(), "handoff", json.RawMessage(`{"targetId":"s1","text":"carry on","mode":"plan"}`)); err != nil || len(calls.prompts) != 2 || calls.prompts[1]["plan_mode"] != true {
+		t.Fatalf("explicit Plan mode was not delivered: %v, %#v", err, calls.prompts)
 	}
 }
 

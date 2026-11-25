@@ -103,7 +103,7 @@ KimiCode+ 支持本地受信增强插件。插件是运行在宿主渲染进程�
 | `attachments` | 系统文件选择、拖入文件暂存与发送附件 | `attachments.stage/release/send`（发送经 `sessions.send`） |
 | `browser:view` | 创建、导航、后退、前进、刷新、显隐、销毁隔离网页视图；读选区/正文；执行站点适配器；在系统浏览器打开当前页 | `browser.open/navigate/back/forward/reload/bounds/visible/extract/adapter/openExternal/close` |
 | `planner:run` | 本地规划引擎：线程、模型、流式、审批 | `planner.*` |
-| `handoff` | 交接预览与提交（新/已有会话，普通/Plan/Tower） | `handoff.preview`、`handoff.commit` |
+| `handoff` | 交接预览与提交（新/已有会话，保留原模式/普通/Plan/Tower） | `handoff.preview`、`handoff.commit` |
 | `models:read` | 可用模型列表（含供应商、能力、自适应思考、上下文/输出上限与推理强度） | `models.list` |
 | `schedule:manage` | 核心持久化定时任务引擎：任务增删改停、立即运行、运行记录与未读状态，以及 `ctx.ui.pickDirectory()` 原生工作目录选择 | `schedule.status/list/save/delete/toggle/runNow/runs/markRead/markAllRead/prefs` |
 | `commands` | 插件命令注册与跨插件调用 | `commands.register/unregister/list/invoke` |
@@ -142,6 +142,8 @@ KimiCode+ 支持本地受信增强插件。插件是运行在宿主渲染进程�
 | `handoff.preview` | `{targetId?, text, mode?, cwd?, model?, title?}` | `{targetId, mode, text, bytes, newSession}`；新建会话时另含 `cwd`/`model`/`title` |
 | `handoff.commit` | `{targetId?, text, mode?, cwd?, model?, title?}` | `{sessionId, created}`；`created` 表示是否新建 |
 | `models.list` | `{}` | `{items:[{id,name}], total}` |
+| `planner.create` | `{title?, model, preset?, options?, sourceSessionId?}` | 完整线程。`sourceSessionId` 用于确定工作目录，之后沿用该目录 |
+| `planner.retry` | `{id, revision}` | 从当前版本继续。适用于截断、暂停、普通失败和额度等待 |
 | `planner.rename` | `{id, title}` | 持久化后的完整线程；标题去首尾空白后为 1–200 字节，且线程必须属于当前插件 |
 | `commands.invoke` | `{command, args?}` | `{command, ownerId, owner, title, args}`（核心授权响应）；`ctx.commands.invoke` 最终返回所属窗口中命令本体的真实结果 |
 
@@ -190,14 +192,24 @@ const rows = await view.adapter('(limit) => [...document.querySelectorAll("artic
 - 返回值经 `JSON.stringify` 限长 200000 字符后解析，插件拿到的是数据，不是页面对象。
 - 适配器抛错时调用失败，不会退化成返回页面正文；`browser.extract` 的选区/正文回退路径保持不变。
 
-### 交接新会话
+### 本地规划与网页归纳
+
+本地规划按选定模型的配置启用思考，应用支持的推理强度、输出上限和请求头。OpenAI 兼容模型流式返回，Anthropic、Gemini 和 Responses 逐轮返回完整的正文、可用思考和工具调用。项目审查预设可查看代码、依赖清单和 Git 状态，每轮最多执行 16 步工具。全功能预设中的写操作仍需逐次审批。
+
+打开历史线程会恢复其模型、预设、选项和工作目录。思考过程可单独展开，计划正文支持标题、列表、表格与代码块。达到输出上限时，面板保留已有内容并显示「从截断处继续」。重试须提交 `planner.get` 返回的当前 `revision`。停止或异常中断后，待完成的工具调用会补齐中断回执，后续请求可使用已有工具结果。
+
+网页提取默认保留用户原话及相关的规划回复。可直接交接原文，也可用模型归纳决策、验证步骤和待确认事项。模型归纳使用临时线程，结束或停止后会清理。
+
+### 交接规划
 
 `handoff.commit` 不指定 `targetId` 时会新建会话，此时可以指定 `cwd`、`model`、`title`：
 
 - `cwd` 必须是已存在的目录；留空使用核心自己的工作目录。
 - `model` 必须在可用模型列表中，并作为第一轮 prompt 的模型下发。
 - `title` 最多 120 个字符，留空为「规划交接」。
-- 指定了 `targetId` 时这些参数一律被忽略：已有会话不会被换目录、换模型或改标题。
+- 新会话默认使用 `plan`。可在预览中切换为 `normal` 或 `tower`。
+- 指定 `targetId` 时，交接使用目标会话自己的目录、模型与标题。默认模式 `inherit` 保留目标的原生 Plan 或 Tower 状态，也可显式选择其他模式。
+- 从本地规划交接时，面板会在选中原文前附上可提取的决策和验证步骤。提交前可编辑全部内容。
 
 ## 运行时接口
 
@@ -305,7 +317,7 @@ await ctx.core.request("credentials.delete", { name: "translator" });
 - 挂载容器不铺背景，继承宿主 CSS 变量。优先复用宿主已有的结构类名和 `--color-*`、`--font-ui` 变量，不要另起配色体系。
 - 插件抛错或 `activate` 失败会被隔离，不影响其他插件和核心。异常超过阈值插件会被自动停用并记录原因。
 - `ctx.storage` 单值上限 32 KiB，键名 1–200 字符。
-- `ctx.events.on` 的订阅按时长轮询实现，只投递已授权的 scope；未授权的 scope 被丢弃。`planner:<threadId>` scope 只对 `planner:run` 开放。
+- `ctx.events.on` 的订阅按时长轮询实现，只投递已授权的 scope；未授权的 scope 被丢弃。`planner:<threadId>` scope 只对 `planner:run` 开放。如果游标失效，运行时通过 `planner.get` 读取最新快照并交给原订阅回调。
 - v2 的挂载点、网页视图、侧栏引用和命令注册都登记在插件作用域里：停用一个插件只释放它自己的资源，其他插件继续工作。
 - 主聊天区的分栏和整页挂载共用一个位置。同一时间只保留一个插件界面。打开新的挂载会先释放前一个界面，关闭已被替换的旧句柄不会影响当前挂载。当前挂载关闭后，官方聊天节点回到原位置。
 - 停用时按相反顺序释放：先跑 `activate` 返回的清理和各个 `Disposable`，再移除分栏容器、右面板标签与入口按钮，最后撤销身份令牌。已实测停用后页面与启用前逐项一致（分栏、面板、侧栏折叠、入口都不残留）。

@@ -782,25 +782,14 @@ export function isPlanningMessage(message) {
   return message.role === "assistant" && text.length >= 160;
 }
 
-/**
- * Selects planning-focused messages by default instead of checking every chat
- * greeting or user prompt. Falls back to assistant replies or all messages when
- * no message exhibits explicit plan structure.
- */
 export function selectPlanningIds(messages) {
   const list = Array.isArray(messages) ? messages.filter(item => item && item.id) : [];
-  if (list.length <= 1) return new Set(list.map(item => item.id));
   const assistants = list.filter(item => item.role === "assistant");
-  if (assistants.length > 0) {
-    const planningAssistants = assistants.filter(isPlanningMessage);
-    if (planningAssistants.length > 0) {
-      return new Set(planningAssistants.map(item => item.id));
-    }
-    return new Set(assistants.map(item => item.id));
-  }
-  const structured = list.filter(isPlanningMessage);
-  if (structured.length > 0) return new Set(structured.map(item => item.id));
-  return new Set(list.map(item => item.id));
+  const planning = assistants.filter(isPlanningMessage);
+  const selected = planning.length ? planning : assistants;
+  if (!selected.length) return new Set(list.map(item => item.id));
+  const ids = new Set(selected.map(item => item.id));
+  return new Set(list.filter(item => item.role === "user" || ids.has(item.id)).map(item => item.id));
 }
 
 function utf8Bytes(text) {
@@ -832,7 +821,8 @@ export function buildSummarizePrompt(rawText, meta = {}) {
     "要求：",
     "1. 剔除寒暄、重复讨论、跑题对话以及残留的网页常驻提示词，只保留与规划和实现直接相关的内容。",
     "2. 保留所有明确的技术选型、文件路径、接口字段、代码片段、边界约束与验收标准，不要编造原文没有提到的需求。",
-    "3. 按「目标与范围」「关键方案与决策」「实施步骤」「约束与待确认项」清晰分段输出（某节无内容可省略）。",
+    "3. 按「目标与范围」「关键方案与决策」「实施步骤」「验证步骤」「待确认项」分段输出。",
+    "4. 保留用户原话中的约束；把冲突、缺失信息和推测明确列为待确认项，不能当成既定决策。没有待确认项时注明原文未提出。",
     "",
     "--- 提取原文开始 ---",
   ].join("\n");
@@ -868,6 +858,8 @@ export async function runWebSummarization(apis, { model, text, site = "", onProg
   });
   let sub = null;
   let stopped = false;
+  let sending = null;
+  let stopping = null;
   let resolveDone;
   let rejectDone;
   const donePromise = new Promise((resolve, reject) => {
@@ -875,6 +867,18 @@ export async function runWebSummarization(apis, { model, text, site = "", onProg
     rejectDone = reject;
   });
 
+  // Cancellation may arrive before send settles. Keep the rejection handled while the
+  // in-flight send reaches a state that can be stopped and removed.
+  void donePromise.catch(() => {});
+  const stop = () => {
+    if (!stopping && typeof plannerApi.stop === "function") {
+      stopping = Promise.resolve(sending).catch(() => {}).then(() => plannerApi.stop(thread.id));
+      void stopping.catch(() => {});
+    }
+    return stopping;
+  };
+  let newestRevision = -1;
+  let terminalStatus = "";
   const extractAssistantReply = snapshot => {
     const msgs = Array.isArray(snapshot?.messages) ? snapshot.messages : [];
     for (let i = msgs.length - 1; i >= 0; i--) {
@@ -885,16 +889,20 @@ export async function runWebSummarization(apis, { model, text, site = "", onProg
     return "";
   };
 
-  const inspectSnapshot = snapshot => {
-    if (!snapshot || snapshot.id !== thread.id) return false;
+  const inspectSnapshot = (snapshot, direct = false) => {
+    if (!snapshot || snapshot.id !== thread.id || stopped) return false;
+    const revision = Number(snapshot.revision ?? 0);
+    if (revision < newestRevision || !direct && !snapshot.messages?.length && snapshot.status === "idle") return false;
+    newestRevision = revision;
     const partial = extractAssistantReply(snapshot);
     if (partial && typeof onProgress === "function") onProgress(partial);
     if (snapshot.status === "running") return false;
+    terminalStatus = snapshot.status;
     if (snapshot.status === "stopped" || stopped) {
       rejectDone(new Error("已取消模型归纳"));
       return true;
     }
-    if (snapshot.status === "error" || snapshot.status === "quota") {
+    if (["error", "quota", "truncated"].includes(snapshot.status)) {
       rejectDone(new Error(snapshot.error || (snapshot.status === "quota" ? "模型额度等待中，请改用直接提取或切换其他模型" : "模型归纳未完成")));
       return true;
     }
@@ -913,11 +921,6 @@ export async function runWebSummarization(apis, { model, text, site = "", onProg
     return false;
   };
 
-  if (eventsApi && typeof eventsApi.on === "function") {
-    sub = eventsApi.on("planner:" + thread.id, payload => {
-      inspectSnapshot(payload);
-    });
-  }
 
   let pollTimer = null;
   // A long-running thread keeps the panel in "归纳中" forever without a bound.
@@ -928,7 +931,7 @@ export async function runWebSummarization(apis, { model, text, site = "", onProg
     rejectDone(new Error("模型归纳超过 180 秒仍未完成，请改用直接提取或稍后重试"));
     stopped = true;
     if (pollTimer) clearTimeout(pollTimer);
-    if (typeof plannerApi.stop === "function") plannerApi.stop(thread.id).catch(() => {});
+    void stop();
   }, 180000);
   if (overallTimer && typeof overallTimer.unref === "function") overallTimer.unref();
   const startPolling = () => {
@@ -949,27 +952,30 @@ export async function runWebSummarization(apis, { model, text, site = "", onProg
   const cancel = async () => {
     stopped = true;
     if (pollTimer) clearTimeout(pollTimer);
-    if (typeof plannerApi.stop === "function") {
-      await plannerApi.stop(thread.id).catch(() => {});
-    }
     rejectDone(new Error("已取消模型归纳"));
+    await stop();
   };
 
-  if (typeof apis?.onCancelReady === "function") apis.onCancelReady(cancel);
-
   try {
-    const sent = await plannerApi.send(thread.id, prompt);
-    if (!inspectSnapshot(sent)) {
+    if (eventsApi && typeof eventsApi.on === "function") {
+      sub = eventsApi.on("planner:" + thread.id, payload => inspectSnapshot(payload));
+    }
+    if (typeof apis?.onCancelReady === "function") apis.onCancelReady(cancel);
+    if (stopped) return await donePromise;
+    sending = plannerApi.send(thread.id, prompt);
+    const sent = await sending;
+    if (!stopped && !inspectSnapshot(sent, true)) {
       startPolling();
     }
     return await donePromise;
   } finally {
-    stopped = true;
     clearTimeout(overallTimer);
     if (pollTimer) clearTimeout(pollTimer);
     sub?.dispose?.();
-    if (typeof plannerApi.remove === "function") {
-      await plannerApi.remove(thread.id).catch(() => {});
+    try {
+      if (stopped || !terminalStatus || terminalStatus === "quota") await stop();
+    } finally {
+      if (typeof plannerApi.remove === "function") await plannerApi.remove(thread.id);
     }
   }
 }
@@ -985,6 +991,8 @@ export function buildHandoffText(messages, selectedIds, meta = {}) {
     lines.push(message.text);
     lines.push("");
   }
+  const summary = meta.sessionTitle ? planHandoffSummary(chosen.filter(message => message.role === "assistant").map(message => message.text).join("\n\n")) : "";
+  if (summary) lines.splice(2, 0, "## 决策与验证摘要", "", summary, "", "## 所选规划原文", "");
   return lines.join("\n").trim();
 }
 
@@ -1003,7 +1011,21 @@ export function planOptions(preset, custom = {}) {
   if (preset === "review") return { context: true, skills: false, tools: true, readOnly: true };
   if (preset === "full") return { context: true, skills: true, tools: true, readOnly: false };
   const tools = custom?.tools === true;
-  return { context: custom?.context === true, skills: custom?.skills === true, tools, readOnly: !tools };
+  return { context: custom?.context === true, skills: custom?.skills === true, tools, readOnly: !tools || custom?.readOnly === true };
+}
+
+export function plannerSettings(thread) {
+  const opts = thread?.options || {};
+  const custom = planOptions("custom", opts);
+  const matches = preset => Object.keys(custom).every(key => planOptions(preset)[key] === custom[key]);
+  const preset = thread?.preset === "custom" || PRESETS.some(item => item.id === thread?.preset && matches(item.id))
+    ? thread.preset
+    : PRESETS.find(item => item.id !== "custom" && matches(item.id))?.id || "custom";
+  return { model: String(thread?.model || ""), preset, custom };
+}
+
+function defaultHandoffMode(targetId) {
+  return targetId ? "inherit" : "plan";
 }
 
 /**
@@ -1011,10 +1033,11 @@ export function planOptions(preset, custom = {}) {
  * only; an existing target must never carry them, because the core would ignore
  * them but the UI would still imply the existing session was reconfigured.
  */
-export function handoffInput({ text = "", targetId = "", target = "", mode = "normal", cwd = "", model = "", title = "" } = {}) {
+export function handoffInput({ text = "", targetId = "", target = "", mode = "", cwd = "", model = "", title = "" } = {}) {
   const lines = String(text || "").trim();
-  const payload = { text: lines, mode: ["normal", "plan", "tower"].includes(mode) ? mode : "normal" };
   const resolvedTarget = String(targetId || target || "").trim();
+  const allowed = ["normal", "plan", "tower", ...(resolvedTarget ? ["inherit"] : [])];
+  const payload = { text: lines, mode: allowed.includes(mode) ? mode : defaultHandoffMode(resolvedTarget) };
   if (resolvedTarget) {
     payload.targetId = resolvedTarget;
     return payload;
@@ -1030,7 +1053,7 @@ export function sameHandoffPayload(a, b) {
   if (!a || !b) return false;
   return a.text === b.text
     && (a.targetId || "") === (b.targetId || "")
-    && (a.mode || "normal") === (b.mode || "normal")
+    && (a.mode || defaultHandoffMode(a.targetId)) === (b.mode || defaultHandoffMode(b.targetId))
     && (a.cwd || "") === (b.cwd || "")
     && (a.model || "") === (b.model || "")
     && (a.title || "") === (b.title || "");
@@ -1551,7 +1574,24 @@ const STYLE = `
 .ekd-msg:hover .ekd-msg-actions,.ekd-msg:focus-within .ekd-msg-actions{opacity:1}
 .ekd-msg-actions button{font-size:12px;min-height:22px;padding:0 6px;color:var(--color-text-secondary,color-mix(in srgb,var(--color-text,#1f2328) 62%,var(--color-bg,#fff)))}
 .ekd-tool{font-size:12px;color:var(--color-text-secondary,color-mix(in srgb,var(--color-text,#1f2328) 62%,var(--color-bg,#fff)));background:color-mix(in srgb,var(--panel,color-mix(in srgb,var(--color-text,#1f2328) 7%,var(--color-bg,#fff))) 80%,transparent);border-radius:6px;padding:4px 8px;white-space:pre-wrap;overflow-wrap:anywhere}
-.ekd-tool summary{cursor:pointer}
+.ekd-tool summary{cursor:pointer;min-height:22px}
+.ekd-tool summary:focus-visible,.ekd-plan-table:focus-visible{outline:2px solid var(--blue,#1783ff);outline-offset:2px}
+.ekd-reasoning{margin:2px 0;font-size:inherit;line-height:1.5}
+.ekd-reasoning>div{padding:4px 0 6px}
+.ekd-plan-text{min-width:0;overflow-wrap:anywhere;line-height:1.55}
+.ekd-plan-text:empty{display:none}
+.ekd-plan-text p{margin:5px 0;white-space:pre-wrap}
+.ekd-plan-text :is(h2,h3,h4,h5,h6){margin:14px 0 4px;line-height:1.35;font-size:1em;font-weight:600}
+.ekd-plan-text h2{font-size:1.15em}
+.ekd-plan-text :is(ol,ul){padding-inline-start:20px;margin:4px 0 8px}
+.ekd-plan-text li+li{margin-top:2px}
+.ekd-plan-text li> :is(ol,ul){margin-block:3px}
+.ekd-plan-text :not(pre)>code{font-family:var(--mono,ui-monospace,monospace);font-size:.93em;background:var(--color-hover,transparent);border-radius:6px;padding:1px 3px}
+.ekd-plan-table{max-width:100%;overflow-x:auto;margin:8px 0}
+.ekd-plan-table table{border-collapse:collapse;text-align:start;width:100%;font-variant-numeric:tabular-nums}
+.ekd-plan-table :is(th,td){text-align:start;vertical-align:top;border:1px solid var(--color-line,color-mix(in srgb,currentColor 20%,transparent));padding:4px 7px}
+.ekd-plan-table th{font-weight:600;background:var(--color-hover,transparent)}
+.ekd-retry{align-self:flex-start}
 .ekd-code{position:relative;display:block;margin:6px 0 0;padding:28px 10px 8px;border-radius:6px;background:var(--panel2,color-mix(in srgb,var(--color-text,#1f2328) 7%,var(--color-bg,#fff)));font-family:var(--mono,ui-monospace,"SF Mono",Menlo,Consolas,monospace);font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}
 .ekd-code button{position:absolute;right:4px;top:4px;font-size:11px;min-height:20px;padding:0 6px}
 .ekd-composer{flex:0 0 auto;border-top:1px solid var(--color-line,color-mix(in srgb,var(--color-text,#1f2328) 16%,transparent));padding:8px 10px;display:flex;flex-direction:column;gap:6px;background:var(--color-bg,#fff)}
@@ -1679,11 +1719,168 @@ export function splitCodeBlocks(text) {
 }
 
 
+const planListItem = /^(\s*)(?:(\d+)[.)、]|[-*+•])\s+(.+)$/;
+const planHeading = /^(#{1,6})\s+(.+)$/;
+const planTableRule = /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/;
+
+function planTableCells(line) {
+  return line.trim().replace(/^\||\|$/g, "").split(/(?<!\\)\|/).map(cell => cell.trim().replace(/\\\|/g, "|"));
+}
+
+export function parsePlanMarkdown(text) {
+  const blocks = [];
+  for (const part of splitCodeBlocks(text)) {
+    if (part.type === "code") {
+      blocks.push(part);
+      continue;
+    }
+    const lines = part.text.replace(/\r\n/g, "\n").split("\n");
+    for (let i = 0; i < lines.length;) {
+      const line = lines[i].trim();
+      const heading = line.match(planHeading);
+      const item = lines[i].match(planListItem);
+      if (!line) {
+        i++;
+      } else if (heading) {
+        blocks.push({ type: "heading", level: heading[1].length, text: heading[2] });
+        i++;
+      } else if (line.includes("|") && planTableRule.test(lines[i + 1] || "")) {
+        const header = planTableCells(line);
+        const rows = [];
+        i += 2;
+        while (i < lines.length && lines[i].includes("|")) rows.push(planTableCells(lines[i++]));
+        blocks.push({ type: "table", header, rows });
+      } else if (item) {
+        const items = [];
+        for (let match = item; match; match = (lines[++i] || "").match(planListItem)) {
+          items.push({ indent: match[1].replace(/\t/g, "    ").length, order: Number(match[2]) || 0, text: match[3] });
+        }
+        blocks.push({ type: "list", items });
+      } else {
+        const paragraph = [line];
+        i++;
+        while (i < lines.length && lines[i].trim() && !planHeading.test(lines[i].trim()) && !planListItem.test(lines[i])
+          && !(lines[i].includes("|") && planTableRule.test(lines[i + 1] || ""))) {
+          paragraph.push(lines[i++].trim());
+        }
+        blocks.push({ type: "paragraph", text: paragraph.join("\n") });
+      }
+    }
+  }
+  return blocks;
+}
+
+export function planHandoffSummary(text) {
+  const sections = [];
+  let section = null;
+  for (const block of parsePlanMarkdown(text)) {
+    if (block.type === "heading") {
+      if (section && block.level > section.level && !/(决策|取舍|验证|验收|测试|decision|validation|verification|test)/i.test(block.text)) {
+        section.lines.push(block.text);
+        continue;
+      }
+      const heading = /(决策|取舍|decision|trade.off)/i.test(block.text) ? "关键决策"
+        : /(验证|验收|测试|validation|verification|test)/i.test(block.text) ? "验证步骤" : "";
+      section = heading ? { title: heading, level: block.level, lines: [] } : null;
+      if (section) sections.push(section);
+    } else if (section && block.type === "list") {
+      section.lines.push(...block.items.map(item => item.text));
+    } else if (section && block.type === "paragraph") {
+      section.lines.push(...block.text.split("\n"));
+    } else if (section && block.type === "code") {
+      section.lines.push("```" + block.lang + "\n" + block.code + "\n```");
+    } else if (section && block.type === "table") {
+      section.lines.push(...block.rows.map(row => row.join(" · ")));
+    }
+  }
+  return sections.filter(item => item.lines.length).map(item => {
+    const summary = item.lines.slice(0, 5).map(line => line.startsWith("```")
+      ? line.slice(0, 1200).replace(/\n```$/, "") + "\n```" : "- " + line.slice(0, 300)).join("\n");
+    return "### " + item.title + "\n" + summary;
+  }).join("\n\n");
+}
+
+function appendPlanInline(element, text) {
+  const inline = /(`[^`\n]+`|\*\*[^*\n]+\*\*)/g;
+  let index = 0;
+  for (const match of text.matchAll(inline)) {
+    element.append(document.createTextNode(text.slice(index, match.index)));
+    const code = match[0][0] === "`";
+    element.append(node(code ? "code" : "strong", "", match[0].slice(code ? 1 : 2, code ? -1 : -2)));
+    index = match.index + match[0].length;
+  }
+  element.append(document.createTextNode(text.slice(index)));
+}
+
+function planBlockView(block, onCode) {
+  if (block.type === "code") {
+    const pre = node("pre", "ekd-code");
+    pre.append(node("code", "", block.code));
+    const send = button("交接此段");
+    send.addEventListener("click", () => onCode(block.code));
+    pre.append(send);
+    return pre;
+  }
+  if (block.type === "table") {
+    const frame = node("div", "ekd-plan-table");
+    frame.tabIndex = 0;
+    frame.setAttribute("aria-label", "规划表格");
+    const table = node("table");
+    const header = node("thead");
+    const body = node("tbody");
+    const appendRow = (parent, tag, cells) => {
+      const row = node("tr");
+      for (const text of cells) {
+        const cell = node(tag);
+        if (tag === "th") cell.scope = "col";
+        appendPlanInline(cell, text);
+        row.append(cell);
+      }
+      parent.append(row);
+    };
+    appendRow(header, "th", block.header);
+    for (const row of block.rows) appendRow(body, "td", row);
+    table.append(header, body);
+    frame.append(table);
+    return frame;
+  }
+  if (block.type === "list") {
+    const lists = node("div", "ekd-plan-lists");
+    const stack = [];
+    for (const item of block.items) {
+      while (stack.length && stack.at(-1).indent > item.indent) stack.pop();
+      let level = stack.at(-1);
+      if (level?.indent === item.indent && level.ordered !== Boolean(item.order)) {
+        stack.pop();
+        level = stack.at(-1);
+      }
+      if (!level || level.indent < item.indent) {
+        const list = node(item.order ? "ol" : "ul");
+        if (item.order) list.start = item.order;
+        (level?.last || lists).append(list);
+        level = { indent: item.indent, ordered: Boolean(item.order), list, last: null };
+        stack.push(level);
+      }
+      const entry = node("li");
+      if (item.order) entry.value = item.order;
+      appendPlanInline(entry, item.text);
+      level.list.append(entry);
+      level.last = entry;
+    }
+    return lists;
+  }
+  const element = node(block.type === "heading" ? "h" + Math.min(6, block.level + 1) : "p");
+  appendPlanInline(element, block.text);
+  return element;
+}
+
+
 const STORAGE_KEYS = {
   sites: "planner.sites",
   lastWeb: "planner.lastWebUrl",
   source: "planner.source",
   drafts: "planner.drafts",
+  settings: "planner.settings",
 };
 
 const GAPS = {
@@ -1732,7 +1929,10 @@ export async function activate(ctx) {
       models: [],
       model: "",
       preset: "review",
-      custom: { context: true, skills: false, tools: false },
+      custom: { context: true, skills: false, tools: false, readOnly: true },
+      sourceSessionId: ctx.activeSessionId?.() || "",
+      settingsDirty: false,
+      configuring: false,
       busy: false,
       sending: false,
       draftRevision: 0,
@@ -1757,6 +1957,11 @@ export async function activate(ctx) {
   let panelObserver = null;
   let disposed = false;
   let threadSubscription = null;
+  let threadFrame = null;
+  let renderedThread = null;
+  let modelChoices = null;
+  let threadFooter = null;
+  const messageViews = new Map();
   let viewNavSubscription = null;
   let previewDraftTimer = null;
   let draftsDirty = false;
@@ -1835,7 +2040,7 @@ export async function activate(ctx) {
   }
 
   async function restore() {
-    const keys = [STORAGE_KEYS.sites, STORAGE_KEYS.lastWeb, STORAGE_KEYS.source, STORAGE_KEYS.drafts];
+    const keys = [STORAGE_KEYS.sites, STORAGE_KEYS.lastWeb, STORAGE_KEYS.source, STORAGE_KEYS.drafts, STORAGE_KEYS.settings];
     const settled = await Promise.allSettled(keys.map(key => storage.get(key)));
     const value = index => (settled[index].status === "fulfilled" ? settled[index].value : undefined);
     const sites = value(0);
@@ -1847,6 +2052,10 @@ export async function activate(ctx) {
     const drafts = value(3);
     if (drafts && typeof drafts === "object") {
       state.drafts = { web: String(drafts.web || ""), local: String(drafts.local || "") };
+    }
+    const settings = value(4);
+    if (settings && typeof settings === "object") {
+      Object.assign(state.local, plannerSettings({ ...settings, options: planOptions(settings.preset, settings.custom) }));
     }
   }
 
@@ -2090,7 +2299,7 @@ export async function activate(ctx) {
 
   async function cancelSummarize() {
     if (!state.summarize.busy) return;
-    state.summarize.seq++;
+    const cancellation = ++state.summarize.seq;
     const cancel = state.summarize.cancel;
     state.summarize.cancel = null;
     state.summarize.busy = false;
@@ -2098,9 +2307,14 @@ export async function activate(ctx) {
     renderPicker();
     renderPreview();
     if (typeof cancel === "function") {
-      await cancel().catch(() => {});
+      try {
+        await cancel();
+      } catch (error) {
+        if (!disposed && state.summarize.seq === cancellation) setStatus("无法确认归纳已停止：" + errorText(error), true);
+        return;
+      }
     }
-    setStatus("已取消模型归纳；仍可使用「直接提取 / 直接交接所选」。");
+    if (!disposed && state.summarize.seq === cancellation) setStatus("已取消模型归纳；仍可使用「直接提取 / 直接交接所选」。");
   }
 
   async function summarizeToPreview(rawText, meta = {}) {
@@ -2135,6 +2349,7 @@ export async function activate(ctx) {
           events: ctx.events,
           onCancelReady: fn => {
             if (state.summarize.seq === seq) state.summarize.cancel = fn;
+            else void fn().catch(error => ctx.log("warn", "取消模型归纳失败：" + errorText(error)));
           },
         },
         {
@@ -2418,27 +2633,71 @@ export async function activate(ctx) {
     }
   }
 
-  function subscribeThread(threadId) {
-    // One live subscription at a time: switching threads releases the previous
-    // one instead of accumulating listeners. The teardown is registered once,
-    // with the plugin, not per switch.
-    if (threadSubscription) {
-      threadSubscription.dispose();
-      threadSubscription = null;
+  function acceptThread(snapshot) {
+    const current = state.local.thread;
+    if (disposed || !snapshot || snapshot.id !== current?.id || (snapshot.revision ?? 0) < (current.revision ?? 0)) return;
+    state.local.thread = snapshot;
+    state.local.busy = snapshot.status === "running";
+    if (threadFrame === null) {
+      threadFrame = -1;
+      const frame = window.requestAnimationFrame(() => {
+        threadFrame = null;
+        if (!disposed) renderThread();
+      });
+      if (threadFrame !== null) threadFrame = frame;
     }
+  }
+
+  function subscribeThread(threadId) {
+    threadSubscription?.dispose();
+    threadSubscription = null;
     if (!threadId) return;
-    threadSubscription = ctx.events.on("planner:" + threadId, payload => {
-      if (!payload || typeof payload !== "object" || payload.id !== threadId) return;
-      const active = state.local.thread?.id;
-      if (active && active !== threadId) return;
-      state.local.thread = payload;
-      state.local.busy = payload.status === "running";
+    threadSubscription = ctx.events.on("planner:" + threadId, acceptThread);
+    void planner.get(threadId).then(acceptThread).catch(() => {});
+  }
+
+  async function changePlannerSettings() {
+    const thread = state.local.thread;
+    state.local.settingsDirty = Boolean(thread);
+    const { model, preset, custom } = state.local;
+    void persist(STORAGE_KEYS.settings, { model, preset, custom: { ...custom } });
+    if (!thread || state.local.configuring) {
       renderThread();
-    });
+      return;
+    }
+    state.local.configuring = true;
+    renderThread();
+    try {
+      await applyPlannerSettings(thread);
+    } catch (error) {
+      setStatus("保存规划配置失败：" + errorText(error), true);
+    } finally {
+      state.local.configuring = false;
+      if (!disposed) renderThread();
+    }
+  }
+
+  function currentPlannerInput() {
+    const { model, preset, custom } = state.local;
+    return { model, preset, options: planOptions(preset, custom) };
+  }
+
+  async function applyPlannerSettings(thread) {
+    if (!state.local.settingsDirty) return;
+    const input = currentPlannerInput();
+    const old = plannerSettings(thread);
+    const oldOptions = planOptions(old.preset, old.custom);
+    if (input.model === old.model && input.preset === old.preset && Object.keys(oldOptions).every(key => input.options[key] === oldOptions[key])) {
+      state.local.settingsDirty = false;
+      return;
+    }
+    const configured = await planner.configure(thread.id, input);
+    acceptThread(configured);
+    state.local.settingsDirty = false;
   }
 
   async function sendLocal() {
-    if (state.local.sending || state.local.busy) return;
+    if (state.local.sending || state.local.configuring || state.local.busy) return;
     const text = String(el.draft.value || "").trim();
     if (!text) {
       setStatus("请输入规划内容。", true);
@@ -2449,7 +2708,6 @@ export async function activate(ctx) {
       setStatus("请先停止当前生成或解除额度等待。", true);
       return;
     }
-    const options = planOptions(state.local.preset, state.local.custom);
     const draftRevision = state.local.draftRevision;
     state.local.selectionGeneration++;
     let thread = state.local.thread;
@@ -2462,18 +2720,16 @@ export async function activate(ctx) {
         return;
       }
       if (!thread) {
-        thread = await planner.create({ model: state.local.model, options });
+        thread = await planner.create({ ...currentPlannerInput(), sourceSessionId: state.local.sourceSessionId });
         if (disposed) return;
         state.local.thread = thread;
         subscribeThread(thread.id);
       } else {
-        state.local.thread = await planner.configure(thread.id, { model: state.local.model, options });
+        await applyPlannerSettings(thread);
       }
       if (disposed) return;
-      const sent = await planner.send(thread.id, text);
-      if (!disposed && state.local.thread?.id === thread.id && (state.local.thread.revision ?? 0) <= (sent.revision ?? 0)) {
-        state.local.thread = sent;
-      }
+      const sent = await planner.send(thread.id, text, state.local.sourceSessionId);
+      acceptThread(sent);
       if (disposed) return;
       if (state.local.draftRevision === draftRevision) {
         setDraft("local", "");
@@ -2496,7 +2752,7 @@ export async function activate(ctx) {
     state.local.busy = true;
     renderThread();
     try {
-      state.local.thread = await planner.stop(thread.id);
+      acceptThread(await planner.stop(thread.id));
     } catch (error) {
       setStatus("停止失败：" + errorText(error), true);
     } finally {
@@ -2506,12 +2762,14 @@ export async function activate(ctx) {
   }
 
   async function retryLocal() {
+    if (state.local.configuring || state.local.busy) return;
     const thread = state.local.thread;
     if (!thread) return;
     state.local.busy = true;
     renderThread();
     try {
-      state.local.thread = await planner.retry(thread.id, thread.revision);
+      await applyPlannerSettings(thread);
+      acceptThread(await planner.retry(thread.id, state.local.thread.revision));
     } catch (error) {
       setStatus("继续失败：" + errorText(error), true);
     } finally {
@@ -2524,7 +2782,7 @@ export async function activate(ctx) {
     const thread = state.local.thread;
     if (!thread) return;
     try {
-      state.local.thread = await planner.approve(thread.id, approvalId, allow);
+      acceptThread(await planner.approve(thread.id, approvalId, allow));
     } catch (error) {
       setStatus("审批失败：" + errorText(error), true);
     }
@@ -2542,12 +2800,16 @@ export async function activate(ctx) {
   }
 
   async function openThread(id) {
-    if (state.local.sending || state.local.busy) return;
+    if (state.local.sending || state.local.configuring || state.local.busy) return;
     const generation = ++state.local.selectionGeneration;
+    const sourceSessionId = ctx.activeSessionId?.() || "";
     try {
       const thread = await planner.get(id);
-      if (state.local.sending || disposed || generation !== state.local.selectionGeneration) return;
+      if (state.local.sending || state.local.configuring || disposed || generation !== state.local.selectionGeneration) return;
       state.local.thread = thread;
+      Object.assign(state.local, plannerSettings(thread));
+      state.local.settingsDirty = false;
+      state.local.sourceSessionId = sourceSessionId;
       state.local.busy = thread.status === "running";
       state.local.confirmingDelete = "";
       setMenuOpen(false);
@@ -2629,7 +2891,7 @@ export async function activate(ctx) {
       site: String(extra.site || state.extraction?.site || ""),
       from,
       target: preserved ? preserved.target : "",
-      mode: preserved ? preserved.mode : "normal",
+      mode: preserved ? preserved.mode : defaultHandoffMode(""),
       cwd: preserved ? preserved.cwd : "",
       model: preserved ? preserved.model : pickHandoffModel(state.local.model, state.handoffModels),
       title: preserved ? preserved.title : "",
@@ -2892,68 +3154,106 @@ export async function activate(ctx) {
     if (!el.threadList) return;
     const stickToBottom = el.threadScroll && nearBottom(el.threadScroll);
     const thread = state.local.thread;
-    el.threadList.replaceChildren();
-    if (!thread) {
-      const empty = node("div", "ekd-empty");
-      empty.append(
-        node("strong", "", "开始一次本地规划"),
-        node("span", "", "不依赖已有会话；交接到 Code 时才创建会话。"),
-      );
-      el.threadList.append(empty);
-    } else {
-      for (const message of thread.messages || []) el.threadList.append(messageView(message));
-      if (thread.approval) el.threadList.append(approvalCard(thread.approval));
-      if (thread.error) {
-        const wrap = node("div", "ekd-msg");
-        wrap.append(node("div", "ekd-status is-error", thread.error));
-        if (thread.status === "quota") {
-          const retry = button("解除等待后继续");
-          retry.disabled = state.local.busy;
-          retry.addEventListener("click", () => void retryLocal());
-          wrap.append(retry);
-        }
-        el.threadList.append(wrap);
+    if (renderedThread !== (thread?.id || "")) {
+      renderedThread = thread?.id || "";
+      messageViews.clear();
+      el.threadList.replaceChildren();
+      threadFooter = node("div", "ekd-list");
+      el.threadList.append(threadFooter);
+      if (!thread) {
+        const empty = node("div", "ekd-empty");
+        empty.append(node("strong", "", "开始一次本地规划"), node("span", "", "交接到 Code 时可以创建会话。"));
+        threadFooter.append(empty);
       }
+    }
+    if (thread) {
+      const messages = thread.messages || [];
+      const ids = new Set(messages.map(item => item.id));
+      for (const [id, view] of messageViews) {
+        if (ids.has(id)) continue;
+        view.wrapper.remove();
+        messageViews.delete(id);
+      }
+      let cursor = el.threadList.firstElementChild;
+      for (const message of messages) {
+        let view = messageViews.get(message.id);
+        if (!view) {
+          view = messageView(message);
+          messageViews.set(message.id, view);
+        }
+        view.update(message);
+        if (view.wrapper !== cursor) el.threadList.insertBefore(view.wrapper, cursor || threadFooter);
+        cursor = view.wrapper.nextElementSibling;
+      }
+      const approval = thread.approval;
+      const error = thread.error || "";
+      const canContinue = thread.canContinue || ["quota", "error", "truncated"].includes(thread.status);
+      const footerKey = JSON.stringify([approval?.id, error, canContinue, thread.status]);
+      if (threadFooter.dataset.revisionKey !== footerKey) {
+        threadFooter.dataset.revisionKey = footerKey;
+        threadFooter.replaceChildren();
+        if (approval) threadFooter.append(approvalCard(approval));
+        if (error) {
+          const wrap = node("div", "ekd-msg");
+          wrap.append(node("div", thread.status === "truncated" ? "ekd-status" : "ekd-status is-error", error));
+          if (canContinue) {
+            const retry = button(thread.status === "truncated" ? "从截断处继续" : thread.status === "quota" ? "解除等待后继续" : "继续生成");
+            retry.classList.add("ekd-retry");
+            retry.addEventListener("click", () => void retryLocal());
+            wrap.append(retry);
+          }
+          threadFooter.append(wrap);
+        }
+      }
+      const retry = threadFooter.querySelector(".ekd-retry");
+      if (retry) retry.disabled = state.local.busy || state.local.sending || state.local.configuring;
     }
     const status = thread?.status || "";
     if (el.runStatus) {
-      el.runStatus.textContent = status === "running" ? "生成中…" : status === "quota" ? "等待额度恢复" : status === "error" ? "上次未完成" : status === "stopped" ? "已停止" : "";
+      el.runStatus.textContent = status === "running" ? "生成中…" : status === "quota" ? "等待额度恢复" : status === "truncated" ? "输出已截断" : status === "error" ? "上次未完成" : status === "stopped" ? "已停止" : "";
       el.runStatus.hidden = !el.runStatus.textContent;
     }
     if (el.stopBtn) el.stopBtn.hidden = status !== "running";
     if (el.sendBtn) {
-      el.sendBtn.disabled = state.local.sending || state.local.busy || status === "running";
+      el.sendBtn.disabled = state.local.sending || state.local.configuring || state.local.busy || status === "running" || status === "quota";
       el.sendBtn.textContent = state.local.sending ? "发送中…" : "发送";
     }
     if (el.threadTitle) el.threadTitle.textContent = thread?.title || "新规划";
-    if (el.newThread) el.newThread.disabled = state.local.sending || state.local.busy || status === "running";
+    if (el.newThread) el.newThread.disabled = state.local.sending || state.local.configuring || state.local.busy || status === "running";
     if (el.workspace) {
       const workspace = thread?.workspace || "";
       el.workspace.textContent = workspace || (surface === "popout" ? "首轮使用弹出时的项目目录" : "首轮使用当前项目目录");
       el.workspace.title = workspace;
     }
+    const locked = state.local.sending || state.local.configuring || state.local.busy || status === "quota";
     if (el.modelSelect) {
-      el.modelSelect.replaceChildren();
-      for (const model of state.local.models) {
-        const option = document.createElement("option");
-        option.value = model.id;
-        option.textContent = model.name;
-        el.modelSelect.append(option);
+      const models = state.local.models;
+      const saved = state.local.model;
+      const missing = saved && !models.some(model => model.id === saved) ? saved : "";
+      if (!modelChoices || modelChoices.list !== models || modelChoices.missing !== missing) {
+        modelChoices = { list: models, missing };
+        const choices = missing ? [...models, { id: saved, name: saved + "（目录未列出）" }] : models;
+        el.modelSelect.replaceChildren();
+        for (const model of choices.length ? choices : [{ id: "", name: "没有可用模型" }]) {
+          const option = document.createElement("option");
+          option.value = model.id;
+          option.textContent = model.name;
+          el.modelSelect.append(option);
+        }
       }
-      if (!state.local.models.length) {
-        const option = document.createElement("option");
-        option.value = "";
-        option.textContent = "没有可用模型";
-        el.modelSelect.append(option);
-      }
-      el.modelSelect.value = state.local.model;
-      el.modelSelect.disabled = state.local.sending || state.local.busy || !state.local.models.length;
+      el.modelSelect.value = saved;
+      el.modelSelect.disabled = locked || !models.length;
     }
-    if (el.presetSelect) el.presetSelect.value = state.local.preset;
+    if (el.presetSelect) {
+      el.presetSelect.value = state.local.preset;
+      el.presetSelect.disabled = locked;
+    }
     if (el.customRow) el.customRow.hidden = state.local.preset !== "custom";
-    if (el.customContext) el.customContext.checked = state.local.custom.context;
-    if (el.customSkills) el.customSkills.checked = state.local.custom.skills;
-    if (el.customTools) el.customTools.checked = state.local.custom.tools;
+    for (const [key, control] of Object.entries({ context: el.customContext, skills: el.customSkills, tools: el.customTools, readOnly: el.customReadOnly })) {
+      if (!control) continue;
+      control.checked = key === "readOnly" && !state.local.custom.tools || state.local.custom[key];
+      control.disabled = locked || key === "readOnly" && !state.local.custom.tools;
+    }
     if (stickToBottom && state.local.thread) {
       el.threadScroll.scrollTop = el.threadScroll.scrollHeight;
     }
@@ -2972,47 +3272,66 @@ export async function activate(ctx) {
       head.append(time);
     }
     wrapper.append(head);
-    if (message.tool) {
-      const details = document.createElement("details");
-      details.className = "ekd-tool";
-      const summary = document.createElement("summary");
-      summary.textContent = "工具 · " + message.tool + (message.text ? "（" + message.text.length + " 字符）" : "");
-      details.append(summary, node("div", "", message.text || ""));
-      wrapper.append(details);
-    } else {
-      for (const part of splitCodeBlocks(message.text || "")) {
-        if (part.type === "code") {
-          const pre = document.createElement("pre");
-          pre.className = "ekd-code";
-          pre.textContent = part.code;
-          const send = button("交接此段");
-          send.addEventListener("click", () => openPreview(buildHandoffText([{ ...message, text: part.code, label: "代码段" }], new Set([message.id]), { sessionTitle: state.local.thread?.title }), "local"));
-          pre.append(send);
-          wrapper.append(pre);
-        } else if (part.text.trim()) {
-          wrapper.append(node("div", "ekd-msg-text", part.text));
-        }
-      }
-    }
+    const details = node("details", "ekd-tool ekd-reasoning");
+    const reasoning = node("div");
+    details.append(node("summary", "", "思考过程"), reasoning);
+    const content = node("div", mine ? "ekd-msg-text" : "ekd-plan-text");
+    wrapper.append(details, content);
     const actions = node("div", "ekd-msg-actions");
     const copy = button("复制");
+    const pick = button("选择交接");
+    let current = null;
+    let rendered = [];
+    const handoffMessage = item => openPreview(buildHandoffText([item], new Set([item.id]), { sessionTitle: state.local.thread?.title }), "local");
     copy.addEventListener("click", async () => {
       try {
         if (!navigator.clipboard) throw new Error("当前宿主没有剪贴板接口");
-        await navigator.clipboard.writeText(message.text || "");
+        await navigator.clipboard.writeText(current.text || "");
         copy.textContent = "已复制";
       } catch {
         copy.textContent = "复制失败";
       }
-      window.setTimeout(() => {
-        copy.textContent = "复制";
-      }, 1600);
+      window.setTimeout(() => { copy.textContent = "复制"; }, 1600);
     });
-    const pick = button("选择交接");
-    pick.addEventListener("click", () => openPreview(buildHandoffText([message], new Set([message.id]), { sessionTitle: state.local.thread?.title }), "local"));
+    pick.addEventListener("click", () => handoffMessage(current));
     actions.append(copy, pick);
     wrapper.append(actions);
-    return wrapper;
+    return {
+      wrapper,
+      update(next) {
+        const previous = current;
+        current = next;
+        if (!previous || previous.reasoning !== next.reasoning || previous.tool !== next.tool || (next.tool && previous.text !== next.text)) {
+          details.hidden = !next.reasoning && !next.tool;
+          details.firstElementChild.textContent = next.tool ? "工具 · " + next.tool : "思考过程";
+          reasoning.textContent = next.tool ? next.text || "" : next.reasoning || "";
+        }
+        actions.hidden = !next.text?.trim();
+        const hideEmpty = !next.text?.trim() && !next.reasoning && !next.tool;
+        wrapper.hidden = hideEmpty;
+        if (next.tool || previous?.text === next.text) return;
+        if (mine) {
+          content.textContent = next.text || "";
+          return;
+        }
+        const blocks = parsePlanMarkdown(next.text || "");
+        const updated = [];
+        for (const [index, block] of blocks.entries()) {
+          const key = JSON.stringify(block);
+          const cached = rendered[index];
+          if (key === cached?.key) {
+            updated.push(cached);
+            continue;
+          }
+          const view = planBlockView(block, code => handoffMessage({ ...current, text: code, label: "代码段" }));
+          content.insertBefore(view, cached?.view || null);
+          cached?.view.remove();
+          updated.push({ key, view });
+        }
+        for (const entry of rendered.slice(updated.length)) entry.view.remove();
+        rendered = updated;
+      },
+    };
   }
 
   function approvalCard(approval) {
@@ -3214,7 +3533,12 @@ export async function activate(ctx) {
     // keepText leaves the textarea value alone, so an async model refresh cannot
     // move the caret away from whatever the user is typing.
     if (el.previewText && !options.keepText) el.previewText.value = preview.text;
-    if (el.previewMode) el.previewMode.value = preview.mode;
+    if (el.previewMode) {
+      const inherit = el.previewInheritOption;
+      inherit.disabled = !preview.target;
+      inherit.hidden = !preview.target;
+      el.previewMode.value = preview.mode;
+    }
     if (el.previewTarget) el.previewTarget.value = preview.target;
     if (el.previewCwd) el.previewCwd.value = preview.cwd;
     if (el.previewTitle) el.previewTitle.value = preview.title;
@@ -3292,7 +3616,7 @@ export async function activate(ctx) {
     if (el.previewSummary) {
       el.previewSummary.hidden = !validConfirmed;
       el.previewSummary.textContent = validConfirmed
-        ? "将写入：" + (validConfirmed.newSession ? "新会话" : "会话 " + validConfirmed.targetId) + " · 模式 " + validConfirmed.mode + " · " + validConfirmed.bytes + " 字节"
+        ? "将写入：" + (validConfirmed.newSession ? "新会话" : "会话 " + validConfirmed.targetId) + " · 模式 " + (validConfirmed.mode === "inherit" ? "保留会话模式" : validConfirmed.mode) + " · " + validConfirmed.bytes + " 字节"
         : "";
     }
     if (el.previewError) {
@@ -3357,11 +3681,13 @@ export async function activate(ctx) {
     const newThread = button("新建规划");
     el.newThread = newThread;
     newThread.addEventListener("click", () => {
-      if (state.local.sending || state.local.busy || state.local.thread?.status === "running") return;
+      if (state.local.sending || state.local.configuring || state.local.busy || state.local.thread?.status === "running") return;
       state.local.selectionGeneration++;
       subscribeThread(null);
       state.local.thread = null;
       state.local.busy = false;
+      state.local.settingsDirty = false;
+      state.local.sourceSessionId = ctx.activeSessionId?.() || "";
       renderThread();
       setStatus("");
       el.draft.focus();
@@ -3527,8 +3853,9 @@ export async function activate(ctx) {
     pane.style.display = "flex";
     pane.style.flexDirection = "column";
     el.threadScroll = node("div", "ekd-scroll");
-    el.threadScroll.setAttribute("aria-live", "polite");
     el.threadList = node("div", "ekd-list");
+    renderedThread = null;
+    modelChoices = null;
     el.threadScroll.append(el.threadList);
     pane.append(el.threadScroll);
     return pane;
@@ -3556,11 +3883,13 @@ export async function activate(ctx) {
     composer.append(el.workspace, el.draft);
     const foot = node("div", "ekd-foot");
     el.runStatus = node("span", "ekd-status");
+    el.runStatus.setAttribute("role", "status");
     el.runStatus.hidden = true;
     el.modelSelect = document.createElement("select");
     el.modelSelect.setAttribute("aria-label", "规划模型");
     el.modelSelect.addEventListener("change", () => {
       state.local.model = el.modelSelect.value;
+      void changePlannerSettings();
     });
     el.presetSelect = document.createElement("select");
     el.presetSelect.setAttribute("aria-label", "规划预设");
@@ -3573,7 +3902,7 @@ export async function activate(ctx) {
     }
     el.presetSelect.addEventListener("change", () => {
       state.local.preset = el.presetSelect.value;
-      renderThread();
+      void changePlannerSettings();
     });
     el.stopBtn = iconButton("stop", "停止生成");
     el.stopBtn.hidden = true;
@@ -3595,6 +3924,7 @@ export async function activate(ctx) {
       box.type = "checkbox";
       box.addEventListener("change", () => {
         state.local.custom[key] = box.checked;
+        void changePlannerSettings();
       });
       wrap.append(box, document.createTextNode(label));
       return { wrap, box };
@@ -3605,7 +3935,9 @@ export async function activate(ctx) {
     el.customContext = context.box;
     el.customSkills = skills.box;
     el.customTools = tools.box;
-    el.customRow.append(context.wrap, skills.wrap, tools.wrap, node("span", "ekd-note", "关闭工具时核心按只读执行"));
+    const readOnly = toggle("只读工具", "readOnly");
+    el.customReadOnly = readOnly.box;
+    el.customRow.append(context.wrap, skills.wrap, tools.wrap, readOnly.wrap);
     composer.append(el.customRow);
     return composer;
   }
@@ -3807,15 +4139,18 @@ export async function activate(ctx) {
     el.previewTarget.append(fresh);
     bindPreviewField(el.previewTarget, ["change"], () => {
       state.preview.target = el.previewTarget.value;
+      state.preview.mode = defaultHandoffMode(state.preview.target);
+      renderPreviewStructure(state.preview, { keepText: true });
     });
 
     el.previewMode = document.createElement("select");
     el.previewMode.setAttribute("aria-label", "交接模式");
-    for (const [value, label] of [["normal", "普通"], ["plan", "Plan"], ["tower", "Tower"]]) {
+    for (const [value, label] of [["inherit", "保留会话模式"], ["normal", "普通"], ["plan", "Plan"], ["tower", "Tower"]]) {
       const option = document.createElement("option");
       option.value = value;
       option.textContent = label;
       el.previewMode.append(option);
+      if (value === "inherit") el.previewInheritOption = option;
     }
     bindPreviewField(el.previewMode, ["change"], () => {
       state.preview.mode = el.previewMode.value;
@@ -4048,6 +4383,7 @@ export async function activate(ctx) {
     }
     flushDrafts();
     if (syncFrame !== null) window.cancelAnimationFrame(syncFrame);
+    if (threadFrame !== null) window.cancelAnimationFrame(threadFrame);
     window.clearTimeout(previewDraftTimer);
     releasePanelObservers();
     sidebarRelease?.dispose();

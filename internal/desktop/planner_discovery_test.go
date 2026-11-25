@@ -98,3 +98,20 @@ func bootstrapActionAllowed(action string) bool {
 	}
 	return pattern.MatchString(action)
 }
+
+func TestPlannerEventPageSignalsLostAndRestartedCursors(t *testing.T) {
+	bus := NewEventBus()
+	defer bus.Close()
+	for i := range 2003 {
+		bus.Publish("unrelated", i)
+	}
+	for _, after := range []int64{0, 1, 4000} {
+		page := bus.Poll(context.Background(), after, []string{"planner:p1"}, 0)
+		if !page.Reset || page.Next != 2003 || len(page.Events) != 0 {
+			t.Fatalf("cursor %d did not reset: %+v", after, page)
+		}
+	}
+	if page := bus.Poll(context.Background(), 2002, []string{"planner:p1"}, 0); page.Reset || page.Next != 2003 {
+		t.Fatalf("valid cursor reset: %+v", page)
+	}
+}

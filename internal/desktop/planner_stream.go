@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"enhancedkimi/internal/config"
@@ -42,20 +44,23 @@ func (s *NativeService) StreamKAPModel(
 	}
 
 	var providerID, upstreamModel string
+	var model modelConfig
 	if owner, target := splitModelKey(modelKey); owner != "" {
 		item, _, ok := lookupProviderModel(snapshot.Models, owner, target)
 		if !ok {
 			return false, nil
 		}
 		providerID = owner
-		upstreamModel = modelPart(firstNonEmpty(item.Model, target))
+		upstreamModel = strings.TrimPrefix(firstNonEmpty(item.Model, target), owner+"/")
+		model = item
 	} else if item, ok := snapshot.Models[modelKey]; ok {
 		owner, target := resolveProviderAndModelID(modelKey, item)
 		if owner == "" || target == "" {
 			return false, nil
 		}
 		providerID = owner
-		upstreamModel = modelPart(target)
+		upstreamModel = strings.TrimPrefix(target, owner+"/")
+		model = item
 	} else {
 		return false, nil
 	}
@@ -84,7 +89,13 @@ func (s *NativeService) StreamKAPModel(
 
 	mem := credentials.NewMemory()
 	const secretRef = "kap-planner-ephemeral"
-	cfg := provider.Config{ID: providerID, Protocol: protocol, BaseURL: baseURL}
+	headers := map[string]string{}
+	for _, configured := range []map[string]string{provCfg.CustomHeaders, model.CustomHeaders} {
+		for name, value := range configured {
+			headers[http.CanonicalHeaderKey(name)] = value
+		}
+	}
+	cfg := provider.Config{ID: providerID, Protocol: protocol, BaseURL: baseURL, CustomHeaders: headers}
 	if secret != "" {
 		if putErr := mem.Put(ctx, secretRef, []byte(secret)); putErr != nil {
 			return true, putErr
@@ -94,36 +105,30 @@ func (s *NativeService) StreamKAPModel(
 		cfg = cfg.WithSecret(&ref)
 	}
 
-	client := provider.New(nil, mem)
-	if protocol == "openai" {
-		body := map[string]any{
-			"model":          upstreamModel,
-			"messages":       messages,
-			"stream":         true,
-			"stream_options": map[string]any{"include_usage": true},
-		}
-		if len(tools) > 0 {
-			body["tools"] = tools
-			body["tool_choice"] = "auto"
-		}
-		return true, client.OpenStream(ctx, cfg, upstreamModel, body, emit, nil)
+	options := provider.PlannerModelOptions{
+		AdaptiveThinking: model.AdaptiveThinking != nil && *model.AdaptiveThinking,
+		DefaultEffort:    model.DefaultEffort,
+		SupportEfforts:   model.SupportEfforts,
+		OffEffort:        model.OffEffort,
 	}
-
-	if len(tools) > 0 {
-		return true, fmt.Errorf("协议 %s 暂不支持带工具流式规划，请改选 OpenAI 兼容供应商或使用网页归纳", protocol)
+	switch {
+	case slices.Contains(model.Capabilities, "always_thinking"):
+		options.Thinking = "always"
+	case slices.Contains(model.Capabilities, "thinking"):
+		options.Thinking = "toggle"
 	}
-	reply, err := client.Complete(ctx, cfg, upstreamModel, nil, messages)
-	if err != nil {
-		return true, err
+	switch thinking := model.Extra["thinking"]; thinking {
+	case "always", "toggle", "none":
+		options.Thinking = thinking.(string)
+	case true:
+		options.Thinking = "toggle"
+	case false:
+		options.Thinking = "none"
 	}
-	return true, emit(provider.StreamEvent{
-		Model:     upstreamModel,
-		Role:      "assistant",
-		Text:      reply.Text,
-		Reasoning: reply.Reasoning,
-		Usage:     reply.Usage,
-		Finish:    firstNonEmpty(reply.FinishReason, "stop"),
-	})
+	if model.MaxOutputSize != nil {
+		options.MaxOutput = *model.MaxOutputSize
+	}
+	return true, provider.New(nil, mem).StreamPlanner(ctx, cfg, upstreamModel, options, messages, tools, emit)
 }
 
 func mapKAPProtocol(rawType string) (string, error) {

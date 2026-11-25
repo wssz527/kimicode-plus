@@ -21,6 +21,7 @@ import (
 type Config struct {
 	ID, Protocol, BaseURL string
 	SecretRef             sql.NullString
+	CustomHeaders         map[string]string
 }
 
 // WithSecret returns a copy that authenticates with ref instead of the
@@ -76,12 +77,13 @@ type ToolCallFunction struct {
 // it produced: pointers are avoided, and omitempty keeps plain text turns
 // unchanged.
 type Message struct {
-	Role             string     `json:"role"`
-	Content          string     `json:"content"`
-	Name             string     `json:"name,omitempty"`
-	ReasoningContent string     `json:"reasoning_content,omitempty"`
-	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string     `json:"tool_call_id,omitempty"`
+	Role             string          `json:"role"`
+	Content          string          `json:"content"`
+	Name             string          `json:"name,omitempty"`
+	ReasoningContent string          `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall      `json:"tool_calls,omitempty"`
+	ToolCallID       string          `json:"tool_call_id,omitempty"`
+	PlannerContext   *PlannerContext `json:"-"`
 }
 type Reply struct {
 	Text         string
@@ -164,6 +166,13 @@ func (c *Client) newRequest(ctx context.Context, p Config, method, suffix string
 	}
 	if p.Protocol == "anthropic" {
 		req.Header.Set("anthropic-version", "2023-06-01")
+	}
+	for name, value := range p.CustomHeaders {
+		switch http.CanonicalHeaderKey(name) {
+		case "Host", "Content-Length", "Transfer-Encoding", "Connection", "Proxy-Authorization", "Accept", "Content-Type", "Authorization", "X-Api-Key", "X-Goog-Api-Key":
+			continue
+		}
+		req.Header.Set(name, value)
 	}
 	return req, nil
 }

@@ -162,3 +162,15 @@ func TestPlannerManifestCapabilitiesAreAllPrivileged(t *testing.T) {
 		}
 	}
 }
+
+func TestPlannerHandoffPreviewDefaultsByTarget(t *testing.T) {
+	for target, want := range map[string]string{"": "plan", "s1": "inherit"} {
+		value, err := handoffPreview(target, "", "continue with the plan", "", "", "")
+		if err != nil || value.(map[string]any)["mode"] != want {
+			t.Errorf("preview for %q = %#v, %v; want %s", target, value, err, want)
+		}
+	}
+	if _, err := handoffPreview("", "inherit", "continue with the plan", "", "", ""); err == nil {
+		t.Fatal("new-session preview accepted inherit")
+	}
+}

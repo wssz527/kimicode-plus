@@ -76,8 +76,14 @@ func TestHandoffCommitDefaultsTheMode(t *testing.T) {
 	if code, value := callPlugin(t, manager, token, "handoff.commit", map[string]any{"text": "carry on"}); code != http.StatusOK {
 		t.Fatalf("handoff.commit => %d %#v", code, value)
 	}
-	if mode := core.last().payload["mode"]; mode != "normal" {
-		t.Fatalf("mode = %v, want normal", mode)
+	if mode := core.last().payload["mode"]; mode != "plan" {
+		t.Fatalf("new mode = %v, want plan", mode)
+	}
+	if code, value := callPlugin(t, manager, token, "handoff.commit", map[string]any{"text": "carry on", "targetId": "s1"}); code != http.StatusOK {
+		t.Fatalf("handoff.commit => %d %#v", code, value)
+	}
+	if mode := core.last().payload["mode"]; mode != "inherit" {
+		t.Fatalf("existing mode = %v, want inherit", mode)
 	}
 }
 
