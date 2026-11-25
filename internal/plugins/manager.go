@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -242,13 +243,15 @@ type Manager struct {
 	onUninstall    func(ctx context.Context, id string, deleteData bool) error
 	onChange       func()
 
-	installMu sync.Mutex
-	mu        sync.Mutex
-	entries   map[string]*entry
-	order     []string
-	tokens    map[string]string
-	lookup    *net.Resolver
-	closed    bool
+	installMu     sync.Mutex
+	mu            sync.Mutex
+	entries       map[string]*entry
+	order         []string
+	tokens        map[string]string
+	staged        map[string]stagedBatch
+	activitySweep atomic.Int64
+	lookup        *net.Resolver
+	closed        bool
 }
 
 // New builds the plugin host. A missing data directory is not fatal: the manager
@@ -269,6 +272,10 @@ func New(db *sql.DB, safe func() bool, options ...Option) (*Manager, error) {
 		opts.Now = func() time.Time { return time.Now().UTC() }
 	}
 	if err := migrate(db); err != nil {
+		return nil, err
+	}
+	activityNow := opts.Now()
+	if err := pruneActivity(context.Background(), db, activityNow); err != nil {
 		return nil, err
 	}
 	officialKeys := make(map[string]ed25519.PublicKey)
@@ -303,6 +310,7 @@ func New(db *sql.DB, safe func() bool, options ...Option) (*Manager, error) {
 		tokens:          make(map[string]string),
 		lookup:          opts.Resolver,
 	}
+	manager.activitySweep.Store(activityNow.Unix())
 	if err := manager.load(); err != nil {
 		return nil, err
 	}
@@ -368,6 +376,7 @@ func (m *Manager) RecordActivity(ctx context.Context, pluginID, kind, detail str
 	if kind == "" {
 		kind = ActivitySession
 	}
+	m.sweepActivity(ctx)
 	_ = recordActivity(ctx, m.db, pluginID, kind, detail, m.now())
 }
 
@@ -1400,18 +1409,35 @@ func (m *Manager) handleDisable(w http.ResponseWriter, r *http.Request) {
 
 func (m *Manager) handleUninstall(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("id"))
-	var body struct {
-		DeleteData          bool `json:"deleteData"`
-		DeleteSchedulerData bool `json:"deleteSchedulerData"`
+	body := &struct {
+		DeleteData bool `json:"deleteData"`
+	}{}
+	if r.ContentLength != 0 {
+		if !httpx.Decode(w, r, &body) {
+			return
+		}
+		if body == nil {
+			httpx.Fail(w, http.StatusBadRequest, "INVALID_JSON", "卸载参数必须是 JSON 对象")
+			return
+		}
 	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
-	}
-	if err := m.UninstallWithOptions(r.Context(), id, body.DeleteData || body.DeleteSchedulerData); err != nil {
+	if err := m.UninstallWithOptions(r.Context(), id, body.DeleteData); err != nil {
 		fail(w, err)
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"id": id, "uninstalled": true})
+}
+
+func (m *Manager) sweepActivity(ctx context.Context) {
+	now := m.now()
+	previous := m.activitySweep.Load()
+	if now.Unix()-previous < int64(time.Hour/time.Second) || !m.activitySweep.CompareAndSwap(previous, now.Unix()) {
+		return
+	}
+	if err := pruneActivity(ctx, m.db, now); err != nil {
+		m.activitySweep.CompareAndSwap(now.Unix(), previous)
+		slog.Warn("plugin activity retention failed", "error", err)
+	}
 }
 
 func (m *Manager) handleActivity(w http.ResponseWriter, r *http.Request) {
@@ -1428,17 +1454,13 @@ func (m *Manager) handleActivity(w http.ResponseWriter, r *http.Request) {
 	if _, err := fmt.Sscanf(r.URL.Query().Get("before"), "%d", &before); err != nil {
 		before = 0
 	}
-	items, err := loadActivity(r.Context(), m.db, id, before, offset+limit)
+	m.sweepActivity(r.Context())
+	items, total, err := loadActivity(r.Context(), m.db, id, before, offset, limit)
 	if err != nil {
 		httpx.Fail(w, http.StatusInternalServerError, "PLUGIN_ACTIVITY_UNAVAILABLE", "无法读取插件活动记录")
 		return
 	}
-	if offset < len(items) {
-		items = items[offset:]
-	} else {
-		items = []Activity{}
-	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"items": items, "total": len(items), "before": before})
+	httpx.JSON(w, http.StatusOK, map[string]any{"items": items, "total": total, "before": before})
 }
 
 // handleToken re-issues the identity token to this renderer. It is the same token

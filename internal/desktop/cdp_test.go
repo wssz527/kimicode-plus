@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -130,5 +131,26 @@ func TestCDPCloseSucceedsWhenPeerDropsWebSocketAndPortIsGone(t *testing.T) {
 	defer cancel()
 	if err := cdp.Close(ctx); err != nil {
 		t.Fatalf("CDP.Close failed even though inspector port was closed: %v", err)
+	}
+}
+
+func TestUserApplicationsHostUsesItsOwnFramework(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	userApp := filepath.Join(home, "Applications", "Kimi Code.app", "Contents")
+	executable := filepath.Join(userApp, "MacOS", "Kimi Code")
+	output := []byte("101 " + executable + " --user-data-dir=/test-profile\n102 " + KimiExecutable + "\n")
+	if pid, err := parseMainPIDs(output, kimiExecutables(), "/test-profile"); err != nil || pid != 101 {
+		t.Fatalf("process = %d, %v", pid, err)
+	}
+	if _, err := parseMainPIDs(output, kimiExecutables(), ""); err == nil {
+		t.Fatal("multiple eligible hosts were treated as one")
+	}
+	if path := kimiFrameworkFor(executable); path != filepath.Join(userApp, "Frameworks", "Electron Framework.framework", "Versions", "A", "Electron Framework") {
+		t.Fatalf("framework path = %s", path)
+	}
+	if !IsVerifiedHost("1.4.2", SupportedElectron) {
+		t.Fatal("accepted host version is missing")
 	}
 }

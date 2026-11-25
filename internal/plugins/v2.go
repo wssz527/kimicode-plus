@@ -7,8 +7,6 @@ import (
 	"math"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -570,48 +568,10 @@ func (m *Manager) commandsAction(ctx context.Context, id, action string, r *http
 	return nil, apiError(http.StatusBadRequest, "PLUGIN_ACTION_UNKNOWN", "未知的命令动作")
 }
 
-// attachment is the normalized form of one file the user picked. Only absolute
-// paths to regular files are accepted, the same rule sessions.send applies.
-type attachment struct {
-	Path string `json:"path"`
-	Name string `json:"name"`
-	Kind string `json:"kind"`
-	Size int64  `json:"size"`
-}
-
-func normalizeAttachments(values []string) ([]attachment, error) {
-	if len(values) == 0 {
-		return nil, apiError(http.StatusBadRequest, "PLUGIN_ATTACHMENT_EMPTY", "没有选择附件")
-	}
-	if len(values) > attachmentMax {
-		return nil, apiError(http.StatusBadRequest, "PLUGIN_ATTACHMENT_LIMIT", fmt.Sprintf("一次最多 %d 个附件", attachmentMax))
-	}
-	out := make([]attachment, 0, len(values))
-	for _, raw := range values {
-		target := strings.TrimSpace(raw)
-		if target == "" || !filepath.IsAbs(target) {
-			return nil, apiError(http.StatusBadRequest, "PLUGIN_ATTACHMENT_PATH", "附件必须是本机文件的绝对路径")
-		}
-		info, err := os.Stat(target)
-		if err != nil || !info.Mode().IsRegular() {
-			return nil, apiError(http.StatusBadRequest, "PLUGIN_ATTACHMENT_MISSING", "附件文件已不存在或无法读取")
-		}
-		kind := "file"
-		switch strings.ToLower(filepath.Ext(target)) {
-		case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp":
-			kind = "image"
-		case ".mp4", ".webm", ".mov":
-			kind = "video"
-		}
-		out = append(out, attachment{Path: target, Name: info.Name(), Kind: kind, Size: info.Size()})
-	}
-	return out, nil
-}
-
 // sendAttachments validates the picked files and forwards them through the
 // existing sessions.send path, so a plugin gets exactly the same attachment
 // handling as the native composer.
-func (m *Manager) sendAttachments(ctx context.Context, id string, payload json.RawMessage) (any, error) {
+func (m *Manager) sendAttachments(ctx context.Context, id, token string, payload json.RawMessage) (any, error) {
 	input, err := decodeObject(payload)
 	if err != nil {
 		return nil, err
@@ -621,55 +581,32 @@ func (m *Manager) sendAttachments(ctx context.Context, id string, payload json.R
 	if sessionID == "" {
 		return nil, apiError(http.StatusBadRequest, "PLUGIN_ATTACHMENT_SESSION", "缺少会话 ID")
 	}
-	rawList, _ := input["paths"].([]any)
-	paths := make([]string, 0, len(rawList))
-	for _, value := range rawList {
-		if path, ok := value.(string); ok {
-			paths = append(paths, path)
-		}
-	}
-	attachments, err := normalizeAttachments(paths)
+	paths, err := parseAttachmentPaths(input["paths"])
 	if err != nil {
 		return nil, err
 	}
+	if len(paths) == 0 {
+		return nil, apiError(http.StatusBadRequest, "PLUGIN_ATTACHMENT_EMPTY", "没有选择附件")
+	}
+	files, err := m.validateStagedPaths(id, token, paths)
+	if err != nil {
+		return nil, err
+	}
+	defer m.releaseSentPaths(files)
 	m.mu.Lock()
 	core := m.core
 	m.mu.Unlock()
 	if core == nil {
 		return nil, apiError(http.StatusServiceUnavailable, "PLUGIN_CORE_UNAVAILABLE", "核心服务尚未就绪，无法发送附件")
 	}
-	files := make([]string, 0, len(attachments))
-	for _, item := range attachments {
-		files = append(files, item.Path)
-	}
 	mode := stringValue(input["mode"])
 	body, _ := json.Marshal(map[string]any{"id": sessionID, "text": text, "attachments": files, "mode": mode})
 	value, err := core.Action(ctx, "sessions.send", body)
-	// A staged batch belongs to this one send. It is removed whether the send
-	// succeeded or not: a failed send must not leave the dropped bytes on disk
-	// for the plugin to reuse later.
-	m.releaseBatch(id, stringValue(input["batch"]))
 	if err != nil {
 		return nil, coreFailure("attachments.send", err)
 	}
 	_ = recordActivity(ctx, m.db, id, ActivitySession, "插件发送附件消息", m.now())
 	return value, nil
-}
-
-// releaseBatch removes one staged batch. Only a name the core itself generated is
-// accepted: a caller that sends a path instead of a batch name has it reduced to
-// its base name and is still confined to this plugin's staging root, so a plugin
-// can never delete anything outside its own directory.
-func (m *Manager) releaseBatch(id, batch string) {
-	batch = filepath.Base(strings.TrimSpace(batch))
-	if batch == "" || batch == "." || batch == ".." || batch == string(filepath.Separator) {
-		return
-	}
-	root, err := m.stageRoot(id)
-	if err != nil {
-		return
-	}
-	_ = os.RemoveAll(filepath.Join(root, batch))
 }
 
 // handoffPreview builds the preview a handoff shows before anything is sent. It

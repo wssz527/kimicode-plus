@@ -35,10 +35,10 @@ const Label = "com.user.kimi-cot-translate.runtime"
 
 // SettingsKey is the plugin-private storage key the adapter reads its settings
 // from. The migration writes it only when the user has no adapter settings yet.
-const SettingsKey = "settings.v1"
+const SettingsKey = plugins.KCTSettingsKey
 
 // PluginID is the bundled adapter this migration gates.
-const PluginID = "kimicode-plus.kct"
+const PluginID = plugins.KCTPluginID
 
 const legacyDataDirName = "kimi-cot-translate"
 

@@ -14,11 +14,85 @@ import (
 	"time"
 )
 
-// Dropped files reach the core as bytes, not as paths: a renderer only has the
-// File object the user dropped, and only the core may write to disk. The core
-// stages them under dataDir/staged/<id>, hands the paths back and removes them
-// after the send. A plugin therefore never learns a path it can keep using, and
-// no byte a plugin sends can land outside its own staging root.
+type stagedBatch struct {
+	token   string
+	files   map[string]os.FileInfo
+	expires time.Time
+	claimed bool
+}
+
+func parseAttachmentPaths(value any) ([]string, error) {
+	if value == nil {
+		return nil, nil
+	}
+	list, ok := value.([]any)
+	if !ok {
+		return nil, apiError(http.StatusBadRequest, "PLUGIN_ATTACHMENT_PATH", "附件路径必须是字符串数组")
+	}
+	if len(list) > attachmentMax {
+		return nil, apiError(http.StatusBadRequest, "PLUGIN_ATTACHMENT_LIMIT", fmt.Sprintf("一次最多 %d 个附件", attachmentMax))
+	}
+	paths := make([]string, 0, len(list))
+	for _, item := range list {
+		path, ok := item.(string)
+		if !ok || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return nil, apiError(http.StatusBadRequest, "PLUGIN_ATTACHMENT_PATH", "附件必须使用核心返回的暂存路径")
+		}
+		paths = append(paths, path)
+	}
+	return paths, nil
+}
+
+func (m *Manager) validateStagedPaths(id, token string, paths []string) ([]string, error) {
+	root, err := m.stageRoot(id)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	denied := apiError(http.StatusForbidden, "PLUGIN_ATTACHMENT_NOT_STAGED", "附件不在当前插件的有效暂存批次中")
+	if m.closed || m.tokens[id] != token {
+		return nil, denied
+	}
+	for _, path := range paths {
+		batchPath := filepath.Dir(path)
+		batch := m.staged[batchPath]
+		if filepath.Dir(batchPath) != root || batch.claimed || batch.token != token || !m.now().Before(batch.expires) || batch.files[path] == nil {
+			return nil, denied
+		}
+		batchInfo, err := os.Lstat(batchPath)
+		if err != nil || !batchInfo.IsDir() {
+			return nil, denied
+		}
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() || !os.SameFile(batch.files[path], info) {
+			return nil, denied
+		}
+	}
+	for _, path := range paths {
+		batchPath := filepath.Dir(path)
+		batch := m.staged[batchPath]
+		batch.claimed = true
+		m.staged[batchPath] = batch
+	}
+	return paths, nil
+}
+
+func (m *Manager) removeStagedBatch(path string, afterSend bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !afterSend && m.staged[path].claimed {
+		return nil
+	}
+	delete(m.staged, path)
+	return os.RemoveAll(path)
+}
+
+func (m *Manager) releaseSentPaths(paths []string) {
+	for _, path := range paths {
+		_ = m.removeStagedBatch(filepath.Dir(path), true)
+	}
+}
 
 const (
 	// A dropped file travels inside a JSON body as base64, so the sizes here are
@@ -42,7 +116,19 @@ func (m *Manager) stageRoot(id string) (string, error) {
 	if _, ok := m.entry(id); !ok {
 		return "", apiError(http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件未安装")
 	}
-	return filepath.Join(m.dataDir, "staged", id), nil
+	data, err := filepath.Abs(m.dataDir)
+	if err != nil {
+		return "", err
+	}
+	parent := filepath.Join(data, "staged")
+	root := filepath.Join(parent, id)
+	for _, dir := range []string{parent, root} {
+		info, err := os.Lstat(dir)
+		if !os.IsNotExist(err) && (err != nil || !info.IsDir()) {
+			return "", apiError(http.StatusServiceUnavailable, "PLUGIN_STORAGE_UNAVAILABLE", "插件暂存目录不可用")
+		}
+	}
+	return root, nil
 }
 
 func (m *Manager) entry(id string) (*entry, bool) {
@@ -55,7 +141,7 @@ func (m *Manager) entry(id string) (*entry, bool) {
 // stageAttachments writes the dropped bytes and returns the paths plus the
 // names they were given. Each call gets its own subdirectory so two concurrent
 // sends cannot overwrite each other's files.
-func (m *Manager) stageAttachments(ctx context.Context, id string, payload json.RawMessage) (any, error) {
+func (m *Manager) stageAttachments(ctx context.Context, id, token string, payload json.RawMessage) (any, error) {
 	input, err := decodeObject(payload)
 	if err != nil {
 		return nil, err
@@ -89,6 +175,7 @@ func (m *Manager) stageAttachments(ctx context.Context, id string, payload json.
 		}
 	}()
 	staged := make([]map[string]any, 0, len(rawList))
+	registered := make(map[string]os.FileInfo, len(rawList))
 	total := int64(0)
 	for index, value := range rawList {
 		item, ok := value.(map[string]any)
@@ -117,8 +204,23 @@ func (m *Manager) stageAttachments(ctx context.Context, id string, payload json.
 		if err = os.WriteFile(target, data, 0o600); err != nil {
 			return nil, apiError(http.StatusInternalServerError, "PLUGIN_STORAGE_UNAVAILABLE", "无法写入暂存附件")
 		}
+		info, err := os.Lstat(target)
+		if err != nil || !info.Mode().IsRegular() {
+			return nil, apiError(http.StatusInternalServerError, "PLUGIN_STORAGE_UNAVAILABLE", "无法登记暂存附件")
+		}
+		registered[target] = info
 		staged = append(staged, map[string]any{"path": target, "name": name, "size": len(data)})
 	}
+	m.mu.Lock()
+	if !subtleEqual(m.tokens[id], token) || m.closed {
+		m.mu.Unlock()
+		return nil, apiError(http.StatusUnauthorized, "PLUGIN_IDENTITY_REJECTED", "插件身份令牌无效")
+	}
+	if m.staged == nil {
+		m.staged = make(map[string]stagedBatch)
+	}
+	m.staged[batch] = stagedBatch{token: token, files: registered, expires: m.now().Add(attachmentStagedTTL)}
+	m.mu.Unlock()
 	cleanup = false
 	_ = recordActivity(ctx, m.db, id, ActivitySession, "插件暂存了拖入的附件", m.now())
 	return map[string]any{"files": staged, "batch": batch}, nil
@@ -156,7 +258,7 @@ func (m *Manager) releaseStagedAttachments(_ context.Context, id string, payload
 	if batch != name && filepath.Dir(filepath.Clean(batch)) != root {
 		return nil, apiError(http.StatusBadRequest, "PLUGIN_ATTACHMENT_BATCH", "暂存批次无效")
 	}
-	if err = os.RemoveAll(filepath.Join(root, name)); err != nil {
+	if err = m.removeStagedBatch(filepath.Join(root, name), false); err != nil {
 		return nil, apiError(http.StatusInternalServerError, "PLUGIN_STORAGE_UNAVAILABLE", "无法清理暂存附件")
 	}
 	return map[string]any{"released": true}, nil
@@ -195,9 +297,24 @@ func (m *Manager) purgeStaged(id string) error {
 	if id == "" || id != filepath.Base(id) || id == "." || id == ".." {
 		return fmt.Errorf("暂存目录无效：%q", id)
 	}
-	root := filepath.Join(m.dataDir, "staged", id)
-	// RemoveAll leaves the shared parent behind, which is what other plugins
-	// still need; only this plugin's own root goes.
+	root, err := filepath.Abs(filepath.Join(m.dataDir, "staged", id))
+	if err != nil {
+		return err
+	}
+	parent, err := os.Lstat(filepath.Dir(root))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil || !parent.IsDir() {
+		return fmt.Errorf("插件暂存目录不可用：%s", filepath.Dir(root))
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for batch := range m.staged {
+		if filepath.Dir(batch) == root {
+			delete(m.staged, batch)
+		}
+	}
 	return os.RemoveAll(root)
 }
 
@@ -232,7 +349,7 @@ func (m *Manager) pruneStagedAttachments(id string) {
 		if infoErr != nil || info.ModTime().After(cutoff) {
 			continue
 		}
-		_ = os.RemoveAll(filepath.Join(root, item.Name()))
+		_ = m.removeStagedBatch(filepath.Join(root, item.Name()), false)
 	}
 }
 

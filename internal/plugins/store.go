@@ -72,6 +72,8 @@ var migrations = []string{
 	)`,
 	`ALTER TABLE plugin_installs ADD COLUMN install_digest TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE plugin_installs ADD COLUMN official_manifest BLOB NOT NULL DEFAULT ''`,
+	`CREATE INDEX IF NOT EXISTS plugin_activity_retention ON plugin_activity(at)`,
+	`CREATE INDEX IF NOT EXISTS plugin_activity_network_recent ON plugin_activity(plugin_id, detail, at) WHERE kind='NETWORK'`,
 }
 
 // record is the persisted half of an install. The manifest is stored verbatim so
@@ -272,28 +274,53 @@ type Activity struct {
 	At       string `json:"at"`
 }
 
-func recordActivity(ctx context.Context, db *sql.DB, pluginID, kind, detail string, now time.Time) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO plugin_activity(plugin_id,kind,detail,at) VALUES(?,?,?,?)`,
-		pluginID, kind, truncate(detail, 400), storage.SortableTime(now))
+const pluginActivityRetention = 30 * 24 * time.Hour
+
+func pruneActivity(ctx context.Context, db *sql.DB, now time.Time) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM plugin_activity WHERE at < ?`, storage.SortableTime(now.Add(-pluginActivityRetention)))
 	return err
 }
 
-func loadActivity(ctx context.Context, db *sql.DB, pluginID string, before int64, limit int) ([]Activity, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id,plugin_id,kind,detail,at FROM plugin_activity
-		WHERE plugin_id=? AND (?<=0 OR id<?) ORDER BY id DESC LIMIT ?`, pluginID, before, before, limit)
-	if err != nil {
-		return nil, err
+func recordActivity(ctx context.Context, db *sql.DB, pluginID, kind, detail string, now time.Time) error {
+	detail = truncate(detail, 400)
+	at := storage.SortableTime(now)
+	if kind == ActivityNetwork {
+		_, err := db.ExecContext(ctx, `INSERT INTO plugin_activity(plugin_id,kind,detail,at)
+   SELECT ?, 'NETWORK', ?, ? WHERE NOT EXISTS (
+    SELECT 1 FROM plugin_activity WHERE plugin_id=? AND kind='NETWORK' AND detail=? AND at>=?
+   )`, pluginID, detail, at, pluginID, detail, storage.SortableTime(now.Add(-time.Minute)))
+		return err
 	}
-	defer rows.Close()
+	_, err := db.ExecContext(ctx, `INSERT INTO plugin_activity(plugin_id,kind,detail,at) VALUES(?,?,?,?)`, pluginID, kind, detail, at)
+	return err
+}
+
+func loadActivity(ctx context.Context, db *sql.DB, pluginID string, before int64, offset, limit int) ([]Activity, int, error) {
 	out := []Activity{}
-	for rows.Next() {
-		var item Activity
-		if err := rows.Scan(&item.ID, &item.PluginID, &item.Kind, &item.Detail, &item.At); err != nil {
-			return nil, err
+	var total int
+	err := storage.Transaction(ctx, db, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM plugin_activity WHERE plugin_id=?`, pluginID).Scan(&total); err != nil {
+			return err
 		}
-		out = append(out, item)
-	}
-	return out, rows.Err()
+		if before <= 0 {
+			before = 1<<63 - 1
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT id,plugin_id,kind,detail,at FROM plugin_activity
+   WHERE plugin_id=? AND id<? ORDER BY id DESC LIMIT ? OFFSET ?`, pluginID, before, limit, offset)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var item Activity
+			if err := rows.Scan(&item.ID, &item.PluginID, &item.Kind, &item.Detail, &item.At); err != nil {
+				return err
+			}
+			out = append(out, item)
+		}
+		return rows.Err()
+	})
+	return out, total, err
 }
 
 func truncate(text string, limit int) string {

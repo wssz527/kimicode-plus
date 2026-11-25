@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,20 +30,24 @@ import (
 var bridgeActionPattern = regexp.MustCompile(`^(?:[a-z]+\.){0,4}[a-zA-Z][a-zA-Z0-9]*$`)
 
 const (
-	windowsBridgeTTL         = 12 * time.Hour
-	windowsBridgeRenewWindow = 3 * time.Hour
+	windowsBridgeRequestsPerSecond = 120
+	windowsBridgeTTL               = 12 * time.Hour
+	windowsBridgeRenewWindow       = 3 * time.Hour
 )
 
 type windowsBridgeSession struct {
 	key          string
 	sessionToken string
+	nativeToken  string
 	expiresAt    time.Time
 }
 
 type windowsBridge struct {
-	mu       sync.Mutex
-	sessions map[string]windowsBridgeSession
-	dialogMu sync.Mutex
+	mu         sync.Mutex
+	sessions   map[string]windowsBridgeSession
+	dialogMu   sync.Mutex
+	rateWindow time.Time
+	rateCount  int
 	// ttl, renewWindow and now are the lifecycle knobs. They are fields rather
 	// than constants so a test can drive twelve hours of use in microseconds;
 	// zero values fall back to the production defaults.
@@ -76,12 +81,36 @@ func (b *windowsBridge) renewalWindow() time.Duration {
 	return windowsBridgeRenewWindow
 }
 
+var windowsBridgeFetchPermissions = []string{"core:read", "settings:write", "models:read", "usage:read", "usage:write", "tasks:read", "tasks:write", "adapter:write", "plugins:read", "plugins:write", "chat:read", "chat:write"}
+var windowsBridgeNativePermissions = []string{"core:read", "settings:write", "models:write", "tasks:read", "tasks:write", "usage:read", "credentials:read", "credentials:write", "adapter:write", "plugins:write", "update:read", "update:write"}
+
+func (b *windowsBridge) allowRequest() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.clock()
+	if now.Sub(b.rateWindow) >= time.Second {
+		b.rateWindow = now
+		b.rateCount = 0
+	}
+	if b.rateCount >= windowsBridgeRequestsPerSecond {
+		return false
+	}
+	b.rateCount++
+	return true
+}
+
+func (s windowsBridgeSession) revoke(guard *security.Guard) {
+	guard.RevokeSessionToken(s.sessionToken)
+	guard.RevokeSessionToken(s.nativeToken)
+}
+
 func (b *windowsBridge) issue(guard *security.Guard) (string, time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := b.clock()
 	for k, s := range b.sessions {
-		if now.After(s.expiresAt) {
+		if !now.Before(s.expiresAt) {
+			s.revoke(guard)
 			delete(b.sessions, k)
 		}
 	}
@@ -96,15 +125,17 @@ func (b *windowsBridge) issue(guard *security.Guard) (string, time.Time) {
 			}
 		}
 		if oldestKey != "" {
+			b.sessions[oldestKey].revoke(guard)
 			delete(b.sessions, oldestKey)
 		}
 	}
 	key := security.Random()
-	sessionToken := guard.IssueSessionToken(security.Permissions)
+	sessionToken := guard.IssueSessionToken(windowsBridgeFetchPermissions)
 	expiresAt := now.Add(b.lifetime())
 	b.sessions[key] = windowsBridgeSession{
 		key:          key,
 		sessionToken: sessionToken,
+		nativeToken:  guard.IssueSessionToken(windowsBridgeNativePermissions),
 		expiresAt:    expiresAt,
 	}
 	return key, expiresAt
@@ -129,7 +160,9 @@ func (b *windowsBridge) lookup(key string, guard *security.Guard) (windowsBridge
 				return windowsBridgeSession{}, false
 			}
 			if sess.expiresAt.Sub(now) < b.renewalWindow() {
-				sess.sessionToken = guard.IssueSessionToken(security.Permissions)
+				sess.revoke(guard)
+				sess.sessionToken = guard.IssueSessionToken(windowsBridgeFetchPermissions)
+				sess.nativeToken = guard.IssueSessionToken(windowsBridgeNativePermissions)
 				sess.expiresAt = now.Add(b.lifetime())
 				b.sessions[candidate] = sess
 			}
@@ -199,6 +232,10 @@ func (a *App) handleWindowsBridgeRPC(w http.ResponseWriter, r *http.Request, gua
 		return
 	}
 	trustedOrigin := allowedBridgeOrigin(origin, guard.Host())
+	if trustedOrigin && !a.winBridge.allowRequest() {
+		bridgeFailure(w, http.StatusTooManyRequests, origin, "RATE_LIMIT", "增强桥请求过于频繁，请稍后再试")
+		return
+	}
 	if r.Method == http.MethodOptions {
 		if !trustedOrigin {
 			writeBridgeJSON(w, http.StatusForbidden, "null", map[string]any{})
@@ -245,7 +282,7 @@ func (a *App) handleWindowsBridgeRPC(w http.ResponseWriter, r *http.Request, gua
 		writeBridgeJSON(w, 200, origin, map[string]any{"protocol": 1, "id": req.ID, "error": map[string]any{"code": "NATIVE_RPC", "message": "增强桥请求格式无效"}})
 		return
 	}
-	result, rpcCode, rpcErr := a.dispatchWindowsBridge(w, r, guard, coreHandler, sess.sessionToken, req.Action, req.Payload)
+	result, rpcCode, rpcErr := a.dispatchWindowsBridge(w, r, guard, coreHandler, sess, req.Action, req.Payload)
 	if rpcErr != nil {
 		if rpcCode == "" {
 			rpcCode = "NATIVE_RPC"
@@ -269,7 +306,7 @@ func (a *App) dispatchWindowsBridge(
 	orig *http.Request,
 	guard *security.Guard,
 	coreHandler http.Handler,
-	sessionToken string,
+	session windowsBridgeSession,
 	action string,
 	payload json.RawMessage,
 ) (any, string, error) {
@@ -287,17 +324,12 @@ func (a *App) dispatchWindowsBridge(
 		if err := json.Unmarshal(payload, &input); err != nil {
 			return nil, "NATIVE_RPC", errors.New("核心请求参数无效")
 		}
-		if !strings.HasPrefix(input.Path, "/enhance/v1/") || strings.Contains(input.Path, "..") || strings.Contains(input.Path, `\`) {
-			return nil, "NATIVE_RPC", errors.New("核心请求路径不被允许")
-		}
 		method := strings.ToUpper(strings.TrimSpace(input.Method))
 		if method == "" {
 			method = http.MethodGet
 		}
-		switch method {
-		case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
-		default:
-			return nil, "NATIVE_RPC", errors.New("核心请求方法不被允许")
+		if !allowedWindowsBridgeFetch(method, input.Path) {
+			return nil, "BRIDGE_ROUTE_DENIED", errors.New("核心请求路径或方法不被允许")
 		}
 		var body []byte
 		if input.BodyBase64 != "" {
@@ -310,10 +342,13 @@ func (a *App) dispatchWindowsBridge(
 			}
 			body = decoded
 		}
-		innerReq := httptest.NewRequest(method, "http://"+guard.Host()+input.Path, bytes.NewReader(body)).WithContext(orig.Context())
+		innerReq, err := http.NewRequestWithContext(orig.Context(), method, "http://"+guard.Host()+input.Path, bytes.NewReader(body))
+		if err != nil {
+			return nil, "BRIDGE_ROUTE_DENIED", errors.New("核心请求路径无效")
+		}
 		innerReq.Host = guard.Host()
 		innerReq.Header.Set("Accept", "application/json")
-		innerReq.Header.Set("Authorization", "Bearer "+sessionToken)
+		innerReq.Header.Set("Authorization", "Bearer "+session.sessionToken)
 		for k, v := range input.Headers {
 			switch strings.ToLower(k) {
 			case "accept", "content-type", "idempotency-key", "x-attachment-sha256", "x-attachment-type":
@@ -354,11 +389,14 @@ func (a *App) dispatchWindowsBridge(
 		_ = ExtendWriteDeadline(w, 4*time.Minute)
 		return a.winBridge.pickPaths(orig.Context(), action == "host.pickDirectory", payload)
 	default:
+		if !allowedWindowsBridgeAction(action) {
+			return nil, "BRIDGE_ACTION_DENIED", errors.New("增强桥动作未获授权")
+		}
 		innerReq := httptest.NewRequest(http.MethodPost, "http://"+guard.Host()+"/enhance/v1/desktop/actions/"+action, bytes.NewReader(payload)).WithContext(orig.Context())
 		innerReq.Host = guard.Host()
 		innerReq.Header.Set("Accept", "application/json")
 		innerReq.Header.Set("Content-Type", "application/json")
-		innerReq.Header.Set("Authorization", "Bearer "+sessionToken)
+		innerReq.Header.Set("Authorization", "Bearer "+session.nativeToken)
 		rec := httptest.NewRecorder()
 		coreHandler.ServeHTTP(rec, innerReq)
 		res := rec.Result()
@@ -386,6 +424,73 @@ func (a *App) dispatchWindowsBridge(
 		}
 		return body.Value, "", nil
 	}
+}
+
+func allowedWindowsBridgeAction(action string) bool {
+	switch action {
+	case "bootstrap", "features.get", "features.set", "events.poll", "sessions.list", "session.view", "session.watch", "session.unwatch", "session.create", "session.send", "session.abort", "session.reply", "handoff",
+		"keepalive.session.get", "keepalive.session.set", "config.get", "config.save", "providers.updateModel", "attach.status", "attach.enable", "attach.disable", "attach.reopen",
+		"diagnostics.get", "contracts.status", "contracts.report", "update.status", "update.check", "update.apply", "update.autoCheck",
+		"cache.summary", "cache.sessions", "cache.history", "cache.retention", "cache.receipts", "cache.turns", "automation.get", "automation.set", "recovery.get", "recovery.set", "recovery.watch", "recovery.unwatch", "recovery.check", "managed.usage", "quota.balances",
+		"accounts.list", "accounts.saveCurrent", "accounts.beginAdd", "accounts.completeAdd", "accounts.rename", "accounts.delete", "accounts.refreshQuotas", "accounts.switchPreflight", "accounts.switch", "accounts.cancelPending", "accounts.resetVault",
+		"plugin.command.register", "plugin.command.unregister", "plugin.command.invoke":
+		return true
+	}
+	return false
+}
+
+func allowedWindowsBridgeFetch(method, target string) bool {
+	parsed, err := url.ParseRequestURI(target)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || strings.ContainsAny(parsed.Path, "\\\x00") || strings.Contains(target, "#") {
+		return false
+	}
+	escaped := strings.ToLower(parsed.EscapedPath())
+	if strings.Contains(escaped, "%2f") || strings.Contains(escaped, "%5c") {
+		return false
+	}
+	path, ok := strings.CutPrefix(parsed.Path, "/enhance/v1/")
+	if !ok {
+		return false
+	}
+	parts := strings.Split(path, "/")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	switch method + " " + path {
+	case "GET health", "GET settings", "PUT settings", "GET gateways", "GET usage", "GET usage/summary", "GET quotas", "POST usage", "POST usage/demo", "POST usage/demo/clear",
+		"GET adapter", "PUT adapter", "GET sessions", "GET web-targets", "POST attachments", "POST attachments/collect", "GET tasks", "POST tasks", "POST tasks/preview",
+		"GET plugins", "GET plugins/updates", "POST plugins/updates/check", "POST plugins/preview", "POST plugins/install", "GET kct/migration", "POST kct/migration/confirm", "GET plugins/monitor/migration", "POST plugins/monitor/migration/confirm",
+		"GET chat/sources", "POST chat/sources", "GET chat/threads", "POST chat/threads":
+		return true
+	}
+	switch parts[0] {
+	case "plugin-runtime":
+		return method == http.MethodPost && len(parts) == 2 && bridgeActionPattern.MatchString(parts[1])
+	case "plugins":
+		if len(parts) < 2 || parts[1] == "updates" {
+			return false
+		}
+		if len(parts) == 2 {
+			return method == http.MethodGet
+		}
+		if parts[2] == "assets" {
+			return method == http.MethodGet && len(parts) >= 4
+		}
+		if len(parts) != 3 {
+			return false
+		}
+		switch method + " " + parts[2] {
+		case "GET activity", "GET legal", "POST enable", "POST disable", "POST uninstall", "POST restore", "POST force-enable", "POST update", "POST token":
+			return true
+		}
+	case "tasks":
+		return method == http.MethodPost && len(parts) == 3 && parts[2] == "reconcile"
+	case "chat":
+		return len(parts) >= 3 && parts[1] == "threads" && (method == http.MethodGet && len(parts) == 3 || method == http.MethodPost && len(parts) == 4 && parts[3] == "messages")
+	}
+	return false
 }
 
 func windowsFeatureUnavailable(feature string) (any, string, error) {

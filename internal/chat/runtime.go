@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"enhancedkimi/internal/config"
@@ -58,14 +60,22 @@ func resolutionNote(value string) string {
 }
 
 type Runtime struct {
-	client   *provider.Client
-	usage    *usage.Service
-	dispatch func(func() error) error
+	client             *provider.Client
+	usage              *usage.Service
+	dispatch           func(func() error) error
+	usageWriteFailures atomic.Uint64
 }
 
 func (s *Service) UseProvider(client *provider.Client, ledger *usage.Service, dispatch func(func() error) error) {
-	s.runtime = &Runtime{client, ledger, dispatch}
+	s.runtime = &Runtime{client: client, usage: ledger, dispatch: dispatch}
 }
+func (s *Service) UsageWriteFailures() uint64 {
+	if s.runtime == nil {
+		return 0
+	}
+	return s.runtime.usageWriteFailures.Load()
+}
+
 func (s *Service) initRequests() error {
 	if err := storage.Migrate(s.db, "chat_runtime", []string{
 		`CREATE TABLE chat_requests(thread_id TEXT NOT NULL,intent TEXT NOT NULL,digest TEXT NOT NULL,id TEXT NOT NULL,state TEXT NOT NULL,usage_json TEXT,at TEXT NOT NULL,PRIMARY KEY(thread_id,intent));`,
@@ -400,7 +410,10 @@ func (s *Service) recordProviderUsage(t Thread, id, at, state string, raw json.R
 		sequence = 2
 		lifecycle = "FINAL"
 	}
-	_, _ = s.runtime.usage.Ingest([]usage.EventInput{{ProviderID: t.ProviderID, Model: t.Model, RequestID: id, AttemptID: "1", SessionID: t.ID, ProjectID: t.ProjectID, AgentID: "light-chat", Role: "main", RequestKind: "chat", Protocol: p.Protocol, Source: "gateway", At: at, Raw: raw, ObservationState: lifecycle, Sequence: &sequence}})
+	if _, err := s.runtime.usage.Ingest([]usage.EventInput{{ProviderID: t.ProviderID, Model: t.Model, RequestID: id, AttemptID: "1", SessionID: t.ID, ProjectID: t.ProjectID, AgentID: "light-chat", Role: "main", RequestKind: "chat", Protocol: p.Protocol, Source: "gateway", At: at, Raw: raw, ObservationState: lifecycle, Sequence: &sequence}}); err != nil {
+		s.runtime.usageWriteFailures.Add(1)
+		slog.Warn("chat usage ingestion failed", "request_id", id, "provider_id", t.ProviderID, "error", err)
+	}
 }
 
 // refreshProviderUsage replays the audit rows into the ledger and mirrors the

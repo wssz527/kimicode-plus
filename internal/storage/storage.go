@@ -36,16 +36,47 @@ func Open(path string) (*sql.DB, error) {
 	if err = f.Close(); err != nil {
 		return nil, err
 	}
+	return openSQLite(path, false)
+}
+
+// OpenReadOnly opens an existing database for snapshot queries while the core
+// continues to write through the WAL connection.
+func OpenReadOnly(path string) (*sql.DB, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(absolute)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("database must be a regular file")
+	}
+	return openSQLite(absolute, true)
+}
+
+func openSQLite(path string, readOnly bool) (*sql.DB, error) {
 	uriPath := filepath.ToSlash(path)
 	if filepath.VolumeName(path) != "" {
 		uriPath = "/" + uriPath
 	}
 	u := &url.URL{Scheme: "file", Path: uriPath}
-	db, err := sql.Open("sqlite", u.String()+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)")
+	options := "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	if readOnly {
+		options += "&mode=ro&_pragma=query_only(1)"
+	} else {
+		options += "&_pragma=journal_mode(WAL)"
+	}
+	db, err := sql.Open("sqlite", u.String()+options)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+	if !readOnly {
+		db.SetMaxOpenConns(1)
+	} else {
+		db.SetMaxOpenConns(4)
+	}
 	if err = db.Ping(); err != nil {
 		db.Close()
 		return nil, err

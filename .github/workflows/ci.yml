@@ -25,6 +25,7 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
         working-directory: web
+      - run: node plugins/monitor-src/build/bundle.mjs --check
       - run: npm run typecheck
         working-directory: web
       - run: npm test

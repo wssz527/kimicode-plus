@@ -424,14 +424,90 @@ func TestInterruptedStreamReportsUnknownOutcome(t *testing.T) {
 	}
 }
 
-func TestStreamingRejectsNonOpenAIProtocol(t *testing.T) {
-	f := newFixture(t, nil)
-	if _, err := f.db.Exec(`INSERT INTO registry_providers VALUES('anth','A','anthropic','https://example.invalid',NULL,'2026-01-01T00:00:00Z'); INSERT INTO registry_models VALUES('anth','claude-x','claude-x')`); err != nil {
+func TestStreamingSynthesizesBufferedNonOpenAIResponses(t *testing.T) {
+	cases := []struct{ protocol, model, path, response string }{
+		{"anthropic", "claude-x", "/v1/messages", `{"content":[{"text":"translated"}],"usage":{"input_tokens":6,"cache_read_input_tokens":1,"cache_creation_input_tokens":0,"output_tokens":3}}`},
+		{"gemini", "gemini-x", "/models/gemini-x:generateContent", `{"candidates":[{"content":{"parts":[{"text":"translated"}]}}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"thoughtsTokenCount":0}}`},
+		{"responses", "responses-x", "/responses", `{"output":[{"content":[{"text":"translated"}]}],"usage":{"input_tokens":7,"output_tokens":3}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.protocol, func(t *testing.T) {
+			f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != tc.path || r.Header.Get("Accept") == "text/event-stream" {
+					t.Errorf("unexpected upstream request %s, %v", r.URL.Path, r.Header)
+				}
+				fmt.Fprint(w, tc.response)
+			})
+			if _, err := f.db.Exec(`UPDATE registry_providers SET protocol=? WHERE id='kimi'`, tc.protocol); err != nil {
+				t.Fatal(err)
+			}
+			f.declareModel(t, "kimi", tc.model)
+			req := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"x"}],"stream":true,"stream_options":{"include_usage":true}}`, tc.model)
+			w := f.completion(t, req)
+			if w.Code != http.StatusOK || !strings.HasPrefix(w.Header().Get("Content-Type"), "text/event-stream") {
+				t.Fatalf("synthetic stream: %d %s", w.Code, w.Body.String())
+			}
+			frames := strings.Split(strings.TrimSpace(w.Body.String()), "\n\n")
+			if len(frames) != 5 || !strings.Contains(frames[0], `"role":"assistant"`) || !strings.Contains(frames[1], `"content":"translated"`) || !strings.Contains(frames[2], `"finish_reason":"stop"`) || !strings.Contains(frames[3], `"total_tokens":10`) || frames[4] != "data: [DONE]" {
+				t.Fatalf("unexpected frames: %s", w.Body.String())
+			}
+			if f.calls.Load() != 1 || (*f.lastBody)["stream"] == true {
+				t.Fatalf("expected one buffered upstream call: %d %#v", f.calls.Load(), *f.lastBody)
+			}
+		})
+	}
+}
+
+func TestQualifiedModelRoutesAgreeAcrossDiscoveryAndCompletion(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	})
+	if _, err := f.db.Exec(`INSERT INTO registry_providers VALUES('other','Other','openai',?,NULL,'2026-01-01T00:00:00Z')`, f.upstream.URL); err != nil {
 		t.Fatal(err)
 	}
-	w := f.completion(t, `{"model":"claude-x","messages":[{"role":"user","content":"x"}],"stream":true}`)
-	if w.Code != 501 || !strings.Contains(w.Body.String(), "STREAM_PROTOCOL") {
-		t.Fatalf("non-openai stream %d: %s", w.Code, w.Body.String())
+	f.declareModel(t, "kimi", "shared")
+	f.declareModel(t, "other", "shared")
+	f.declareModel(t, "other", "kimi/shared")
+	list := f.do(t, http.MethodGet, "/v1/models", "", f.token)
+	var catalog struct {
+		Data []modelEntry `json:"data"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &catalog); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"kimi/shared": "kimi", "other/shared": "other", "other/kimi/shared": "other"}
+	if len(catalog.Data) != len(want) {
+		t.Fatalf("catalog: %s", list.Body)
+	}
+	for _, entry := range catalog.Data {
+		if expected := want[entry.ID]; expected == "" || expected != entry.OwnedBy {
+			t.Fatalf("entry: %+v", entry)
+		}
+		get := f.do(t, http.MethodGet, "/v1/models/"+entry.ID, "", f.token)
+		if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"owned_by":"`+entry.OwnedBy+`"`) {
+			t.Fatalf("retrieve %q = %d %s", entry.ID, get.Code, get.Body)
+		}
+	}
+	if get := f.do(t, http.MethodGet, "/v1/models/shared", "", f.token); get.Code != http.StatusConflict {
+		t.Fatalf("ambiguous retrieve = %d %s", get.Code, get.Body)
+	}
+	w := f.completion(t, `{"model":"kimi/shared","messages":[{"role":"user","content":"x"}]}`)
+	if w.Code != http.StatusOK || (*f.lastBody)["model"] != "shared" || !strings.Contains(w.Body.String(), `"model":"kimi/shared"`) {
+		t.Fatalf("qualified completion = %d %s, upstream=%+v", w.Code, w.Body, *f.lastBody)
+	}
+}
+
+func TestUsageWriteFailureIsCounted(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1}}`)
+	})
+	f.declareModel(t, "kimi", "known")
+	if _, err := f.db.Exec(`DROP TABLE usage_events`); err != nil {
+		t.Fatal(err)
+	}
+	w := f.completion(t, `{"model":"known","messages":[{"role":"user","content":"x"}]}`)
+	if w.Code != http.StatusOK || f.gateway.UsageWriteFailures() != 1 {
+		t.Fatalf("reply=%d errors=%d %s", w.Code, f.gateway.UsageWriteFailures(), w.Body)
 	}
 }
 

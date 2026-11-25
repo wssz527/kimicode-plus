@@ -124,8 +124,12 @@ jobs:
             fi
             exit 1
           fi
+      - name: Check bundled Monitor
+        run: node plugins/monitor-src/build/bundle.mjs --check
       - name: Cross-build and package
         env:
+          RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.PLUGIN_SIGNING_PRIVATE_KEY }}
+          RELEASE_REQUIRE_SIGNING: "1"
           VER: ${{ steps.version.outputs.version }}
         run: |
           VERSION="$VER" sh scripts/crossbuild.sh

@@ -1030,8 +1030,11 @@ func (e *Engine) executeRun(ctx context.Context, task Task, run RunRecord) {
 		}
 	}
 
-	beforeTurns, _ := e.exec.GetSessionTurns(execCtx, targetSessionID, 20)
+	beforeTurns, beforeErr := e.exec.GetSessionTurns(execCtx, targetSessionID, 20)
 	prevTurnCount := len(beforeTurns)
+	if beforeErr != nil {
+		prevTurnCount = -1
+	}
 	prevLastTurnID := ""
 	if prevTurnCount > 0 {
 		prevLastTurnID = beforeTurns[prevTurnCount-1].TurnID
@@ -1097,10 +1100,6 @@ func (e *Engine) waitForSessionIdle(ctx context.Context, task Task, run *RunReco
 	}
 }
 
-func countNewTurns(turns []TurnInfo, prevLastTurnID string, prevTurnCount int) int {
-	return len(newTurnsSince(turns, prevLastTurnID, prevTurnCount))
-}
-
 // newTurnsSince returns only the turns produced after prevLastTurnID. A bound
 // session carries its whole history, and an approval left in that history must
 // not immediately fail every new run.
@@ -1123,7 +1122,6 @@ func newTurnsSince(turns []TurnInfo, prevLastTurnID string, prevTurnCount int) [
 
 func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionID string, prevTurnCount int, prevLastTurnID string, timeoutMin, maxTurns int) (string, string, string) {
 	sawBusy := false
-	idlePolls := 0
 	for {
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
 			e.abortRemoteSession(sessionID)
@@ -1151,15 +1149,14 @@ func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionI
 			pageSize = prevTurnCount + maxTurns + 5
 		}
 		turns, tErr := e.exec.GetSessionTurns(execCtx, sessionID, pageSize)
+		var newTurns []TurnInfo
 		if tErr == nil {
-			if maxTurns > 0 {
-				added := countNewTurns(turns, prevLastTurnID, prevTurnCount)
-				if added > maxTurns {
-					e.abortRemoteSession(sessionID)
-					return RunFailed, FailureMaxTurns, fmt.Sprintf("已超过单次最大回合数限制（%d 回合），已尝试中止本次运行", maxTurns)
-				}
+			newTurns = newTurnsSince(turns, prevLastTurnID, prevTurnCount)
+			if maxTurns > 0 && len(newTurns) > maxTurns {
+				e.abortRemoteSession(sessionID)
+				return RunFailed, FailureMaxTurns, fmt.Sprintf("已超过单次最大回合数限制（%d 回合），已尝试中止本次运行", maxTurns)
 			}
-			for _, turn := range newTurnsSince(turns, prevLastTurnID, prevTurnCount) {
+			for _, turn := range newTurns {
 				if turn.HasApproval {
 					detail := "会话出现待批准操作，无人值守模式不会自动批准，请打开会话处理"
 					if turn.ApprovalTitle != "" {
@@ -1174,24 +1171,13 @@ func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionI
 		}
 		if sess.Busy || sess.MainTurnActive {
 			sawBusy = true
-			idlePolls = 0
 		} else {
-			newTurnSeen := false
-			var latestErr string
-			if tErr == nil && len(turns) > 0 {
-				last := turns[len(turns)-1]
-				if len(turns) > prevTurnCount || (last.TurnID != "" && last.TurnID != prevLastTurnID) || (prevTurnCount == 0 && last.HasAssistantMsg) {
-					newTurnSeen = true
-				}
-				if last.ErrorMessage != "" && (newTurnSeen || sawBusy) {
-					latestErr = last.ErrorMessage
+			if len(newTurns) > 0 {
+				if latestErr := newTurns[len(newTurns)-1].ErrorMessage; latestErr != "" {
+					return RunFailed, FailureExecution, "执行失败：" + latestErr
 				}
 			}
-			if latestErr != "" {
-				return RunFailed, FailureExecution, "执行失败：" + latestErr
-			}
-			idlePolls++
-			if sawBusy || newTurnSeen || idlePolls >= 2 {
+			if sawBusy || len(newTurns) > 0 {
 				return RunCompleted, FailureNone, "已完成"
 			}
 		}

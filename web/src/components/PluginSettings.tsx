@@ -42,12 +42,12 @@ const CAPABILITY_LABELS: Record<string, { title: string; detail: string }> = {
 
 export function capabilityLabel(name: string): { title: string; detail: string } {
   if (name === "net:https") {
-    return { title: "访问任意公网 HTTPS 服务", detail: "经核心代理访问用户配置的公网 HTTPS 地址；仅限加密连接，仍拦截本机与内网地址。" };
+    return { title: "高风险 · 访问任意公网 HTTPS 服务", detail: "插件可经核心代理向公网 HTTPS 端点发送内容。配置自定义端点之前，请确认接收方可信。" };
   }
   if (name.startsWith("net:")) {
     const host = name.slice(4);
     if (host === "localhost" || host === "127.0.0.1" || host === "::1") {
-      return { title: "访问本机服务", detail: `经核心代理请求 ${host} 上的服务；其他主机一律拒绝。` };
+      return { title: "高风险 · 访问本机服务", detail: `插件可经核心代理连接 ${host} 上的端口。配置端点之前，请确认对应服务可信。` };
     }
     return { title: `访问 ${host}`, detail: `经核心代理访问 ${host} 的网络请求；其他主机一律拒绝。` };
   }

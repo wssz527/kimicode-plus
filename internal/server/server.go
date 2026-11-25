@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"log/slog"
 	"net/http"
 	"path"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -43,15 +45,15 @@ type Module struct {
 	Message string `json:"message,omitempty"`
 }
 type NativeOptions struct {
-	Home                  string
-	CWD                   string
-	DataDir               string
-	Executable            string
-	Profile               string
-	CoreURL               string
-	PairingToken          string
-	RestartState          func() updater.RestartState
-	RequestRestart        func()
+	Home                          string
+	CWD                           string
+	DataDir                       string
+	Executable                    string
+	Profile                       string
+	CoreURL                       string
+	PairingToken                  string
+	RestartState                  func() updater.RestartState
+	RequestRestart                func()
 	UpdateAPIBaseURL              string
 	UpdateHTTPClient              *http.Client
 	PluginUpdateReleaseBaseURL    string
@@ -290,7 +292,16 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 		gw := gateway.New(providerClient, ledger, cfg.Dispatch, gatewayToken)
 		gw.Register(mux)
 		mux.HandleFunc("GET /enhance/v1/gateway", func(w http.ResponseWriter, r *http.Request) {
-			httpx.JSON(w, 200, map[string]any{"enabled": true, "baseUrl": gatewayURLForRequest(app, r, guard), "tokenMasked": gateway.MaskToken(gatewayToken), "tokenAvailable": true, "streaming": true, "reasoningContent": true, "toolCalls": true, "multiAccount": false, "writesUserConfig": false})
+			httpx.JSON(w, http.StatusOK, map[string]any{
+				"enabled": true, "baseUrl": gatewayURLForRequest(app, r, guard),
+				"tokenMasked": gateway.MaskToken(gatewayToken), "tokenAvailable": true,
+				"streaming": true, "streamingModes": map[string]string{
+					"openai": provider.StreamingMode("openai"), "responses": provider.StreamingMode("responses"),
+					"anthropic": provider.StreamingMode("anthropic"), "gemini": provider.StreamingMode("gemini"),
+				},
+				"usageWriteFailures": gw.UsageWriteFailures(), "reasoningContent": true,
+				"toolCalls": true, "multiAccount": false, "writesUserConfig": false,
+			})
 		})
 		mux.HandleFunc("GET /enhance/v1/gateway/preview", func(w http.ResponseWriter, r *http.Request) {
 			httpx.JSON(w, 200, gw.PreviewConfig(gatewayHostBase(app, r, guard)))
@@ -417,7 +428,11 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 				currentCredentials = "ENCRYPTED_VAULT_MANUAL_UNLOCK"
 			}
 		}
-		httpx.JSON(w, 200, map[string]any{"status": "OK", "version": Version, "safeMode": cfg.Safe(), "modules": app.modules, "uptimeMs": time.Since(app.started).Milliseconds(), "adapter": app.adapter.Status(r.Context()), "compaction": compactionStatus, "credentials": currentCredentials})
+		payload := map[string]any{"status": "OK", "version": Version, "safeMode": cfg.Safe(), "modules": app.modules, "uptimeMs": time.Since(app.started).Milliseconds(), "adapter": app.adapter.Status(r.Context()), "compaction": compactionStatus, "credentials": currentCredentials}
+		if chatReady {
+			payload["chatUsageWriteFailures"] = chats.UsageWriteFailures()
+		}
+		httpx.JSON(w, 200, payload)
 	})
 	if native.EnableAutoUpdateCheck && app.updater != nil {
 		app.updater.StartAutoCheck()
@@ -648,15 +663,56 @@ func registerUpdateRoutes(mux *http.ServeMux, manager *updater.Manager) {
 	})
 }
 
+type recoveryWriter struct {
+	http.ResponseWriter
+	committed bool
+}
+
+func (w *recoveryWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *recoveryWriter) WriteHeader(status int) {
+	if status == http.StatusSwitchingProtocols || status >= 200 {
+		w.committed = true
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *recoveryWriter) Write(data []byte) (int, error) {
+	w.committed = true
+	return w.ResponseWriter.Write(data)
+}
+
+type recoveryFlusher struct{ *recoveryWriter }
+
+func (w recoveryFlusher) Flush() { _ = w.FlushError() }
+
+func (w recoveryFlusher) FlushError() error {
+	w.committed = true
+	return http.NewResponseController(w.ResponseWriter).Flush()
+}
+
 func recoverer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tracked := &recoveryWriter{ResponseWriter: w}
 		defer func() {
-			if recover() != nil {
-				log.Printf("request isolated id=%s", security.Random()[:12])
-				httpx.Fail(w, 500, "INTERNAL_ERROR", "操作失败，核心服务仍在运行")
+			value := recover()
+			if value == nil {
+				return
+			}
+			if value == http.ErrAbortHandler {
+				panic(value)
+			}
+			slog.Error("request panic isolated", "request_id", security.Random()[:12], "panic_type", fmt.Sprintf("%T", value), "stack", string(debug.Stack()))
+			if !tracked.committed {
+				httpx.Fail(tracked, 500, "INTERNAL_ERROR", "操作失败，核心服务仍在运行")
 			}
 		}()
-		next.ServeHTTP(w, r)
+		if _, ok := w.(http.Flusher); ok {
+			next.ServeHTTP(recoveryFlusher{tracked}, r)
+			return
+		}
+		next.ServeHTTP(tracked, r)
 	})
 }
+
 func (a *App) String() string { return fmt.Sprintf("Enhanced Kimi Desktop %s", Version) }

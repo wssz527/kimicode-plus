@@ -2,13 +2,16 @@ package gateway
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"enhancedkimi/internal/config"
@@ -21,11 +24,12 @@ import (
 // authenticates with the local gateway token, and the provider key stays in the
 // vault.
 type Gateway struct {
-	client   *provider.Client
-	usage    *usage.Service
-	dispatch func(func() error) error
-	token    string
-	started  time.Time
+	client             *provider.Client
+	usage              *usage.Service
+	dispatch           func(func() error) error
+	token              string
+	started            time.Time
+	usageWriteFailures atomic.Uint64
 }
 
 const (
@@ -51,7 +55,7 @@ func (g *Gateway) Token() string { return g.token }
 // its own token check because Kimi Code is not a paired UI client.
 func (g *Gateway) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/models", g.authorize(g.models))
-	mux.HandleFunc("GET /v1/models/{id}", g.authorize(g.modelByID))
+	mux.HandleFunc("GET /v1/models/{id...}", g.authorize(g.modelByID))
 	mux.HandleFunc("POST /v1/chat/completions", g.authorize(g.completions))
 }
 
@@ -176,72 +180,59 @@ type modelEntry struct {
 func (g *Gateway) models(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	rows, err := g.client.DB.QueryContext(ctx, `SELECT id,name FROM registry_providers ORDER BY name,id`)
+	rows, err := g.client.DB.QueryContext(ctx, `SELECT m.provider_id,m.model_id FROM registry_models m
+  JOIN registry_providers p ON p.id=m.provider_id ORDER BY p.name,m.provider_id,m.model_id`)
 	if err != nil {
-		gatewayFail(w, 503, "GATEWAY_STORAGE", "无法读取供应商配置")
+		g.routeFailure(w, err)
 		return
 	}
-	providers := []string{}
+	defer rows.Close()
+	entries := []routedModel{}
+	counts := map[string]int{}
+	qualified := map[string]bool{}
 	for rows.Next() {
-		var providerID, name string
-		if err := rows.Scan(&providerID, &name); err != nil {
-			rows.Close()
-			gatewayFail(w, 503, "GATEWAY_STORAGE", "无法读取供应商配置")
+		var entry routedModel
+		if err := rows.Scan(&entry.providerID, &entry.modelID); err != nil {
+			g.routeFailure(w, err)
 			return
 		}
-		providers = append(providers, providerID)
+		entries = append(entries, entry)
+		counts[entry.modelID]++
+		qualified[entry.qualifiedID()] = true
 	}
-	rows.Close()
 	if err := rows.Err(); err != nil {
-		gatewayFail(w, 503, "GATEWAY_STORAGE", "无法读取供应商配置")
+		g.routeFailure(w, err)
 		return
 	}
-	out := []modelEntry{}
-	seen := map[string]bool{}
-	truncated := false
-	// The connection pool holds one connection, so the provider list is read
-	// fully before any per-provider query starts.
-	for _, providerID := range providers {
-		entries, err := g.client.CatalogModels(ctx, providerID)
-		if err != nil {
-			// A broken provider must not hide the healthy ones; the caller can
-			// still route by model ID.
-			continue
+	out := make([]modelEntry, 0, min(len(entries), MaxModels))
+	for _, entry := range entries[:min(len(entries), MaxModels)] {
+		id := entry.modelID
+		if counts[id] > 1 || qualified[id] {
+			id = entry.qualifiedID()
 		}
-		for _, entry := range entries {
-			// Kimi Code addresses models by bare ID. A duplicate ID across
-			// providers stays ambiguous on purpose instead of silently picking
-			// one supplier.
-			if seen[entry.ID] {
-				continue
-			}
-			if len(out) >= MaxModels {
-				truncated = true
-				break
-			}
-			seen[entry.ID] = true
-			out = append(out, modelEntry{ID: entry.ID, Object: "model", Created: g.started.Unix(), OwnedBy: providerID})
-		}
+		out = append(out, g.modelEntry(id, entry.providerID))
 	}
 	payload := map[string]any{"object": "list", "data": out}
-	if truncated {
+	if len(entries) > MaxModels {
 		payload["has_more"] = true
 	}
-	writeJSON(w, 200, payload)
+	writeJSON(w, http.StatusOK, payload)
 }
 
-// modelByID answers the retrieve form some clients probe before generation.
+func (g *Gateway) modelEntry(id, provider string) modelEntry {
+	return modelEntry{ID: id, Object: "model", Created: g.started.Unix(), OwnedBy: provider}
+}
+
 func (g *Gateway) modelByID(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	var owner string
-	err := g.client.DB.QueryRowContext(ctx, `SELECT provider_id FROM registry_models WHERE model_id=? ORDER BY provider_id LIMIT 1`, id).Scan(&owner)
+	target, err := g.resolveModel(ctx, id)
 	if err != nil {
-		gatewayFail(w, 404, "MODEL_NOT_FOUND", "没有供应商声明该模型")
+		g.routeFailure(w, err)
 		return
 	}
-	writeJSON(w, 200, modelEntry{ID: id, Object: "model", Created: g.started.Unix(), OwnedBy: owner})
+	writeJSON(w, http.StatusOK, g.modelEntry(id, target.providerID))
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -328,7 +319,7 @@ func (g *Gateway) completions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := strings.TrimSpace(in.Model)
-	if model == "" || len(model) > 200 || strings.ContainsAny(model, "\x00\r\n") {
+	if model == "" || len(model) > 64+1+200 || strings.ContainsAny(model, "\x00\r\n") {
 		gatewayFail(w, 400, "INVALID_MODEL", "model 不能为空")
 		return
 	}
@@ -352,7 +343,7 @@ func (g *Gateway) completions(w http.ResponseWriter, r *http.Request) {
 		gatewayFail(w, 400, "INVALID_TOOLS", err.Error())
 		return
 	}
-	providerID, err := g.route(r.Context(), model)
+	target, err := g.resolveModel(r.Context(), model)
 	if err != nil {
 		g.routeFailure(w, err)
 		return
@@ -364,24 +355,24 @@ func (g *Gateway) completions(w http.ResponseWriter, r *http.Request) {
 		in.AgentID = "gateway"
 	}
 	requestID := shortID()
-	body, err := g.upstreamBody(in, model, messages)
+	body, err := g.upstreamBody(in, target.modelID, messages)
 	if err != nil {
 		gatewayFail(w, 400, "INVALID_REQUEST", err.Error())
 		return
 	}
-	effective, account, err := g.client.EffectiveConfig(r.Context(), providerID)
+	effective, account, err := g.client.EffectiveConfig(r.Context(), target.providerID)
 	if err != nil {
 		gatewayFail(w, 502, "PROVIDER_CONFIG", "无法读取供应商配置")
 		return
 	}
 	attribution := usage.EventInput{
-		ProviderID: providerID, Model: model, RequestID: requestID, AttemptID: "1",
+		ProviderID: target.providerID, Model: target.modelID, RequestID: requestID, AttemptID: "1",
 		SessionID: in.SessionID, ProjectID: in.ProjectID, AgentID: in.AgentID,
 		Role: "main", RequestKind: "gateway", Protocol: effective.Protocol,
 		Source: "gateway", At: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	if in.Stream {
-		g.streamCompletion(w, r, effective, model, body, attribution, account.AccountID)
+		g.streamCompletion(w, r, effective, model, body, messages, attribution, account.AccountID)
 		return
 	}
 	g.bufferedCompletion(w, r, effective, model, body, messages, attribution, account.AccountID)
@@ -580,33 +571,55 @@ func contentText(raw json.RawMessage) (string, error) {
 	return builder.String(), nil
 }
 
-// route picks the provider that owns a model ID. A model listed by more than
-// one provider is an explicit ambiguity error: v0 has no failover, so guessing
-// would silently bill a different account.
+type routedModel struct {
+	providerID string
+	modelID    string
+}
+
+func (m routedModel) qualifiedID() string { return m.providerID + "/" + m.modelID }
+
 func (g *Gateway) route(ctx context.Context, model string) (string, error) {
-	rows, err := g.client.DB.QueryContext(ctx, `SELECT DISTINCT provider_id FROM registry_models WHERE model_id=? ORDER BY provider_id`, model)
+	resolved, err := g.resolveModel(ctx, model)
+	return resolved.providerID, err
+}
+
+func (g *Gateway) resolveModel(ctx context.Context, model string) (routedModel, error) {
+	owner, suffix, _ := strings.Cut(model, "/")
+	rows, err := g.client.DB.QueryContext(ctx, `SELECT m.provider_id,m.model_id FROM registry_models m
+  JOIN registry_providers p ON p.id=m.provider_id
+  WHERE m.model_id=? OR (m.provider_id=? AND m.model_id=?)`, model, owner, suffix)
 	if err != nil {
-		return "", err
+		return routedModel{}, err
 	}
 	defer rows.Close()
-	candidates := []string{}
+	var bare, qualified routedModel
+	var count int
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return "", err
+		var target routedModel
+		if err := rows.Scan(&target.providerID, &target.modelID); err != nil {
+			return routedModel{}, err
 		}
-		candidates = append(candidates, id)
+		if target.qualifiedID() == model {
+			qualified = target
+		}
+		if target.modelID == model {
+			bare = target
+			count++
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return "", err
+		return routedModel{}, err
 	}
-	switch len(candidates) {
+	if qualified.providerID != "" {
+		return qualified, nil
+	}
+	switch count {
 	case 0:
-		return "", errRoute{code: "MODEL_NOT_FOUND", message: "没有供应商声明该模型；请先导入目录", status: 404}
+		return routedModel{}, errRoute{code: "MODEL_NOT_FOUND", message: "没有供应商声明该模型；请先导入目录", status: 404}
 	case 1:
-		return candidates[0], nil
+		return bare, nil
 	default:
-		return "", errRoute{code: "AMBIGUOUS_MODEL", message: "多个供应商声明该模型，网关不自动选择", status: 409}
+		return routedModel{}, errRoute{code: "AMBIGUOUS_MODEL", message: "多个供应商声明该模型；请使用 provider/model 格式", status: 409}
 	}
 }
 
@@ -628,5 +641,7 @@ func (g *Gateway) routeFailure(w http.ResponseWriter, err error) {
 }
 
 func shortID() string {
-	return strings.ToLower(fmt.Sprintf("%x", time.Now().UnixNano()))
+	var id [16]byte
+	_, _ = rand.Read(id[:])
+	return hex.EncodeToString(id[:])
 }

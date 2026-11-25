@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -140,7 +141,7 @@ func resolveHost(ctx context.Context, options AttachOptions) (ProcessInfo, error
 	if err != nil {
 		return ProcessInfo{}, err
 	}
-	if info.Executable != KimiExecutable {
+	if !slices.Contains(kimiExecutables(), info.Executable) {
 		return ProcessInfo{}, errors.New("目标进程不是 Kimi Code 主进程")
 	}
 	command, err := CommandLine(ctx, pid)
@@ -181,7 +182,7 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (result *Att
 			return nil, nil
 		}
 	}
-	if err := CheckInspectorFuse(KimiFramework); err != nil {
+	if err := CheckInspectorFuse(kimiFrameworkFor(info.Executable)); err != nil {
 		return nil, err
 	}
 	if err := VerifyLiveProcess(ctx, info); err != nil {
@@ -331,13 +332,14 @@ func discoverHostDarwin(ctx context.Context, profile string) (map[string]any, er
 	if err != nil {
 		return map[string]any{"running": false, "reason": err.Error()}, nil
 	}
-	if _, err = ProcessIdentity(ctx, pid); err != nil {
+	info, err := ProcessIdentity(ctx, pid)
+	if err != nil {
 		return map[string]any{"running": false, "reason": err.Error()}, nil
 	}
 	command, _ := CommandLine(ctx, pid)
 	debug := IsDebugInstance(command)
 	fuse := "ready"
-	if err := CheckInspectorFuse(KimiFramework); err != nil {
+	if err := CheckInspectorFuse(kimiFrameworkFor(info.Executable)); err != nil {
 		if errors.Is(err, ErrInspectorDisabled) {
 			fuse = "signal-disabled"
 		} else {

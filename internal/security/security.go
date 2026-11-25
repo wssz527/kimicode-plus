@@ -15,7 +15,10 @@ import (
 
 var Permissions = []string{"core:read", "settings:write", "models:read", "models:write", "usage:read", "usage:write", "tasks:read", "tasks:write", "chat:read", "chat:write", "plugins:read", "plugins:write", "adapter:write", "credentials:read", "credentials:write", "workspace:read", "workspace:write", "browser:read", "browser:write", "update:read", "update:write"}
 
-const ElectronMainPermission = "host:electron-main"
+const (
+	ElectronMainPermission  = "host:electron-main"
+	WindowsBridgePermission = "host:windows-bridge"
+)
 
 type electronMainKey struct{}
 
@@ -149,7 +152,7 @@ func permission(r *http.Request) string {
 	case p == "adapter" && write:
 		category = "adapter"
 	case p == "desktop/bridge-session":
-		return "adapter:write"
+		return WindowsBridgePermission
 	case strings.HasPrefix(p, "desktop/actions/"):
 		return nativeActionPermission(strings.TrimPrefix(p, "desktop/actions/"))
 	}
@@ -160,7 +163,7 @@ func permission(r *http.Request) string {
 }
 func nativeActionPermission(action string) string {
 	switch action {
-	case "bootstrap", "events.poll", "config.get", "automation.get", "recovery.get", "diagnostics.get", "contracts.status":
+	case "bootstrap", "events.poll", "features.get", "config.get", "automation.get", "recovery.get", "diagnostics.get", "contracts.status", "attach.status":
 		return "core:read"
 	case "accounts.list", "accounts.switchPreflight":
 		return "credentials:read"
@@ -168,24 +171,38 @@ func nativeActionPermission(action string) string {
 		return "credentials:write"
 	case "contracts.report":
 		return "adapter:write"
-	case "session.view", "session.watch", "session.unwatch":
+	case "models.list":
+		return "models:read"
+	case "providers.updateModel":
+		return "models:write"
+	case "session.view", "session.watch", "session.unwatch", "sessions.list", "sessions.view", "sessions.history", "sessions.diff", "sessions.watch", "sessions.unwatch", "keepalive.session.get", "schedule.list", "schedule.runs", "schedule.checkGit":
 		return "tasks:read"
 	case "managed.usage", "cache.summary", "cache.sessions", "cache.history", "cache.turns", "cache.retention", "cache.receipts", "quota.balances":
 		return "usage:read"
-	case "config.save", "automation.set", "recovery.set", "attach.reopen":
+	case "features.set", "config.save", "automation.set", "recovery.set", "attach.enable", "attach.disable", "attach.reopen":
 		return "settings:write"
-	case "planner.get", "planner.threads":
+	case "planner.get", "planner.threads", "planner.service.get":
 		return "chat:read"
+	case "planner.models":
+		return "models:read"
 	case "update.status":
 		return "update:read"
 	case "update.check", "update.apply", "update.autoCheck":
 		return "update:write"
+	case "plugin.command.register", "plugin.command.unregister", "plugin.command.invoke":
+		return "plugins:write"
 	default:
 		if strings.HasPrefix(action, "planner.") {
 			return "chat:write"
 		}
 		return "tasks:write"
 	}
+}
+
+func (g *Guard) RevokeSessionToken(token string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.grants, token)
 }
 
 func (g *Guard) Pair(w http.ResponseWriter, r *http.Request) {
@@ -216,7 +233,7 @@ func (g *Guard) Pair(w http.ResponseWriter, r *http.Request) {
 	if requested == nil {
 		requested = Permissions
 	}
-	allowed := map[string]bool{ElectronMainPermission: true}
+	allowed := map[string]bool{ElectronMainPermission: true, WindowsBridgePermission: true}
 	for _, p := range Permissions {
 		allowed[p] = true
 	}

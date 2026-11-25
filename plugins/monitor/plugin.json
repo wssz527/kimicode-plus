@@ -1,7 +1,7 @@
 {
   "id": "kimicode-plus.monitor",
   "name": "Monitor",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "apiVersion": 1,
   "description": "复刻自 kimi-code-monitor 桌面版的模块化侧边栏：Rive 蓝球形象、5h 与每周额度条、加油包与外部供应商余额、每日用量与会话逐轮统计、三区拖拽与迷你模式。",
   "author": "KimiCode+",
