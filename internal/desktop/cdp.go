@@ -79,13 +79,29 @@ func FindMainPID(ctx context.Context, profile string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return parseMainPID(output, KimiExecutable, profile)
+	return parseMainPIDs(output, kimiExecutables(), profile)
 }
 
 // parseMainPID keeps only main processes (no --type= helper) of this executable.
 // An empty profile accepts every instance; otherwise the command line must carry
 // that exact --user-data-dir value.
 func parseMainPID(output []byte, executable, profile string) (int, error) {
+	return parseMainPIDs(output, []string{executable}, profile)
+}
+
+func kimiExecutables() []string {
+	candidates := []string{KimiExecutable}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, strings.TrimPrefix(KimiExecutable, "/")))
+	}
+	return candidates
+}
+
+func kimiFrameworkFor(executable string) string {
+	return filepath.Join(filepath.Dir(filepath.Dir(executable)), "Frameworks/Electron Framework.framework/Versions/A/Electron Framework")
+}
+
+func parseMainPIDs(output []byte, executables []string, profile string) (int, error) {
 	matches := []int{}
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
 	for scanner.Scan() {
@@ -96,7 +112,14 @@ func parseMainPID(output []byte, executable, profile string) (int, error) {
 		}
 		pid, err := strconv.Atoi(line[:separator])
 		command := strings.TrimSpace(line[separator+1:])
-		if err != nil || command != executable && !strings.HasPrefix(command, executable+" ") {
+		matchesExecutable := false
+		for _, executable := range executables {
+			if command == executable || strings.HasPrefix(command, executable+" ") {
+				matchesExecutable = true
+				break
+			}
+		}
+		if err != nil || !matchesExecutable {
 			continue
 		}
 		if strings.Contains(command, "--type=") {
@@ -215,6 +238,7 @@ var SupportedHosts = []HostContract{
 	{AppVersion: "1.3.4", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1, Verified: true},
 	{AppVersion: "1.3.5", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1, Verified: true},
 	{AppVersion: "1.3.7", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1, Verified: true},
+	{AppVersion: "1.4.2", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1, Verified: true},
 }
 
 type HostIdentity struct {

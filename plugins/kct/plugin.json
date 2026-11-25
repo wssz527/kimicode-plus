@@ -1,9 +1,9 @@
 {
   "id": "kimicode-plus.kct",
   "name": "思考内容翻译",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "apiVersion": 1,
-  "description": "为思考内容提供内嵌翻译：展开思考块后按段落翻译，代码块与链接保持原样，可随时切回原文。移植自独立版 kimi-cot-translate。",
+  "description": "为思考内容提供内嵌翻译：展开思考块后按段落翻译，代码块与链接保持原样，可随时切回原文。移植自独立版 kimi-cot-translate。自定义公网 HTTPS 或本机服务会接收待翻译的内容，请确认端点归属。",
   "author": "KimiCode+",
   "license": "MIT",
   "hostVersions": ["1.*"],

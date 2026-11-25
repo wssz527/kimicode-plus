@@ -6,7 +6,11 @@ written, because a packaging test must not be able to publish anything.
 
 Run with: python3 scripts/test_package.py
 """
+import base64
+from contextlib import redirect_stdout
 import hashlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -71,6 +75,7 @@ class PackageHarness:
         return subprocess.run(
             [sys.executable, str(self.root / 'scripts' / 'package.py'), *args],
             cwd=self.root, capture_output=True, text=True, timeout=120,
+            env={**os.environ, 'RELEASE_SIGNING_PRIVATE_KEY': '', 'RELEASE_REQUIRE_SIGNING': '0'},
         )
 
     def cleanup(self):
@@ -112,6 +117,25 @@ class PackageManifestGateTest(unittest.TestCase):
         for entry in published:
             self.assertEqual(entry['publishedAt'], '2026-11-22T08:00:00Z')
             self.assertEqual(entry['releaseNotes'], '修复更新检查\n\n保留 SHA-256 校验')
+
+    def test_optional_ed25519_signature_preserves_the_manifest_array(self):
+        self.harness.write_manifest()
+        spec = importlib.util.spec_from_file_location('release_package', ROOT / 'scripts' / 'package.py')
+        package = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(package)
+        env = {
+            'RELEASE_SIGNING_PRIVATE_KEY': base64.b64encode(bytes(range(32))).decode(),
+            'RELEASE_REQUIRE_SIGNING': '0',
+        }
+        with (mock.patch.object(package, 'ROOT', self.harness.root),
+              mock.patch.object(sys, 'argv', ['package.py']),
+              mock.patch.dict(os.environ, env), redirect_stdout(io.StringIO())):
+            package.main()
+        published = json.loads((self.harness.root / 'dist' / 'release' / 'manifest.json').read_text())
+        self.assertEqual([entry['target'] for entry in published], list(TARGETS))
+        self.assertEqual(len(base64.b64decode(published[0]['signature']['value'], validate=True)), 64)
+        self.assertEqual(published[0]['signature']['keyId'], 'official-ed25519-2026')
+        self.assertTrue(all('signature' not in entry for entry in published[1:]))
 
     def test_missing_manifest_is_refused_with_a_rebuild_hint(self):
         result = self.harness.run('--version', self.harness.version)

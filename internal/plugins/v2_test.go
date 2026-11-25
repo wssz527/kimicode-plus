@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -303,20 +304,15 @@ func TestBrowserViewIDSpaceIsPerPlugin(t *testing.T) {
 }
 
 func TestAttachmentValidation(t *testing.T) {
-	dir := t.TempDir()
-	file := dir + "/note.txt"
-	if err := os.WriteFile(file, []byte("hello"), 0o600); err != nil {
-		t.Fatal(err)
+	file := filepath.Join(t.TempDir(), "photo.png")
+	paths, err := parseAttachmentPaths([]any{file})
+	if err != nil || len(paths) != 1 || paths[0] != file {
+		t.Fatalf("absolute path = %v, %v", paths, err)
 	}
-	items, err := normalizeAttachments([]string{file})
-	if err != nil || len(items) != 1 || items[0].Kind != "file" || items[0].Name != "note.txt" {
-		t.Fatalf("valid attachment rejected: %#v %v", items, err)
-	}
-	if _, err := normalizeAttachments([]string{"relative.txt"}); err == nil {
-		t.Fatal("relative path was accepted")
-	}
-	if _, err := normalizeAttachments([]string{dir + "/missing.txt"}); err == nil {
-		t.Fatal("missing file was accepted")
+	for _, input := range []any{[]any{"relative.txt"}, []any{5}, "not an array"} {
+		if _, err := parseAttachmentPaths(input); err == nil {
+			t.Fatalf("invalid attachment payload accepted: %#v", input)
+		}
 	}
 }
 

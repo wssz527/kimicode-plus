@@ -266,6 +266,7 @@ export async function renderSettings(ctx, element) {
     }
     save.disabled = true;
     try {
+      if (validEndpoint(next.customEndpoint)) next.customEndpoint = new URL(next.customEndpoint).href;
       await ctx.storage.set(SETTINGS_KEY, next);
       Object.assign(settings, next);
       setStatus("已保存。已展开的思考块会按新设置重新翻译。", "ok");
@@ -430,7 +431,7 @@ function validEndpoint(raw) {
   } catch {
     return false;
   }
-  if (url.username || url.password) return false;
+  if (url.username || url.password || url.hash) return false;
   if (url.protocol === "https:") return true;
   return url.protocol === "http:" && LOCAL_ENDPOINT_HOSTS.has(url.hostname);
 }

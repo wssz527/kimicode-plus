@@ -17,6 +17,7 @@ import { test } from "node:test";
 // 路径解析从 web/ 出发：npm test 从该包运行，与其他读文件的测试同一约定
 const source = readFileSync("../plugins/monitor/renderer.js", "utf8");
 const settingsSource = readFileSync("../plugins/monitor/settings.js", "utf8");
+const monitorSource = (path: string) => readFileSync(`../plugins/monitor-src/${path}`, "utf8");
 const manifest = JSON.parse(readFileSync("../plugins/monitor/plugin.json", "utf8"));
 
 const runtime = globalThis as unknown as Record<string, any>;
@@ -93,8 +94,8 @@ test("the shipped default layout keeps the pet and both quota bars in the mini z
 
 test("the desktop default turns the sidebar tidy off", () => {
   // 装配层显式写出默认布局：只有侧栏整理与上游不同（桌面默认不整理）
-  const body = /PANEL_WIDGET_CONFIG = \{([\s\S]*?)\n\};/.exec(source)?.[1] ?? "";
-  assert.ok(body, "layout literal is in the bundle");
+  const body = /PANEL_WIDGET_CONFIG = \{([\s\S]*?)\n\};/.exec(monitorSource("src/main.js"))?.[1] ?? "";
+  assert.ok(body, "layout literal is in the renderer entry");
   assert.match(body, /sidebarTidy: false/);
   assert.match(body, /orderMini: \["pet", "quota5h", "quotaWeek"\]/);
 });
@@ -142,15 +143,16 @@ test("the settings entry reads and writes the same storage keys as the panel", (
 });
 
 test("the settings page writes before it commits and explains a failure", () => {
-  const save = /async function saveConfig\(mutate\)[\s\S]*?\n  \}/.exec(settingsSource)?.[0] ?? "";
-  assert.ok(save, "saveConfig is in the shipped settings file");
+  const settingsEntry = monitorSource("src/settings.js");
+  const save = /async function saveConfig\(mutate\)[\s\S]*?\n  \}/.exec(settingsEntry)?.[0] ?? "";
+  assert.ok(save, "saveConfig is in the settings entry");
   const writeAt = save.indexOf("await ctx.storage.set");
   const commitAt = save.indexOf("config = next");
   assert.ok(writeAt >= 0 && commitAt > writeAt, "settings commit only after a successful write");
   assert.match(save, /仍在使用上次保存的设置/);
   // 设置页自带作用域样式，注入的 <style> 随面板一起移除
-  assert.match(settingsSource, /createElement\("style"\)/);
-  assert.match(settingsSource, /style\.remove\(\)/);
+  assert.match(settingsEntry, /createElement\("style"\)/);
+  assert.match(settingsEntry, /style\.remove\(\)/);
 });
 
 test("sidebar tidy is a persisted switch and is removed when the plugin stops", () => {
@@ -282,15 +284,15 @@ test("deactivate clears timers, listeners, globals and rive instance", async () 
 });
 
 test("external provider rows carry consoleUrl for click navigation", () => {
-  assert.match(source, /openExternalUrl/);
+  assert.match(monitorSource("vendor/content/widget-structure.js"), /openExternalUrl\(target\.dataset\.url\)/);
   assert.match(source, /ksb-external-row/);
   assert.match(source, /data-url/);
   assert.match(source, /consoleUrl/);
 });
 
 test("historical cache.turns snapshots are marked as replays so idle turns do not enter thinking", () => {
-  const stepHelper = /function stepEvent\([\s\S]*?\n\}/.exec(source)?.[0] ?? "";
-  assert.ok(stepHelper, "stepEvent helper is present in bundle");
+  const stepHelper = /function stepEvent\([\s\S]*?\n\}/.exec(monitorSource("src/datasource.js"))?.[0] ?? "";
+  assert.ok(stepHelper, "stepEvent helper is present in the data source");
   assert.match(stepHelper, /kcmReplay:\s*true/);
   assert.match(stepHelper, /kcmSkipDaily:\s*true/);
 });

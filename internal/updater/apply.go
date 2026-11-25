@@ -32,8 +32,9 @@ const (
 )
 
 var (
-	checksumPattern = regexp.MustCompile(`^([a-f0-9]{64}) [ *]([^/\\\s]+)$`)
-	ErrUnavailable  = errors.New("当前没有可用的核心更新")
+	releaseDigestPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	checksumPattern      = regexp.MustCompile(`^([a-f0-9]{64}) [ *]([^/\\\s]+)$`)
+	ErrUnavailable       = errors.New("当前没有可用的核心更新")
 )
 
 func (m *Manager) Apply(ctx context.Context) (Status, error) {
@@ -191,7 +192,7 @@ func (m *Manager) downloadCandidates(latestVersion string) []downloadCandidate {
 			continue
 		}
 		candidates = append(candidates, downloadCandidate{
-			archive:   asset{Name: m.archive.Name, URL: archiveURL, Size: m.archive.Size},
+			archive:   asset{Name: m.archive.Name, URL: archiveURL, Size: m.archive.Size, signedSHA256: m.archive.signedSHA256},
 			checksums: asset{Name: m.checksums.Name, URL: checksumURL},
 		})
 	}
@@ -267,6 +268,9 @@ func (m *Manager) downloadChecksum(ctx context.Context, candidate downloadCandid
 	}
 	if digest == "" {
 		return "", errors.New("SHA256SUMS 中缺少当前安装包的有效 SHA-256 校验值")
+	}
+	if candidate.archive.signedSHA256 != "" && digest != candidate.archive.signedSHA256 {
+		return "", errors.New("SHA256SUMS 与签名发布清单的安装包校验值不一致")
 	}
 	return digest, nil
 }

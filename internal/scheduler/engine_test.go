@@ -833,3 +833,26 @@ func (d *delayedTurnExecutor) GetSession(ctx context.Context, id string) (Sessio
 	}
 	return d.fakeExecutor.GetSession(ctx, id)
 }
+
+func TestObserveTurnOutcomeRequiresProgressEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		before int
+		prior  string
+	}{
+		{"unchanged history", 1, "old"}, {"unknown history baseline", -1, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			executor := newFakeExecutor()
+			executor.sessions["s1"] = SessionInfo{ID: "s1", PendingInteraction: "none"}
+			executor.turns["s1"] = []TurnInfo{{TurnID: "old", HasAssistantMsg: true}}
+			e := &Engine{exec: executor, pollInterval: time.Millisecond}
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+			defer cancel()
+			status, failure, _ := e.observeTurnOutcome(ctx, context.Background(), "s1", tc.before, tc.prior, 1, 0)
+			if status != RunFailed || failure != FailureTimeout || len(executor.abortedIDs) != 1 {
+				t.Fatalf("idle observation = %s/%s, aborts=%v", status, failure, executor.abortedIDs)
+			}
+		})
+	}
+}

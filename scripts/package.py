@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import tarfile
 import zipfile
 
@@ -168,6 +169,10 @@ def main():
         if not binary.is_file():
             raise SystemExit(f'Missing cross build: {binary.name}')
 
+    signing_key = os.environ.get('RELEASE_SIGNING_PRIVATE_KEY', '').strip()
+    if os.environ.get('RELEASE_REQUIRE_SIGNING') == '1' and not signing_key:
+        raise SystemExit('RELEASE_SIGNING_PRIVATE_KEY is required to sign the core release manifest')
+
     release = dist / 'release'
     release.mkdir(exist_ok=True)
     published_at = os.environ.get('RELEASE_PUBLISHED_AT', '').strip()
@@ -200,6 +205,16 @@ def main():
             entry['releaseNotes'] = release_notes
         manifest.append(entry)
     manifest_json = json.dumps(manifest, indent=2)
+    if signing_key:
+        try:
+            signed = subprocess.run(
+                ['go', 'run', './internal/updater/cmd/sign-manifest'],
+                cwd=Path(__file__).resolve().parents[1], input=manifest_json.encode('utf-8'),
+                stdout=subprocess.PIPE, check=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise SystemExit(f'Could not sign the release manifest: {error}') from error
+        manifest_json = signed.stdout.decode('utf-8')
     (release / 'manifest.json').write_text(manifest_json + '\n', encoding='utf-8')
     (release / 'SHA256SUMS').write_text(''.join(f'{entry["sha256"]}  {entry["archive"]}\n' for entry in manifest), encoding='utf-8')
     print(manifest_json)

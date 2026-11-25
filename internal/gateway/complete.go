@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -20,7 +22,7 @@ func (g *Gateway) bufferedCompletion(w http.ResponseWriter, r *http.Request, con
 	var reply provider.Reply
 	err := g.dispatch(func() error {
 		var err error
-		reply, err = g.client.Complete(r.Context(), config, model, body, messages)
+		reply, err = g.client.Complete(r.Context(), config, attribution.Model, body, messages)
 		return err
 	})
 	if err != nil {
@@ -34,23 +36,16 @@ func (g *Gateway) bufferedCompletion(w http.ResponseWriter, r *http.Request, con
 	if reply.Reasoning != "" {
 		message["reasoning_content"] = reply.Reasoning
 	}
-	finish := reply.FinishReason
 	if len(reply.ToolCalls) > 0 {
 		message["tool_calls"] = reply.ToolCalls
-		if finish == "" || finish == "stop" {
-			finish = "tool_calls"
-		}
-	}
-	if finish == "" {
-		finish = "stop"
 	}
 	writeJSON(w, 200, map[string]any{
 		"id":      "chatcmpl-" + shortID(),
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
 		"model":   model,
-		"choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finish}},
-		"usage":   usageOrNull(reply.Usage),
+		"choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": reply.CompletionFinish()}},
+		"usage":   gatewayWireUsage(config.Protocol, reply.Usage),
 	})
 }
 
@@ -76,7 +71,7 @@ func usageOrNull(raw json.RawMessage) any {
 // protocol, a buffered upstream, an upstream 401/429 or an immediate failure
 // therefore returns a real error status instead of a 200 whose only content is
 // an error.
-func (g *Gateway) streamCompletion(w http.ResponseWriter, r *http.Request, config provider.Config, model string, body map[string]any, attribution usage.EventInput, accountID string) {
+func (g *Gateway) streamCompletion(w http.ResponseWriter, r *http.Request, config provider.Config, model string, body map[string]any, messages []provider.Message, attribution usage.EventInput, accountID string) {
 	attribution = withAccount(attribution, accountID)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -144,7 +139,17 @@ func (g *Gateway) streamCompletion(w http.ResponseWriter, r *http.Request, confi
 	}
 	var streamErr error
 	dispatchErr := g.dispatch(func() error {
-		streamErr = g.client.OpenStream(r.Context(), config, model, body, emit, nil)
+		if provider.StreamingMode(config.Protocol) == "synthetic" {
+			var reply provider.Reply
+			reply, streamErr = g.client.Complete(r.Context(), config, attribution.Model, body, messages)
+			usageRaw = reply.Usage
+			if streamErr == nil {
+				streamErr = writeBufferedStream(reply, config.Protocol, body, emit)
+				usageRaw = reply.Usage
+			}
+		} else {
+			streamErr = g.client.OpenStream(r.Context(), config, attribution.Model, body, emit, nil)
+		}
 		return nil
 	})
 	if dispatchErr != nil {
@@ -185,6 +190,56 @@ func (g *Gateway) streamCompletion(w http.ResponseWriter, r *http.Request, confi
 	attribution.ObservationState = "FINAL"
 	g.record(attribution, usageRaw)
 }
+
+func writeBufferedStream(reply provider.Reply, protocol string, body map[string]any, emit func(provider.StreamEvent) error) error {
+	for _, event := range []provider.StreamEvent{{Role: "assistant"}, reply.CompletionDelta(), {Finish: reply.CompletionFinish()}} {
+		if err := emit(event); err != nil {
+			return err
+		}
+	}
+	options, _ := body["stream_options"].(map[string]any)
+	if options["include_usage"] == true {
+		if value := gatewayWireUsage(protocol, reply.Usage); value != nil {
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				return err
+			}
+			return emit(provider.StreamEvent{Usage: encoded})
+		}
+	}
+	return nil
+}
+
+func gatewayWireUsage(protocol string, raw json.RawMessage) any {
+	value := usageOrNull(raw)
+	if protocol == "openai" || value == nil {
+		return value
+	}
+	fields, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	counts := usage.Normalize(protocol, fields)
+	out := map[string]any{}
+	if counts.Input != nil {
+		out["prompt_tokens"] = *counts.Input
+	}
+	if counts.Output != nil {
+		out["completion_tokens"] = *counts.Output
+	}
+	if counts.Input != nil && counts.Output != nil && *counts.Input <= math.MaxInt64-*counts.Output {
+		out["total_tokens"] = *counts.Input + *counts.Output
+	}
+	if counts.Read != nil {
+		out["prompt_tokens_details"] = map[string]int64{"cached_tokens": *counts.Read}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (g *Gateway) UsageWriteFailures() uint64 { return g.usageWriteFailures.Load() }
 
 func streamErrorCode(err error) string {
 	var api *provider.APIError
@@ -241,7 +296,10 @@ func (g *Gateway) record(attribution usage.EventInput, raw json.RawMessage) {
 	if attribution.At == "" {
 		attribution.At = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	_, _ = g.usage.Ingest([]usage.EventInput{attribution})
+	if _, err := g.usage.Ingest([]usage.EventInput{attribution}); err != nil {
+		g.usageWriteFailures.Add(1)
+		slog.Warn("gateway usage ingestion failed", "request_id", attribution.RequestID, "provider_id", attribution.ProviderID, "error", err)
+	}
 }
 
 // mergeUsageRaw keeps the protocol usage object and adds the account id.

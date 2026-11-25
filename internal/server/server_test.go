@@ -169,3 +169,36 @@ func TestModuleMigrationFailureIsIsolated(t *testing.T) {
 		t.Fatal("core settings unavailable after registry fault")
 	}
 }
+
+func TestRecovererKeepsCommittedResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		write  func(http.ResponseWriter)
+		status int
+		body   string
+	}{
+		{"before headers", func(http.ResponseWriter) {}, http.StatusInternalServerError, "INTERNAL_ERROR"},
+		{"after explicit headers", func(w http.ResponseWriter) { w.WriteHeader(http.StatusAccepted) }, http.StatusAccepted, ""},
+		{"after body", func(w http.ResponseWriter) { _, _ = w.Write([]byte("partial")) }, http.StatusOK, "partial"},
+		{"after flush", func(w http.ResponseWriter) { w.(http.Flusher).Flush() }, http.StatusOK, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := recoverer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				tc.write(w)
+				panic("test panic")
+			}))
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
+			if w.Code != tc.status {
+				t.Fatalf("status %d, want %d", w.Code, tc.status)
+			}
+			if tc.status == http.StatusInternalServerError {
+				if !bytes.Contains(w.Body.Bytes(), []byte(tc.body)) {
+					t.Fatalf("body %q", w.Body)
+				}
+			} else if w.Body.String() != tc.body {
+				t.Fatalf("committed body %q, want %q", w.Body, tc.body)
+			}
+		})
+	}
+}

@@ -13,7 +13,7 @@
  * 产物上限 8 MiB（internal/plugins/manager.go 的 assetLimit），超出直接失败。
  */
 
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -23,6 +23,18 @@ const sourceDir = resolve(here, "..");
 const pluginDir = resolve(sourceDir, "..", "monitor");
 const repoRoot = resolve(sourceDir, "..", "..");
 const assetLimit = 8 << 20;
+const check = process.argv.includes("--check");
+
+function publishOutput(filename, contents) {
+  const path = join(pluginDir, filename);
+  if (check) {
+    if (!readFileSync(path).equals(contents)) {
+      throw new Error(`${filename} 与源码构建结果不一致。请运行 node plugins/monitor-src/build/bundle.mjs`);
+    }
+    return;
+  }
+  writeFileSync(path, contents);
+}
 
 // esbuild 已经随 web/ 的 devDependencies 装好（vite 的依赖），这里复用同一份，
 // 不再为插件构建引入第二个打包器版本。找不到时明确报错，不静默跳过。
@@ -94,15 +106,16 @@ const targets = [
 ];
 
 for (const target of targets) {
-  await build({
+  const result = await build({
     entryPoints: [join(sourceDir, target.entry)],
     outfile: join(pluginDir, target.outfile),
     bundle: true,
+    write: false,
     format: "esm",
     platform: "browser",
     target: ["chrome110", "safari16"],
     treeShaking: true,
-    minify: false,
+    minify: true,
     legalComments: "inline",
     charset: "utf8",
     define,
@@ -122,10 +135,12 @@ for (const target of targets) {
     ],
     logLevel: "warning"
   });
-  const size = statSync(join(pluginDir, target.outfile)).size;
+  const contents = Buffer.from(result.outputFiles[0].contents);
+  const size = contents.length;
   if (size > assetLimit) {
     throw new Error(`${target.outfile} 有 ${size} 字节，超过宿主上限 ${assetLimit}`);
   }
+  publishOutput(target.outfile, contents);
   console.log(`${target.outfile.padEnd(14)} ${(size / 1024).toFixed(1)} KiB`);
 }
 
@@ -144,11 +159,5 @@ kimi_avatar_web-PnsTWI-X.riv 沿用上游的分发方式；素材为 Kimi 官方
 端点、解析规则与测试数据见 internal/quota/ 的源码。
 `;
 
-const noticePath = join(pluginDir, "NOTICE");
-try {
-  if (readFileSync(noticePath, "utf8") === notice) process.exitCode = 0;
-} catch {
-  // 不存在时下面写入
-}
-writeFileSync(noticePath, notice);
-console.log("NOTICE 已更新");
+publishOutput("NOTICE", Buffer.from(notice));
+if (!check) console.log("NOTICE 已更新");

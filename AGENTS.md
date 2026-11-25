@@ -9,14 +9,14 @@ https://cnb.cool/wssz527/kimicode-plus/-/releases/latest/download/manifest.json
 https://github.com/wssz527/kimicode-plus/releases/latest/download/manifest.json
 ```
 
-客户端读取 `manifest.json` 获取最新版本号、发布时间、更新说明与各平台归档名，再从同一发布源的 `download/v<version>/` 下载对应平台压缩包及 `SHA256SUMS` 完成 SHA-256 校验与自替换；若优先源检查或下载失败，自动回退到备用源并同样执行完整校验（实现见 `internal/updater/updater.go`、`internal/updater/apply.go`、`internal/updater/archive.go`）。
+客户端读取 `manifest.json` 获取最新版本号、发布时间、更新说明与各平台归档名，再从同一发布源的 `download/v<version>/` 下载对应平台压缩包及 `SHA256SUMS` 验证内嵌 Ed25519 签名并核对签名摘要、SHA-256 清单和实际归档后自替换；若优先源检查或下载失败，自动回退到备用源并同样执行完整校验（实现见 `internal/updater/`）。历史未签名清单在过渡期仍可使用，也可设置 `EKD_UPDATE_REQUIRE_SIGNATURE=1` 强制验签。
 
 ### 标准发版流程（优先采用）
 
 1. 将 `internal/server/server.go` 中的 `var Version = "<X.Y.Z>"` 更新为新版本号（语义化版本，不含 `v` 前缀）。
 2. 完成下方全部验证（前端检查与构建、嵌入资产、Go 检查与测试、打包与同步测试、真实二进制验收）。
 3. 提交发布改动，**并将面向用户的更新说明写入该发布 commit 的提交信息**。`.github/workflows/release.yml` 打包时会读取 `git log -1 --format=%B` 写入 `manifest.json` 的 `releaseNotes`，读取 `git log -1 --format=%cI` 写入 `publishedAt`。后续仅在 GitHub/CNB 网页编辑正文不会同步回 `manifest.json`。
-4. 基于该提交打注释标签 `v<X.Y.Z>` 并推送到远端。GitHub Actions（`.github/workflows/release.yml`）构建、交叉编译与打包后，将资产上传至 GitHub 草稿。通过 `scripts/sync_cnb_release.py` 同步到 CNB 镜像后公开 GitHub Release。`CNB_TOKEN` 需要 `wssz527/kimicode-plus` 的 `repo-code` 和 `repo-release` 读写权限，默认在构建前检查。手动运行时可显式选择 `skip_cnb_mirror`，镜像会继续提供上一版本。若同标签已有草稿或正式 Release，工作流停止，先核对已有记录。
+4. 基于该提交打注释标签 `v<X.Y.Z>` 并推送到远端。GitHub Actions（`.github/workflows/release.yml`）构建、交叉编译并通过 `PLUGIN_SIGNING_PRIVATE_KEY` 签名核心 `manifest.json` 后，将资产上传至 GitHub 草稿。通过 `scripts/sync_cnb_release.py` 同步到 CNB 镜像后公开 GitHub Release。`CNB_TOKEN` 需要 `wssz527/kimicode-plus` 的 `repo-code` 和 `repo-release` 读写权限，默认在构建前检查。手动运行时可显式选择 `skip_cnb_mirror`，镜像会继续提供上一版本。若同标签已有草稿或正式 Release，工作流停止，先核对已有记录。
 
 ### 自动更新生效的硬性要求（缺一不可）
 
@@ -27,7 +27,7 @@ https://github.com/wssz527/kimicode-plus/releases/latest/download/manifest.json
   - Tag 必须严格命名为 `v<X.Y.Z>`，且与 `manifest.json` 中每条记录的 `version`（`<X.Y.Z>`）一致。
   - 正式版必须是非草稿（non-draft）且非预发布（`prerelease: false`）。带 `-beta.1`、`-rc.1` 等预发布后缀的标签会发布为 Pre-release，不会被 `latest/download/manifest.json` 指向。
 - **必须上传的 6 个核心资产**（严禁只替换单个安装包而不同步更新 `manifest.json` 和 `SHA256SUMS`；上传 CNB 时须将 `manifest.json` 放在最后上传，确保清单可见时全部归档与校验文件已就位）：
-  1. `manifest.json`：由 `scripts/package.py` 生成；所有条目 `version` 必须一致且与 tag 匹配。缺少该文件时，固定入口会返回 404，客户端会视为“尚未发布正式 Release 版本”而不会提示更新。
+  1. `manifest.json`：由 `scripts/package.py` 生成，官方工作流使用内嵌 Ed25519 签名；所有条目 `version` 必须一致且与 tag 匹配。缺少该文件时，固定入口会返回 404，客户端会视为“尚未发布正式 Release 版本”而不会提示更新。
   2. `SHA256SUMS`：包含全部发布压缩包的 64 位小写 SHA-256 摘要，格式须匹配 `^([a-f0-9]{64}) [ *]([^/\\\s]+)$` 且无重复项。缺少或摘要不一致会拒绝安装。
   3. `enhanced-kimi-<X.Y.Z>-darwin-arm64.tar.gz`
   4. `enhanced-kimi-<X.Y.Z>-darwin-amd64.tar.gz`
@@ -43,8 +43,10 @@ https://github.com/wssz527/kimicode-plus/releases/latest/download/manifest.json
 sh scripts/build.sh
 VERSION=<X.Y.Z> sh scripts/crossbuild.sh
 python3 scripts/notices.py
-RELEASE_PUBLISHED_AT="<ISO8601时间>" RELEASE_NOTES="<更新说明>" python3 scripts/package.py --version <X.Y.Z>
+RELEASE_REQUIRE_SIGNING=1 RELEASE_PUBLISHED_AT="<ISO8601时间>" RELEASE_NOTES="<更新说明>" python3 scripts/package.py --version <X.Y.Z>
 ```
+
+运行打包前从受控的密钥管理环境提供 `RELEASE_SIGNING_PRIVATE_KEY`，对应既有官方 Ed25519 公钥。
 
 手工在 GitHub 创建 Release 时，必须先保存为 Draft，将 `dist/release/*.tar.gz`、`dist/release/*.zip`、`dist/release/SHA256SUMS`、`dist/release/manifest.json` 与 `dist/THIRD_PARTY_NOTICES.txt` 全部上传完整后再点击 Publish；同步到 CNB 时可使用 `CNB_TOKEN=... python3 scripts/sync_cnb_release.py --tag v<X.Y.Z> ...`（该脚本会自动按“归档 → `SHA256SUMS` → `manifest.json`”顺序上传）。
 

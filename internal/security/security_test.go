@@ -88,7 +88,7 @@ func TestNativeActionPermissionsFollowIntent(t *testing.T) {
 		"accounts.delete": "credentials:write", "accounts.refreshQuotas": "credentials:write",
 		"accounts.switch": "credentials:write", "accounts.cancelPending": "credentials:write",
 		"accounts.resetVault": "credentials:write",
-		"session.send": "tasks:write", "session.create": "tasks:write", "session.abort": "tasks:write",
+		"session.send":        "tasks:write", "session.create": "tasks:write", "session.abort": "tasks:write",
 		"session.reply": "tasks:write", "handoff": "tasks:write",
 	} {
 		r := httptest.NewRequest(http.MethodPost, "/enhance/v1/desktop/actions/"+action, nil)
@@ -188,12 +188,12 @@ func TestPluginRuntimeRoutesCountAsPluginTraffic(t *testing.T) {
 		// The KCT handover is driven by the plugin page, so it has to be plugin
 		// traffic as well. Classified as core traffic, the confirm button answered
 		// 403 to the only client that can press it.
-		"/enhance/v1/kct/migration":             "plugins:read",
-		"/enhance/v1/kct/migration/confirm":     "plugins:write",
-		"/enhance/v1/plugins/monitor/migration": "plugins:read",
+		"/enhance/v1/kct/migration":                     "plugins:read",
+		"/enhance/v1/kct/migration/confirm":             "plugins:write",
+		"/enhance/v1/plugins/monitor/migration":         "plugins:read",
 		"/enhance/v1/plugins/monitor/migration/confirm": "plugins:write",
-		"/enhance/v1/credentials/reset":         "credentials:write",
-		"/enhance/v1/update/auto-check":         "update:write",
+		"/enhance/v1/credentials/reset":                 "credentials:write",
+		"/enhance/v1/update/auto-check":                 "update:write",
 	}
 	for path, expected := range cases {
 		method := http.MethodGet
@@ -203,6 +203,24 @@ func TestPluginRuntimeRoutesCountAsPluginTraffic(t *testing.T) {
 		r := httptest.NewRequest(method, path, nil)
 		if actual := permission(r); actual != expected {
 			t.Errorf("%s %s: got %s, want %s", method, path, actual, expected)
+		}
+	}
+}
+
+func TestNativeActionPermissions(t *testing.T) {
+	for _, tc := range []struct{ action, permission string }{
+		{"features.get", "core:read"}, {"features.set", "settings:write"},
+		{"attach.status", "core:read"}, {"attach.enable", "settings:write"},
+		{"keepalive.session.get", "tasks:read"}, {"keepalive.session.set", "tasks:write"},
+		{"sessions.history", "tasks:read"}, {"sessions.send", "tasks:write"},
+		{"models.list", "models:read"}, {"providers.updateModel", "models:write"},
+		{"planner.threads", "chat:read"}, {"planner.send", "chat:write"},
+		{"update.status", "update:read"}, {"update.apply", "update:write"},
+		{"accounts.list", "credentials:read"}, {"accounts.rename", "credentials:write"},
+		{"cache.receipts", "usage:read"}, {"contracts.report", "adapter:write"},
+	} {
+		if actual := nativeActionPermission(tc.action); actual != tc.permission {
+			t.Errorf("%s = %q, want %q", tc.action, actual, tc.permission)
 		}
 	}
 }

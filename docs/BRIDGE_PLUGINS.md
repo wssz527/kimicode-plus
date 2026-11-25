@@ -1,6 +1,6 @@
 # 任务桥接、模拟适配器与插件生命周期
 
-本文件记录旧版 `internal/bridge` Outbox、Mock Adapter、`internal/plugins` 与 `internal/redact` 的实现契约、与 `docs/API_CONTRACT.md` 的精确偏差，以及可复现的验证结果。`internal/desktop` 现已另有真实 KAP 会话、规划、运行时接入、后台自动化和额度恢复路径；本机附件也可直接经 KAP prompt 发送，它们不经过本文的 Mock Outbox，详见 `NATIVE_INTEGRATION.md`。缓存指标的官方额度读取和 UNKNOWN 处理属于原生路径，不能与本文件的兼容事件导入或模拟资源计数混为一谈。侧栏 Monitor 现在是预装插件（`plugins/monitor/`），只经 `metrics:read` 读 `cache.*`；核心没有 `monitor.summary` 私有通道。界面参考固定 MIT 上游版本，许可随插件包交付，但不运行上游采集器；自动化回执不代表缓存命中率。
+本文件记录旧版 `internal/bridge` Outbox、Mock Adapter、`internal/plugins` 与 `internal/redact` 的实现契约，以及可复现的验证结果。`internal/desktop` 现已另有真实 KAP 会话、规划、运行时接入、后台自动化和额度恢复路径；本机附件也可直接经 KAP prompt 发送，它们不经过本文的 Mock Outbox，详见 `NATIVE_INTEGRATION.md`。缓存指标的官方额度读取和 UNKNOWN 处理属于原生路径，不能与本文件的兼容事件导入混为一谈。侧栏 Monitor 现在是预装插件（`plugins/monitor/`），只经 `metrics:read` 读 `cache.*`；核心没有 `monitor.summary` 私有通道。界面参考固定 MIT 上游版本，许可随插件包交付，但不运行上游采集器；自动化回执不代表缓存命中率。
 
 ## 模块位置与集成签名
 
@@ -9,7 +9,7 @@
 | 脱敏 | `internal/redact/redact.go` | `Text(string) string`、`Findings(string) []string`、`JoinFindings(...[]string) []string` | 无路由 |
 | 模拟适配器 | `internal/desktop/mock.go` | `NewMock() *Mock`；`Mock` 实现 `Adapter` | `Register(mux)` |
 | 任务桥 | `internal/bridge/model.go`、`internal/bridge/service.go` | `New(db *sql.DB, adapter desktop.Adapter, safe func() bool) (*Service, error)` | `Register(mux)` |
-| 插件管理 | `internal/plugins/manager.go` | `New(db *sql.DB, safe func() bool) (*Manager, error)` | `Register(mux)`、`Close() error` |
+| 插件管理 | `internal/plugins/manager.go` | `New(db *sql.DB, safe func() bool, options ...Option) (*Manager, error)` | `Register(mux)`、`Close() error` |
 
 所有 `Register` 只注册 `/enhance/v1` 开头的完整模式，自身不创建子路由，也不假定挂载前缀。`bridge.New` 与 `plugins.New` 各自调用 `storage.Migrate`，模块名分别为 `bridge`、`plugins`；迁移在同一事务内记录版本，模块版本高于程序时报错而不是继续运行。
 
@@ -37,11 +37,11 @@ type Adapter interface {
 | POST | `/enhance/v1/tasks/preview` | `{task}` => `PreviewResult` |
 | POST | `/enhance/v1/tasks` | `{intent,task,confirmed,confirmationHash?,mockBehavior?,acknowledgeUnverifiedAttachments?}` => `Record` |
 | POST | `/enhance/v1/tasks/{id}/reconcile` | 请求体必须是 `{}`；只查询，不提交 |
-| GET | `/enhance/v1/plugins` | 内置模拟插件列表 + `safeMode` + `notice` |
-| GET | `/enhance/v1/plugins/health` | 状态/资源/故障计数聚合，`processes` 恒为 0 |
-| POST | `/enhance/v1/plugins/{id}` | `{"action":"ENABLE"\|"DISABLE"\|"FAULT"}` |
+| GET | `/enhance/v1/plugins` | 安装记录、能力、状态和安全模式 |
+| GET | `/enhance/v1/plugins/{id}/activity` | 脱敏的活动记录，支持 `before`、`offset` 和 `limit`，`total` 为插件保留总数 |
+| POST | `/enhance/v1/plugins/{id}/uninstall` | 可选 `{"deleteData":true}`，删除安装文件并保留卸载标记 |
 
-错误统一为 `{error:{code,message}}`。插件动作失败时，响应同时带 `plugin` 字段返回故障后的快照，便于界面就地更新。
+错误统一为 `{error:{code,message}}`。
 
 ## 任务包与校验
 
@@ -117,31 +117,28 @@ Mock 只有三条合成会话，`owner` 固定为 `official-host`，`kind` 为 `
 
 插件不在本文件描述的桥接层里，而是核心的本地插件宿主：包结构、清单、能力、运行时接口、生命周期与 HTTP 接口见 [PLUGINS.md](PLUGINS.md)。这里只记录与桥接相关的约束。
 
-- **没有内置模拟插件**：不存在 `kct`、`monitor`、`fault-demo` 这类进程内模拟定义，也没有 `registerBuiltins`、`FAULT` 动作或"模拟资源计数"。插件列表只反映真实安装。
+- 插件列表显示核心登记的预装和第三方包，以及各包的生命周期状态。
 - **插件不是桥接适配器**：插件通过 `/enhance/v1/plugin-runtime/{action}` 取用核心能力，与 Outbox、任务投递、原生适配器互不影响。桥接降级时插件照常工作。
 - **进程内运行**：插件是运行在宿主渲染进程里的 ES module，核心不启动 Node 服务，也没有插件宿主子进程。
 - **安全模式**：`safe func() bool` 为真时拒绝安装与启用，并停止已运行插件、撤销其身份令牌；关闭后可以重新启用。插件页同时显示该状态。
 - **`Close` 是终止操作**：撤销全部令牌，之后安装、启用、动作调用都返回 `MANAGER_CLOSED`。
 - **不修改官方包体**：插件只读取本机数据目录，不写入 Kimi Code 官方存储，不回写官方凭据。
 
-Monitor 与 KCT 是后续阶段的适配插件，本阶段不实现；它们将来只能经上述接口接入，核心不为其保留私有通道或硬编码挂载。
+Monitor 和 KCT 作为预装插件使用上述接口。插件带附件发送时需要 `attachments` 能力，文件必须由当前插件会话调用 `attachments.stage` 暂存。消费后的批次由核心清理。活动保留 30 天，同一插件一分钟内的相同网络活动合为一条。
 
-## 与 `docs/API_CONTRACT.md` 的精确偏差
+## 旧 Outbox 行为补充
 
 1. **`POST /tasks` 增加 `confirmationHash`、`acknowledgeUnverifiedAttachments` 两个可选请求字段**，用于绑定预览和显式接受附件缺口。契约原文只列了 `intent`、`task`、`confirmed`、`mockBehavior`。未知字段会被 `httpx.Decode` 拒绝，所以这两个字段是新增的显式契约项。
 2. **`POST /tasks` 的 `mockBehavior` 只影响 Mock 行为的注入**，不改变校验规则；生产适配器可忽略该字段。行为枚举大小写不敏感，规范化为大写。
 3. **`UNKNOWN` 以 200 + 记录形式返回**，因为任务可能已经送达，界面必须展示"未知"而不是失败。**`REJECTED` 返回对应的 HTTP 错误码**（`409`/`503`/`404`，见上文结果分类表），不会以 200 伪装成功；记录本身仍保留在 Outbox 中，可通过 `GET /tasks` 查看。
-4. **新增 `GET /enhance/v1/plugins/health`**。契约只列 `GET /plugins`；健康聚合是额外只读端点。
-5. **`GET /plugins` 响应增加 `notice` 与每个插件的 `sandbox`、`controlled` 字段**；`items` 内包含 `enabled`、`faults`、`error`、`resources`、`safeMode`。
-6. **`GET /sessions` 响应增加 `mock`、`ownership`、`notice`**，会话项增加 `kind`。
-7. **`GET /tasks` 记录额外包含 `findings`、`confirmationHash`、`checkpointHash`、`checkpointAdvanced`、`note`、`replayed`、`createdAt`、`updatedAt`**。
-8. **`TaskPackage` 的 `messages[]` 额外接受并返回 `sequence`**；`trust` 由服务端强制覆写为 `untrusted-web`。
-9. **`linkedTaskId` 的语义收紧**：带 `parentCheckpoint>0` 时必填，且必须指向父检查点所属任务。契约只把它列为可选字段。
-10. **附件上限为 1 MiB/项**，通过独立上传写入私有 store；任务 JSON 只保留引用。store 总量和保留策略见 API_CONTRACT.md。
-11. **`GET /tasks` 的 `total` 由 SQL `COUNT(1)` 得出**，`items` 只包含当前 `LIMIT/OFFSET` 页；契约未规定分页实现。
-12. **记录 `id` 由 `intent + payload hash` 派生**（`task-` + 16 位十六进制）。早期版本只由 payload 派生，导致 `REJECTED` 后合法重试撞主键；该行为已修正。
-13. **`POST /plugins/{id}` 新增错误码** `PLUGIN_ENABLING`、`PLUGIN_ACTIVATION_CANCELLED`、`MANAGER_CLOSED`；契约只规定了三个 action。
-14. **`receipt.state` 必须显式为 `DELIVERED`**；契约示例省略了该字段，本实现把它当作回执有效性的一部分。
+4. **`GET /sessions` 响应增加 `mock`、`ownership`、`notice`**，会话项增加 `kind`。
+5. **`GET /tasks` 记录额外包含 `findings`、`confirmationHash`、`checkpointHash`、`checkpointAdvanced`、`note`、`replayed`、`createdAt`、`updatedAt`**。
+6. **`TaskPackage` 的 `messages[]` 额外接受并返回 `sequence`**；`trust` 由服务端强制覆写为 `untrusted-web`。
+7. **`linkedTaskId` 的语义收紧**：带 `parentCheckpoint>0` 时必填，且必须指向父检查点所属任务。契约只把它列为可选字段。
+8. **附件上限为 1 MiB/项**，通过独立上传写入私有 store；任务 JSON 只保留引用。store 总量和保留策略见 API_CONTRACT.md。
+9. **`GET /tasks` 的 `total` 由 SQL `COUNT(1)` 得出**，`items` 只包含当前 `LIMIT/OFFSET` 页；契约未规定分页实现。
+10. **记录 `id` 由 `intent + payload hash` 派生**（`task-` + 16 位十六进制）。早期版本只由 payload 派生，导致 `REJECTED` 后合法重试撞主键；该行为已修正。
+11. **`receipt.state` 必须显式为 `DELIVERED`**；契约示例省略了该字段，本实现把它当作回执有效性的一部分。
 
 ## 验证
 
@@ -186,6 +183,6 @@ SQLite 事务回滚由 `storage.Transaction` 保证；`claim` 在单事务内写
 
 - 本文件所述旧 Outbox 没有对接真实官方宿主或真实网站上传，生产任务目标仍为 Mock；幂等只在该 Outbox 语义内成立。0.1.1 的本地 HTTP 接收端验证仅证明附件原字节传输。当前原生 KAP `handoff` 已能向真实 Code 会话发送文本，`session.send` 可发送本机文件路径，但属于另一条链路，不使用旧 Outbox 的附件上传或幂等回执。系统文件选择窗口的 GUI 点选、网站上传仍未验收。
 - 没有验证真实网站 DOM、草稿写入或回复完成；`source.url` 仅保存引用。
-- 没有操作系统级沙箱、独立进程、签名或卸载验证；插件隔离仅限 Go 层 `recover` 与资源作用域。
+- 插件在宿主 renderer 中运行，使用核心的能力校验、资源作用域和故障隔离。官方插件更新清单由核心使用内置公钥验证。
 - 脱敏是规则匹配，不能保证识别全部敏感内容；仍需人工核对预览。
 - 服务层通过 `Manager.EnforceSafeMode` 响应安全模式开关，该调用可逆、可重复；`Manager.Close` 只在进程退出时调用，调用后 `Enable` 返回 `MANAGER_CLOSED`。两条路径互不复用，安全模式不会终止插件管理器。

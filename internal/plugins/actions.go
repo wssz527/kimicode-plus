@@ -102,6 +102,7 @@ func (m *Manager) runAction(ctx context.Context, id, token, action string, param
 		r = r.WithContext(context.WithValue(r.Context(), paramsKey{}, params))
 	}
 
+	m.sweepActivity(ctx)
 	grants := item.grants
 	switch {
 	case action == "runtime.info":
@@ -182,11 +183,40 @@ func (m *Manager) runAction(ctx context.Context, id, token, action string, param
 	}
 	switch {
 	case action == "attachments.stage":
-		return m.stageAttachments(ctx, id, payload)
+		return m.stageAttachments(ctx, id, token, payload)
 	case action == "attachments.release":
 		return m.releaseStagedAttachments(ctx, id, payload)
 	case action == "attachments.send":
-		return m.sendAttachments(ctx, id, payload)
+		return m.sendAttachments(ctx, id, token, payload)
+	case action == "sessions.send":
+		input, err := decodeObject(payload)
+		if err != nil {
+			return nil, err
+		}
+		if value := input["attachments"]; value != nil {
+			paths, err := parseAttachmentPaths(value)
+			if err != nil {
+				return nil, err
+			}
+			if len(paths) > 0 {
+				if err := grants.Authorize("attachments.send"); err != nil {
+					return nil, err
+				}
+				if err := m.verifyPrivilege(item); err != nil {
+					return nil, err
+				}
+				files, err := m.validateStagedPaths(id, token, paths)
+				if err != nil {
+					return nil, err
+				}
+				defer m.releaseSentPaths(files)
+				input["attachments"] = files
+				payload, err = json.Marshal(input)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
 	case action == "sessions.watch" || action == "sessions.unwatch":
 		input, err := decodeObject(payload)
 		if err != nil {

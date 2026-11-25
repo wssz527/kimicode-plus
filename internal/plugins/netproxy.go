@@ -17,6 +17,9 @@ import (
 	"enhancedkimi/internal/redact"
 )
 
+const KCTPluginID = "kimicode-plus.kct"
+const KCTSettingsKey = "settings.v1"
+
 const (
 	proxyResponseLimit = 8 << 20
 	proxyRequestLimit  = 1 << 20
@@ -136,6 +139,11 @@ func (m *Manager) proxy(ctx context.Context, id string, grants Grants, vault *cr
 	default:
 		return nil, apiError(http.StatusBadRequest, "PLUGIN_NET_METHOD", "不支持的请求方法 "+method)
 	}
+	if id == KCTPluginID {
+		if err := m.authorizeTranslationEndpoint(ctx, parsed, method, request.Credential); err != nil {
+			return nil, err
+		}
+	}
 	if len(request.Body) > proxyRequestLimit {
 		return nil, apiError(http.StatusRequestEntityTooLarge, "PLUGIN_NET_BODY", "请求体超过 1MB")
 	}
@@ -195,14 +203,7 @@ func (m *Manager) proxy(ctx context.Context, id string, grants Grants, vault *cr
 			return nil, apiError(http.StatusForbidden, "PLUGIN_NET_HOST_DENIED", "插件网络目标不能是本机或内网地址 "+literal)
 		}
 	}
-	port := parsed.Port()
-	if port == "" {
-		if parsed.Scheme == "https" {
-			port = "443"
-		} else {
-			port = "80"
-		}
-	}
+	port := endpointPort(parsed)
 
 	// Behind an HTTP(S) proxy the socket goes to the proxy, which owns DNS for
 	// the target. A local answer is still checked when one arrives: a name that
@@ -282,6 +283,57 @@ func itoa(value int) string {
 		digits[i] = '-'
 	}
 	return string(digits[i:])
+}
+
+func (m *Manager) authorizeTranslationEndpoint(ctx context.Context, endpoint *url.URL, method, credential string) error {
+	deny := apiError(http.StatusForbidden, "PLUGIN_NET_ENDPOINT_DENIED", "翻译请求必须发送至已配置的翻译端点")
+	if method != http.MethodPost || endpoint.Fragment != "" {
+		return deny
+	}
+	host := strings.ToLower(endpoint.Hostname())
+	if credential == "" && endpoint.Scheme == "https" && (endpoint.Port() == "" || endpoint.Port() == "443") {
+		switch host + endpoint.EscapedPath() {
+		case "edge.microsoft.com/translate/translatetext", "translate.googleapis.com/translate_a/single":
+			return nil
+		}
+	}
+	raw, found, err := storageGet(ctx, m.db, KCTPluginID, KCTSettingsKey)
+	if err != nil {
+		return apiError(http.StatusServiceUnavailable, "PLUGIN_STORAGE_FAILED", "无法读取翻译端点设置")
+	}
+	var settings struct {
+		Provider       string `json:"provider"`
+		CustomEndpoint string `json:"customEndpoint"`
+		UseCredential  *bool  `json:"useCredential"`
+	}
+	if !found || json.Unmarshal(raw, &settings) != nil || settings.Provider != "custom" || (credential != "" && (credential != "translator" || settings.UseCredential != nil && !*settings.UseCredential)) {
+		return deny
+	}
+	configured, err := parseProxyURL(settings.CustomEndpoint)
+	if err != nil || configured.Fragment != "" || (configured.Scheme != "https" && !isLoopbackTarget(configured.Hostname())) {
+		return deny
+	}
+	if endpoint.Scheme != configured.Scheme || !strings.EqualFold(endpoint.Hostname(), configured.Hostname()) || endpointPort(endpoint) != endpointPort(configured) || endpointPath(endpoint) != endpointPath(configured) || endpoint.RawQuery != configured.RawQuery {
+		return deny
+	}
+	return nil
+}
+
+func endpointPort(endpoint *url.URL) string {
+	if port := endpoint.Port(); port != "" {
+		return port
+	}
+	if endpoint.Scheme == "https" {
+		return "443"
+	}
+	return "80"
+}
+
+func endpointPath(endpoint *url.URL) string {
+	if endpoint.Path == "" {
+		return "/"
+	}
+	return endpoint.EscapedPath()
 }
 
 // parseProxyURL accepts only http and https. A plugin cannot ask the core to

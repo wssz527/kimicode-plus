@@ -174,7 +174,7 @@ func TestFailedFaultCleanupIsRecordedWithoutChangingTheFault(t *testing.T) {
 	if faulted.State != StateFaulted || !strings.Contains(faulted.Error, "PLUGIN_CRASH") {
 		t.Fatalf("cleanup failures changed the fault: %#v", faulted)
 	}
-	items, err := loadActivity(ctx, manager.db, "test.official", 0, 50)
+	items, _, err := loadActivity(ctx, manager.db, "test.official", 0, 0, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestSafeModeStopsEveryStoppedPluginEvenWhenOneFails(t *testing.T) {
 	if seen["test.first"] != 1 || seen["test.second"] != 1 {
 		t.Fatalf("safe mode called stop %v, want once per stopped plugin", seen)
 	}
-	items, err := loadActivity(ctx, manager.db, "test.first", 0, 50)
+	items, _, err := loadActivity(ctx, manager.db, "test.first", 0, 0, 50)
 	if err != nil {
 		t.Fatal(err)
 	}

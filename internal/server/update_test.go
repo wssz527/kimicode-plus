@@ -65,8 +65,8 @@ func TestUpdateRoutesAndNativeActionsShareManager(t *testing.T) {
 	if err := json.Unmarshal(res.Body.Bytes(), &action); err != nil || res.Code != http.StatusOK || action.Value != status {
 		t.Fatalf("native status: %d %s, %v", res.Code, res.Body, err)
 	}
-	adapterToken := guard.IssueSessionToken([]string{"adapter:write"})
-	res = request(http.MethodPost, "/enhance/v1/desktop/bridge-session", adapterToken, "{}")
+	bridgeBootstrapToken := guard.IssueSessionToken([]string{security.WindowsBridgePermission})
+	res = request(http.MethodPost, "/enhance/v1/desktop/bridge-session", bridgeBootstrapToken, "{}")
 	var bridge struct{ BridgeKey string }
 	if err := json.Unmarshal(res.Body.Bytes(), &bridge); err != nil || res.Code != http.StatusOK || bridge.BridgeKey == "" {
 		t.Fatalf("could not create Windows bridge session: HTTP %d, %v", res.Code, err)

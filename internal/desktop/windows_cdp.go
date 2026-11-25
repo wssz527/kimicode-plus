@@ -17,6 +17,8 @@ import (
 	"github.com/coder/websocket"
 
 	"enhancedkimi/internal/webassets"
+
+	"enhancedkimi/internal/security"
 )
 
 // WindowsCDPTarget mirrors one entry returned by Chromium's /json/list endpoint.
@@ -117,7 +119,7 @@ func mintWindowsBridgeKey(ctx context.Context, coreURL, pairingToken string) (st
 	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	pairBody, _ := json.Marshal(map[string]any{
 		"pairingToken": pairingToken,
-		"permissions":  []string{"adapter:write"},
+		"permissions":  []string{security.WindowsBridgePermission},
 	})
 	pairReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(coreURL, "/")+"/enhance/v1/pair", bytes.NewReader(pairBody))
 	if err != nil {

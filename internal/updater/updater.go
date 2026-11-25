@@ -2,6 +2,7 @@ package updater
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"enhancedkimi/plugins"
 )
 
 const (
@@ -44,29 +47,31 @@ var (
 )
 
 type Options struct {
-	CurrentVersion        string
-	Executable            string
-	TargetExecutable      func() string
-	DataDir               string
-	Safe                  func() bool
-	Dispatch              func(func() error) error
-	RestartState          func() RestartState
-	RequestRestart        func()
-	launchSupervisor      func(string, string) error
-	Launchd               LaunchdOptions
-	HealthyModules        func() []string
-	APIBaseURL            string
-	ReleaseBaseURL        string
-	MirrorReleaseBaseURL  string
-	AllowInsecureHTTP     bool
-	AllowTemporaryExe     bool
-	GOOS                  string
-	GOARCH                string
-	HTTPClient            *http.Client
-	Now                   func() time.Time
-	OnStatusChange        func(Status)
-	AutoCheckInitialDelay time.Duration
-	AutoCheckInterval     time.Duration
+	CurrentVersion           string
+	Executable               string
+	TargetExecutable         func() string
+	DataDir                  string
+	Safe                     func() bool
+	Dispatch                 func(func() error) error
+	RestartState             func() RestartState
+	RequestRestart           func()
+	launchSupervisor         func(string, string) error
+	Launchd                  LaunchdOptions
+	HealthyModules           func() []string
+	APIBaseURL               string
+	ReleaseBaseURL           string
+	MirrorReleaseBaseURL     string
+	AllowInsecureHTTP        bool
+	RequireManifestSignature bool
+	ManifestPublicKeys       map[string]ed25519.PublicKey
+	AllowTemporaryExe        bool
+	GOOS                     string
+	GOARCH                   string
+	HTTPClient               *http.Client
+	Now                      func() time.Time
+	OnStatusChange           func(Status)
+	AutoCheckInitialDelay    time.Duration
+	AutoCheckInterval        time.Duration
 }
 
 // LaunchdOptions describes the macOS login item that owns the resident core.
@@ -102,9 +107,10 @@ type Status struct {
 }
 
 type asset struct {
-	Name string `json:"name"`
-	URL  string `json:"browser_download_url"`
-	Size int64  `json:"size"`
+	Name         string `json:"name"`
+	URL          string `json:"browser_download_url"`
+	Size         int64  `json:"size"`
+	signedSHA256 string
 }
 
 type release struct {
@@ -120,6 +126,7 @@ type releaseManifestEntry struct {
 	Target       string `json:"target"`
 	Archive      string `json:"archive"`
 	PackageBytes int64  `json:"packageBytes"`
+	SHA256       string `json:"sha256"`
 	PublishedAt  string `json:"publishedAt"`
 	ReleaseNotes string `json:"releaseNotes"`
 }
@@ -133,14 +140,14 @@ type Manager struct {
 	releaseSources []string
 	manifest       bool
 	client         http.Client
-	configErr   error
-	ctx         context.Context
-	cancel      context.CancelFunc
-	operation   sync.Mutex
-	mu          sync.RWMutex
-	status      Status
-	archive     asset
-	checksums   asset
+	configErr      error
+	ctx            context.Context
+	cancel         context.CancelFunc
+	operation      sync.Mutex
+	mu             sync.RWMutex
+	status         Status
+	archive        asset
+	checksums      asset
 
 	statusWake       chan struct{}
 	publishedState   string
@@ -153,6 +160,10 @@ type Manager struct {
 }
 
 func New(options Options) *Manager {
+	if options.ManifestPublicKeys == nil {
+		options.ManifestPublicKeys = plugins.OfficialPublicKeys()
+	}
+	options.RequireManifestSignature = options.RequireManifestSignature || os.Getenv("EKD_UPDATE_REQUIRE_SIGNATURE") == "1"
 	if options.GOOS == "" {
 		options.GOOS = runtime.GOOS
 	}
@@ -452,6 +463,9 @@ func (m *Manager) checkInternal(ctx context.Context, silent bool) (response Stat
 
 func (m *Manager) latest(ctx context.Context) (*release, error) {
 	if !m.manifest {
+		if m.options.RequireManifestSignature {
+			return nil, errors.New("核心更新要求使用签名发布清单")
+		}
 		return m.latestFromAPI(ctx)
 	}
 	var (
@@ -550,8 +564,12 @@ func (m *Manager) releaseFromManifest(body []byte) (*release, error) {
 }
 
 func (m *Manager) releaseFromManifestAt(body []byte, base string) (*release, error) {
+	payload, signed, err := verifyReleaseManifest(body, m.options.ManifestPublicKeys, m.options.RequireManifestSignature)
+	if err != nil {
+		return nil, err
+	}
 	var entries []releaseManifestEntry
-	if err := json.Unmarshal(body, &entries); err != nil || len(entries) == 0 {
+	if err := json.Unmarshal(payload, &entries); err != nil || len(entries) == 0 {
 		return nil, errors.New("更新服务返回了无效的发布清单")
 	}
 	version := strings.TrimPrefix(entries[0].Version, "v")
@@ -569,10 +587,18 @@ func (m *Manager) releaseFromManifestAt(body []byte, base string) (*release, err
 			return nil, errors.New("发布清单包含不一致的版本或无效的包大小")
 		}
 		if entry.Archive != "" {
+			signedSHA256 := ""
+			if signed {
+				if !releaseDigestPattern.MatchString(entry.SHA256) {
+					return nil, errors.New("签名发布清单缺少安装包 SHA-256 校验值")
+				}
+				signedSHA256 = entry.SHA256
+			}
 			latest.Assets = append(latest.Assets, asset{
-				Name: entry.Archive,
-				URL:  base + "/download/" + url.PathEscape(latest.Tag) + "/" + url.PathEscape(entry.Archive),
-				Size: entry.PackageBytes,
+				Name:         entry.Archive,
+				URL:          base + "/download/" + url.PathEscape(latest.Tag) + "/" + url.PathEscape(entry.Archive),
+				Size:         entry.PackageBytes,
+				signedSHA256: signedSHA256,
 			})
 		}
 	}

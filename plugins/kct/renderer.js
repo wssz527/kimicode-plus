@@ -1019,7 +1019,7 @@ function createSettingsPopover({ ctx, engine, blocks }) {
         return;
       }
       endpointNote.textContent = raw ? "" : "尚未填写端点，翻译会暂停。";
-      void apply({ customEndpoint: raw });
+      void apply({ customEndpoint: customEndpoint({ customEndpoint: raw }) });
     });
 
     const modelInput = document.createElement("input");
@@ -1178,7 +1178,7 @@ function customEndpoint(settings) {
   } catch {
     return "";
   }
-  if (url.username || url.password) return "";
+  if (url.username || url.password || url.hash) return "";
   // 远程端点由清单的 net:https 授权（只允许 TLS）；本机服务用清单列出的字面目标。
   if (url.protocol === "https:") return url.href;
   if (url.protocol === "http:" && LOCAL_ENDPOINT_HOSTS.has(url.hostname)) return url.href;

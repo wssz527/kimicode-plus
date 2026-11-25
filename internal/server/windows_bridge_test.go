@@ -32,10 +32,10 @@ func TestWindowsBridgeSessionAndRPCDispatch(t *testing.T) {
 	}
 	defer app.Close()
 
-	// 1. Pair to get session token with adapter:write.
+	// 1. Pair to get the Windows bridge bootstrap permission.
 	pairBody, _ := json.Marshal(map[string]any{
 		"pairingToken": guard.PairingToken(),
-		"permissions":  []string{"adapter:write"},
+		"permissions":  []string{security.WindowsBridgePermission},
 	})
 	pairReq := httptest.NewRequest(http.MethodPost, "http://"+host+"/enhance/v1/pair", bytes.NewReader(pairBody))
 	pairReq.Host = host
@@ -49,6 +49,15 @@ func TestWindowsBridgeSessionAndRPCDispatch(t *testing.T) {
 		SessionToken string `json:"sessionToken"`
 	}
 	_ = json.Unmarshal(pairRec.Body.Bytes(), &pairRes)
+
+	adapterReq := httptest.NewRequest(http.MethodPost, "http://"+host+"/enhance/v1/desktop/bridge-session", strings.NewReader(`{}`))
+	adapterReq.Header.Set("Content-Type", "application/json")
+	adapterReq.Header.Set("Authorization", "Bearer "+guard.IssueSessionToken([]string{"adapter:write"}))
+	adapterRec := httptest.NewRecorder()
+	app.Handler.ServeHTTP(adapterRec, adapterReq)
+	if adapterRec.Code != http.StatusForbidden {
+		t.Fatalf("adapter permission minted a Windows bridge session: %d %s", adapterRec.Code, adapterRec.Body)
+	}
 
 	// 2. Mint Windows bridgeKey.
 	mintReq := httptest.NewRequest(http.MethodPost, "http://"+host+"/enhance/v1/desktop/bridge-session", bytes.NewReader([]byte(`{}`)))
@@ -340,5 +349,100 @@ func TestWindowsBridgeRenewedTokenStillAuthorizesCoreCalls(t *testing.T) {
 	}
 	if len(seen) != 2 || seen[0] == "" || seen[1] == "" || seen[0] == seen[1] {
 		t.Fatalf("expected two distinct live tokens, got %q", seen)
+	}
+}
+
+func TestWindowsBridgeRateLimitAndAllowlist(t *testing.T) {
+	guard := security.New("127.0.0.1:18444")
+	bridge := newWindowsBridge()
+	now := time.Now()
+	bridge.now = func() time.Time { return now }
+	key, _ := bridge.issue(guard)
+	app := &App{winBridge: bridge}
+	var dispatched int
+	handler := app.wrapWindowsBridge(guard, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dispatched++
+		if r.URL.Path != "/enhance/v1/plugins/test.example/activity" || r.URL.Query().Get("limit") != "1" {
+			t.Errorf("unexpected forwarding: %s", r.URL)
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	rpc := func(action string, payload any) *httptest.ResponseRecorder {
+		t.Helper()
+		body, err := json.Marshal(map[string]any{"protocol": 1, "id": "test", "action": action, "payload": payload})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "http://"+guard.Host()+"/ekd/native/v1", bytes.NewReader(body))
+		req.Header.Set("Origin", "app://renderer")
+		req.Header.Set("X-EKD-Bridge", key)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	for _, tc := range []struct{ method, path string }{
+		{"POST", "/enhance/v1/desktop/bridge-session"},
+		{"POST", "/enhance/v1/desktop/actions/attach.status"},
+		{"GET", "/enhance/v1/credentials"},
+		{"PUT", "/enhance/v1/plugins/test.example/activity"},
+		{"GET", "/enhance/v1/plugins/test.example/assets/%2e%2e/activity"},
+		{"GET", "/enhance/v1/plugins%2ftest.example%2factivity"},
+	} {
+		rec := rpc("core.fetch", map[string]string{"method": tc.method, "path": tc.path})
+		if !strings.Contains(rec.Body.String(), "BRIDGE_ROUTE_DENIED") {
+			t.Fatalf("%s %s = %d %s", tc.method, tc.path, rec.Code, rec.Body)
+		}
+	}
+	if rec := rpc("schedule.runNow", nil); !strings.Contains(rec.Body.String(), "BRIDGE_ACTION_DENIED") {
+		t.Fatalf("unknown action = %d %s", rec.Code, rec.Body)
+	}
+	if dispatched != 0 {
+		t.Fatalf("denied requests were forwarded: %d", dispatched)
+	}
+	payload := map[string]string{"path": "/enhance/v1/plugins/test.example/activity?limit=1"}
+	rec := rpc("core.fetch", payload)
+	if rec.Code != http.StatusOK || dispatched != 1 {
+		t.Fatalf("allowed route = %d %s", rec.Code, rec.Body)
+	}
+	for range windowsBridgeRequestsPerSecond {
+		rec = rpc("window.ensureWidth", nil)
+	}
+	if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "RATE_LIMIT") {
+		t.Fatalf("limit = %d %s", rec.Code, rec.Body)
+	}
+	now = now.Add(time.Second)
+	if rec := rpc("core.fetch", payload); rec.Code != http.StatusOK || dispatched != 2 {
+		t.Fatalf("next window = %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestWindowsBridgeSurfaceTokensDoNotSharePermissions(t *testing.T) {
+	guard := security.New("127.0.0.1:18444")
+	bridge := newWindowsBridge()
+	key, _ := bridge.issue(guard)
+	session, ok := bridge.lookup(key, guard)
+	if !ok {
+		t.Fatal("bridge session missing")
+	}
+	handler := guard.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	for _, tc := range []struct {
+		method, path, token string
+		want                int
+	}{
+		{"GET", "/enhance/v1/plugins", session.sessionToken, http.StatusNoContent},
+		{"GET", "/enhance/v1/plugins", session.nativeToken, http.StatusForbidden},
+		{"POST", "/enhance/v1/desktop/actions/accounts.delete", session.sessionToken, http.StatusForbidden},
+		{"POST", "/enhance/v1/desktop/actions/accounts.delete", session.nativeToken, http.StatusNoContent},
+		{"POST", "/enhance/v1/desktop/bridge-session", session.nativeToken, http.StatusForbidden},
+		{"POST", "/enhance/v1/desktop/bridge-session", session.sessionToken, http.StatusForbidden},
+	} {
+		r := httptest.NewRequest(tc.method, "http://"+guard.Host()+tc.path, strings.NewReader(`{}`))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Authorization", "Bearer "+tc.token)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Code != tc.want {
+			t.Errorf("%s %s = %d, want %d", tc.method, tc.path, w.Code, tc.want)
+		}
 	}
 }

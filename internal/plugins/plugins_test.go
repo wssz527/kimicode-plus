@@ -479,7 +479,7 @@ func TestActivityTracksLifecycle(t *testing.T) {
 	if err := manager.Disable(ctx, "test.sample"); err != nil {
 		t.Fatal(err)
 	}
-	items, err := loadActivity(ctx, manager.db, "test.sample", 0, 20)
+	items, _, err := loadActivity(ctx, manager.db, "test.sample", 0, 0, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,7 +667,7 @@ func TestCredentialPlaintextNeverReachesActivity(t *testing.T) {
 	if strings.Contains(recorder.Body.String(), "synthetic-secret") {
 		t.Fatal("error response leaked the credential")
 	}
-	items, err := loadActivity(ctx, manager.db, "test.creds", 0, 50)
+	items, _, err := loadActivity(ctx, manager.db, "test.creds", 0, 0, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
