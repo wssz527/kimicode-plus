@@ -34,10 +34,41 @@ export interface NativeSession {
   main_turn_active?: boolean;
   pending_interaction?: string;
 }
+export interface NativeToolCall {
+  id: string;
+  name: string;
+  status: string;
+  input?: unknown;
+  output?: unknown;
+  duration?: number;
+}
+export interface NativeMessage extends Omit<DemoMessage, "toolCalls"> {
+  turnId?: string;
+  streaming?: boolean;
+  toolCalls?: NativeToolCall[];
+}
+export type NativeApprovalDecision = "approved" | "rejected" | "cancelled";
+export interface NativeQuestion {
+  id: string;
+  question: string;
+  header?: string;
+  body?: string;
+  options: { id: string; label: string }[];
+  multi_select?: boolean;
+  allow_other?: boolean;
+  other_label?: string;
+}
+export interface NativeApproval {
+  id: string;
+  title: string;
+  detail?: string;
+  options?: { label: string; value: string; decision?: NativeApprovalDecision }[];
+  questions?: NativeQuestion[];
+}
 export interface SessionView {
   session: NativeSession;
-  messages: DemoMessage[];
-  approvals: { id: string; title: string; detail?: string; options?: { label: string; value: string }[] }[];
+  messages: NativeMessage[];
+  approvals: NativeApproval[];
   goal?: { status?: string; [key: string]: unknown };
 }
 /** Cache metrics mirrored from internal/cache. Every numeric cache field can be
@@ -474,6 +505,7 @@ export interface NativeHooks {
   activeSession: () => string;
   close: () => void;
   pickSession?: (exclude: string[]) => Promise<string>;
+  localFilePath?: (file: File) => string;
 }
 export interface NativeTransport {
   request: <T = unknown>(action: string, payload?: Record<string, unknown>) => Promise<T>;
@@ -491,6 +523,7 @@ export interface NativeHost {
   ensureWidth: (width: number) => Promise<void>;
   openSettings: (tab?: string) => Promise<void>;
   pickSession: (exclude: string[]) => Promise<string>;
+  localFilePath?: NativeHooks["localFilePath"];
   close: () => void;
 }
 export function followNativeSession(ids: string[], id: string): string[] {
@@ -686,6 +719,7 @@ export function createNativeHost(transport: NativeTransport, hooks: NativeHooks,
   const host: NativeHost = {
     onActiveSession: hooks.onActiveSession,
     onAddSession: hooks.onAddSession,
+    localFilePath: hooks.localFilePath,
     request: transport.request,
     subscribe: (scopeName, listener) => channel.subscribe(scopeName, listener as Listener),
     activeSession: hooks.activeSession,

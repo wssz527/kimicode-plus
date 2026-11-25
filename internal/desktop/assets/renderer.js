@@ -172,6 +172,8 @@ async function installNativeRenderer(options) {
     ensureFrame: null,
     ensureCancel: null,
     sessionContainer: null,
+    sessionHeader: null,
+    sessionHeaderObserver: null,
     sessionHostElement: null,
     sessionHandle: null,
     sessionRelease: null,
@@ -277,6 +279,10 @@ async function installNativeRenderer(options) {
       onAddSession: listener => listen('ekd:add-session', listener),
       close,
       pickSession: exclude => options.popout ? transport.request('host.pickSession', { exclude }) : pickSession(exclude),
+      localFilePath: typeof window.kimiDesktop?.getPathForFile === 'function' ? file => {
+        try { return window.kimiDesktop.getPathForFile(file) || ''; }
+        catch { return ''; }
+      } : undefined,
     }, channel);
   }
   function mount(element, surface, host, extra = {}) {
@@ -343,7 +349,33 @@ async function installNativeRenderer(options) {
       if (shouldExpand) document.querySelector('button.sidebar-toggle-btn[aria-label="展开侧边栏"]')?.click();
     };
   }
+  function composerStyleProbe(composer) {
+    const entry = { id: 'dom.composer_style', group: 'dom', label: '同屏输入框原生主题' };
+    if (!composer) return { ...entry, status: 'untested', reason: '等待官方聊天输入框' };
+    const radius = getComputedStyle(composer).getPropertyValue('--radius-composer').trim();
+    return radius
+      ? { ...entry, status: 'available', detail: `--radius-composer: ${radius}` }
+      : { ...entry, status: 'disabled', reason: '缺少 --radius-composer，已启用同屏输入框内置样式' };
+  }
+  function syncSessionHeader() {
+    const host = state.sessionHostElement;
+    if (!host) return;
+    const header = document.querySelector('header.chat-header');
+    if (header === state.sessionHeader) return;
+    state.sessionHeaderObserver?.disconnect();
+    state.sessionHeaderObserver = null;
+    state.sessionHeader = header;
+    const measure = () => host.style.setProperty('--ekd-header-h', `${header?.getBoundingClientRect().height || 0}px`);
+    measure();
+    if (header && typeof ResizeObserver === 'function') {
+      state.sessionHeaderObserver = new ResizeObserver(measure);
+      state.sessionHeaderObserver.observe(header);
+    }
+  }
   function closeSessions() {
+    state.sessionHeaderObserver?.disconnect();
+    state.sessionHeaderObserver = null;
+    state.sessionHeader = null;
     unmountHandle(state.sessionHandle);
     state.sessionHandle = null;
     state.sessionHostElement?.remove();
@@ -374,6 +406,7 @@ async function installNativeRenderer(options) {
     element.className = 'ekd-session-host';
     container.append(element);
     state.sessionHostElement = element;
+    syncSessionHeader();
     const host = makeHost(closeSessions);
     state.sessionHandle = mount(element, 'sessions', host, { initialExtraIds: extraIds, onNativeRestore: closeSessions });
   }
@@ -1666,7 +1699,18 @@ async function installNativeRenderer(options) {
     html[data-color-scheme="dark"]{color-scheme:dark}
     html[data-color-scheme="light"]{color-scheme:light}
     [data-ekd-containment=sessions]>:not(.ekd-session-host),[data-ekd-containment=settings]>:not(.ekd-settings-mount){display:none!important}
-    .ekd-session-host{display:flex;flex:1;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden;padding-top:44px;box-sizing:border-box;-webkit-app-region:no-drag}
+    .ekd-session-host{
+      --ekd-composer-radius:var(--radius-composer,32px);
+      --ekd-composer-corner:var(--corner-shape-composer,superellipse(1.5));
+      --ekd-composer-bg:var(--color-composer-bg,light-dark(#fff,#1f1f1f));
+      --ekd-composer-line:var(--color-composer-line,light-dark(#0002,#fff2));
+      --ekd-composer-focus:var(--color-composer-focus-line,light-dark(#0004,#fff4));
+      --ekd-composer-control:36px;
+      --ekd-hairline:var(--p-hairline,1px);
+      --ekd-divider:var(--color-line,light-dark(#0002,#fff2));
+      display:flex;flex:1;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden;
+      padding-top:var(--ekd-header-h,0px);box-sizing:border-box;-webkit-app-region:no-drag
+    }
     header.chat-header~.chat-layout .ekd-session-host,header.chat-header~.ekd-session-host{padding-top:0}
     .pt-body[data-ekdp-panel]>:not(.ekdp-panel-host){display:none!important}
     .pt-body[data-ekdp-panel]>.ekdp-panel-host[hidden]{display:none!important}
@@ -1988,8 +2032,12 @@ async function installNativeRenderer(options) {
       }
     }
     if (state.sessionContainer && !state.sessionContainer.isConnected) closeSessions();
-    if (state.sessionContainer) state.sessionContainer.setAttribute('data-ekd-containment', 'sessions');
-    scheduleContractReport(evaluation.probes, firstEvaluation || Boolean(module.findSettingsDialogParts(document)));
+    if (state.sessionContainer) {
+      state.sessionContainer.setAttribute('data-ekd-containment', 'sessions');
+      syncSessionHeader();
+    }
+    const composer = document.querySelector('.composer-card, .composer');
+    scheduleContractReport([...evaluation.probes, composerStyleProbe(composer)], firstEvaluation || Boolean(module.findSettingsDialogParts(document)));
   }
   const legacyZombieTimers = [];
   function reclaimLegacyZombie() {

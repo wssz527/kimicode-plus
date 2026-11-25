@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   createDOMContractState,
   evaluateDOMContracts,
@@ -332,4 +333,50 @@ test("findChatHeaderTail prefers the chat header and falls back to a loose .ch-t
   unrelated.className = "side-footer";
   empty.body.append(unrelated);
   assert.equal(findChatHeaderTail(empty as unknown as Document), null);
+});
+
+test("missing native composer radius reports a style fallback without gating the pane", () => {
+  const renderer = readFileSync("../internal/desktop/assets/renderer.js", "utf8");
+  const start = renderer.indexOf("function composerStyleProbe(composer)");
+  const end = renderer.indexOf("function syncSessionHeader()", start);
+  assert.ok(start >= 0 && end > start);
+  const run = new Function("getComputedStyle", `${renderer.slice(start, end)}\nreturn composerStyleProbe;`);
+  const probe = run((composer: { radius: string }) => ({
+    getPropertyValue(name: string) { return name === "--radius-composer" ? composer.radius : ""; },
+  }));
+  assert.equal(probe(null).status, "untested");
+  assert.deepEqual(probe({ radius: " 32px " }), {
+    id: "dom.composer_style", group: "dom", label: "同屏输入框原生主题", status: "available", detail: "--radius-composer: 32px",
+  });
+  assert.equal(probe({ radius: "" }).status, "disabled");
+  assert.match(probe({ radius: "" }).reason, /内置样式/);
+  assert.match(renderer, /scheduleContractReport\(\[\.\.\.evaluation\.probes, composerStyleProbe\(composer\)\]/);
+});
+
+test("the same pane host follows the current header size and releases replaced observers", () => {
+  const renderer = readFileSync("../internal/desktop/assets/renderer.js", "utf8");
+  const start = renderer.indexOf("function syncSessionHeader()");
+  const end = renderer.indexOf("function closeSessions()", start);
+  assert.ok(start >= 0 && end > start);
+  const changes: string[] = [];
+  let header = { height: 46, getBoundingClientRect() { return { height: this.height }; } };
+  let observer: FakeResizeObserver | undefined;
+  class FakeResizeObserver {
+    connected = false;
+    constructor(readonly onResize: () => void) { observer = this; }
+    observe(target: typeof header) { assert.equal(target, header); this.connected = true; }
+    disconnect() { this.connected = false; }
+  }
+  const state = { sessionHostElement: { style: { setProperty(name: string, value: string) { changes.push(`${name}:${value}`); } } }, sessionHeader: null, sessionHeaderObserver: null };
+  const run = new Function("document", "state", "ResizeObserver", `${renderer.slice(start, end)}\nreturn syncSessionHeader;`);
+  const sync = run({ querySelector(selector: string) { assert.equal(selector, "header.chat-header"); return header; } }, state, FakeResizeObserver);
+  sync();
+  const first = observer!;
+  header.height = 51;
+  first.onResize();
+  header = { ...header, height: 60 };
+  sync();
+  assert.equal(first.connected, false);
+  assert.equal(observer?.connected, true);
+  assert.deepEqual(changes, ["--ekd-header-h:46px", "--ekd-header-h:51px", "--ekd-header-h:60px"]);
 });

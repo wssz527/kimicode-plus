@@ -29,7 +29,7 @@ function extract(file: string, names: string[], extra = ""): Record<string, unkn
   return exports;
 }
 
-const sessionPanesFile = "src/components/workbench/SessionPanes.tsx";
+const approvalCardFile = "src/components/workbench/ApprovalCard.tsx";
 const piecesFile = "src/components/workbench/pieces.tsx";
 const nativeSettingsFile = "src/components/NativeSettings.tsx";
 const cacheSettingsFile = "src/components/CacheSettings.tsx";
@@ -68,44 +68,33 @@ test("an in-flight plugin view keeps its own close callback when its plugin upda
 // ---------------------------------------------------------------- 同屏审批
 
 type Option = { label: string; value: string };
-const approval = extract(sessionPanesFile, ["approvalDecision", "approvalOptions"], `
-type ApprovalOption = { label: string; value: string };
-const DEFAULT_APPROVAL_OPTIONS: ApprovalOption[] = [
+type Decision = "approved" | "rejected" | "cancelled";
+const approval = extract(approvalCardFile, ["approvalDecision", "approvalOptions"], `
+const DEFAULT_APPROVAL_OPTIONS = [
   { label: "允许", value: "approved" },
   { label: "拒绝", value: "rejected" },
 ];
-const APPROVAL_DECISIONS: Record<string, string> = {
-  approved: "approved",
-  allow: "approved",
-  rejected: "rejected",
-  deny: "rejected",
-  denied: "rejected",
-  cancelled: "cancelled",
-  cancel: "cancelled",
+const APPROVAL_DECISIONS = {
+  approved: "approved", allow: "approved", rejected: "rejected", deny: "rejected", denied: "rejected",
+  cancelled: "cancelled", cancel: "cancelled",
 };
 `) as {
-  approvalDecision(value: string, fromServer: boolean): string | { decision: string; selectedLabel: string } | null;
+  approvalDecision(option: Option & { decision?: Decision }, explicit?: Decision): { decision: Decision; selectedLabel?: string } | null;
   approvalOptions(options?: Option[] | null): Option[];
 };
 
-test("an approval click can never turn a refusal or an unknown value into an approval", () => {
-  // Both spellings of a refusal map to a refusal; nothing falls through to "approved".
-  assert.equal(approval.approvalDecision("rejected", false), "rejected");
-  assert.equal(approval.approvalDecision("deny", false), "rejected");
-  assert.equal(approval.approvalDecision("denied", true), "rejected");
-  assert.equal(approval.approvalDecision("approved", true), "approved");
-  assert.equal(approval.approvalDecision("allow", false), "approved");
-  assert.equal(approval.approvalDecision("cancelled", true), "cancelled");
-  assert.equal(approval.approvalDecision("cancel", false), "cancelled");
-
-  // An unrecognized value from a server list keeps its label but still approves;
-  // the same value from a fallback list is refused instead of being guessed.
-  assert.deepEqual(approval.approvalDecision("继续执行 rm -rf", true), {
-    decision: "approved",
-    selectedLabel: "继续执行 rm -rf",
+test("only recognized and explicit decisions reply to an approval", () => {
+  const decision = (value: string) => approval.approvalDecision({ value, label: value });
+  for (const value of ["rejected", "deny", "denied"]) assert.deepEqual(decision(value), { decision: "rejected" });
+  assert.deepEqual(decision("allow"), { decision: "approved" });
+  assert.deepEqual(decision("cancel"), { decision: "cancelled" });
+  for (const value of ["自定义选项", "constructor", ""]) assert.equal(decision(value), null);
+  assert.deepEqual(approval.approvalDecision({ value: "revise", label: "修改", decision: "rejected" }), {
+    decision: "rejected", selectedLabel: "revise",
   });
-  assert.equal(approval.approvalDecision("继续执行 rm -rf", false), null);
-  assert.equal(approval.approvalDecision("", true), null);
+  assert.deepEqual(approval.approvalDecision({ value: "仅本次", label: "仅本次" }, "approved"), {
+    decision: "approved", selectedLabel: "仅本次",
+  });
 });
 
 test("an empty server option list still renders the allow and refuse buttons", () => {

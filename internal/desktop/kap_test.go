@@ -262,3 +262,50 @@ func TestKAPBackoffGrowsWhileEndpointIsUnreachable(t *testing.T) {
 		t.Fatalf("unreachable endpoint blocked shutdown for %s", elapsed)
 	}
 }
+
+func TestSessionFramesPreserveStructuredThinkingToolsAndQuestions(t *testing.T) {
+	service := &NativeService{bus: NewEventBus(), cache: map[string]cachedSession{
+		"s1": {session: NativeSession{ID: "s1", Busy: true}, turns: []NativeTurn{{TurnID: "t1"}}},
+	}}
+	apply := func(raw string) SessionView {
+		t.Helper()
+		var frame NativeFrame
+		if err := json.Unmarshal([]byte(raw), &frame); err != nil {
+			t.Fatal(err)
+		}
+		service.applyFrame(frame)
+		return sessionViewFromCache(service.cache["s1"])
+	}
+	apply(`{"type":"item.started","session_id":"s1","turn_id":"t1","item":{"item_id":"r1","type":"reasoning","status":"running","text":"first"}}`)
+	view := apply(`{"type":"item.delta","session_id":"s1","turn_id":"t1","item_id":"r1","field":"text","delta":" thought"}`)
+	if len(view.Messages) != 1 || view.Messages[0].Reasoning != "first thought" || !view.Messages[0].Streaming {
+		t.Fatalf("streamed reasoning = %+v", view.Messages)
+	}
+	apply(`{"type":"item.started","session_id":"s1","turn_id":"t1","item":{"item_id":"a1","type":"assistant_message","thinking":"second"}}`)
+	view = apply(`{"type":"thinking.delta","session_id":"s1","turn_id":"t1","item_id":"a1","delta":" thought"}`)
+	if view.Messages[1].Reasoning != "second thought" || view.Messages[1].TurnID != "t1" {
+		t.Fatalf("inline reasoning = %+v", view.Messages[1])
+	}
+	apply(`{"type":"item.started","session_id":"s1","turn_id":"t1","item":{"item_id":"tool1","type":"tool_call","name":"Inspect","status":"running","stage":"input"}}`)
+	view = apply(`{"type":"item.delta","session_id":"s1","turn_id":"t1","item_id":"tool1","field":"input_text","delta":"partial input"}`)
+	if call := view.Messages[2].ToolCalls[0]; call.Status != "running" || call.Input != "partial input" {
+		t.Fatalf("tool input and status missing: %+v", call)
+	}
+	view = apply(`{"type":"item.ended","session_id":"s1","turn_id":"t1","item":{"item_id":"tool1","type":"tool_call","name":"Inspect","status":"ended","outcome":"completed","input":{"name":"example"},"output":[1,2],"duration_ms":23}}`)
+	call := view.Messages[2].ToolCalls[0]
+	if call.ID != "tool1" || call.Name != "Inspect" || call.Status != "completed" || call.Duration == nil || *call.Duration != 23 || call.Input.(map[string]any)["name"] != "example" || len(call.Output.([]any)) != 2 {
+		t.Fatalf("tool call lost structured fields: %+v", call)
+	}
+	view = apply(`{"type":"interaction","session_id":"s1","agent_id":"main","interaction_id":"q1","kind":"question","status":"pending","request":{"questions":[{"id":"selection","question":"Choose an option","options":[{"id":"all","label":"All"}],"multi_select":true,"allow_other":true}]}}`)
+	if len(view.Approvals) != 1 || view.Approvals[0].Questions[0].ID != "selection" || !view.Approvals[0].Questions[0].MultiSelect {
+		t.Fatalf("question missing from session: %+v", view.Approvals)
+	}
+	view = apply(`{"type":"interaction","session_id":"s1","interaction_id":"q1","kind":"question","status":"ended"}`)
+	if len(view.Approvals) != 0 {
+		t.Fatalf("ended question persisted: %+v", view.Approvals)
+	}
+	view = apply(`{"type":"turn.ended","session_id":"s1","turn":{"turn_id":"t1"}}`)
+	if view.Messages[0].Streaming || view.Messages[0].Reasoning != "first thought" {
+		t.Fatalf("completion lost reasoning or left it streaming: %+v", view.Messages[0])
+	}
+}

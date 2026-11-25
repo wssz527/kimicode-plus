@@ -4,6 +4,16 @@
    base.css. Page-specific composition stays in pages.css.
    ========================================================================== */
 
+.wb-native-composer button,
+.wb-jump-bottom {
+  -webkit-app-region: no-drag;
+  font: inherit;
+}
+
+.wb-native-composer :disabled {
+  cursor: not-allowed;
+}
+
 /* ---------- page container ---------- */
 
 .page {

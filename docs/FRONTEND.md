@@ -24,7 +24,9 @@ web/
   src/components/PluginSettings.tsx 插件列表、详情、启停安装与插件凭据入口
   src/components/PluginCredentials.tsx 插件申请凭据的添加、替换与删除面板（不回显明文）
   src/components/AccountsSection.tsx 官方「账户」页内的多账号切换与钥匙串状态
-  src/components/SessionGrid.tsx 最多三个同屏会话
+  src/components/SessionGrid.tsx 最多三个同屏会话，按窗格数恢复本机宽度比例
+ src/components/workbench/NativeComposer.tsx 同屏会话输入、附件与发送控制
+ src/components/workbench/ApprovalCard.tsx 工具审批、反馈与问答交互
   src/components/workbench/SessionPanes.tsx 会话窗格与输入区
   src/components/workbench/ControlMenu.tsx 窗格头部菜单与模型/权限选择
   src/components/workbench/pieces.tsx 窗格共享的小组件与图标
@@ -75,7 +77,11 @@ ENHANCE_DEV_TARGET=http://127.0.0.1:8899 npm run dev       # 覆盖目标
 
 `mountSurface` 将规划、会话、设置或 Monitor 挂入宿主提供的元素。`createNativeHost` 通过主进程 loopback RPC 调用真实动作，`events.poll` 按 session/规划 scope 分发更新；`createCoreTransport` 将 Core 请求交给主进程 `core.fetch`，不向 renderer 暴露 Bearer token。设置窗口由 AuthProvider 包裹，但已安装 transport 时不需要再次手工配对。
 
-原生功能边界：统一规划入口默认网页，来源、地址与配置放菜单；本地规划有流式、停止、预设、工具审批和交接，网页只提取增强自建页面的选区/正文并交接 Code，不是网站内自动聊天。菜单、设置及会话选择弹层出现时隐藏网页子视图。多会话最多三个，同一入口逐次追加；主窗格跟随官方侧栏，已显示会话交换而不重复，`SessionInputProvider` 以 session ID 保存草稿、模型、权限和附件，切换位置不丢状态；多会话输入框与官方单会话保持一致（仅展示发送权限与模型，不含额外的发送方式下拉框）。消息复用 Markdown 渲染、时间、复制与引用回复；附件加号调用系统文件选择，文件通过真实 KAP prompt 发送。
+原生功能边界：统一规划入口默认网页，来源、地址与配置放菜单；本地规划有流式、停止、预设、工具审批和交接，网页只提取增强自建页面的选区/正文并交接 Code，不是网站内自动聊天。菜单、设置及会话选择弹层出现时隐藏网页子视图。多会话最多三个，同一入口逐次追加。主窗格跟随官方侧栏，已显示会话交换位置。`SessionInputProvider` 按会话保存草稿、模型、权限、发送模式、思考和待发附件，本机存储按两窗格或三窗格恢复比例。`NativeComposer` 的同一个 36 px 按钮切换发送与停止。附件可通过文件选择、拖入或粘贴添加，每条消息最多 16 个附件。无本机路径的剪贴板图片以内联方式发送，合计上限 1 MiB。
+
+宿主将 `--radius-composer`、`--color-composer-*` 和分割线变量桥接到影子树。缺少圆角变量时使用 32 px 回退值，并在 `dom.composer_style` 显示降级诊断。官方头部尺寸由 `ResizeObserver` 跟踪。消息按回合显示流式思考和结构化工具状态及输入输出。代码块支持复制和自动换行。距底小于 80 px 时新消息会跟随到底部，向上阅读时可通过「回到底部」恢复跟随。
+
+同屏通过 `session.send` 的 `clientMessageId` 去重，同一发送意图重试时复用标识。核心以会话 ID 和消息标识为键，通过两分钟内存窗口复用已接收或送达状态不明的结果。审批卡接受可选反馈，未知自定义选项须明确选择允许或拒绝，问答卡按问题 ID 提交 `answers`。
 
 设置不再使用单层 5 项列表加子页返回，改为官方原生标签归位：官方「账户」页顶部由 `AccountsSection.tsx` 提供多账号列表与切换（钥匙串可用时直接显示免密解锁状态）；官方「模型供应商」模型行通过 `internal/desktop/assets/provider_enhance.js` 行内展开「能力与限制」面板，补齐图片/视频/工具能力、思考强度（`no` / `low` / `medium` / `high` / `xhigh` / `max`）与上下文/最大输出长度（保存时无损保留已有的 `adaptive_thinking` 与未知字段）；官方「智能体与会话」页由 `NativeSettings.tsx` 注入子代理模型池、子代理时限、单轮步数上限与权限规则；官方「实验室」页由 `OfficialSettingsSections.tsx` 注入会话并排与规划实验开关；官方「插件」页新增 KimiCode+ 分段承载增强插件的安装、启停与授权；独立的「缓存与用量」标签页由 `CacheSettings.tsx` 承载缓存、保活、压缩与实际用量；「KimiCode+」标签页由 `SettingsSurface.tsx` 提供状态与诊断、功能归位索引，以及任一官方页探针失效时的回落小节。凭据增改删嵌入申请该凭据的插件详情页（`PluginCredentials.tsx`）。`CacheSettings`、浏览器权限复用已有 `Toggle`，缓存保存后读回再更新草稿基线。opaque origin 的请求 ID 使用随机回退；缓存、布局、权限、供应商能力补齐和子代理模型池的实机流程已通过。
 

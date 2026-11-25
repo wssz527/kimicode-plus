@@ -32,4 +32,5 @@ export type IconName =
   | "power"
   | "file"
   | "play"
+  | "stop"
   | "reconcile";
