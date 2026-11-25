@@ -10,6 +10,16 @@ interface MiniNode {
   className: string;
   classList: { contains(token: string): boolean };
   disabled: boolean;
+  checked: boolean;
+  hidden: boolean;
+  type: string;
+  showModal(): void;
+  getClientRects(): unknown[];
+  focus(): void;
+  removeAttribute(name: string): void;
+  closest(selector: string): MiniNode | null;
+  fire(type: string, metadata?: Record<string, unknown>): { defaultPrevented: boolean };
+  before(...nodes: Array<MiniNode | string>): void;
   value: string;
   dataset: Record<string, string>;
   attributes: Map<string, string>;
@@ -26,13 +36,13 @@ interface MiniNode {
   after(...nodes: Array<MiniNode | string>): void;
   replaceChildren(...nodes: Array<MiniNode | string>): void;
   remove(): void;
-  showModal(): void;
   close(): void;
   querySelectorAll(selector: string): MiniNode[];
   querySelector(selector: string): MiniNode | null;
 }
 
 function createMiniDocument() {
+  let activeElement: MiniNode;
   function makeNode(tagName: string, textContent = ""): MiniNode {
     const node: MiniNode = {
       tagName: tagName.toUpperCase(),
@@ -45,6 +55,27 @@ function createMiniDocument() {
         },
       },
       disabled: false,
+      checked: false,
+      hidden: false,
+      type: '',
+      getClientRects() {
+        for (let current: MiniNode | null = this; current; current = current.parentElement) {
+          if (current.hidden) return [];
+        }
+        return this.isConnected ? [{}] : [];
+      },
+      focus() {
+        activeElement = this;
+      },
+      removeAttribute(name) {
+        this.attributes.delete(name);
+      },
+      closest(selector) {
+        for (let current: MiniNode | null = this; current; current = current.parentElement) {
+          if (matchesSingle(current, selector)) return current;
+        }
+        return null;
+      },
       value: "",
       dataset: {},
       attributes: new Map<string, string>(),
@@ -55,7 +86,8 @@ function createMiniDocument() {
       shown: false,
       setAttribute(name: string, value: string) {
         this.attributes.set(name, String(value));
-        if (name === "value") this.value = String(value);
+        if (name === "value") this.value = value;
+        if (name === "type") this.type = value;
       },
       getAttribute(name: string) {
         return this.attributes.get(name) ?? null;
@@ -65,17 +97,50 @@ function createMiniDocument() {
         list.push(handler);
         this.listeners.set(type, list);
       },
+      fire(type, metadata = {}) {
+        const event = {
+          target: this,
+          defaultPrevented: false,
+          stopped: false,
+          preventDefault() { this.defaultPrevented = true; },
+          stopImmediatePropagation() { this.stopped = true; },
+          ...metadata,
+        };
+        for (let current: MiniNode | null = this; current && !event.stopped; current = current.parentElement) {
+          for (const handler of current.listeners.get(type) ?? []) handler(event);
+        }
+        return event;
+      },
       click() {
         if (this.disabled) return;
-        for (const handler of this.listeners.get("click") ?? []) {
-          handler({ preventDefault() {}, stopPropagation() {}, target: this });
+        this.focus();
+        if (this.type === "checkbox") this.checked = !this.checked;
+        if (this.type === "radio") {
+          const name = this.getAttribute("name");
+          for (const radio of body.querySelectorAll(`input[name="${name}"]`)) radio.checked = radio === this;
         }
+        this.fire("click");
+        if (this.type === "checkbox" || this.type === "radio") {
+          this.fire("input");
+          this.fire("change");
+        }
+      },
+      before(...nodes) {
+        if (!this.parentElement) return;
+        const parent = this.parentElement;
+        const index = parent.children.indexOf(this);
+        parent.append(...nodes);
+        parent.children.splice(index, 0, ...parent.children.splice(-nodes.length));
       },
       append(...nodes: Array<MiniNode | string>) {
         for (const child of nodes) {
           const item = typeof child === "string" ? makeNode("#text", child) : child;
           item.parentElement = this;
-          item.isConnected = this.isConnected;
+          function connect(node: MiniNode, connected: boolean) {
+            node.isConnected = connected;
+            node.children.forEach(child => connect(child, connected));
+          }
+          connect(item, this.isConnected);
           this.children.push(item);
         }
       },
@@ -195,10 +260,15 @@ function createMiniDocument() {
   const body = makeNode("body");
   head.isConnected = true;
   body.isConnected = true;
+  activeElement = body;
+  const eventTarget = new EventTarget();
 
   return {
     head,
     body,
+    get activeElement() { return activeElement; },
+    addEventListener: eventTarget.addEventListener.bind(eventTarget),
+    removeEventListener: eventTarget.removeEventListener.bind(eventTarget),
     createElement: (tag: string) => makeNode(tag),
     createElementNS: (_ns: string, tag: string) => makeNode(tag),
     createTextNode: (text: string) => makeNode("#text", text),
@@ -207,54 +277,71 @@ function createMiniDocument() {
   };
 }
 
-interface ProviderEnhanceHandle {
-  formatSize(num: unknown): string;
-  parseSize(raw: unknown, allowEmpty?: boolean): { value: number | null; error: string };
-  thinkingMode(model: Record<string, unknown>): "none" | "toggle" | "always";
-  readThinkingState(model: Record<string, unknown>): { thinking: "none" | "toggle" | "always"; adaptiveThinking: boolean };
-  applyThinkingState(
-    baseCapabilities: string[],
-    thinking: "none" | "toggle" | "always",
-    adaptiveThinking?: boolean,
-  ): { capabilities: string[]; thinking: "none" | "toggle" | "always"; adaptive_thinking: boolean };
-  selectThinkingOption(draft: Record<string, unknown>, option: string): void;
-  draftOf(model: Record<string, unknown>): {
-    capabilities: Set<string>;
-    thinking: "none" | "toggle" | "always";
-    adaptiveThinking: boolean;
-    maxContextSize: number;
-    maxOutputSize: number | null;
-    supportEfforts: string[];
+type Model = Record<string, unknown>;
+type Action = { action: string; payload?: Record<string, unknown> };
+
+function loadFixture(request?: (action: string, payload?: Record<string, unknown>) => Promise<unknown>, providerId = "team") {
+  const doc = createMiniDocument();
+  const window = new EventTarget();
+  const calls: Action[] = [];
+  const config = {
+    providers: { [providerId]: { type: "openai", base_url: "https://example.com/v1" } },
+    models: {
+      [`${providerId}/family/alpha`]: { maxContextSize: 262144, capabilities: ["audio_in", "image_in", "tool_use", "thinking"], supportEfforts: ["no", "high", "high"], adaptiveThinking: true },
+      [`${providerId}/beta`]: { max_context_size: 65536, max_output_size: 1024 },
+    } as Record<string, Model>,
   };
-  openPanel(context: {
-    providerId: string;
-    key: string;
-    model: Record<string, unknown>;
-    managed: boolean;
-    row?: MiniNode;
-    button?: MiniNode;
-  }): void;
-  closePanel(): void;
-  scan(): void;
-  CONTEXT_PRESETS: Array<{ label: string; value: number }>;
-  THINKING_OPTIONS: Array<{ value: string; label: string; title: string }>;
-  state: { panel: MiniNode | null; panelRow: MiniNode | null; panelButton: MiniNode | null; style: MiniNode | null };
+  const context = vm.createContext({
+    document: doc, window, Event, CustomEvent: Event, setTimeout, clearTimeout,
+    MutationObserver: class { observe() {} disconnect() {} },
+  });
+  vm.runInContext(readFileSync("../internal/desktop/assets/provider_enhance.js", "utf8"), context);
+  const enhance = context.createProviderEnhance({ request: async (action: string, payload?: Record<string, unknown>) => {
+    calls.push(JSON.parse(JSON.stringify({ action, payload })) as Action);
+    if (action === "config.get") return structuredClone(config);
+    return request?.(action, payload) ?? {};
+  } }) as { install(): void; remove(): void; scan(): void };
+
+  function node(tag: string, className = "") {
+    const element = doc.createElement(tag);
+    element.className = className;
+    return element;
+  }
+  const official = node("section", "ui-dialog");
+  official.setAttribute("role", "dialog");
+  const form = node("div", "pf");
+  const field = node("div", "pf-field");
+  const name = node("input", "ui-input");
+  name.value = providerId;
+  field.append(name);
+  const table = node("div", "pmt");
+  const heading = node("div", "pmt-grid pmt-head");
+  heading.append("模型 ID", "上下文", "移除");
+  table.append(heading);
+  function addRow(modelID: string) {
+    const row = node("div", "pmt-grid");
+    const id = node("input");
+    id.value = modelID;
+    const ctxInput = node("input");
+    ctxInput.value = "128000";
+    row.append(id, ctxInput, node("button"));
+    table.append(row);
+    return { row, ctxInput };
+  }
+  const alpha = addRow("family/alpha");
+  const beta = addRow("beta");
+  form.append(node("button", "pf-back"), field, table);
+  official.append(form);
+  doc.body.append(official);
+  enhance.install();
+  return { doc, window, form, table, heading, alpha, beta, config, calls, enhance, addRow };
 }
 
-function loadProviderEnhance(request: (action: string, payload?: Record<string, unknown>) => Promise<unknown> = async () => ({})) {
-  const doc = createMiniDocument();
-  const source = readFileSync("../internal/desktop/assets/provider_enhance.js", "utf8");
-  const context = vm.createContext({ document: doc });
-  vm.runInContext(source, context);
-  const factory = context.createProviderEnhance as (options: {
-    request: (action: string, payload?: Record<string, unknown>) => Promise<unknown>;
-  }) => ProviderEnhanceHandle;
-  return { doc, enhance: factory({ request }) };
-}
+const settle = () => new Promise(resolve => setTimeout(resolve, 5));
+const inspector = (form: MiniNode) => form.querySelector("dialog.ekd-px-dialog")!;
 
 function allText(node: MiniNode): string {
-  if (node.nodeType === 3) return node.textContent;
-  return (node.textContent || "") + node.children.map(allText).join("");
+  return node.textContent + node.children.map(allText).join("");
 }
 
 function findButton(root: MiniNode, label: string): MiniNode {
@@ -263,438 +350,187 @@ function findButton(root: MiniNode, label: string): MiniNode {
   return hit;
 }
 
-function plain<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
+function key(window: EventTarget, key: string, shiftKey = false) {
+  const event = new Event("keydown", { cancelable: true });
+  Object.assign(event, { key, shiftKey });
+  window.dispatchEvent(event);
+  return event.defaultPrevented;
 }
 
-test("bidirectional thinking mapping preserves stored adaptive_thinking and supports effort-driven toggle", () => {
-  const { enhance } = loadProviderEnhance();
-
-  const noneStored = { capabilities: ["image_in", "tool_use"], adaptiveThinking: false };
-  assert.deepEqual(plain(enhance.readThinkingState(noneStored)), { thinking: "none", adaptiveThinking: false });
-  assert.deepEqual(plain(enhance.applyThinkingState(["tool_use", "image_in"], "none", true)), {
-    capabilities: ["image_in", "tool_use"],
-    thinking: "none",
-    adaptive_thinking: false,
-  });
-
-  const effortOnlyStored = { capabilities: ["tool_use"], supportEfforts: ["high", "low", "no"] };
-  const effortDraft = enhance.draftOf(effortOnlyStored);
-  assert.equal(effortDraft.thinking, "toggle");
-  assert.equal(effortDraft.adaptiveThinking, false);
-  assert.deepEqual(plain(effortDraft.supportEfforts), ["low", "high"]);
-
-  const adaptiveStored = { capabilities: ["video_in", "thinking"], adaptive_thinking: true };
-  const adaptiveDraft = enhance.draftOf(adaptiveStored);
-  assert.equal(adaptiveDraft.thinking, "toggle");
-  assert.equal(adaptiveDraft.adaptiveThinking, true);
-  assert.deepEqual(
-    plain(enhance.applyThinkingState([...adaptiveDraft.capabilities], adaptiveDraft.thinking, adaptiveDraft.adaptiveThinking)),
-    { capabilities: ["video_in", "thinking"], thinking: "toggle", adaptive_thinking: true },
-  );
-
-  // Toggling efforts on an adaptive model preserves adaptive_thinking; clicking `no` disables thinking
-  enhance.selectThinkingOption(adaptiveDraft, "high");
-  assert.equal(adaptiveDraft.thinking, "toggle");
-  assert.equal(adaptiveDraft.adaptiveThinking, true);
-  assert.deepEqual(plain(adaptiveDraft.supportEfforts), ["high"]);
-
-  enhance.selectThinkingOption(adaptiveDraft, "no");
-  assert.equal(adaptiveDraft.thinking, "none");
-  assert.equal(adaptiveDraft.adaptiveThinking, false);
-  assert.deepEqual(plain(adaptiveDraft.supportEfforts), []);
-
-  // Re-enabling an effort before saving restores preserved adaptive_thinking
-  enhance.selectThinkingOption(adaptiveDraft, "medium");
-  assert.equal(adaptiveDraft.thinking, "toggle");
-  assert.equal(adaptiveDraft.adaptiveThinking, true);
-  assert.deepEqual(plain(adaptiveDraft.supportEfforts), ["medium"]);
-
-  const alwaysStored = { capabilities: ["tool_use", "always_thinking", "thinking"], adaptiveThinking: true };
-  assert.deepEqual(plain(enhance.readThinkingState(alwaysStored)), { thinking: "always", adaptiveThinking: false });
-  assert.deepEqual(plain(enhance.applyThinkingState(["tool_use"], "always", true)), {
-    capabilities: ["tool_use", "always_thinking"],
-    thinking: "always",
-    adaptive_thinking: false,
-  });
+test("preserves official columns, displays saved capabilities and keeps a tracked modal focus loop", async () => {
+  const { doc, window, heading, form, alpha, beta, enhance } = loadFixture();
+  await settle();
+  assert.equal(heading.children.length, 3);
+  assert.equal(alpha.row.children.slice(0, 3).map(node => node.tagName).join(","), "INPUT,INPUT,BUTTON");
+  const trigger = findButton(alpha.row, "图片 · 工具 · 思考 · 其他 1 项 · 256K");
+  assert.equal(findButton(beta.row, "未配置 · 64K").getAttribute("aria-expanded"), "false");
+  trigger.click();
+  await settle();
+  const panel = inspector(form);
+  assert.ok(panel.shown);
+  assert.equal(trigger.getAttribute("aria-controls"), panel.getAttribute("id"));
+  assert.equal(trigger.getAttribute("aria-expanded"), "true");
+  assert.equal(panel.parentElement, form);
+  assert.match(allText(panel), /audio_in/);
+  const close = findButton(panel, "关闭");
+  assert.equal(doc.activeElement, close);
+  assert.equal(key(window, "Tab"), true);
+  assert.equal(doc.activeElement, findButton(panel, "填入目录建议"));
+  assert.equal(key(window, "Tab", true), true);
+  assert.equal(doc.activeElement, close);
+  const output = panel.querySelectorAll("input.ekd-px-input")[1]!;
+  output.value = "32K";
+  output.fire("input");
+  assert.equal(key(window, "Escape"), true);
+  assert.equal(inspector(form), panel);
+  assert.match(allText(panel), /有未保存的修改/);
+  assert.equal(doc.activeElement, findButton(panel, "放弃修改"));
+  findButton(panel, "放弃修改").click();
+  assert.equal(inspector(form), null);
+  assert.equal(doc.activeElement, trigger);
+  assert.equal(trigger.getAttribute("aria-expanded"), "false");
+  enhance.remove();
+  assert.equal(alpha.row.querySelector("[data-ekd-px-button]"), null);
 });
 
-test("inline panel exposes direct thinking options (no/low/medium/high/xhigh/max), omits adaptive thinking, and uses 256K-1M presets", () => {
-  const { enhance } = loadProviderEnhance();
-
-  assert.deepEqual(
-    plain(enhance.THINKING_OPTIONS.map(item => [item.value, item.label])),
-    [
-      ["no", "no"],
-      ["low", "low"],
-      ["medium", "medium"],
-      ["high", "high"],
-      ["xhigh", "xhigh"],
-      ["max", "max"],
-    ],
-  );
-  assert.deepEqual(
-    plain(enhance.CONTEXT_PRESETS.map(item => [item.label, item.value])),
-    [
-      ["256K", 262144],
-      ["350K", 358400],
-      ["500K", 512000],
-      ["600K", 614400],
-      ["1M", 1048576],
-    ],
-  );
-  assert.deepEqual(plain(enhance.parseSize("1K", false)), { value: 1024, error: "" });
-  assert.deepEqual(plain(enhance.parseSize("1KB", false)), { value: 1024, error: "" });
-  assert.deepEqual(plain(enhance.parseSize("256K", false)), { value: 262144, error: "" });
-  assert.deepEqual(plain(enhance.parseSize("1M", false)), { value: 1048576, error: "" });
-  assert.deepEqual(plain(enhance.parseSize("1MB", false)), { value: 1048576, error: "" });
-
-  // No thinking -> `no` pressed, all efforts unpressed. The adaptive switch is
-  // still offered: the core's omitempty drops an unset field, and a model that
-  // never wrote adaptive_thinking must not lose the control.
-  enhance.openPanel({
-    providerId: "custom",
-    key: "custom/m-none",
-    model: { displayName: "NoThink", maxContextSize: 262144, capabilities: ["tool_use"] },
-    managed: false,
-  });
-  let drawer = enhance.state.panel!;
-  assert.equal(drawer.tagName, "DIV");
-  assert.ok(allText(drawer).includes("自适应思考"), "adaptive thinking must be offered for a custom model");
-  assert.equal(findButton(drawer, "自适应思考（adaptive_thinking）").getAttribute("aria-pressed"), "false");
-  const contextPresetsGroup = drawer.querySelectorAll(".ekd-px-presets")[0]!;
-  assert.deepEqual(
-    contextPresetsGroup.querySelectorAll("button").map(b => allText(b).trim()),
-    ["256K", "350K", "500K", "600K", "1M"],
-  );
-  assert.equal(findButton(drawer, "no").getAttribute("aria-pressed"), "true");
-  assert.equal(findButton(drawer, "medium").getAttribute("aria-pressed"), "false");
-  assert.equal(findButton(drawer, "256K").getAttribute("aria-pressed"), "true");
-  assert.equal(drawer.querySelectorAll(".ekd-px-limits").length, 1, "context and output limits share one horizontal grid");
-
-  // Configured efforts -> `no` unpressed, selected efforts pressed
-  enhance.openPanel({
-    providerId: "custom",
-    key: "custom/m-efforts",
-    model: {
-      displayName: "ThinkModel",
-      maxContextSize: 1048576,
-      capabilities: ["thinking"],
-      supportEfforts: ["medium", "xhigh", "max"],
-    },
-    managed: false,
-  });
-  drawer = enhance.state.panel!;
-  assert.equal(findButton(drawer, "no").getAttribute("aria-pressed"), "false");
-  assert.equal(findButton(drawer, "medium").getAttribute("aria-pressed"), "true");
-  assert.equal(findButton(drawer, "xhigh").getAttribute("aria-pressed"), "true");
-  assert.equal(findButton(drawer, "max").getAttribute("aria-pressed"), "true");
-  assert.equal(findButton(drawer, "1M").getAttribute("aria-pressed"), "true");
+test("validates output against saved context and sends only edited capability fields", async () => {
+  const { calls, form, alpha } = loadFixture();
+  await settle();
+  alpha.row.querySelector("[data-ekd-px-button]")!.click();
+  await settle();
+  const panel = inspector(form);
+  const output = panel.querySelectorAll("input.ekd-px-input")[1]!;
+  const adaptive = panel.querySelector('input[role="switch"]')!;
+  assert.equal(adaptive.checked, true);
+  assert.equal(panel.querySelector('input[name="ekd-px-thinking"][value="toggle"]')?.checked, true);
+  assert.equal(panel.querySelectorAll("input[type=radio]").length, 3);
+  assert.doesNotMatch(allText(panel), /\bno\b/i);
+  assert.equal(panel.querySelectorAll("label").filter(node => allText(node) === "high").length, 1);
+  const save = findButton(panel, "保存");
+  output.value = "1M";
+  output.fire("input");
+  assert.equal(output.getAttribute("aria-invalid"), "true");
+  assert.equal(save.disabled, true);
+  output.value = "";
+  output.fire("input");
+  panel.querySelector('input[value="always"]')!.click();
+  assert.equal(adaptive.disabled, true);
+  save.click();
+  await settle();
+  const write = calls.find(call => call.action === "providers.updateModel");
+  assert.deepEqual(write?.payload, { providerId: "team", model: "team/family/alpha", edit: { thinking: "always" } });
+  assert.equal(alpha.ctxInput.value, "128000");
+  assert.match(allText(panel), /已保存并核对/);
 });
 
-test("inline panel clicks submit direct thinking efforts, preserve adaptive_thinking, and clear thinking on no", async () => {
-  const requests: Array<{ action: string; payload?: Record<string, unknown> }> = [];
-  const { doc, enhance } = loadProviderEnhance(async (action, payload) => {
-    requests.push({ action, payload });
-    return {};
+test("saves both edited limits atomically and flags unsaved changes in the official row", async () => {
+  const { calls, form, alpha } = loadFixture();
+  await settle();
+  alpha.row.querySelector("[data-ekd-px-button]")!.click();
+  await settle();
+  const panel = inspector(form);
+  assert.match(allText(panel), /官方表单有未保存的模型改动/);
+  const [context, output] = panel.querySelectorAll("input.ekd-px-input");
+  context!.value = "";
+  context!.fire("input");
+  assert.equal(context!.getAttribute("aria-invalid"), "true");
+  context!.value = "64K";
+  output!.value = "128K";
+  output!.fire("input");
+  assert.equal(output!.getAttribute("aria-invalid"), "true");
+  context!.value = "384K";
+  context!.fire("input");
+  assert.equal(output!.getAttribute("aria-invalid"), "false");
+  findButton(panel, "保存").click();
+  await settle();
+  assert.deepEqual(calls.find(call => call.action === "providers.updateModel")?.payload?.edit, {
+    max_context_size: 393216,
+    max_output_size: 131072,
   });
-
-  const row = doc.createElement("div");
-  row.className = "pmt-grid";
-  const idInput = doc.createElement("input");
-  idInput.value = "m1";
-  const ctxInput = doc.createElement("input");
-  ctxInput.value = "128000";
-  row.append(idInput, ctxInput);
-  doc.body.append(row);
-
-  enhance.openPanel({
-    providerId: "custom",
-    key: "custom/m1",
-    model: { displayName: "M1", maxContextSize: 128000, capabilities: ["image_in"] },
-    managed: false,
-    row,
-  });
-  const drawer = enhance.state.panel!;
-  assert.equal(drawer.parentElement, row, "drawer renders inline inside the model row");
-
-  findButton(drawer, "medium").click();
-  findButton(drawer, "xhigh").click();
-  findButton(drawer, "500K").click();
-
-  const inputs = drawer.querySelectorAll("input.ekd-px-input");
-  assert.equal(inputs.length, 2);
-  assert.equal(inputs[0]?.value, "500K");
-  inputs[1]!.value = "32K";
-
-  findButton(drawer, "保存").click();
-  await new Promise(resolve => setTimeout(resolve, 0));
-
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0]?.action, "providers.updateModel");
-  assert.deepEqual(plain(requests[0]?.payload?.edit), {
-    capabilities: ["image_in", "thinking"],
-    thinking: "toggle",
-    max_context_size: 512000,
-    max_output_size: 32768,
-    support_efforts: ["medium", "xhigh"],
-  });
-  assert.equal(ctxInput.value, "512000", "saving inline panel syncs official row context input");
-
-  // Clicking `no` clears all efforts and disables thinking without writing literal "no"
-  findButton(drawer, "no").click();
-  findButton(drawer, "保存").click();
-  await new Promise(resolve => setTimeout(resolve, 0));
-  assert.deepEqual(plain(requests[1]?.payload?.edit), {
-    capabilities: ["image_in"],
-    thinking: "none",
-    max_context_size: 512000,
-    max_output_size: 32768,
-    support_efforts: [],
-  });
-
-  // Stored adaptive_thinking: true (e.g. Claude) survives edits until `no` is explicitly selected
-  enhance.openPanel({
-    providerId: "anthropic",
-    key: "anthropic/claude-opus-4-6",
-    model: {
-      displayName: "Claude Opus 4.6",
-      maxContextSize: 200000,
-      capabilities: ["tool_use", "thinking"],
-      adaptiveThinking: true,
-      supportEfforts: ["low", "medium", "high"],
-    },
-    managed: false,
-    row,
-  });
-  const claudeDrawer = enhance.state.panel!;
-  findButton(claudeDrawer, "max").click();
-  findButton(claudeDrawer, "保存").click();
-  await new Promise(resolve => setTimeout(resolve, 0));
-  assert.deepEqual(plain(requests[2]?.payload?.edit), {
-    capabilities: ["tool_use", "thinking"],
-    thinking: "toggle",
-    adaptive_thinking: true,
-    max_context_size: 200000,
-    max_output_size: null,
-    support_efforts: ["low", "medium", "high", "max"],
-  });
-
-  findButton(claudeDrawer, "no").click();
-  findButton(claudeDrawer, "保存").click();
-  await new Promise(resolve => setTimeout(resolve, 0));
-  assert.deepEqual(plain(requests[3]?.payload?.edit), {
-    capabilities: ["tool_use"],
-    thinking: "none",
-    max_context_size: 200000,
-    max_output_size: null,
-    support_efforts: [],
-  });
+  assert.equal(alpha.ctxInput.value, "128000");
 });
 
-test("row enhance button toggles inline collapsible drawer inside the model row", async () => {
-  const { doc, enhance } = loadProviderEnhance(async (action) => {
-    if (action === "config.get") {
-      return {
-        providers: {
-          "custom-a": { type: "openai_legacy", baseUrl: "https://api.example.com/v1" },
-        },
-        models: {
-          "custom-a/demo-model": { displayName: "Demo Model", maxContextSize: 262144, capabilities: ["tool_use"] },
-        },
-      };
-    }
-    return {};
-  });
-
-  const dialog = doc.createElement("div");
-  dialog.className = "settings-dialog";
-  const form = doc.createElement("div");
-  form.className = "pf";
-  const back = doc.createElement("button");
-  back.className = "pf-back";
-
-  const fieldType = doc.createElement("div");
-  fieldType.className = "pf-field";
-  const typeText = doc.createElement("span");
-  typeText.className = "ui-select__value-text";
-  typeText.textContent = "openai_legacy";
-  fieldType.append(typeText);
-
-  const fieldName = doc.createElement("div");
-  fieldName.className = "pf-field";
-  const nameInput = doc.createElement("input");
-  nameInput.className = "ui-input";
-  nameInput.value = "custom-a";
-  fieldName.append(nameInput);
-
-  const fieldUrl = doc.createElement("div");
-  fieldUrl.className = "pf-field";
-  const urlInput = doc.createElement("input");
-  urlInput.className = "ui-input";
-  urlInput.value = "https://api.example.com/v1";
-  fieldUrl.append(urlInput);
-
-  const table = doc.createElement("div");
-  table.className = "pmt";
-  const row = doc.createElement("div");
-  row.className = "pmt-grid";
-  const modelInput = doc.createElement("input");
-  modelInput.value = "demo-model";
-  const removeBtn = doc.createElement("button");
-  removeBtn.setAttribute("aria-label", "移除模型");
-  row.append(modelInput, removeBtn);
-  table.append(row);
-
-  form.append(back, fieldType, fieldName, fieldUrl, table);
-  dialog.append(form);
-  doc.body.append(dialog);
-
+test("re-reads just-imported rows and renders managed rows read-only", async () => {
+  const { form, config, enhance, addRow } = loadFixture();
+  await settle();
+  const fresh = addRow("just-imported");
   enhance.scan();
-  await new Promise(resolve => setTimeout(resolve, 10));
+  await settle();
+  const trigger = findButton(fresh.row, "未保存");
+  config.models["team/just-imported"] = { maxContextSize: 131072, capabilities: ["video_in"] };
+  trigger.click();
+  await settle();
+  assert.ok(inspector(form));
+  assert.equal(inspector(form).querySelector("input.ekd-px-input")?.value, "128K");
+  assert.equal(allText(trigger), "视频 · 128K");
 
-  const btn = row.querySelector("[data-ekd-px-button]");
-  assert.ok(btn, "expected injected enhance button");
-  assert.equal(btn.getAttribute("aria-label"), "能力与限制");
-  assert.equal(btn.getAttribute("aria-expanded"), "false");
-  assert.equal(btn.getAttribute("title"), "展开设置模型能力、思考强度与上下文限制");
-  assert.equal(btn.getAttribute("data-ekd-enhance"), "1");
-  assert.ok(allText(btn).includes("能力与限制"), "button should contain readable label text");
-
-  btn.click();
-  await new Promise(resolve => setTimeout(resolve, 10));
-  assert.ok(enhance.state.panel?.shown, "clicking the labeled button should expand the inline panel");
-  assert.equal(enhance.state.panel?.parentElement, row);
-  assert.equal(btn.getAttribute("aria-expanded"), "true");
-
-  btn.click();
-  await new Promise(resolve => setTimeout(resolve, 10));
-  assert.equal(enhance.state.panel, null, "clicking again collapses the inline panel");
-  assert.equal(btn.getAttribute("aria-expanded"), "false");
+  const managed = loadFixture(undefined, "managed:kimi-code");
+  await settle();
+  findButton(managed.alpha.row, "只读").click();
+  await settle();
+  const panel = inspector(managed.form);
+  assert.match(allText(panel), /内置订阅供应商/);
+  assert.equal(panel.querySelectorAll("input").every(input => input.disabled), true);
+  assert.equal(managed.form.querySelector(".ekd-px-toolbar")?.hidden, true);
 });
 
-test("decorates provider form inside 1.3.2 ui-dialog / role=dialog without .settings-dialog", async () => {
-  const { doc, enhance } = loadProviderEnhance(async (action) => {
-    if (action === "config.get") {
-      return {
-        providers: {
-          magpie: { type: "openai_legacy", base_url: "http://127.0.0.1:3425/v1" },
-        },
-        models: {
-          "magpie/glm-5.3": { displayName: "GLM-5.3", maxContextSize: 614400, capabilities: ["tool_use"] },
-        },
-      };
+test("uses exact official and public suggestions only as a draft", async () => {
+  const { calls, form, beta } = loadFixture(async (action, payload) => {
+    switch (action) {
+      case "models.list": return { items: [
+        { id: "other/beta", provider: "other", model: "beta", capabilities: ["image_in"] },
+        { id: "team/beta", provider: "team", model: "beta", capabilities: ["tool_use"] },
+      ] };
+      case "providers.modelSuggestion":
+        assert.deepEqual(JSON.parse(JSON.stringify(payload)), { providerId: "team", model: "team/beta" });
+        return { suggestion: { video_in: true, thinking: true, max_output_size: 8192 } };
+      default: return {};
     }
-    return {};
   });
-
-  const dialog = doc.createElement("div");
-  dialog.className = "ui-dialog ui-dialog--xl ui-dialog--flush ui-dialog--fixed-height ui-dialog--grouped";
-  dialog.setAttribute("role", "dialog");
-  const form = doc.createElement("div");
-  form.className = "pf";
-  const back = doc.createElement("button");
-  back.className = "pf-back";
-
-  const fieldName = doc.createElement("div");
-  fieldName.className = "pf-field";
-  const nameInput = doc.createElement("input");
-  nameInput.className = "ui-input";
-  nameInput.value = "magpie";
-  fieldName.append(nameInput);
-
-  const fieldType = doc.createElement("div");
-  fieldType.className = "pf-field";
-  const typeText = doc.createElement("span");
-  typeText.className = "ui-select__value-text";
-  typeText.textContent = "OpenAI";
-  fieldType.append(typeText);
-
-  const fieldKey = doc.createElement("div");
-  fieldKey.className = "pf-field";
-  const keyInput = doc.createElement("input");
-  keyInput.className = "ui-input";
-  keyInput.value = "sk-redacted";
-  fieldKey.append(keyInput);
-
-  const fieldUrl = doc.createElement("div");
-  fieldUrl.className = "pf-field";
-  const urlInput = doc.createElement("input");
-  urlInput.className = "ui-input";
-  urlInput.value = "http://127.0.0.1:3425/v1";
-  fieldUrl.append(urlInput);
-
-  const table = doc.createElement("div");
-  table.className = "pmt";
-  const head = doc.createElement("div");
-  head.className = "pmt-grid pmt-head";
-  const row = doc.createElement("div");
-  row.className = "pmt-grid";
-  const modelInput = doc.createElement("input");
-  modelInput.value = "glm-5.3";
-  const removeBtn = doc.createElement("button");
-  removeBtn.setAttribute("aria-label", "移除模型");
-  row.append(modelInput, removeBtn);
-  table.append(head, row);
-
-  form.append(back, fieldName, fieldType, fieldKey, fieldUrl, table);
-  dialog.append(form);
-  doc.body.append(dialog);
-
-  enhance.scan();
-  await new Promise(resolve => setTimeout(resolve, 10));
-
-  assert.equal(table.dataset.ekdPxTable, "1");
-  assert.ok(head.querySelector("[data-ekd-px-head-pad]"), "expected header column pad");
-  const btn = row.querySelector("[data-ekd-px-button]");
-  assert.ok(btn, "expected injected enhance button inside .ui-dialog");
-  assert.ok(enhance.state.style?.textContent.includes(".ui-dialog .pf .pmt[data-ekd-px-table=\"1\"]"));
-  assert.ok(enhance.state.style?.textContent.includes("[role=\"dialog\"] .pf .pmt[data-ekd-px-table=\"1\"]"));
-
-  btn.click();
-  await new Promise(resolve => setTimeout(resolve, 10));
-  assert.ok(enhance.state.panel?.shown, "clicking enhance button inside .ui-dialog should open inline drawer");
+  await settle();
+  beta.row.querySelector("[data-ekd-px-button]")!.click();
+  await settle();
+  const panel = inspector(form);
+  findButton(panel, "填入目录建议").click();
+  await settle();
+  assert.equal(calls.some(call => call.action.startsWith("providers.update")), false);
+  assert.match(allText(panel), /官方模型目录、models.dev/);
+  findButton(panel, "保存").click();
+  await settle();
+  assert.deepEqual(calls.find(call => call.action === "providers.updateModel")?.payload?.edit, {
+    capabilities: ["video_in", "tool_use"], thinking: "toggle", max_output_size: 8192,
+  });
 });
 
-test("adaptive thinking can be switched on for a model that never stored the field, and survives an effort click", async () => {
-  const requests: Array<{ action: string; payload?: Record<string, unknown> }> = [];
-  const { doc, enhance } = loadProviderEnhance(async (action, payload) => {
-    requests.push({ action, payload });
-    return {};
-  });
+test("submits selected models once from the batch template and returns focus to the toolbar", async () => {
+  const { doc, form, calls, alpha, beta } = loadFixture();
+  await settle();
+  const toolbar = form.querySelector(".ekd-px-toolbar")!;
+  const toggle = findButton(toolbar, "批量配置");
+  toggle.click();
+  findButton(toolbar, "全选已保存模型").click();
+  for (const item of [alpha, beta]) assert.equal(item.row.querySelector("input[type=checkbox]")?.checked, true);
+  findButton(toolbar, "编辑能力模板").click();
+  await settle();
+  const panel = inspector(form);
+  panel.querySelector("input[type=checkbox]")!.click();
+  findButton(panel, "保存到 2 个模型").click();
+  await settle();
+  assert.equal(inspector(form), null);
+  assert.equal(doc.activeElement, toggle);
+  assert.deepEqual(calls.filter(call => call.action.startsWith("providers.update")), [{
+    action: "providers.updateModels",
+    payload: { providerId: "team", models: ["team/family/alpha", "team/beta"].map(model => ({ model, edit: { capabilities: ["image_in"], thinking: "none" } })) },
+  }]);
+});
 
-  const row = doc.createElement("div");
-  row.className = "pmt-grid";
-  const idInput = doc.createElement("input");
-  idInput.value = "m-adaptive";
-  const ctxInput = doc.createElement("input");
-  ctxInput.value = "200000";
-  row.append(idInput, ctxInput);
-  doc.body.append(row);
-
-  // The core answers with no adaptive_thinking field at all (`omitempty`).
-  enhance.openPanel({
-    providerId: "openrouter",
-    key: "openrouter/m-adaptive",
-    model: { displayName: "Custom", maxContextSize: 200000, capabilities: ["tool_use", "thinking"] },
-    managed: false,
-    row,
-  });
-  const drawer = enhance.state.panel!;
-  const adaptive = findButton(drawer, "自适应思考（adaptive_thinking）");
-  assert.equal(adaptive.getAttribute("aria-pressed"), "false");
-
-  adaptive.click();
-  assert.equal(adaptive.getAttribute("aria-pressed"), "true", "clicking the switch turns it on");
-
-  // A later effort click must not silently drop the switch that was just turned on.
-  findButton(drawer, "high").click();
-  assert.equal(adaptive.getAttribute("aria-pressed"), "true", "an effort click keeps the adaptive switch on");
-
-  findButton(drawer, "保存").click();
-  await new Promise(resolve => setTimeout(resolve, 0));
-  const edit = requests[0]?.payload?.edit as Record<string, unknown>;
-  assert.equal(edit.thinking, "toggle");
-  assert.equal(edit.adaptive_thinking, true, "the saved edit carries adaptive_thinking: true");
-  assert.deepEqual(plain(edit.support_efforts), ["high"]);
+test("theme rules keep state text separate from the host accent and preserve the official grid", async () => {
+  const { doc } = loadFixture();
+  const css = doc.head.querySelector("style")!.textContent;
+  assert.doesNotMatch(css, /pmt-grid|96px/);
+  assert.match(css, /--px-bg:var\(--color-bg,/);
+  assert.match(css, /--px-ink:var\(--color-text,/);
+  assert.match(css, /\.ekd-px-mode:has\(:checked\)\{background:var\(--px-fill\);color:var\(--px-ink\)/);
+  assert.match(css, /--px-error:light-dark\(#9b2325,#ffb4ab\)/);
+  assert.match(css, /--px-muted:color-mix\(in srgb,var\(--px-ink\) 86%,var\(--px-bg\)\)/);
 });

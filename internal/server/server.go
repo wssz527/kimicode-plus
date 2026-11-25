@@ -148,10 +148,12 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 	// registry_providers/registry_models directly, while the HTTP surface that
 	// served the separate model page is gone: models are configured on the
 	// official provider form.
+	var catalog *registry.Service
 	add("registry", func() error {
 		s, e := registry.New(db)
 		if e == nil {
 			s.RegisterGateways(mux)
+			catalog = s
 		}
 		return e
 	})
@@ -320,6 +322,9 @@ func NewWithNative(db *sql.DB, guard *security.Guard, forceSafe bool, gatewayTok
 				nativeService.UseVault(vault)
 			}
 			nativeService.UseUpdater(app.updater)
+			if catalog != nil {
+				nativeService.UsePublicModelCatalog(catalog)
+			}
 			nativeService.Register(mux)
 			app.native = nativeService
 			nativeRef.Store(nativeService)

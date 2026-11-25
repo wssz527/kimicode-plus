@@ -219,7 +219,7 @@ func TestUpdateProviderModelKeepsTheStoredThinkingWhenTheDialogSaysToggle(t *tes
 	}
 }
 
-func TestUpdateProviderModelClearsOmittedLimits(t *testing.T) {
+func TestUpdateProviderModelClearsExplicitNullOutput(t *testing.T) {
 	models := inspectModels()
 	alpha := models["r2-inspect/alpha"]
 	output := int64(2048)
@@ -228,7 +228,7 @@ func TestUpdateProviderModelClearsOmittedLimits(t *testing.T) {
 	store := newOfficialModelStore(models)
 	service, _ := newAutomationTestService(t, store.handler())
 	value, err := updateModelAction(t, service, `{"providerId":"r2-inspect","model":"r2-inspect/alpha","edit":{
-		"capabilities":["thinking"],"thinking":"none","max_context_size":131072}}`)
+		"capabilities":["thinking"],"thinking":"none","max_context_size":131072,"max_output_size":null}}`)
 	if err != nil {
 		t.Fatalf("updateModel: %v", err)
 	}
@@ -305,6 +305,18 @@ func TestMergeModelThinkingModes(t *testing.T) {
 	}
 }
 
+func TestMergeModelPreservesOnlySupportedDefaultEffort(t *testing.T) {
+	base := modelConfig{DefaultEffort: "high", SupportEfforts: []string{"low", "high"}}
+	if got := mergeModel(base, ModelEdit{SupportEfforts: []string{"medium", "high"}}); got.DefaultEffort != "high" {
+		t.Fatalf("supported default effort was cleared: %#v", got)
+	}
+	for _, edit := range []ModelEdit{{SupportEfforts: []string{"medium"}}, {Thinking: "none"}} {
+		if got := mergeModel(base, edit); got.DefaultEffort != "" {
+			t.Fatalf("unsupported default effort survived: %#v", got)
+		}
+	}
+}
+
 func TestMergeModelIgnoresUnknownCapabilities(t *testing.T) {
 	merged := mergeModel(modelConfig{}, ModelEdit{Thinking: "none", Capabilities: []string{"telepathy", "image_in"}})
 	if !sameStrings(merged.Capabilities, []string{"image_in"}) {
@@ -356,7 +368,7 @@ func TestDecodeModelEditRejectsBadShapes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("nil output cap should mean unset: %v", err)
 	}
-	if edit.MaxOutputSize != nil || edit.MaxContextSize != 1024 || edit.Thinking != "none" {
+	if edit.MaxOutputSize != nil || !edit.OutputChanged || edit.MaxContextSize != 1024 || edit.Thinking != "" {
 		t.Fatalf("defaults not applied: %#v", edit)
 	}
 }
@@ -826,5 +838,113 @@ func TestThinkingNoDisablesThinkingAndNeverWritesLiteralNo(t *testing.T) {
 	}
 	if strings.Contains(lastBody, `"adaptive_thinking":true`) {
 		t.Fatalf("PUT body kept adaptive_thinking=true when thinking is disabled: %s", lastBody)
+	}
+}
+
+func TestUpdateProviderModelPartialEditPreservesContextAndOtherFields(t *testing.T) {
+	models := inspectModels()
+	alpha := models["r2-inspect/alpha"]
+	size := int64(8192)
+	alpha.MaxOutputSize = &size
+	alpha.AdaptiveThinking = boolPtr(true)
+	alpha.SupportEfforts = []string{"medium", "high"}
+	alpha.Capabilities = append(alpha.Capabilities, "audio_in")
+	models["r2-inspect/alpha"] = alpha
+	store := newOfficialModelStore(models)
+	service, _ := newAutomationTestService(t, store.handler())
+	value, err := updateModelAction(t, service, `{"providerId":"r2-inspect","model":"alpha","edit":{"capabilities":["tool_use"]}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := savedModel(t, value)
+	if got.MaxContextSize != alpha.MaxContextSize || !sameOptionalInt(got.MaxOutputSize, alpha.MaxOutputSize) || !sameStrings(got.SupportEfforts, alpha.SupportEfforts) || !sameOptionalBool(got.AdaptiveThinking, alpha.AdaptiveThinking) || !sameCapabilitySet(got.Capabilities, []string{"tool_use", "thinking", "audio_in"}) {
+		t.Fatalf("partial edit overwrote official or custom fields: %#v", got)
+	}
+	if _, err := updateModelAction(t, service, `{"providerId":"r2-inspect","model":"alpha","edit":{"max_output_size":131073}}`); err == nil || !strings.Contains(err.Error(), "不能超过") {
+		t.Fatalf("accepted an output above saved context: %v", err)
+	}
+	value, err = updateModelAction(t, service, `{"providerId":"r2-inspect","model":"alpha","edit":{"max_context_size":131073}}`)
+	if err != nil || savedModel(t, value).MaxContextSize != 131073 || !sameOptionalInt(savedModel(t, value).MaxOutputSize, &size) {
+		t.Fatalf("context edit changed output = %v, %v", value, err)
+	}
+	value, err = updateModelAction(t, service, `{"providerId":"r2-inspect","model":"alpha","edit":{"max_context_size":200000,"max_output_size":150000}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = savedModel(t, value)
+	if got.MaxContextSize != 200000 || got.MaxOutputSize == nil || *got.MaxOutputSize != 150000 {
+		t.Fatalf("combined limits = %#v", got)
+	}
+	value, err = updateModelAction(t, service, `{"providerId":"r2-inspect","model":"alpha","edit":{"max_output_size":null}}`)
+	if err != nil || savedModel(t, value).MaxOutputSize != nil {
+		t.Fatalf("clear output = %v, %v", value, err)
+	}
+}
+
+func TestUpdateProviderModelsValidatesWholeBatchBeforeWriting(t *testing.T) {
+	store := newOfficialModelStore(inspectModels())
+	service, _ := newAutomationTestService(t, store.handler())
+	update := func(models string) (any, error) {
+		return service.Action(context.Background(), "providers.updateModels", json.RawMessage(`{"providerId":"r2-inspect","models":`+models+`}`))
+	}
+	for _, invalid := range []string{
+		`[{"model":"alpha","edit":{"thinking":"none"}},{"model":"beta","edit":{"max_output_size":65537}}]`,
+		`[{"model":"alpha","edit":{"thinking":"none"}},{"model":"r2-inspect/alpha","edit":{"capabilities":[]}}]`,
+		`[{"model":"alpha","edit":{"thinking":"none"}},{"model":"other/gamma","edit":{"thinking":"none"}}]`,
+		`[{"model":"alpha","edit":{"thinking":"none"}},{"model":"missing","edit":{"thinking":"none"}}]`,
+	} {
+		if _, err := update(invalid); err == nil || len(store.bodies) != 0 {
+			t.Fatalf("invalid batch attempted a write: %s, %v", invalid, err)
+		}
+	}
+	value, err := update(`[{"model":"beta","edit":{"capabilities":["video_in"]}},{"model":"alpha","edit":{"capabilities":["tool_use"]}}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := value.(map[string]any)["models"].([]providerModelUpdate)
+	if len(response) != 2 || response[0].Key != "r2-inspect/beta" || response[1].Key != "r2-inspect/alpha" {
+		t.Fatalf("unexpected batch readback order: %#v", response)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.bodies) != 1 || !sameCapabilitySet(store.models["r2-inspect/beta"].Capabilities, []string{"video_in"}) || !sameCapabilitySet(store.models["r2-inspect/alpha"].Capabilities, []string{"tool_use", "thinking"}) || store.models["other/gamma"].MaxContextSize != 8192 {
+		t.Fatalf("batch write count or stored models incorrect: %d, %#v", len(store.bodies), store.models)
+	}
+}
+
+func TestCompareModelIgnoresCapabilityOrderAndDuplicates(t *testing.T) {
+	expected := modelConfig{Capabilities: []string{"image_in", "tool_use", "audio_in"}}
+	actual := modelConfig{Capabilities: []string{"audio_in", "tool_use", "tool_use", "image_in"}}
+	if err := compareModel(expected, actual); err != nil {
+		t.Fatal(err)
+	}
+	actual.Capabilities[0] = "video_in"
+	if err := compareModel(expected, actual); err == nil {
+		t.Fatal("capability changes were ignored")
+	}
+}
+
+func TestConfigActionsRedactCredentialsAndRetainModelOrder(t *testing.T) {
+	response := `{"providers":{"env":{"type":"openai","api_key":"fixture-alpha","apiKey":"fixture-beta","custom_headers":{"X-Custom":"fixture-header"},"env":{"VARIABLE":"fixture-env"},"oauth":{"access_token":"fixture-oauth"}}},"models":{"env/model":{"maxContextSize":8192,"extra":[{"clientSecret":"fixture-secret","enabled":true}]}},"secondary_model":{"models":{"env/z":"first","env/a":"second"}}}`
+	service, _ := newAutomationTestService(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":`+response+`}`)
+	}))
+	for _, input := range []struct{ action, payload string }{
+		{"config.get", `{}`},
+		{"config.save", `{"patch":{"default_model":"env/model"}}`},
+	} {
+		value, err := service.Action(context.Background(), input.action, json.RawMessage(input.payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := `{"providers":{"env":{"type":"openai"}},"models":{"env/model":{"maxContextSize":8192,"extra":[{"enabled":true}]}},"secondary_model":{"models":{"env/z":"first","env/a":"second"}}}`
+		if string(body) != want {
+			t.Fatalf("%s config response = %s", input.action, body)
+		}
 	}
 }
