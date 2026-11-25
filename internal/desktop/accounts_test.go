@@ -1372,13 +1372,16 @@ func TestKeepAliveIgnoresStaleOpenBackgroundWhenKAPReportsIdle(t *testing.T) {
 	fake.sessions[0]["pending_interaction"] = "none"
 	fake.mu.Unlock()
 
-	if _, err := service.Action(ctx, "bootstrap", nil); err != nil {
-		t.Fatalf("bootstrap: %v", err)
+	if err := service.syncAutomationSessions(ctx, time.Now().UTC()); err != nil {
+		t.Fatalf("sync automation sessions: %v", err)
 	}
-	settings := AutomationSettings{KeepAlive: KeepAliveSettings{Enabled: true, Minutes: 1}}
-	candidate, ok := service.keepAliveGate(ctx, "sess-1", settings, time.Now().UTC())
-	if candidate.OpenBackground != 0 || candidate.Blocked {
-		t.Fatalf("stale cache_live leaked into the keepalive decision: %+v (ok=%v)", candidate, ok)
+	snapshot, ok := service.automationSnapshot("sess-1")
+	if !ok {
+		t.Fatal("missing native session snapshot")
+	}
+	live := service.automationLive(ctx, snapshot)
+	if idleKeepAliveBlocked(snapshot, live) {
+		t.Fatalf("stale cache_live blocked an officially idle session: %+v", live)
 	}
 }
 

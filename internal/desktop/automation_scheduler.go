@@ -8,6 +8,9 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
+
+	"enhancedkimi/internal/cache"
 	"time"
 
 	"enhancedkimi/internal/security"
@@ -244,7 +247,7 @@ func (s *NativeService) refreshAutomationSnapshot(ctx context.Context, id string
 
 func (s *NativeService) runCompaction(ctx context.Context, settings AutomationSettings, id string, now time.Time) {
 	snapshot, ok := s.automationSnapshot(id)
-	if !ok || sessionIsArchivedOrDone(snapshot.session) || goalBlocksIdle(snapshot) || compactionBlocked(snapshot, s.openBackground(ctx, id)) || s.isIdleKeepAliveProtecting(ctx, settings, id, now) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
+	if !ok || sessionIsArchivedOrDone(snapshot.session) || goalBlocksIdle(snapshot) || compactionBlocked(snapshot, s.automationLive(ctx, snapshot)) || s.isIdleKeepAliveProtecting(ctx, settings, id, now) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
 		return
 	}
 	// Check the cheap local signals before refreshing: refreshAutomationSnapshot
@@ -259,7 +262,7 @@ func (s *NativeService) runCompaction(ctx context.Context, settings AutomationSe
 		return
 	}
 	snapshot, ok, err = s.refreshAutomationSnapshot(ctx, id, now)
-	if err != nil || !ok || sessionIsArchivedOrDone(snapshot.session) || goalBlocksIdle(snapshot) || compactionBlocked(snapshot, s.openBackground(ctx, id)) || s.isIdleKeepAliveProtecting(ctx, settings, id, now) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
+	if err != nil || !ok || sessionIsArchivedOrDone(snapshot.session) || goalBlocksIdle(snapshot) || compactionBlocked(snapshot, s.automationLive(ctx, snapshot)) || s.isIdleKeepAliveProtecting(ctx, settings, id, now) || now.Sub(snapshot.lastActivity) < time.Duration(settings.Compaction.IdleMinutes)*time.Minute {
 		return
 	}
 	if !compactionContextOverThreshold(snapshot.session.Usage, settings.Compaction.ContextThreshold) {
@@ -304,29 +307,51 @@ func compactionContextOverThreshold(usage *NativeUsage, threshold int) bool {
 	return float64(usage.ContextTokens)/float64(*usage.ContextLimit)*100 >= float64(threshold)
 }
 
-// compactionBlocked applies the same D8 definition of "running" that keepalive uses.
-// A session whose main agent finished its turn while a background subagent still runs
-// reports busy=false, so checking only the official flags would let idle compaction
-// compact a session that is in fact still working.
-func compactionBlocked(snapshot automationSnapshot, openBackground int) bool {
-	if snapshot.session.Busy || snapshot.session.MainTurnActive || pendingNativeInteraction(snapshot) {
-		return true
-	}
-	return openBackground > 0
+func compactionBlocked(snapshot automationSnapshot, live cache.LiveSignals) bool {
+	status := strings.ToLower(strings.TrimSpace(snapshot.session.Status))
+	return snapshot.session.Busy || snapshot.session.MainTurnActive || status == "background" || status == "turn" || pendingNativeInteraction(snapshot) || live.OpenBackground > 0 || live.Blocked
 }
 
-// openBackground reads the recorded open-background count, returning 0 when the cache
-// layer is unavailable so a missing signal cannot block automation outright.
+func (s *NativeService) automationLive(ctx context.Context, snapshot automationSnapshot) cache.LiveSignals {
+	// A daemon restart can leave a background counter open in the session log.
+	if strings.EqualFold(strings.TrimSpace(snapshot.session.Status), "idle") {
+		return cache.LiveSignals{}
+	}
+	store, err := s.cacheStore()
+	if err != nil {
+		return cache.LiveSignals{}
+	}
+	live, _ := store.Live(ctx, snapshot.session.ID)
+	return live
+}
+
 func (s *NativeService) openBackground(ctx context.Context, id string) int {
 	store, err := s.cacheStore()
 	if err != nil {
 		return 0
 	}
-	live, err := store.Live(ctx, id)
-	if err != nil {
-		return 0
-	}
+	live, _ := store.Live(ctx, id)
 	return live.OpenBackground
+}
+
+const automationIntentRetention = 30 * 24 * time.Hour
+
+func (s *NativeService) pruneAutomationIntents(ctx context.Context, now time.Time) error {
+	if !s.intentPrunedAt.IsZero() && now.Sub(s.intentPrunedAt) < time.Hour {
+		return nil
+	}
+	// Recovery rows are persistent state. Old compaction revisions also prevent
+	// repeating an already completed compaction until the session changes.
+	_, err := s.db.ExecContext(ctx, `DELETE FROM automation_intents AS old
+		WHERE old.updated_at < ? AND old.kind IN ('keepalive','idle_keepalive','compaction')
+		AND (old.kind <> 'compaction' OR old.rowid <> (
+			SELECT newer.rowid FROM automation_intents newer WHERE newer.kind=old.kind AND newer.session_id=old.session_id
+			ORDER BY newer.created_at DESC,newer.rowid DESC LIMIT 1
+		))`, storage.SortableTime(now.Add(-automationIntentRetention)))
+	if err == nil {
+		s.intentPrunedAt = now
+	}
+	return err
 }
 
 func (s *NativeService) syncAutomationSessions(ctx context.Context, now time.Time) error {
@@ -384,8 +409,7 @@ func (s *NativeService) automationTick(ctx context.Context, now time.Time) error
 		return nil
 	}
 	var syncErr error
-	hasIdleOverrides := s.hasAnySessionKeepAliveOverride(ctx)
-	if settings.KeepAlive.Enabled || settings.IdleKeepAlive.Enabled || hasIdleOverrides || settings.Compaction.Enabled || settings.Recovery.Enabled {
+	if settings.IdleKeepAlive.Enabled || settings.Compaction.Enabled || settings.Recovery.Enabled {
 		// Refresh the session-record metrics first: keepalive's clock and its
 		// background-subagent condition both come from cache_steps/cache_live, so they
 		// must be current before any policy decision this tick. Creating the store here
@@ -401,18 +425,17 @@ func (s *NativeService) automationTick(ctx context.Context, now time.Time) error
 	if err = s.expireCompactions(ctx, now); err != nil {
 		return err
 	}
-	for _, id := range s.automationSessionIDs() {
-		if settings.KeepAlive.Enabled {
-			s.runKeepAliveOnce(ctx, settings, id, now)
-		}
-		if settings.IdleKeepAlive.Enabled || hasIdleOverrides {
-			s.runIdleKeepAliveOnce(ctx, settings, id, now)
-		}
-		if settings.Compaction.Enabled {
-			s.runCompaction(ctx, settings, id, now)
+	if syncErr == nil && (settings.IdleKeepAlive.Enabled || settings.Compaction.Enabled) {
+		for _, id := range s.automationSessionIDs() {
+			if settings.IdleKeepAlive.Enabled {
+				s.runIdleKeepAliveOnce(ctx, settings, id, now)
+			}
+			if settings.Compaction.Enabled {
+				s.runCompaction(ctx, settings, id, now)
+			}
 		}
 	}
-	return errors.Join(syncErr, s.recoveryTick(ctx, settings, now))
+	return errors.Join(syncErr, s.pruneAutomationIntents(ctx, now), s.recoveryTick(ctx, settings, now))
 }
 
 func (s *NativeService) runAutomation() {

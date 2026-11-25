@@ -731,7 +731,7 @@ func (s *Store) Retention(ctx context.Context, now time.Time) (Retention, error)
 		lastSeen := aggregate.lastSeen
 		models = append(models, ModelRetention{
 			Model:       model,
-			IdleBuckets: retentionBuckets(aggregate.buckets),
+			IdleBuckets: retentionBuckets(aggregate.buckets, true),
 			Samples:     aggregate.samples,
 			LastSeen:    &lastSeen,
 		})
@@ -753,7 +753,7 @@ func (s *Store) Retention(ctx context.Context, now time.Time) (Retention, error)
 		return models[i].Model < models[j].Model
 	})
 	return Retention{
-		IdleBuckets: retentionBuckets(aggregates),
+		IdleBuckets: retentionBuckets(aggregates, false),
 		ByModel:     models,
 		Note:        fmt.Sprintf("按主代理两次请求的间隔统计缓存读取比例；总体包含全部主代理样本。分模型只计入同一会话连续使用同一已知模型的请求，且只列出至少 %d 个样本、上报过缓存数据的模型，最近 %d 天活跃的模型排在前面。", minModelRetentionSamples, int(modelRecentWindow/(24*time.Hour))),
 	}, nil
@@ -766,11 +766,15 @@ func addRetentionSample(totals *rowTotals, read, creation, other int64) {
 	totals.other += other
 }
 
-func retentionBuckets(aggregates []rowTotals) []RetentionBucket {
+func retentionBuckets(aggregates []rowTotals, knownModel bool) []RetentionBucket {
 	buckets := make([]RetentionBucket, 0, len(retentionBounds))
 	for index, bound := range retentionBounds {
 		totals := aggregates[index]
 		state, rate := reportedOf(totals)
+		if knownModel && state == NotReported && totals.other > 0 {
+			zero := 0.0
+			state, rate = Reported, &zero
+		}
 		buckets = append(buckets, RetentionBucket{
 			Label: bound.label, MinMs: bound.min, MaxMs: bound.max,
 			Samples: int(totals.steps), HitRate: rate, Reported: state,

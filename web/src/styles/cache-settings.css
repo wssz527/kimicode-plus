@@ -600,46 +600,6 @@
   overflow-wrap: anywhere;
 }
 
-.eks-advanced {
-  border-top: var(--eks-hairline);
-}
-
-.eks-advanced-summary {
-  padding: 10px 14px;
-  font-size: 12px;
-  color: var(--eks-muted);
-  cursor: pointer;
-  user-select: none;
-  list-style: none;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.eks-advanced-summary::-webkit-details-marker {
-  display: none;
-}
-
-.eks-advanced-summary::before {
-  content: "▸";
-  font-size: 10px;
-  transition: transform 140ms ease;
-}
-
-.eks-advanced[open] .eks-advanced-summary::before {
-  transform: rotate(90deg);
-}
-
-.eks-advanced-summary:hover {
-  color: var(--eks-text);
-  background: var(--eks-hover);
-}
-
-.eks-advanced-body {
-  display: flex;
-  flex-direction: column;
-}
-
 /* ---------- 窄容器 ---------- */
 
 @container (max-width: 520px) {

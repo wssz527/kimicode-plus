@@ -668,6 +668,9 @@ func TestRetentionBuckets(t *testing.T) {
 	if buckets := retention.ByModel[0].IdleBuckets; buckets[0].Samples != 1 || buckets[0].HitRate == nil || *buckets[0].HitRate != 0.6 || buckets[1].Samples != 0 {
 		t.Fatalf("other model polluted same-model samples: %+v", buckets)
 	}
+	if bucket := retention.ByModel[0].IdleBuckets[3]; bucket.Reported != Reported || bucket.HitRate == nil || *bucket.HitRate != 0 {
+		t.Fatalf("known model's zero-read bucket should report a miss: %+v", bucket)
+	}
 	if model := retention.ByModel[0]; model.Samples != 2 || model.LastSeen == nil || !model.LastSeen.Equal(start.Add(21*time.Minute)) {
 		t.Fatalf("model summary = %+v, want 2 samples last seen at %v", model, start.Add(21*time.Minute))
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -14,71 +15,20 @@ import (
 	"time"
 )
 
-func TestProviderCacheTTLAndIntervalDerivation(t *testing.T) {
-	cfg := map[string]any{
-		"default_model": "kimi-code/kimi-for-coding",
-		"providers": map[string]any{
-			"kimi-code": map[string]any{
-				"type":  "kimi",
-				"oauth": map[string]any{"storage": "file", "key": "kimi-code"},
-			},
-			"kimi-sub-url": map[string]any{
-				"type":     "openai_legacy",
-				"base_url": "https://api.kimi.com/coding/v1",
-			},
-			"moonshot-cn": map[string]any{
-				"type":     "openai_legacy",
-				"base_url": "https://api.moonshot.cn/v1",
-			},
-			"moonshot-ai": map[string]any{
-				"type":     "openai_legacy",
-				"base_url": "https://api.moonshot.ai/v1",
-			},
-			"custom-other": map[string]any{
-				"type":     "openai_legacy",
-				"base_url": "https://example.com/v1",
-			},
-		},
-		"models": map[string]any{
-			"kimi-code/kimi-for-coding": map[string]any{"provider": "kimi-code", "model": "kimi-for-coding"},
-			"kimi-sub-url/k2.5":         map[string]any{"provider": "kimi-sub-url", "model": "k2.5"},
-			"moonshot-cn/kimi-k2":       map[string]any{"provider": "moonshot-cn", "model": "kimi-k2"},
-			"moonshot-ai/kimi-k2":       map[string]any{"provider": "moonshot-ai", "model": "kimi-k2"},
-			"custom-other/gpt":          map[string]any{"provider": "custom-other", "model": "gpt"},
-		},
-	}
-
-	defaults := defaultProviderTTLSettings()
-	cases := []struct {
-		name         string
-		model        string
-		ttlCfg       ProviderTTLSettings
-		wantType     string
-		wantTTL      int
-		wantInterval int
+func TestProviderClassificationAndFallback(t *testing.T) {
+	config := newIdleTestHarness("kimi-code/kimi-for-coding").config
+	for _, tc := range []struct {
+		model, provider string
+		interval        int
 	}{
-		{"managed subscription", "kimi-code/kimi-for-coding", defaults, ProviderTypeSubscription, 30, 25},
-		{"coding api subscription", "kimi-sub-url/k2.5", defaults, ProviderTypeSubscription, 30, 25},
-		{"moonshot cn open platform", "moonshot-cn/kimi-k2", defaults, ProviderTypeOpenPlatform, 5, 4},
-		{"moonshot ai open platform", "moonshot-ai/kimi-k2", defaults, ProviderTypeOpenPlatform, 5, 4},
-		{"other unknown disabled", "custom-other/gpt", defaults, ProviderTypeOther, 0, 0},
-		{"other custom configured", "custom-other/gpt", ProviderTTLSettings{SubscriptionMinutes: 30, OpenPlatformMinutes: 5, OtherMinutes: 12}, ProviderTypeOther, 12, 10},
-		{"synthetic 2 min ttl", "kimi-code/kimi-for-coding", ProviderTTLSettings{SubscriptionMinutes: 2, OpenPlatformMinutes: 5, OtherMinutes: 0}, ProviderTypeSubscription, 2, 1},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := resolveCachePolicyFromConfig(tc.model, cfg, tc.ttlCfg)
-			if got.ProviderType != tc.wantType {
-				t.Fatalf("ProviderType = %q, want %q", got.ProviderType, tc.wantType)
-			}
-			if got.TTLMinutes != tc.wantTTL {
-				t.Fatalf("TTLMinutes = %d, want %d", got.TTLMinutes, tc.wantTTL)
-			}
-			if got.IntervalMinutes != tc.wantInterval {
-				t.Fatalf("IntervalMinutes = %d, want %d", got.IntervalMinutes, tc.wantInterval)
-			}
-		})
+		{"kimi-code/kimi-for-coding", ProviderTypeSubscription, 25},
+		{"moonshot/kimi-k2", ProviderTypeOpenPlatform, 4},
+		{"custom/model", ProviderTypeOther, 4},
+	} {
+		policy := applyRetentionPolicy(resolveCachePolicyFromConfig(tc.model, config), nil)
+		if policy.ProviderType != tc.provider || policy.IntervalMinutes != tc.interval || policy.Source != "fallback" {
+			t.Errorf("model %s: unexpected policy %+v", tc.model, policy)
+		}
 	}
 }
 
@@ -104,6 +54,12 @@ type idleTestHarness struct {
 	onTurnsReadIndex int
 	mutateWorkspace  func() error
 	nextTurnNum      int
+	wirePath         string
+	probeCacheRead   int
+	probeCacheWrite  int
+	rejectPrompt     bool
+	slowPrompt       bool
+	acknowledge      chan struct{}
 }
 
 func newIdleTestHarness(model string) *idleTestHarness {
@@ -145,7 +101,8 @@ func newIdleTestHarness(model string) *idleTestHarness {
 				"custom/model":              map[string]any{"provider": "custom", "model": "model"},
 			},
 		},
-		nextTurnNum: 1,
+		nextTurnNum:    1,
+		probeCacheRead: 900,
 	}
 }
 
@@ -163,7 +120,7 @@ func (h *idleTestHarness) handler(t *testing.T) http.Handler {
 			writeNativeTestEnvelope(w, h.session)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions/s1/agents/main/turns":
 			h.turnsReads++
-			if h.onTurnsRead != nil && h.turnsReads-h.promptTurnsBase == h.onTurnsReadIndex {
+			if h.onTurnsRead != nil && len(h.prompts) > 0 && h.turnsReads-h.promptTurnsBase == h.onTurnsReadIndex {
 				h.onTurnsRead()
 			}
 			cp := append([]NativeTurn(nil), h.turns...)
@@ -176,18 +133,30 @@ func (h *idleTestHarness) handler(t *testing.T) http.Handler {
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			h.prompts = append(h.prompts, body)
+			if h.rejectPrompt {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
 			h.promptTurnsBase = h.turnsReads
 			turnID := "turn-ka-" + string(rune('0'+h.nextTurnNum))
 			userMsgID := "msg-ka-u-" + string(rune('0'+h.nextTurnNum))
 			h.nextTurnNum++
-			items := []NativeItem{
-				{ItemID: userMsgID, Type: "user_message", Text: idleKeepAlivePrompt},
-			}
+			content := body["content"].([]any)
+			message := content[0].(map[string]any)["text"].(string)
+			items := []NativeItem{{ItemID: userMsgID, Type: "user_message", Text: message}}
 			if h.emitToolCall {
 				items = append(items, NativeItem{ItemID: "tool-1", Type: "tool_call", Name: "Bash"})
 			}
-			items = append(items, NativeItem{ItemID: "msg-ka-a", Type: "assistant_message", Text: "1"})
+			if !h.slowPrompt {
+				items = append(items, NativeItem{ItemID: "msg-ka-a", Type: "assistant_message", Text: "1"})
+			}
 			h.turns = append(h.turns, NativeTurn{TurnID: turnID, Items: items})
+			if h.wirePath != "" && (h.probeCacheRead > 0 || h.probeCacheWrite > 0) {
+				appendIdleTestStep(t, h.wirePath, h.session["agent_config"].(map[string]any)["model"].(string), turnID, time.Now().UTC(), h.probeCacheRead, h.probeCacheWrite)
+			}
+			if h.acknowledge != nil {
+				close(h.acknowledge)
+			}
 			if h.mutateWorkspace != nil {
 				if err := h.mutateWorkspace(); err != nil {
 					t.Error(err)
@@ -242,6 +211,7 @@ func startIdleKeepAliveService(t *testing.T, h *idleTestHarness, home string, la
 	if h.session["metadata"] == nil {
 		h.session["metadata"] = map[string]any{"cwd": home}
 	}
+	h.wirePath = filepath.Join(home, "sessions", "wd_test", "session_s1", "agents", "main", "wire.jsonl")
 	service, _ := newAutomationTestServiceWithHome(t, h.handler(t), home)
 	service.verifyPoll = 15 * time.Millisecond
 	service.idleVerifyPoll = 15 * time.Millisecond
@@ -264,6 +234,21 @@ func startIdleKeepAliveService(t *testing.T, h *idleTestHarness, home string, la
 	}
 	service.mu.Unlock()
 	return service
+}
+
+func appendIdleTestStep(t *testing.T, path, model, turn string, at time.Time, read, creation int) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	usage := fmt.Sprintf(`{"inputOther":1000,"output":1,"inputCacheRead":%d,"inputCacheCreation":%d}`, read, creation)
+	if _, err = fmt.Fprintf(file, `{"type":"usage.record","agentId":"main","model":%q,"usage":%s,"usageScope":"turn","time":%d}`+"\n"+
+		`{"type":"context.append_loop_event","agentId":"main","event":{"type":"step.end","uuid":%q,"turnId":%q,"step":1,"finishReason":"end_turn","usage":%s},"time":%d}`+"\n",
+		model, usage, at.UnixMilli(), "step-"+turn, turn, usage, at.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func waitUntilIdleDone(t *testing.T, service *NativeService, id string) {
@@ -357,7 +342,12 @@ func TestIdleKeepAliveCountLimitUndoAndUserReset(t *testing.T) {
 		t.Fatalf("after user reset = %+v, want used=0 and empty stop reason", afterReset)
 	}
 
-	// 26m after user message, keepalive fires again.
+	// User activity alone cannot warm the prefix. Add the real model step.
+	h.mu.Lock()
+	h.turns = append(h.turns, NativeTurn{TurnID: "turn-user-2", Items: []NativeItem{{Type: "user_message", Text: "new request"}, {Type: "assistant_message", Text: "hello"}}})
+	h.mu.Unlock()
+	appendIdleTestStep(t, h.wirePath, "kimi-code/kimi-for-coding", "turn-user-2", userAt.Add(time.Second), 900, 0)
+	// 26m after the real request, keepalive fires again.
 	t4 := userAt.Add(26 * time.Minute)
 	service.runIdleKeepAliveOnce(context.Background(), settings, "s1", t4)
 	waitUntilIdleDone(t, service, "s1")
@@ -366,56 +356,6 @@ func TestIdleKeepAliveCountLimitUndoAndUserReset(t *testing.T) {
 		t.Fatalf("prompts after reset = %d, want 3", len(h.prompts))
 	}
 	h.mu.Unlock()
-}
-
-func TestIdleKeepAliveUntilOverrideStopsAtDeadline(t *testing.T) {
-	home := t.TempDir()
-	now := time.Now().UTC().Truncate(time.Millisecond)
-	keepAliveFixture{home: home, mainAge: 4*time.Minute + 20*time.Second, background: false}.write(t, "moonshot/kimi-k2")
-
-	h := newIdleTestHarness("moonshot/kimi-k2")
-	service := startIdleKeepAliveService(t, h, home, now.Add(-4*time.Minute-20*time.Second))
-
-	// Global is OFF, per-session override is "until" +10m.
-	settings := defaultAutomationSettings()
-	settings.IdleKeepAlive.Enabled = false
-	if err := service.storeAutomationSettings(context.Background(), settings); err != nil {
-		t.Fatal(err)
-	}
-	until := now.Add(6 * time.Minute)
-	if _, err := service.setSessionKeepAlive(context.Background(), map[string]any{
-		"id":      "s1",
-		"mode":    IdleModeUntil,
-		"untilAt": until.Format(time.RFC3339),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	// Reset AnchorAt to simulate the prior message 4m20s ago (within 5m open-platform TTL, >= 4m interval).
-	rec, _ := service.loadSessionKeepAlive(context.Background(), "s1")
-	rec.AnchorAt = now.Add(-4*time.Minute - 20*time.Second).Format(time.RFC3339Nano)
-	_ = service.saveSessionKeepAlive(context.Background(), rec, now)
-
-	// Before deadline -> fires.
-	service.runIdleKeepAliveOnce(context.Background(), settings, "s1", now)
-	waitUntilIdleDone(t, service, "s1")
-	h.mu.Lock()
-	if len(h.prompts) != 1 {
-		t.Fatalf("prompts before until = %d, want 1", len(h.prompts))
-	}
-	h.mu.Unlock()
-
-	// After deadline -> stops without sending.
-	afterUntil := until.Add(1 * time.Minute)
-	service.runIdleKeepAliveOnce(context.Background(), settings, "s1", afterUntil)
-	h.mu.Lock()
-	if len(h.prompts) != 1 {
-		t.Fatalf("prompts after until = %d, want 1", len(h.prompts))
-	}
-	h.mu.Unlock()
-	view, _ := service.sessionKeepAliveView(context.Background(), "s1", afterUntil)
-	if view.StoppedReason != "until_reached" {
-		t.Fatalf("StoppedReason = %q, want until_reached", view.StoppedReason)
-	}
 }
 
 func TestIdleKeepAliveBlocksCompactionUntilFinished(t *testing.T) {
@@ -436,6 +376,9 @@ func TestIdleKeepAliveBlocksCompactionUntilFinished(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if _, err := service.cacheScan(context.Background(), now, false); err != nil {
+		t.Fatal(err)
+	}
 	// While keepalive still has budget (0/1), compaction MUST NOT run.
 	service.runCompaction(context.Background(), settings, "s1", now)
 	h.mu.Lock()
@@ -520,7 +463,7 @@ func TestIdleKeepAliveGuardrails(t *testing.T) {
 		}
 		h.mu.Unlock()
 		view, _ := service.sessionKeepAliveView(context.Background(), "s1", now)
-		if view.StoppedReason != "quota_low" || !strings.Contains(view.StatusLabel, "额度不足") {
+		if view.StoppedReason != "quota_low" || !strings.Contains(view.StoppedDetail, "剩余额度") {
 			t.Fatalf("low quota view = %+v", view)
 		}
 		batch := service.bus.Poll(context.Background(), 0, []string{"keepalive"}, 10*time.Millisecond)
@@ -732,8 +675,8 @@ func TestIdleKeepAliveUndoSafetyChecks(t *testing.T) {
 		}
 		h.mu.Unlock()
 		view, _ := service.sessionKeepAliveView(context.Background(), "s1", now)
-		if view.StoppedReason != "undo_skipped" {
-			t.Fatalf("StoppedReason = %q, want undo_skipped", view.StoppedReason)
+		if view.StoppedReason != "undo_failed" {
+			t.Fatalf("StoppedReason = %q, want undo_failed", view.StoppedReason)
 		}
 	})
 
@@ -744,10 +687,10 @@ func TestIdleKeepAliveUndoSafetyChecks(t *testing.T) {
 		wantUndo   bool
 		wantNote   string
 	}{
-		{name: "git status and file content unchanged", wantUndo: true, wantNote: "已自动撤回保活回合"},
-		{name: "git status unchanged but file changed", wantNote: "工作区文件发生变化"},
-		{name: "git fingerprint unknown before prompt", largeFirst: true, wantNote: "无法确认保活前的工作区状态"},
-		{name: "git fingerprint unknown before undo", largeAfter: true, wantNote: "无法确认撤回前的工作区状态"},
+		{name: "git status and file content unchanged", wantUndo: true, wantNote: "已撤回保活回合"},
+		{name: "git status unchanged but file changed", wantNote: "工作区状态无法确认或已变化"},
+		{name: "git fingerprint unknown before prompt", largeFirst: true, wantNote: "暂时无法确认工作区状态"},
+		{name: "git fingerprint unknown before undo", largeAfter: true, wantNote: "工作区状态无法确认或已变化"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := newIdleTestGitRepository(t)
@@ -790,15 +733,18 @@ func TestIdleKeepAliveUndoSafetyChecks(t *testing.T) {
 			h.mu.Lock()
 			prompts, undos := len(h.prompts), len(h.undos)
 			h.mu.Unlock()
-			wantUndos, wantStop := 0, "undo_skipped"
-			if tc.wantUndo {
-				wantUndos, wantStop = 1, ""
+			wantPrompts, wantUndos := 1, 0
+			if tc.largeFirst {
+				wantPrompts = 0
 			}
-			if prompts != 1 || undos != wantUndos {
-				t.Fatalf("prompts = %d, undos = %d, want 1 and %d", prompts, undos, wantUndos)
+			if tc.wantUndo {
+				wantUndos = 1
+			}
+			if prompts != wantPrompts || undos != wantUndos {
+				t.Fatalf("prompts = %d, undos = %d, want %d and %d", prompts, undos, wantPrompts, wantUndos)
 			}
 			view, err := service.sessionKeepAliveView(context.Background(), "s1", now)
-			if err != nil || view.StoppedReason != wantStop || !strings.Contains(view.LastNote, tc.wantNote) {
+			if err != nil || view.StoppedReason != "" || !strings.Contains(view.LastNote, tc.wantNote) {
 				t.Fatalf("keepalive view = %+v, err = %v", view, err)
 			}
 		})
@@ -820,7 +766,7 @@ func TestIdleKeepAliveUndoSafetyChecks(t *testing.T) {
 		waitUntilIdleDone(t, service, "s1")
 
 		view, _ := service.sessionKeepAliveView(context.Background(), "s1", now)
-		if view.StoppedReason != "undo_failed" || !strings.Contains(view.StatusLabel, "撤回失败") {
+		if view.StoppedReason != "undo_failed" || !strings.Contains(view.StoppedDetail, "撤回") {
 			t.Fatalf("undo_failed view = %+v", view)
 		}
 		// Must not retry on next tick.
@@ -950,7 +896,7 @@ func TestIdleKeepAliveRechecksActivityAfterGitScan(t *testing.T) {
 					},
 				})
 			},
-			wantNote: "保活期间出现新回合，已跳过撤回",
+			wantNote: "会话已变化，本次未撤回",
 		},
 		{
 			name: "session becomes busy during the scan",
@@ -958,7 +904,7 @@ func TestIdleKeepAliveRechecksActivityAfterGitScan(t *testing.T) {
 				h.session["busy"] = true
 				h.session["main_turn_active"] = true
 			},
-			wantNote: "会话已恢复活动，已跳过撤回",
+			wantNote: "会话已恢复活动，本次未撤回",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -972,7 +918,7 @@ func TestIdleKeepAliveRechecksActivityAfterGitScan(t *testing.T) {
 			keepAliveFixture{home: home, mainAge: 26 * time.Minute}.write(t, "kimi-code/kimi-for-coding")
 			h := newIdleTestHarness("kimi-code/kimi-for-coding")
 			h.session["metadata"] = map[string]any{"cwd": repo}
-			h.onTurnsReadIndex = 3
+			h.onTurnsReadIndex = 2
 			h.onTurnsRead = func() { tc.inject(h) }
 			service := startIdleKeepAliveService(t, h, home, now.Add(-26*time.Minute))
 			settings := defaultAutomationSettings()
@@ -1007,5 +953,165 @@ func TestIdleKeepAliveRechecksActivityAfterGitScan(t *testing.T) {
 				t.Fatalf("test repository was modified: %q", after)
 			}
 		})
+	}
+}
+
+func TestKeepAliveGlobalSwitchAndColdActivation(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	now := time.Now().UTC()
+	model := "kimi-code/kimi-for-coding"
+	keepAliveFixture{home: home, mainAge: 2 * time.Hour}.write(t, model)
+	h := newIdleTestHarness(model)
+	s := startIdleKeepAliveService(t, h, home, now.Add(-2*time.Hour))
+	view, err := s.setSessionKeepAlive(ctx, map[string]any{"id": "s1", "mode": IdleModeCount, "targetCount": float64(3)})
+	if err != nil || view.EffectiveEnabled || view.State != KeepAliveStateDisabled {
+		t.Fatalf("count override under global off: %+v, %v", view, err)
+	}
+	if err = s.automationTick(ctx, now); err != nil || s.initializedCacheStore() != nil {
+		t.Fatalf("a disabled override initialized a cache scan, err=%v", err)
+	}
+	settings := defaultAutomationSettings()
+	settings.IdleKeepAlive.Enabled = true
+	if err = s.storeAutomationSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	s.runIdleKeepAliveOnce(ctx, settings, "s1", now)
+	view, err = s.sessionKeepAliveView(ctx, "s1", now)
+	if err != nil || view.StoppedReason != "" || view.UsedCount != 0 || !strings.Contains(view.StoppedDetail, "真实请求") {
+		t.Fatalf("cold historical session = %+v, %v", view, err)
+	}
+	appendIdleTestStep(t, h.wirePath, model, "turn-user-2", now.Add(time.Minute), 900, 0)
+	h.mu.Lock()
+	h.turns = append(h.turns, NativeTurn{TurnID: "turn-user-2", Items: []NativeItem{{Type: "user_message", Text: "next"}}})
+	h.mu.Unlock()
+	s.runIdleKeepAliveOnce(ctx, settings, "s1", now.Add(27*time.Minute))
+	waitUntilIdleDone(t, s, "s1")
+	view, err = s.sessionKeepAliveView(ctx, "s1", now.Add(27*time.Minute))
+	if err != nil || view.LastResult != keepAliveHit || view.UsedCount != 1 {
+		t.Fatalf("keepalive after real request = %+v, %v", view, err)
+	}
+}
+
+func TestKeepAliveReadDoesNotWriteAndLegacyModeStops(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	home := t.TempDir()
+	model := "kimi-code/kimi-for-coding"
+	keepAliveFixture{home: home, mainAge: 26 * time.Minute}.write(t, model)
+	s := startIdleKeepAliveService(t, newIdleTestHarness(model), home, now.Add(-26*time.Minute))
+	if _, err := s.db.Exec(`INSERT INTO session_keepalive_state(session_id,mode,until_at) VALUES('s1','until','2030-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	view, err := s.sessionKeepAliveView(ctx, "s1", now)
+	if err != nil || view.State != KeepAliveStateStopped || view.Mode != IdleModeOff || view.StoppedReason != "legacy_until_removed" {
+		t.Fatalf("legacy view = %+v, %v", view, err)
+	}
+	var mode string
+	if err := s.db.QueryRow(`SELECT mode FROM session_keepalive_state WHERE session_id='s1'`).Scan(&mode); err != nil || mode != "until" {
+		t.Fatalf("get mutated legacy data: mode=%q err=%v", mode, err)
+	}
+	var tables int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cache_steps'`).Scan(&tables); err != nil || tables != 0 {
+		t.Fatalf("get initialized cache tables: count=%d err=%v", tables, err)
+	}
+}
+
+func TestKeepAliveBudgetAndMissFuseAcrossProviders(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		model    string
+		interval time.Duration
+	}{
+		{"kimi-code/kimi-for-coding", 25 * time.Minute},
+		{"moonshot/kimi-k2", 4 * time.Minute},
+		{"custom/model", 4 * time.Minute},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			home := t.TempDir()
+			now := time.Now().UTC()
+			age := tc.interval + 15*time.Second
+			keepAliveFixture{home: home, mainAge: age, lastCacheRead: 900}.write(t, tc.model)
+			h := newIdleTestHarness(tc.model)
+			h.probeCacheRead, h.probeCacheWrite = 0, 1000
+			s := startIdleKeepAliveService(t, h, home, now.Add(-age))
+			settings := defaultAutomationSettings()
+			settings.IdleKeepAlive.Enabled = true
+			settings.IdleKeepAlive.DefaultCount = 4
+			if err := s.storeAutomationSettings(ctx, settings); err != nil {
+				t.Fatal(err)
+			}
+			for i := range 3 {
+				tick := now.Add(time.Duration(i) * age)
+				s.runIdleKeepAliveOnce(ctx, settings, "s1", tick)
+				waitUntilIdleDone(t, s, "s1")
+			}
+			view, err := s.sessionKeepAliveView(ctx, "s1", now.Add(2*age))
+			if err != nil || view.StoppedReason != "consecutive_misses" || view.LastResult != keepAliveMiss || view.UsedCount != 2 || view.SpentTokens <= 0 {
+				t.Fatalf("miss fuse = %+v, %v", view, err)
+			}
+			if got := decideIdleKeepAlive(sessionKeepAliveRecord{LastRequestAt: now.Add(-age).Format(time.RFC3339Nano), SpentTokens: idleKeepAliveTokenBudget - 100}, view.Policy, now, 4, 101); got.reason != "token_budget" || got.due {
+				t.Fatalf("estimate exceeds remaining budget: %+v", got)
+			}
+		})
+	}
+}
+
+func TestKeepAliveSlowTurnAndTransientRejection(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	now := time.Now().UTC()
+	model := "kimi-code/kimi-for-coding"
+	keepAliveFixture{home: home, mainAge: 26 * time.Minute}.write(t, model)
+	h := newIdleTestHarness(model)
+	h.rejectPrompt = true
+	s := startIdleKeepAliveService(t, h, home, now.Add(-26*time.Minute))
+	settings := defaultAutomationSettings()
+	settings.IdleKeepAlive.Enabled = true
+	if err := s.storeAutomationSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	s.runIdleKeepAliveOnce(ctx, settings, "s1", now)
+	waitUntilIdleDone(t, s, "s1")
+	s.runIdleKeepAliveOnce(ctx, settings, "s1", now.Add(time.Second))
+	h.mu.Lock()
+	if len(h.prompts) != 1 {
+		t.Fatalf("retry fired during backoff: %d prompts", len(h.prompts))
+	}
+	h.rejectPrompt, h.slowPrompt, h.acknowledge = false, true, make(chan struct{})
+	ack := h.acknowledge
+	h.mu.Unlock()
+	s.runIdleKeepAliveOnce(ctx, settings, "s1", now.Add(time.Minute))
+	select {
+	case <-ack:
+	case <-time.After(3 * time.Second):
+		t.Fatal("retry never reached official API")
+	}
+	time.Sleep(50 * time.Millisecond)
+	s.runIdleKeepAliveOnce(ctx, settings, "s1", now.Add(2*time.Minute))
+	h.mu.Lock()
+	if len(h.prompts) != 2 || len(h.undos) != 0 {
+		t.Fatalf("pending reply produced duplicate send or premature undo: prompts=%d undos=%d", len(h.prompts), len(h.undos))
+	}
+	tail := &h.turns[len(h.turns)-1]
+	tail.Items = append(tail.Items, NativeItem{Type: "assistant_message", Text: "1"})
+	h.mu.Unlock()
+	waitUntilIdleDone(t, s, "s1")
+	view, err := s.sessionKeepAliveView(ctx, "s1", now.Add(time.Minute))
+	if err != nil || view.LastResult != keepAliveHit || view.UsedCount != 1 || view.StoppedReason != "" {
+		t.Fatalf("retry following transient rejection = %+v, %v", view, err)
+	}
+}
+
+func TestKeepAliveTurnMustOnlyContainMatchingUserMessage(t *testing.T) {
+	job := idleKeepAliveJob{preLastTurnID: "previous", message: idleKeepAlivePrompt + " #nonce", userMessageID: "expected"}
+	for _, items := range [][]NativeItem{
+		{{Type: "user_message", ItemID: "unexpected", Text: job.message}},
+		{{Type: "assistant_message", ItemID: "expected", Text: job.message}},
+		{{Type: "user_message", ItemID: "expected", Text: job.message}, {Type: "user_message", Text: "real question"}},
+	} {
+		if isIdleKeepAliveTurn(NativeTurn{TurnID: "candidate", Items: items}, job) {
+			t.Errorf("accepted misattributed turn with items %+v", items)
+		}
 	}
 }

@@ -24,11 +24,6 @@ import (
 	"enhancedkimi/internal/storage"
 )
 
-// idleKeepAlivePrompt asks the model for a single-character reply with no tool use
-// or extended reasoning. The turn is undone via POST /sessions/{id}:undo once it
-// settles, leaving the conversation history identical while refreshing cache TTL.
-const idleKeepAlivePrompt = "[保活]仅回复1"
-
 const (
 	ProviderTypeSubscription = "subscription"
 	ProviderTypeOpenPlatform = "open_platform"
@@ -37,13 +32,10 @@ const (
 	IdleModeDefault = "default"
 	IdleModeOff     = "off"
 	IdleModeCount   = "count"
-	IdleModeUntil   = "until"
 
-	KeepAliveStateActive          = "active"
-	KeepAliveStateWaitingSubagent = "waiting_subagent"
-	KeepAliveStateIdleKeepAlive   = "idle_keepalive"
-	KeepAliveStateIdleCompaction  = "idle_compaction"
-	KeepAliveStateStopped         = "stopped"
+	KeepAliveStateDisabled = "disabled"
+	KeepAliveStateActive   = "keeping_alive"
+	KeepAliveStateStopped  = "stopped"
 )
 
 type ResolvedCachePolicy struct {
@@ -51,26 +43,28 @@ type ResolvedCachePolicy struct {
 	Provider        string `json:"provider"`
 	ProviderType    string `json:"providerType"`
 	ProviderLabel   string `json:"providerLabel"`
-	BaseURL         string `json:"baseUrl,omitempty"`
-	TTLMinutes      int    `json:"ttlMinutes"`
+	WindowMinutes   int    `json:"windowMinutes"`
 	IntervalMinutes int    `json:"intervalMinutes"`
-	MarginMinutes   int    `json:"marginMinutes"`
+	Source          string `json:"source"`
 }
 
 type sessionKeepAliveRecord struct {
 	SessionID           string
 	Mode                string
 	TargetCount         int
-	UntilAt             string
 	UsedCount           int
 	AnchorAt            string
+	LastRequestAt       string
 	LastKeepAliveAt     string
 	LastKeepAliveTurnID string
+	LastPrompt          string
 	LastResult          string
 	LastNote            string
 	StoppedReason       string
 	StoppedDetail       string
-	UpdatedAt           string
+	RetryAt             string
+	SpentTokens         int64
+	Misses              int
 }
 
 type SessionKeepAliveView struct {
@@ -78,7 +72,6 @@ type SessionKeepAliveView struct {
 	State            string              `json:"state"`
 	Mode             string              `json:"mode"`
 	TargetCount      int                 `json:"targetCount"`
-	UntilAt          string              `json:"untilAt,omitempty"`
 	EffectiveEnabled bool                `json:"effectiveEnabled"`
 	EffectiveLimit   int                 `json:"effectiveLimit"`
 	UsedCount        int                 `json:"usedCount"`
@@ -91,7 +84,9 @@ type SessionKeepAliveView struct {
 	LastKeepAliveAt  string              `json:"lastKeepAliveAt,omitempty"`
 	StoppedReason    string              `json:"stoppedReason,omitempty"`
 	StoppedDetail    string              `json:"stoppedDetail,omitempty"`
-	EstimatedCost    string              `json:"estimatedCost"`
+	EstimatedTokens  int64               `json:"estimatedTokens"`
+	BudgetTokens     int64               `json:"budgetTokens"`
+	SpentTokens      int64               `json:"spentTokens"`
 	Policy           ResolvedCachePolicy `json:"policy"`
 	InFlight         bool                `json:"inFlight"`
 	GlobalEnabled    bool                `json:"globalEnabled"`
@@ -99,18 +94,8 @@ type SessionKeepAliveView struct {
 }
 
 type idleInFlightState struct {
-	SentAt        time.Time
-	PromptID      string
 	UserMessageID string
 	TurnID        string
-}
-
-func defaultSessionKeepAliveRecord(sessionID string) sessionKeepAliveRecord {
-	return sessionKeepAliveRecord{
-		SessionID:   sessionID,
-		Mode:        IdleModeDefault,
-		TargetCount: 2,
-	}
 }
 
 func sessionIsArchivedOrDone(session NativeSession) bool {
@@ -137,22 +122,6 @@ func goalActiveForIdleKeepAlive(raw json.RawMessage) bool {
 	return strings.EqualFold(strings.TrimSpace(goal.Status), "active")
 }
 
-// cacheIntervalForTTL derives the keepalive interval and safety margin from a
-// cache TTL in minutes. 30 min -> margin 5 (interval 25); 5 min -> margin 1 (interval 4).
-func cacheIntervalForTTL(ttlMinutes int) (interval int, margin int) {
-	if ttlMinutes < providerTTLMinMinutes {
-		return 0, 0
-	}
-	margin = (ttlMinutes + 2) / 6
-	if margin < 1 {
-		margin = 1
-	}
-	if margin >= ttlMinutes {
-		margin = ttlMinutes - 1
-	}
-	return ttlMinutes - margin, margin
-}
-
 func providerLabelForType(kind string) string {
 	switch kind {
 	case ProviderTypeSubscription:
@@ -173,7 +142,7 @@ func providerBaseURL(cfg map[string]any) string {
 	return ""
 }
 
-func classifyProvider(providerKey string, providerCfg map[string]any) (string, string) {
+func classifyProvider(providerKey string, providerCfg map[string]any) string {
 	key := strings.ToLower(strings.TrimSpace(providerKey))
 	baseURL := providerBaseURL(providerCfg)
 
@@ -182,22 +151,22 @@ func classifyProvider(providerKey string, providerCfg map[string]any) (string, s
 			switch typed := oauth.(type) {
 			case string:
 				if strings.TrimSpace(typed) != "" {
-					return ProviderTypeSubscription, baseURL
+					return ProviderTypeSubscription
 				}
 			case map[string]any:
 				if len(typed) > 0 {
-					return ProviderTypeSubscription, baseURL
+					return ProviderTypeSubscription
 				}
 			case bool:
 				if typed {
-					return ProviderTypeSubscription, baseURL
+					return ProviderTypeSubscription
 				}
 			}
 		}
 		if typ, ok := providerCfg["type"].(string); ok {
 			switch strings.ToLower(strings.TrimSpace(typ)) {
 			case "kimi", "kimi-code", "managed":
-				return ProviderTypeSubscription, baseURL
+				return ProviderTypeSubscription
 			}
 		}
 	}
@@ -207,28 +176,28 @@ func classifyProvider(providerKey string, providerCfg map[string]any) (string, s
 			host := strings.ToLower(parsed.Hostname())
 			path := strings.ToLower(strings.TrimRight(parsed.Path, "/"))
 			if host == "api.kimi.com" && (path == "/coding" || strings.HasPrefix(path, "/coding/")) {
-				return ProviderTypeSubscription, baseURL
+				return ProviderTypeSubscription
 			}
 			if host == "api.moonshot.cn" || host == "api.moonshot.ai" {
-				return ProviderTypeOpenPlatform, baseURL
+				return ProviderTypeOpenPlatform
 			}
 		}
 	}
 
 	switch key {
 	case "kimi-code", "managed:kimi-code", "kimi-for-coding", "managed":
-		return ProviderTypeSubscription, baseURL
+		return ProviderTypeSubscription
 	}
 	if strings.Contains(key, "api.kimi.com/coding") {
-		return ProviderTypeSubscription, baseURL
+		return ProviderTypeSubscription
 	}
 	if strings.Contains(key, "api.moonshot.cn") || strings.Contains(key, "api.moonshot.ai") {
-		return ProviderTypeOpenPlatform, baseURL
+		return ProviderTypeOpenPlatform
 	}
-	return ProviderTypeOther, baseURL
+	return ProviderTypeOther
 }
 
-func resolveCachePolicyFromConfig(modelID string, cfg map[string]any, ttlCfg ProviderTTLSettings) ResolvedCachePolicy {
+func resolveCachePolicyFromConfig(modelID string, cfg map[string]any) ResolvedCachePolicy {
 	modelID = strings.TrimSpace(modelID)
 	if modelID == "" && cfg != nil {
 		for _, key := range []string{"default_model", "defaultModel"} {
@@ -275,27 +244,8 @@ func resolveCachePolicyFromConfig(modelID string, cfg map[string]any, ttlCfg Pro
 		}
 	}
 
-	kind, baseURL := classifyProvider(providerKey, providerCfg)
-	ttlMinutes := 0
-	switch kind {
-	case ProviderTypeSubscription:
-		ttlMinutes = ttlCfg.SubscriptionMinutes
-	case ProviderTypeOpenPlatform:
-		ttlMinutes = ttlCfg.OpenPlatformMinutes
-	default:
-		ttlMinutes = ttlCfg.OtherMinutes
-	}
-	interval, margin := cacheIntervalForTTL(ttlMinutes)
-	return ResolvedCachePolicy{
-		Model:           modelID,
-		Provider:        providerKey,
-		ProviderType:    kind,
-		ProviderLabel:   providerLabelForType(kind),
-		BaseURL:         baseURL,
-		TTLMinutes:      ttlMinutes,
-		IntervalMinutes: interval,
-		MarginMinutes:   margin,
-	}
+	kind := classifyProvider(providerKey, providerCfg)
+	return ResolvedCachePolicy{Model: modelID, Provider: providerKey, ProviderType: kind, ProviderLabel: providerLabelForType(kind)}
 }
 
 func (s *NativeService) cachedOfficialConfig(ctx context.Context, now time.Time) map[string]any {
@@ -330,226 +280,6 @@ func (s *NativeService) invalidateOfficialConfigCache() {
 	s.idleConfigCache = nil
 	s.idleConfigAt = time.Time{}
 	s.idleMu.Unlock()
-}
-
-func (s *NativeService) loadSessionKeepAlive(ctx context.Context, sessionID string) (sessionKeepAliveRecord, error) {
-	record := defaultSessionKeepAliveRecord(sessionID)
-	if sessionID == "" || s == nil || s.db == nil {
-		return record, nil
-	}
-	err := s.db.QueryRowContext(ctx, `SELECT mode,target_count,until_at,used_count,anchor_at,last_keepalive_at,last_keepalive_turn_id,last_result,last_note,stopped_reason,stopped_detail,updated_at FROM session_keepalive_state WHERE session_id=?`, sessionID).
-		Scan(&record.Mode, &record.TargetCount, &record.UntilAt, &record.UsedCount, &record.AnchorAt, &record.LastKeepAliveAt, &record.LastKeepAliveTurnID, &record.LastResult, &record.LastNote, &record.StoppedReason, &record.StoppedDetail, &record.UpdatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return record, nil
-	}
-	if err != nil {
-		return record, err
-	}
-	if record.Mode == "" {
-		record.Mode = IdleModeDefault
-	}
-	if record.TargetCount < idleKeepAliveMinCount {
-		record.TargetCount = 2
-	}
-	return record, nil
-}
-
-func (s *NativeService) saveSessionKeepAlive(ctx context.Context, record sessionKeepAliveRecord, now time.Time) error {
-	if s == nil || s.db == nil {
-		return nil
-	}
-	if record.SessionID == "" {
-		return errors.New("缺少会话 ID")
-	}
-	if record.Mode == "" {
-		record.Mode = IdleModeDefault
-	}
-	if record.TargetCount < idleKeepAliveMinCount {
-		record.TargetCount = 2
-	}
-	record.UpdatedAt = storage.SortableTime(now)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO session_keepalive_state(session_id,mode,target_count,until_at,used_count,anchor_at,last_keepalive_at,last_keepalive_turn_id,last_result,last_note,stopped_reason,stopped_detail,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET mode=excluded.mode,target_count=excluded.target_count,until_at=excluded.until_at,used_count=excluded.used_count,anchor_at=excluded.anchor_at,last_keepalive_at=excluded.last_keepalive_at,last_keepalive_turn_id=excluded.last_keepalive_turn_id,last_result=excluded.last_result,last_note=excluded.last_note,stopped_reason=excluded.stopped_reason,stopped_detail=excluded.stopped_detail,updated_at=excluded.updated_at`,
-		record.SessionID, record.Mode, record.TargetCount, record.UntilAt, record.UsedCount, record.AnchorAt, record.LastKeepAliveAt, record.LastKeepAliveTurnID, record.LastResult, record.LastNote, record.StoppedReason, record.StoppedDetail, record.UpdatedAt)
-	return err
-}
-
-func (s *NativeService) hasAnySessionKeepAliveOverride(ctx context.Context) bool {
-	if s == nil || s.db == nil {
-		return false
-	}
-	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM session_keepalive_state WHERE mode IN ('count','until')`).Scan(&count)
-	return err == nil && count > 0
-}
-
-func (s *NativeService) isIdleKeepAliveInFlight(sessionID string) bool {
-	s.idleMu.Lock()
-	defer s.idleMu.Unlock()
-	_, ok := s.idleInFlight[sessionID]
-	return ok
-}
-
-func (s *NativeService) idleInFlightInfo(sessionID string) (idleInFlightState, bool) {
-	s.idleMu.Lock()
-	defer s.idleMu.Unlock()
-	info, ok := s.idleInFlight[sessionID]
-	return info, ok
-}
-
-func (s *NativeService) setIdleInFlight(sessionID string, info idleInFlightState) {
-	s.idleMu.Lock()
-	if s.idleInFlight == nil {
-		s.idleInFlight = map[string]idleInFlightState{}
-	}
-	s.idleInFlight[sessionID] = info
-	s.idleMu.Unlock()
-}
-
-func (s *NativeService) clearIdleInFlight(sessionID string) {
-	s.idleMu.Lock()
-	delete(s.idleInFlight, sessionID)
-	s.idleMu.Unlock()
-}
-
-func (s *NativeService) idleKeepAlivePoll() time.Duration {
-	if s.idleVerifyPoll > 0 {
-		return s.idleVerifyPoll
-	}
-	if s.verifyPoll > 0 && s.verifyPoll < 2*time.Second {
-		return s.verifyPoll
-	}
-	return 1500 * time.Millisecond
-}
-
-func parseSortableOrRFC3339(value string) time.Time {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return time.Time{}
-	}
-	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
-		return parsed
-	}
-	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
-		return parsed
-	}
-	return time.Time{}
-}
-
-// noteUserMessage resets the idle keepalive cycle whenever the user sends a real
-// message in this session (N4: 用户发出消息后，计时和次数都重置).
-func (s *NativeService) noteUserMessage(ctx context.Context, sessionID string, at time.Time) {
-	if sessionID == "" || s == nil || s.db == nil {
-		return
-	}
-	if at.IsZero() {
-		at = time.Now().UTC()
-	}
-	record, err := s.loadSessionKeepAlive(ctx, sessionID)
-	if err != nil {
-		return
-	}
-	anchor := parseSortableOrRFC3339(record.AnchorAt)
-	if !anchor.IsZero() && !at.After(anchor) && record.UsedCount == 0 && record.StoppedReason == "" {
-		return
-	}
-	record.UsedCount = 0
-	record.AnchorAt = storage.SortableTime(at)
-	record.LastKeepAliveAt = ""
-	record.LastKeepAliveTurnID = ""
-	record.StoppedReason = ""
-	record.StoppedDetail = ""
-	_ = s.saveSessionKeepAlive(ctx, record, at)
-	s.idleMu.Lock()
-	delete(s.idleAlerted, sessionID)
-	s.idleMu.Unlock()
-	s.publishSessionKeepAliveUpdate(ctx, sessionID, at)
-}
-
-func (s *NativeService) noteUserMessageFromFrame(frame NativeFrame) {
-	if frame.SessionID == "" {
-		return
-	}
-	if frame.Type != "turn.started" && frame.Type != "item.started" {
-		return
-	}
-	if frame.Type == "item.started" && frame.Item.Type != "user_message" {
-		return
-	}
-	if frame.Type == "item.started" && strings.TrimSpace(frame.Item.Text) == idleKeepAlivePrompt {
-		return
-	}
-	if frame.Type == "turn.started" {
-		for _, item := range frame.Turn.Items {
-			if item.Type == "user_message" && strings.TrimSpace(item.Text) == idleKeepAlivePrompt {
-				return
-			}
-		}
-	}
-	if info, active := s.idleInFlightInfo(frame.SessionID); active {
-		if frame.Type == "item.started" && info.UserMessageID != "" && frame.Item.ItemID == info.UserMessageID {
-			return
-		}
-		if frame.TurnID != "" && info.TurnID != "" && frame.TurnID == info.TurnID {
-			return
-		}
-		if frame.Turn.TurnID != "" && info.TurnID != "" && frame.Turn.TurnID == info.TurnID {
-			return
-		}
-		// While an idle keepalive send is freshly in flight and we haven't bound TurnID yet,
-		// avoid mistaking the keepalive's own turn.started for a user message.
-		if time.Since(info.SentAt) < 15*time.Second && frame.Type == "turn.started" && len(frame.Turn.Items) == 0 {
-			return
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	s.noteUserMessage(ctx, frame.SessionID, time.Now().UTC())
-}
-
-// syncUserActivityReset inspects cache_live.last_user_prompt and cache_steps to detect
-// user messages sent directly in the official UI (bypassing our bridge).
-func (s *NativeService) syncUserActivityReset(ctx context.Context, record *sessionKeepAliveRecord, live cache.LiveSignals, lastStep cache.Step, lastStepSeen bool, now time.Time) bool {
-	if s.isIdleKeepAliveInFlight(record.SessionID) {
-		return false
-	}
-	anchor := parseSortableOrRFC3339(record.AnchorAt)
-	lastKA := parseSortableOrRFC3339(record.LastKeepAliveAt)
-
-	isKeepAliveStamp := func(ts time.Time) bool {
-		if lastKA.IsZero() {
-			return false
-		}
-		diff := ts.Sub(lastKA)
-		return diff >= -5*time.Second && diff <= 45*time.Second
-	}
-
-	var resetAt time.Time
-	if !live.LastUserPrompt.IsZero() && live.LastUserPrompt.After(anchor) && !isKeepAliveStamp(live.LastUserPrompt) {
-		resetAt = live.LastUserPrompt
-	}
-	if lastStepSeen && !lastStep.At.IsZero() && lastStep.At.After(anchor) && lastStep.At.After(lastKA) {
-		isKnownKATurn := record.LastKeepAliveTurnID != "" && lastStep.TurnID == record.LastKeepAliveTurnID
-		if !isKnownKATurn && !isKeepAliveStamp(lastStep.At) && lastStep.At.After(resetAt) {
-			resetAt = lastStep.At
-		}
-	}
-	if resetAt.IsZero() {
-		return false
-	}
-	changed := record.UsedCount != 0 || record.StoppedReason != "" || record.LastKeepAliveAt != "" || !resetAt.Equal(anchor)
-	record.UsedCount = 0
-	record.AnchorAt = storage.SortableTime(resetAt)
-	record.LastKeepAliveAt = ""
-	record.LastKeepAliveTurnID = ""
-	record.StoppedReason = ""
-	record.StoppedDetail = ""
-	if changed {
-		_ = s.saveSessionKeepAlive(ctx, *record, now)
-		s.idleMu.Lock()
-		delete(s.idleAlerted, record.SessionID)
-		s.idleMu.Unlock()
-	}
-	return changed
 }
 
 func managedQuotaRemainingPercent(usage managedUsage, now time.Time) (float64, bool) {
@@ -602,450 +332,6 @@ func (s *NativeService) checkIdleQuotaGuard(ctx context.Context, settings Automa
 		return true, rem, fmt.Sprintf("剩余额度约 %.0f%%，低于阈值 %d%%", rem, settings.IdleKeepAlive.MinQuotaPercent)
 	}
 	return false, rem, ""
-}
-
-func (s *NativeService) publishKeepAliveAlert(sessionID, reasonKey, severity, title, message string) {
-	s.idleMu.Lock()
-	if s.idleAlerted == nil {
-		s.idleAlerted = map[string]string{}
-	}
-	if s.idleAlerted[sessionID] == reasonKey {
-		s.idleMu.Unlock()
-		return
-	}
-	s.idleAlerted[sessionID] = reasonKey
-	s.idleMu.Unlock()
-
-	s.bus.Publish("keepalive", map[string]any{
-		"type":      "keepalive.alert",
-		"sessionId": sessionID,
-		"reason":    reasonKey,
-		"severity":  severity,
-		"title":     title,
-		"message":   message,
-	})
-}
-
-func (s *NativeService) publishKeepAliveSuppress(sessionID, promptID string, expiresAt time.Time) {
-	s.bus.Publish("keepalive", map[string]any{
-		"type":      "keepalive.suppress",
-		"sessionId": sessionID,
-		"promptId":  promptID,
-		"expiresAt": expiresAt.UTC().Format(time.RFC3339Nano),
-	})
-}
-
-func (s *NativeService) publishSessionKeepAliveUpdate(ctx context.Context, sessionID string, now time.Time) {
-	view, err := s.sessionKeepAliveView(ctx, sessionID, now)
-	if err != nil {
-		return
-	}
-	s.bus.Publish("keepalive", map[string]any{
-		"type":      "keepalive.session",
-		"sessionId": sessionID,
-		"view":      view,
-	})
-}
-
-func effectiveIdleConfig(settings AutomationSettings, record sessionKeepAliveRecord, now time.Time) (enabled bool, limit int, until time.Time, exhausted bool, exhaustedReason string) {
-	switch record.Mode {
-	case IdleModeOff:
-		return false, 0, time.Time{}, false, ""
-	case IdleModeCount:
-		limit = record.TargetCount
-		if limit < idleKeepAliveMinCount {
-			limit = 1
-		}
-		if record.UsedCount >= limit {
-			return true, limit, time.Time{}, true, "count_exhausted"
-		}
-		return true, limit, time.Time{}, false, ""
-	case IdleModeUntil:
-		until = parseSortableOrRFC3339(record.UntilAt)
-		if until.IsZero() || !now.Before(until) {
-			return true, 0, until, true, "until_reached"
-		}
-		return true, 0, until, false, ""
-	default: // IdleModeDefault
-		if !settings.IdleKeepAlive.Enabled {
-			return false, settings.IdleKeepAlive.DefaultCount, time.Time{}, false, ""
-		}
-		limit = settings.IdleKeepAlive.DefaultCount
-		if record.UsedCount >= limit {
-			return true, limit, time.Time{}, true, "count_exhausted"
-		}
-		return true, limit, time.Time{}, false, ""
-	}
-}
-
-func (s *NativeService) resolveSessionPolicy(ctx context.Context, sessionID string, snapshot automationSnapshot, lastStep cache.Step, lastStepSeen bool, settings AutomationSettings, now time.Time) ResolvedCachePolicy {
-	modelID := strings.TrimSpace(snapshot.session.Model)
-	if modelID == "" && lastStepSeen {
-		modelID = strings.TrimSpace(lastStep.Model)
-	}
-	cfg := s.cachedOfficialConfig(ctx, now)
-	return resolveCachePolicyFromConfig(modelID, cfg, settings.IdleKeepAlive.ProviderTTL)
-}
-
-// isIdleKeepAliveProtecting reports whether idle keepalive currently owns this session
-// so idle compaction must hold off (N4: 保活期间绝不压缩；保活结束后仍然空闲再进入压缩).
-func (s *NativeService) isIdleKeepAliveProtecting(ctx context.Context, settings AutomationSettings, sessionID string, now time.Time) bool {
-	if s.isIdleKeepAliveInFlight(sessionID) {
-		return true
-	}
-	snapshot, ok := s.automationSnapshot(sessionID)
-	if !ok || sessionIsArchivedOrDone(snapshot.session) || pendingNativeInteraction(snapshot) || goalBlocksIdle(snapshot) || goalActiveForIdleKeepAlive(snapshot.goal) {
-		return false
-	}
-	record, err := s.loadSessionKeepAlive(ctx, sessionID)
-	if err != nil {
-		return false
-	}
-	var live cache.LiveSignals
-	var lastStep cache.Step
-	var lastStepSeen bool
-	if store, storeErr := s.cacheStore(); storeErr == nil {
-		_, _ = store.Scan(ctx, now, false)
-		live, _ = store.Live(ctx, sessionID)
-		lastStep, lastStepSeen, _ = store.LastMainStep(ctx, sessionID)
-	}
-	s.syncUserActivityReset(ctx, &record, live, lastStep, lastStepSeen, now)
-
-	enabled, _, _, exhausted, _ := effectiveIdleConfig(settings, record, now)
-	if !enabled {
-		return false
-	}
-	if record.StoppedReason != "" && record.StoppedReason != "count_exhausted" && record.StoppedReason != "until_reached" {
-		return false
-	}
-	policy := s.resolveSessionPolicy(ctx, sessionID, snapshot, lastStep, lastStepSeen, settings, now)
-	if policy.TTLMinutes < providerTTLMinMinutes || policy.IntervalMinutes <= 0 {
-		return false
-	}
-	// If cache already expired past TTL with no active keepalive, do not block compaction.
-	lastReq := latestKeepAliveClock(record, lastStep, lastStepSeen, snapshot)
-	if !lastReq.IsZero() && now.Sub(lastReq) >= time.Duration(policy.TTLMinutes)*time.Minute {
-		return false
-	}
-	if !exhausted {
-		return true
-	}
-	// After the final keepalive fires, hold off compaction until that refreshed cache
-	// interval has elapsed so compaction does not immediately wipe the cache we just kept alive.
-	lastKA := parseSortableOrRFC3339(record.LastKeepAliveAt)
-	if !lastKA.IsZero() && now.Sub(lastKA) < time.Duration(policy.IntervalMinutes)*time.Minute {
-		return true
-	}
-	return false
-}
-
-func latestKeepAliveClock(record sessionKeepAliveRecord, lastStep cache.Step, lastStepSeen bool, snapshot automationSnapshot) time.Time {
-	var best time.Time
-	consider := func(ts time.Time) {
-		if !ts.IsZero() && ts.After(best) {
-			best = ts
-		}
-	}
-	if lastStepSeen {
-		consider(lastStep.At)
-	}
-	consider(parseSortableOrRFC3339(record.LastKeepAliveAt))
-	consider(parseSortableOrRFC3339(record.AnchorAt))
-	if best.IsZero() {
-		consider(snapshot.lastActivity)
-	}
-	return best
-}
-
-func (s *NativeService) stopIdleKeepAlive(ctx context.Context, record *sessionKeepAliveRecord, reason, detail string, alert bool, now time.Time) {
-	prevReason := record.StoppedReason
-	record.StoppedReason = reason
-	record.StoppedDetail = detail
-	if reason == "undo_failed" {
-		record.LastResult = "undo_failed"
-		record.LastNote = detail
-	}
-	_ = s.saveSessionKeepAlive(ctx, *record, now)
-	if prevReason != reason {
-		s.publishSessionKeepAliveUpdate(ctx, record.SessionID, now)
-	}
-	if alert {
-		title := "空闲缓存保活已停止"
-		severity := "warning"
-		if reason == "undo_failed" || reason == "error" {
-			severity = "error"
-		}
-		name := s.cachedTitle(record.SessionID)
-		msg := detail
-		if name != "" {
-			msg = fmt.Sprintf("会话「%s」：%s", name, detail)
-		}
-		s.publishKeepAliveAlert(record.SessionID, reason, severity, title, msg)
-	}
-}
-
-// runIdleKeepAliveOnce evaluates the N4 idle-session keepalive state machine for one session.
-func (s *NativeService) runIdleKeepAliveOnce(ctx context.Context, settings AutomationSettings, id string, now time.Time) {
-	if s.isAutomationPausedForSwitch() || s.isIdleKeepAliveInFlight(id) {
-		return
-	}
-	snapshot, ok := s.automationSnapshot(id)
-	if !ok {
-		return
-	}
-	record, err := s.loadSessionKeepAlive(ctx, id)
-	if err != nil {
-		return
-	}
-
-	var live cache.LiveSignals
-	var lastStep cache.Step
-	var lastStepSeen bool
-	if store, storeErr := s.cacheStore(); storeErr == nil {
-		_, _ = store.Scan(ctx, now, false)
-		live, _ = store.Live(ctx, id)
-		lastStep, lastStepSeen, _ = store.LastMainStep(ctx, id)
-	}
-	s.syncUserActivityReset(ctx, &record, live, lastStep, lastStepSeen, now)
-
-	// Guardrail: archived or done session stops immediately.
-	if sessionIsArchivedOrDone(snapshot.session) {
-		if record.StoppedReason != "archived" && (record.Mode == IdleModeCount || record.Mode == IdleModeUntil || settings.IdleKeepAlive.Enabled) {
-			s.stopIdleKeepAlive(ctx, &record, "archived", "会话已归档或完成", false, now)
-		}
-		return
-	}
-
-	// Guardrail: active turn, waiting for subagent, blocked wait, pending interaction, or active/blocked goal.
-	if snapshot.session.Busy || snapshot.session.MainTurnActive || live.OpenBackground > 0 || live.Blocked || pendingNativeInteraction(snapshot) || goalBlocksIdle(snapshot) || goalActiveForIdleKeepAlive(snapshot.goal) {
-		return
-	}
-
-	enabled, _, _, exhausted, exhaustedReason := effectiveIdleConfig(settings, record, now)
-	if !enabled {
-		return
-	}
-	if exhausted {
-		if record.StoppedReason != exhaustedReason {
-			detail := "保活次数已用完"
-			if exhaustedReason == "until_reached" {
-				detail = "已到达保活截止时间"
-			}
-			s.stopIdleKeepAlive(ctx, &record, exhaustedReason, detail, false, now)
-		}
-		return
-	}
-	// Hard stop reasons stay stopped until user sends a new message or changes override.
-	switch record.StoppedReason {
-	case "undo_failed", "undo_skipped", "quota_low", "error":
-		return
-	}
-
-	policy := s.resolveSessionPolicy(ctx, id, snapshot, lastStep, lastStepSeen, settings, now)
-	if policy.TTLMinutes < providerTTLMinMinutes || policy.IntervalMinutes <= 0 {
-		if record.StoppedReason != "provider_unknown" {
-			s.stopIdleKeepAlive(ctx, &record, "provider_unknown", "当前供应商缓存时长未知，可在高级设置中配置", false, now)
-		}
-		return
-	}
-	if record.StoppedReason == "provider_unknown" {
-		record.StoppedReason = ""
-		record.StoppedDetail = ""
-		_ = s.saveSessionKeepAlive(ctx, record, now)
-	}
-
-	lastReq := latestKeepAliveClock(record, lastStep, lastStepSeen, snapshot)
-	if lastReq.IsZero() {
-		return
-	}
-	elapsed := now.Sub(lastReq)
-	interval := time.Duration(policy.IntervalMinutes) * time.Minute
-	ttl := time.Duration(policy.TTLMinutes) * time.Minute
-	if elapsed < interval {
-		return
-	}
-	// Guardrail: Kimi Code shutdown / long absence past cache TTL must not catch up.
-	if elapsed >= ttl {
-		if record.StoppedReason != "expired" {
-			s.stopIdleKeepAlive(ctx, &record, "expired", "距上次请求已超过缓存时长，不补发保活", false, now)
-		}
-		return
-	}
-
-	// Guardrail: quota threshold check (default 10%).
-	if low, _, detail := s.checkIdleQuotaGuard(ctx, settings, policy, now); low {
-		s.stopIdleKeepAlive(ctx, &record, "quota_low", detail, true, now)
-		return
-	}
-
-	// Refresh fresh session, turns, and goal from official daemon before committing to send.
-	loaded, err := s.readSession(ctx, id)
-	if err != nil {
-		return
-	}
-	if sessionIsArchivedOrDone(loaded.session) {
-		s.stopIdleKeepAlive(ctx, &record, "archived", "会话已归档或完成", false, now)
-		return
-	}
-	if loaded.session.Busy || loaded.session.MainTurnActive || pendingNativeInteraction(snapshotFromCache(loaded)) || goalBlocksIdle(snapshotFromCache(loaded)) || goalActiveForIdleKeepAlive(loaded.goal) {
-		return
-	}
-	if len(loaded.turns) == 0 {
-		return
-	}
-	if s.isAutomationPausedForSwitch() {
-		return
-	}
-	if store, storeErr := s.cacheStore(); storeErr == nil {
-		if liveNow, liveErr := store.Live(ctx, id); liveErr == nil && (liveNow.OpenBackground > 0 || liveNow.Blocked) {
-			return
-		}
-	}
-
-	revision := contextRevision(snapshotFromCache(loaded))
-	intent, _, err := s.beginAutomation(ctx, "idle_keepalive", id, revision, now)
-	if err != nil {
-		return
-	}
-
-	preLastTurnID := loaded.turns[len(loaded.turns)-1].TurnID
-	preGit, preGitErr := gitStatusFingerprint(ctx, loaded.session.CWD)
-	sentAt := time.Now().UTC()
-	if !now.IsZero() && now.Before(sentAt.Add(-time.Minute)) {
-		// Preserve synthetic test clock when caller injects a simulated timestamp.
-		sentAt = now
-	}
-
-	s.setIdleInFlight(id, idleInFlightState{SentAt: sentAt})
-	s.publishKeepAliveSuppress(id, "", time.Now().UTC().Add(s.keepAliveWindow()))
-	_ = s.WatchSessionInternal(id)
-
-	// Send with zero parameter overrides so cache prefix stays byte-identical.
-	body := map[string]any{
-		"content": []any{map[string]string{"type": "text", "text": idleKeepAlivePrompt}},
-	}
-	rawResp, sendErr := s.kap.Request(ctx, http.MethodPost, "/sessions/"+url.PathEscape(id)+"/prompts", body)
-	if sendErr != nil {
-		s.clearIdleInFlight(id)
-		note := "空闲保活消息发送失败：" + sendErr.Error()
-		_ = s.updateAutomation(ctx, intent.ID, "failed", note, now)
-		s.publishAutomationReceipt("idle_keepalive", id, "failed", note)
-		reason := "error"
-		var nativeErr *NativeError
-		if errors.As(sendErr, &nativeErr) && nativeErr.Status == http.StatusTooManyRequests {
-			reason = "quota_low"
-		}
-		s.stopIdleKeepAlive(ctx, &record, reason, note, true, now)
-		return
-	}
-
-	var promptResp struct {
-		PromptID      string `json:"prompt_id"`
-		UserMessageID string `json:"user_message_id"`
-	}
-	_ = json.Unmarshal(rawResp, &promptResp)
-	s.setIdleInFlight(id, idleInFlightState{
-		SentAt:        sentAt,
-		PromptID:      promptResp.PromptID,
-		UserMessageID: promptResp.UserMessageID,
-	})
-	if promptResp.PromptID != "" {
-		s.publishKeepAliveSuppress(id, promptResp.PromptID, time.Now().UTC().Add(s.keepAliveWindow()))
-	}
-
-	record.UsedCount++
-	record.LastKeepAliveAt = storage.SortableTime(sentAt)
-	record.LastResult = "acknowledged"
-	record.LastNote = "空闲保活已发送，等待回合结束并自动撤回"
-	record.StoppedReason = ""
-	record.StoppedDetail = ""
-	_ = s.saveSessionKeepAlive(ctx, record, now)
-
-	ackNote := "空闲保活已发送，等待回合结束并自动撤回"
-	_ = s.updateAutomation(ctx, intent.ID, "acknowledged", ackNote, now)
-	s.publishAutomationReceipt("idle_keepalive", id, "acknowledged", ackNote)
-	s.publishSessionKeepAliveUpdate(ctx, id, now)
-
-	anchorStepUUID := ""
-	if lastStepSeen {
-		anchorStepUUID = lastStep.StepUUID
-	}
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.completeIdleKeepAlive(idleKeepAliveJob{
-			intentID:       intent.ID,
-			sessionID:      id,
-			preLastTurnID:  preLastTurnID,
-			userMessageID:  promptResp.UserMessageID,
-			promptID:       promptResp.PromptID,
-			cwd:            loaded.session.CWD,
-			preGit:         preGit,
-			preGitErr:      preGitErr,
-			anchorStepUUID: anchorStepUUID,
-			model:          policy.Model,
-			sentAt:         sentAt,
-		})
-	}()
-}
-
-type idleKeepAliveJob struct {
-	intentID       string
-	sessionID      string
-	preLastTurnID  string
-	userMessageID  string
-	promptID       string
-	cwd            string
-	preGit         string
-	preGitErr      error
-	anchorStepUUID string
-	model          string
-	sentAt         time.Time
-}
-
-func findIdleKeepAliveTurn(turns []NativeTurn, preLastTurnID, userMessageID string) (turn NativeTurn, index int, found bool) {
-	start := 0
-	if preLastTurnID != "" {
-		for i, candidate := range turns {
-			if candidate.TurnID == preLastTurnID {
-				start = i + 1
-				break
-			}
-		}
-	}
-	for i := start; i < len(turns); i++ {
-		candidate := turns[i]
-		for _, item := range candidate.Items {
-			if userMessageID != "" && item.ItemID == userMessageID {
-				return candidate, i, true
-			}
-			if item.Type == "user_message" && strings.TrimSpace(item.Text) == idleKeepAlivePrompt {
-				return candidate, i, true
-			}
-		}
-	}
-	return NativeTurn{}, -1, false
-}
-
-func turnHasToolCall(turn NativeTurn) bool {
-	for _, item := range turn.Items {
-		if item.Type == "tool_call" {
-			return true
-		}
-	}
-	return false
-}
-
-func turnHasSettledOutput(turn NativeTurn) bool {
-	if turn.Error != nil {
-		return true
-	}
-	for _, item := range turn.Items {
-		if item.Type == "assistant_message" {
-			return true
-		}
-	}
-	return false
 }
 
 const (
@@ -1340,482 +626,849 @@ func (s *gitFingerprintScan) hashFile(digest hash.Hash, path string, info os.Fil
 	return nil
 }
 
+func (s *NativeService) loadSessionKeepAlive(ctx context.Context, id string) (sessionKeepAliveRecord, error) {
+	record := sessionKeepAliveRecord{SessionID: id, Mode: IdleModeDefault, TargetCount: 2}
+	err := s.db.QueryRowContext(ctx, `SELECT mode,target_count,used_count,anchor_at,last_request_at,last_keepalive_at,last_keepalive_turn_id,last_prompt,last_result,last_note,stopped_reason,stopped_detail,retry_at,spent_tokens,misses FROM session_keepalive_state WHERE session_id=?`, id).
+		Scan(&record.Mode, &record.TargetCount, &record.UsedCount, &record.AnchorAt, &record.LastRequestAt, &record.LastKeepAliveAt, &record.LastKeepAliveTurnID, &record.LastPrompt, &record.LastResult, &record.LastNote, &record.StoppedReason, &record.StoppedDetail, &record.RetryAt, &record.SpentTokens, &record.Misses)
+	if errors.Is(err, sql.ErrNoRows) {
+		return record, nil
+	}
+	if record.TargetCount < idleKeepAliveMinCount || record.TargetCount > idleKeepAliveMaxCount {
+		record.TargetCount = 2
+	}
+	switch record.Mode {
+	case "until":
+		record.Mode = IdleModeOff
+		record.StoppedReason = "legacy_until_removed"
+		record.StoppedDetail = "旧版截止时刻保活已停用，请重新选择保活次数"
+	case IdleModeDefault, IdleModeOff, IdleModeCount:
+	default:
+		record.Mode = IdleModeDefault
+	}
+	return record, err
+}
+
+func (s *NativeService) saveSessionKeepAlive(ctx context.Context, record sessionKeepAliveRecord, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO session_keepalive_state(session_id,mode,target_count,used_count,anchor_at,last_request_at,last_keepalive_at,last_keepalive_turn_id,last_prompt,last_result,last_note,stopped_reason,stopped_detail,retry_at,spent_tokens,misses,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(session_id) DO UPDATE SET mode=excluded.mode,target_count=excluded.target_count,used_count=excluded.used_count,anchor_at=excluded.anchor_at,last_request_at=excluded.last_request_at,last_keepalive_at=excluded.last_keepalive_at,last_keepalive_turn_id=excluded.last_keepalive_turn_id,last_prompt=excluded.last_prompt,last_result=excluded.last_result,last_note=excluded.last_note,stopped_reason=excluded.stopped_reason,stopped_detail=excluded.stopped_detail,retry_at=excluded.retry_at,spent_tokens=excluded.spent_tokens,misses=excluded.misses,updated_at=excluded.updated_at`,
+		record.SessionID, record.Mode, record.TargetCount, record.UsedCount, record.AnchorAt, record.LastRequestAt, record.LastKeepAliveAt, record.LastKeepAliveTurnID, record.LastPrompt, record.LastResult, record.LastNote, record.StoppedReason, record.StoppedDetail, record.RetryAt, record.SpentTokens, record.Misses, storage.SortableTime(now))
+	return err
+}
+
+func (s *NativeService) idleInFlightInfo(id string) (idleInFlightState, bool) {
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	info, ok := s.idleInFlight[id]
+	return info, ok
+}
+
+func (s *NativeService) isIdleKeepAliveInFlight(id string) bool {
+	_, active := s.idleInFlightInfo(id)
+	return active
+}
+
+func (s *NativeService) setIdleInFlight(id string, info idleInFlightState) {
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	if s.idleInFlight == nil {
+		s.idleInFlight = map[string]idleInFlightState{}
+	}
+	s.idleInFlight[id] = info
+}
+
+func (s *NativeService) clearIdleInFlight(id string) {
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	delete(s.idleInFlight, id)
+}
+
+func (s *NativeService) idleKeepAlivePoll() time.Duration {
+	if s.idleVerifyPoll > 0 {
+		return s.idleVerifyPoll
+	}
+	if s.verifyPoll > 0 {
+		return s.verifyPoll
+	}
+	return 1500 * time.Millisecond
+}
+
+func parseSortableOrRFC3339(value string) time.Time {
+	at, _ := time.Parse(time.RFC3339Nano, strings.TrimSpace(value))
+	return at
+}
+
+func (record *sessionKeepAliveRecord) resetCycle(at time.Time) {
+	record.AnchorAt = storage.SortableTime(at)
+	record.UsedCount, record.SpentTokens, record.Misses = 0, 0, 0
+	record.LastRequestAt, record.RetryAt = "", ""
+	if record.StoppedReason != "legacy_until_removed" {
+		record.StoppedReason, record.StoppedDetail = "", ""
+	}
+}
+
+func (s *NativeService) noteUserMessage(ctx context.Context, id string, at time.Time) {
+	if id == "" || s.db == nil {
+		return
+	}
+	s.idleStateMu.Lock()
+	record, err := s.loadSessionKeepAlive(ctx, id)
+	changed := err == nil && at.After(parseSortableOrRFC3339(record.AnchorAt))
+	if changed {
+		record.resetCycle(at)
+		err = s.saveSessionKeepAlive(ctx, record, at)
+	}
+	s.idleStateMu.Unlock()
+	if changed && err == nil {
+		s.publishSessionKeepAliveUpdate(ctx, id, at)
+	}
+}
+
+func (s *NativeService) noteUserMessageFromFrame(frame NativeFrame) {
+	if frame.SessionID == "" || (frame.Type != "turn.started" && frame.Type != "item.started") {
+		return
+	}
+	info, _ := s.idleInFlightInfo(frame.SessionID)
+	if info.TurnID != "" && (frame.TurnID == info.TurnID || frame.Turn.TurnID == info.TurnID) {
+		return
+	}
+	items := frame.Turn.Items
+	if frame.Type == "item.started" {
+		items = []NativeItem{frame.Item}
+	}
+	for _, item := range items {
+		if item.Type != "user_message" || isKeepAlivePrompt(item.Text) || (info.UserMessageID != "" && item.ItemID == info.UserMessageID) {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		s.noteUserMessage(ctx, frame.SessionID, time.Now().UTC())
+		cancel()
+		return
+	}
+}
+
+func (s *NativeService) initializedCacheStore() *cache.Store {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	return s.store
+}
+
+func (s *NativeService) retentionForPolicy(ctx context.Context, store *cache.Store, now time.Time) cache.Retention {
+	if store == nil {
+		return cache.Retention{}
+	}
+	s.idleMu.Lock()
+	if !s.idleRetentionAt.IsZero() && now.Sub(s.idleRetentionAt) < 5*time.Minute {
+		result := s.idleRetention
+		s.idleMu.Unlock()
+		return result
+	}
+	s.idleMu.Unlock()
+	result, err := store.Retention(ctx, now)
+	if err != nil {
+		return cache.Retention{}
+	}
+	s.idleMu.Lock()
+	s.idleRetention, s.idleRetentionAt = result, now
+	s.idleMu.Unlock()
+	return result
+}
+
+func (s *NativeService) resolveSessionPolicy(ctx context.Context, snapshot automationSnapshot, lastStep cache.Step, store *cache.Store, now time.Time) ResolvedCachePolicy {
+	model := strings.TrimSpace(snapshot.session.Model)
+	if model == "" && lastStep.Model != cache.ModelUnknown {
+		model = lastStep.Model
+	}
+	policy := resolveCachePolicyFromConfig(model, s.cachedOfficialConfig(ctx, now))
+	retention := s.retentionForPolicy(ctx, store, now)
+	for _, item := range retention.ByModel {
+		if item.Model == policy.Model {
+			return applyRetentionPolicy(policy, item.IdleBuckets)
+		}
+	}
+	// A completed step can report an unqualified model name while the daemon
+	// session uses its provider-qualified config key.
+	_, shortModel := splitModelKey(policy.Model)
+	if shortModel != "" && shortModel == lastStep.Model {
+		for _, item := range retention.ByModel {
+			if item.Model == lastStep.Model {
+				return applyRetentionPolicy(policy, item.IdleBuckets)
+			}
+		}
+	}
+	return applyRetentionPolicy(policy, nil)
+}
+
+func effectiveIdleConfig(settings AutomationSettings, record sessionKeepAliveRecord) (bool, int) {
+	if !settings.IdleKeepAlive.Enabled || record.Mode == IdleModeOff {
+		return false, 0
+	}
+	if record.Mode == IdleModeCount {
+		return true, record.TargetCount
+	}
+	return true, settings.IdleKeepAlive.DefaultCount
+}
+
+func idleKeepAliveBlocked(snapshot automationSnapshot, live cache.LiveSignals) bool {
+	return compactionBlocked(snapshot, live) || goalBlocksIdle(snapshot) || goalActiveForIdleKeepAlive(snapshot.goal)
+}
+
+type keepAliveDecision struct {
+	warm   bool
+	due    bool
+	reason string
+	detail string
+}
+
+func decideIdleKeepAlive(record sessionKeepAliveRecord, policy ResolvedCachePolicy, now time.Time, limit int, estimate int64) keepAliveDecision {
+	if record.StoppedReason == "undo_failed" || record.StoppedReason == "unconfirmed" {
+		return keepAliveDecision{reason: record.StoppedReason, detail: record.StoppedDetail}
+	}
+	if record.Misses >= 2 {
+		return keepAliveDecision{reason: "consecutive_misses", detail: "连续两次保活未命中缓存，等待下一次真实请求"}
+	}
+	lastRequest := parseSortableOrRFC3339(record.LastRequestAt)
+	elapsed := now.Sub(lastRequest)
+	if policy.IntervalMinutes <= 0 {
+		return keepAliveDecision{reason: "low_retention", detail: "短间隔的实测缓存读取比例过低"}
+	}
+	warm := !lastRequest.IsZero() && elapsed >= 0 && elapsed < time.Duration(policy.WindowMinutes)*time.Minute
+	if record.UsedCount >= limit {
+		return keepAliveDecision{warm: warm && elapsed < time.Duration(policy.IntervalMinutes)*time.Minute && record.LastResult == keepAliveHit, reason: "count_exhausted", detail: "本轮保活次数已用完"}
+	}
+	if !warm {
+		if record.UsedCount > 0 {
+			return keepAliveDecision{reason: "expired", detail: "当前缓存可能已冷却，等待下一次真实请求"}
+		}
+		return keepAliveDecision{detail: "等待下一次真实请求激活缓存"}
+	}
+	if estimate <= 0 || estimate > idleKeepAliveTokenBudget-record.SpentTokens {
+		return keepAliveDecision{reason: "token_budget", detail: "本次 Token 估算不可用或超出本轮剩余预算"}
+	}
+	if now.Before(parseSortableOrRFC3339(record.RetryAt)) {
+		return keepAliveDecision{warm: true, detail: record.LastNote}
+	}
+	return keepAliveDecision{warm: true, due: elapsed >= time.Duration(policy.IntervalMinutes)*time.Minute}
+}
+
+func (s *NativeService) observeRealStep(ctx context.Context, record *sessionKeepAliveRecord, step cache.Step) {
+	if step.At.IsZero() || !step.At.After(parseSortableOrRFC3339(record.AnchorAt)) || !step.At.After(parseSortableOrRFC3339(record.LastRequestAt)) {
+		return
+	}
+	if step.TurnID != "" && step.TurnID == record.LastKeepAliveTurnID {
+		return
+	}
+	if (record.LastPrompt != "" || record.UsedCount > 0) && !step.At.Before(parseSortableOrRFC3339(record.LastKeepAliveAt)) {
+		// After a lost ACK or a restart, a timestamp alone cannot distinguish
+		// our probe from the user's next request.
+		turns, err := s.nativeTurns(ctx, record.SessionID, 20)
+		if err != nil || step.TurnID == "" {
+			return
+		}
+		matched := false
+		for _, turn := range turns {
+			if turn.TurnID == step.TurnID {
+				for _, item := range turn.Items {
+					matched = matched || (item.Type == "user_message" && !isKeepAlivePrompt(item.Text))
+				}
+				break
+			}
+		}
+		if !matched {
+			return
+		}
+	}
+	legacyStop := record.StoppedReason == "legacy_until_removed"
+	if legacyStop {
+		return
+	}
+	record.resetCycle(step.At)
+	record.LastPrompt = ""
+	record.LastRequestAt = storage.SortableTime(step.At)
+}
+
+func (s *NativeService) publishSessionKeepAliveUpdate(ctx context.Context, id string, now time.Time) {
+	if view, err := s.sessionKeepAliveView(ctx, id, now); err == nil {
+		s.bus.Publish("keepalive", map[string]any{"type": "keepalive.session", "sessionId": id, "view": view})
+	}
+}
+
+func (s *NativeService) publishKeepAliveAlert(id, reason, detail string) {
+	message := detail
+	if name := s.cachedTitle(id); name != "" {
+		message = fmt.Sprintf("会话「%s」：%s", name, detail)
+	}
+	s.bus.Publish("keepalive", map[string]any{
+		"type": "keepalive.alert", "sessionId": id, "reason": reason,
+		"title": "缓存保活已停止", "severity": "warning", "message": message,
+	})
+}
+
+func (s *NativeService) isIdleKeepAliveProtecting(ctx context.Context, settings AutomationSettings, id string, now time.Time) bool {
+	if s.isIdleKeepAliveInFlight(id) {
+		return true
+	}
+	if !settings.IdleKeepAlive.Enabled {
+		return false
+	}
+	snapshot, ok := s.automationSnapshot(id)
+	if !ok || sessionIsArchivedOrDone(snapshot.session) || idleKeepAliveBlocked(snapshot, s.automationLive(ctx, snapshot)) {
+		return false
+	}
+	record, err := s.loadSessionKeepAlive(ctx, id)
+	enabled, limit := effectiveIdleConfig(settings, record)
+	if err != nil || !enabled {
+		return false
+	}
+	store := s.initializedCacheStore()
+	if store == nil {
+		return false
+	}
+	step, _, err := store.LastMainStep(ctx, id)
+	if err != nil {
+		return false
+	}
+	s.observeRealStep(ctx, &record, step)
+	policy := s.resolveSessionPolicy(ctx, snapshot, step, store, now)
+	decision := decideIdleKeepAlive(record, policy, now, limit, keepAliveTokenEstimate(snapshot.session, step))
+	return record.StoppedReason != "quota_low" && decision.warm
+}
+
+const idleKeepAliveRetryDelay = 30 * time.Second
+
+type idleKeepAliveJob struct {
+	intentID      string
+	sessionID     string
+	preLastTurnID string
+	message       string
+	userMessageID string
+	cwd           string
+	preGit        string
+	priorStep     cache.Step
+	before        sessionKeepAliveRecord
+	estimate      int64
+	actualTokens  int64
+	sentAt        time.Time
+	sendNote      string
+}
+
+func (s *NativeService) runIdleKeepAliveOnce(ctx context.Context, settings AutomationSettings, id string, now time.Time) {
+	if !settings.IdleKeepAlive.Enabled || s.isAutomationPausedForSwitch() || s.isIdleKeepAliveInFlight(id) {
+		return
+	}
+	snapshot, ok := s.automationSnapshot(id)
+	if !ok || sessionIsArchivedOrDone(snapshot.session) || idleKeepAliveBlocked(snapshot, s.automationLive(ctx, snapshot)) {
+		return
+	}
+	store, err := s.cacheStore()
+	if err != nil {
+		return
+	}
+	if _, err = store.Scan(ctx, now, false); err != nil {
+		return
+	}
+	step, _, err := store.LastMainStep(ctx, id)
+	if err != nil {
+		return
+	}
+	s.idleStateMu.Lock()
+	record, err := s.loadSessionKeepAlive(ctx, id)
+	enabled, limit := effectiveIdleConfig(settings, record)
+	s.idleStateMu.Unlock()
+	if err != nil || !enabled {
+		return
+	}
+	original := record
+	s.observeRealStep(ctx, &record, step)
+	policy := s.resolveSessionPolicy(ctx, snapshot, step, store, now)
+	decision := decideIdleKeepAlive(record, policy, now, limit, keepAliveTokenEstimate(snapshot.session, step))
+	if record.StoppedReason == "quota_low" {
+		return
+	}
+	record.StoppedReason, record.StoppedDetail = decision.reason, decision.detail
+	if record != original && !s.saveKeepAliveChange(ctx, original, record, now) {
+		return
+	}
+	if !decision.due {
+		return
+	}
+
+	loaded, err := s.readSession(ctx, id)
+	if err != nil {
+		s.deferIdleKeepAlive(ctx, record, "暂时无法读取会话，稍后重试", now)
+		return
+	}
+	fresh := snapshotFromCache(loaded)
+	if sessionIsArchivedOrDone(fresh.session) || idleKeepAliveBlocked(fresh, s.automationLive(ctx, fresh)) || len(loaded.turns) == 0 || s.isAutomationPausedForSwitch() {
+		return
+	}
+	if !fresh.goalKnown {
+		s.deferIdleKeepAlive(ctx, record, "暂时无法确认目标状态，稍后重试", now)
+		return
+	}
+	if snapshot.session.UpdatedAt != fresh.session.UpdatedAt || snapshot.session.Model != fresh.session.Model {
+		return
+	}
+	estimate := keepAliveTokenEstimate(fresh.session, step)
+	if estimate <= 0 || estimate > idleKeepAliveTokenBudget-record.SpentTokens {
+		s.stopKeepAlive(ctx, record, "token_budget", "本次 Token 估算不可用或超出本轮剩余预算", now)
+		return
+	}
+	if low, _, detail := s.checkIdleQuotaGuard(ctx, settings, policy, now); low {
+		s.stopKeepAlive(ctx, record, "quota_low", detail, now)
+		return
+	}
+	preGit, err := gitStatusFingerprint(ctx, fresh.session.CWD)
+	if err != nil {
+		s.deferIdleKeepAlive(ctx, record, "暂时无法确认工作区状态，稍后重试", now)
+		return
+	}
+	latest, ok := s.automationSnapshot(id)
+	if !ok || latest.revision != snapshot.revision || idleKeepAliveBlocked(latest, s.automationLive(ctx, latest)) {
+		return
+	}
+	intent, _, err := s.beginAutomation(ctx, "idle_keepalive", id, contextRevision(fresh), now)
+	if err != nil {
+		return
+	}
+	message := idleKeepAlivePrompt + " #" + intent.ID
+	before := record
+	record.LastPrompt, record.LastResult, record.LastNote = message, keepAliveSent, "请求已提交，正在核对缓存结果"
+	record.LastKeepAliveAt, record.RetryAt = storage.SortableTime(now), ""
+	record.UsedCount++
+	record.SpentTokens += estimate
+	if !s.saveKeepAliveChange(ctx, before, record, now) {
+		_ = s.updateAutomation(ctx, intent.ID, "cancelled", "候选已发生变化", now)
+		return
+	}
+	s.setIdleInFlight(id, idleInFlightState{})
+	job := idleKeepAliveJob{intentID: intent.ID, sessionID: id, preLastTurnID: loaded.turns[len(loaded.turns)-1].TurnID,
+		message: message, cwd: fresh.session.CWD, preGit: preGit, priorStep: step, before: before, estimate: estimate, sentAt: now}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.sendIdleKeepAlive(job)
+	}()
+}
+
+func (s *NativeService) saveKeepAliveChange(ctx context.Context, before, after sessionKeepAliveRecord, now time.Time) bool {
+	s.idleStateMu.Lock()
+	current, err := s.loadSessionKeepAlive(ctx, before.SessionID)
+	if err == nil && current == before {
+		err = s.saveSessionKeepAlive(ctx, after, now)
+	} else {
+		s.idleStateMu.Unlock()
+		return false
+	}
+	s.idleStateMu.Unlock()
+	if err != nil {
+		return false
+	}
+	if after.StoppedReason != before.StoppedReason && after.StoppedReason != "" {
+		s.publishKeepAliveAlert(after.SessionID, after.StoppedReason, after.StoppedDetail)
+	}
+	if after.StoppedReason != before.StoppedReason || after.AnchorAt != before.AnchorAt {
+		s.publishSessionKeepAliveUpdate(ctx, after.SessionID, now)
+	}
+	return true
+}
+
+func (s *NativeService) deferIdleKeepAlive(ctx context.Context, record sessionKeepAliveRecord, note string, now time.Time) {
+	after := record
+	after.RetryAt, after.LastNote = storage.SortableTime(now.Add(idleKeepAliveRetryDelay)), note
+	s.saveKeepAliveChange(ctx, record, after, now)
+}
+
+func (s *NativeService) stopKeepAlive(ctx context.Context, record sessionKeepAliveRecord, reason, detail string, now time.Time) {
+	after := record
+	after.StoppedReason, after.StoppedDetail = reason, detail
+	s.saveKeepAliveChange(ctx, record, after, now)
+}
+
+func (s *NativeService) sendIdleKeepAlive(job idleKeepAliveJob) {
+	defer func() {
+		s.clearIdleInFlight(job.sessionID)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		s.publishSessionKeepAliveUpdate(ctx, job.sessionID, time.Now().UTC())
+	}()
+	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+	settings, err := s.automationSettings(ctx)
+	record, recordErr := s.loadSessionKeepAlive(ctx, job.sessionID)
+	snapshot, found := s.automationSnapshot(job.sessionID)
+	enabled, limit := effectiveIdleConfig(settings, record)
+	if err != nil || recordErr != nil || !enabled || record.UsedCount > limit || record.AnchorAt != job.before.AnchorAt || !found || idleKeepAliveBlocked(snapshot, s.automationLive(ctx, snapshot)) || s.isSafe() || s.isAutomationPausedForSwitch() {
+		cancel()
+		s.finishIdleKeepAlive(job, "", "cancelled", "发送前会话或设置发生变化", "", false, true)
+		return
+	}
+	loaded, err := s.readSession(ctx, job.sessionID)
+	latest := snapshotFromCache(loaded)
+	if err != nil || !latest.goalKnown || sessionIsArchivedOrDone(latest.session) || idleKeepAliveBlocked(latest, s.automationLive(ctx, latest)) ||
+		latest.session.CWD != job.cwd || latest.session.Model != snapshot.session.Model || latest.session.UpdatedAt != snapshot.session.UpdatedAt ||
+		len(loaded.turns) == 0 || loaded.turns[len(loaded.turns)-1].TurnID != job.preLastTurnID || s.isAutomationPausedForSwitch() {
+		cancel()
+		s.finishIdleKeepAlive(job, "", "cancelled", "发送前无法确认会话仍处于原空闲回合，稍后重试", "", false, true)
+		return
+	}
+	body := map[string]any{"content": []any{map[string]string{"type": "text", "text": job.message}}}
+	raw, err := s.kap.Request(ctx, http.MethodPost, "/sessions/"+url.PathEscape(job.sessionID)+"/prompts", body)
+	cancel()
+	if err != nil {
+		var transport *kapTransportError
+		var native *NativeError
+		switch {
+		case errors.As(err, &native) && native.Status >= 400 && native.Status < 500:
+			s.finishIdleKeepAlive(job, "", keepAliveUnknown, "官方暂未接受请求，稍后重试", "", false, true)
+			return
+		case errors.As(err, &transport) && !transport.sent:
+			s.finishIdleKeepAlive(job, "", keepAliveUnknown, "网络连接暂时不可用，稍后重试", "", false, true)
+			return
+		default:
+			job.sendNote = "发送结果暂不可确认"
+		}
+	} else {
+		var response struct {
+			UserMessageID string `json:"user_message_id"`
+		}
+		_ = json.Unmarshal(raw, &response)
+		job.userMessageID = response.UserMessageID
+	}
+	s.setIdleInFlight(job.sessionID, idleInFlightState{UserMessageID: job.userMessageID})
+	ackCtx, ackCancel := context.WithTimeout(s.ctx, 3*time.Second)
+	ackNote := "保活请求已发送，等待核对缓存用量"
+	if job.sendNote != "" {
+		ackNote = job.sendNote + "，正在查找对应回合"
+	}
+	_ = s.updateAutomation(ackCtx, job.intentID, keepAliveSent, ackNote, time.Now().UTC())
+	s.publishAutomationReceipt("idle_keepalive", job.sessionID, keepAliveSent, ackNote)
+	s.publishSessionKeepAliveUpdate(ackCtx, job.sessionID, job.sentAt)
+	ackCancel()
+	s.completeIdleKeepAlive(job)
+}
+
+func isIdleKeepAliveTurn(turn NativeTurn, job idleKeepAliveJob) bool {
+	if turn.TurnID == "" || turn.TurnID == job.preLastTurnID {
+		return false
+	}
+	count := 0
+	for _, item := range turn.Items {
+		if item.Type != "user_message" {
+			continue
+		}
+		if strings.TrimSpace(item.Text) != job.message || (job.userMessageID != "" && item.ItemID != job.userMessageID) {
+			return false
+		}
+		count++
+	}
+	return count == 1
+}
+
+func findIdleKeepAliveTurn(turns []NativeTurn, job idleKeepAliveJob) (NativeTurn, bool) {
+	for i := len(turns) - 1; i >= 0; i-- {
+		if turns[i].TurnID == job.preLastTurnID {
+			break
+		}
+		if isIdleKeepAliveTurn(turns[i], job) {
+			return turns[i], i == len(turns)-1 && i > 0 && turns[i-1].TurnID == job.preLastTurnID
+		}
+	}
+	return NativeTurn{}, false
+}
+
+func turnHasToolCall(turn NativeTurn) bool {
+	for _, item := range turn.Items {
+		if item.Type == "tool_call" {
+			return true
+		}
+	}
+	return false
+}
+
+func turnHasSettledOutput(turn NativeTurn) bool {
+	if turn.Error != nil {
+		return true
+	}
+	for _, item := range turn.Items {
+		if item.Type == "assistant_message" {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *NativeService) completeIdleKeepAlive(job idleKeepAliveJob) {
-	defer s.clearIdleInFlight(job.sessionID)
-
-	deadline := time.Now().Add(s.keepAliveWindow())
-	poll := s.idleKeepAlivePoll()
-	ctx := s.ctx
-	var keepAliveTurn NativeTurn
-	var keepAliveFound bool
-
+	ctx, cancel := context.WithTimeout(s.ctx, s.keepAliveWindow())
+	defer cancel()
+	poll := time.NewTicker(s.idleKeepAlivePoll())
+	defer poll.Stop()
+	var turn NativeTurn
 	for {
 		select {
 		case <-ctx.Done():
+			s.finishIdleKeepAlive(job, turn.TurnID, keepAliveUnknown, "保活回合未在核对窗口内完成，等待下一次真实请求", "unconfirmed", false, false)
 			return
-		case <-time.After(poll):
+		case <-poll.C:
 		}
-
-		tickCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		rawSession, sessionErr := s.kap.Request(tickCtx, http.MethodGet, "/sessions/"+url.PathEscape(job.sessionID), nil)
-		turns, turnsErr := s.nativeTurns(tickCtx, job.sessionID, 20)
-		cancel()
-
-		if sessionErr == nil && turnsErr == nil {
-			session, mapErr := mapNativeSession(rawSession)
-			if mapErr == nil {
-				turn, idx, found := findIdleKeepAliveTurn(turns, job.preLastTurnID, job.userMessageID)
-				if found {
-					keepAliveTurn = turn
-					keepAliveFound = true
-					if info, ok := s.idleInFlightInfo(job.sessionID); ok && info.TurnID != turn.TurnID {
-						info.TurnID = turn.TurnID
-						s.setIdleInFlight(job.sessionID, info)
-					}
-					// If another turn has already started after our keepalive turn, never undo.
-					if idx < len(turns)-1 {
-						s.finishIdleKeepAliveWithoutUndo(job, "completed", "保活期间出现新回合，已跳过撤回，保留当前对话", false, "")
-						return
-					}
-					if !session.Busy && !session.MainTurnActive && (turnHasSettledOutput(turn) || time.Now().After(deadline)) {
-						break
-					}
-				}
-			}
+		loaded, err := s.readSession(ctx, job.sessionID)
+		if err != nil {
+			continue
 		}
-
-		if time.Now().After(deadline) {
-			if !keepAliveFound {
-				s.finishIdleKeepAliveWithoutUndo(job, keepAliveInvalid, "保活后在超时窗口内未观测到对应回合，保活无效", false, "")
-				return
-			}
+		candidate, isLast := findIdleKeepAliveTurn(loaded.turns, job)
+		if candidate.TurnID == "" {
+			continue
+		}
+		turn = candidate
+		s.setIdleInFlight(job.sessionID, idleInFlightState{UserMessageID: job.userMessageID, TurnID: turn.TurnID})
+		if !isLast {
+			s.finishIdleKeepAlive(job, turn.TurnID, keepAliveUnknown, "保活后已有新回合，保留当前对话", "", false, false)
+			return
+		}
+		snapshot := snapshotFromCache(loaded)
+		if !idleKeepAliveBlocked(snapshot, s.automationLive(ctx, snapshot)) && turnHasSettledOutput(turn) {
 			break
 		}
 	}
-
-	// Read usage step from local session records (closed-loop verdict, no extra model request).
-	verdict := keepAliveVerdict{
-		State: keepAliveUnknown,
-		Note:  "空闲保活回合已完成，暂未读取到缓存字段",
+	if turnHasToolCall(turn) {
+		s.finishIdleKeepAlive(job, turn.TurnID, keepAliveUnknown, "保活回合触发工具，已保留回合供检查", "undo_failed", false, false)
+		return
 	}
-	if store, err := s.cacheStore(); err == nil {
-		for attempt := 0; attempt < 3; attempt++ {
-			scanCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			_, _ = store.Scan(scanCtx, time.Now().UTC(), true)
-			step, found, stepErr := store.StepAfter(scanCtx, job.sessionID, job.sentAt.Add(-time.Second))
-			cancel()
-			if stepErr == nil && found && step.StepUUID != job.anchorStepUUID {
-				verdict = judgeKeepAlive(step, job.model)
+
+	state, note := keepAliveUnknown, "保活回合尚无可核实的缓存用量"
+	if store := s.initializedCacheStore(); store != nil {
+		for attempt := 0; attempt < 3 && ctx.Err() == nil; attempt++ {
+			_, _ = store.Scan(ctx, time.Now().UTC(), true)
+			step, found, err := store.FirstMainStepForTurn(ctx, job.sessionID, turn.TurnID)
+			if err == nil && found && step.StepUUID != job.priorStep.StepUUID {
+				reportsCache := job.priorStep.Model == step.Model && (job.priorStep.InputCacheRead > 0 || job.priorStep.InputCacheCreation > 0)
+				state, note = judgeKeepAlive(step, reportsCache)
+				job.actualTokens = step.InputOther + step.InputCacheRead + step.InputCacheCreation + step.Output
 				break
 			}
 			if attempt < 2 {
 				select {
 				case <-ctx.Done():
-					return
-				case <-time.After(minDuration(poll, 300*time.Millisecond)):
+				case <-poll.C:
 				}
 			}
 		}
 	}
-
-	// Final safety check immediately before :undo.
-	checkCtx, checkCancel := context.WithTimeout(ctx, 15*time.Second)
-	defer checkCancel()
-	latestTurns, err := s.nativeTurns(checkCtx, job.sessionID, 20)
+	postGit, err := gitStatusFingerprint(ctx, job.cwd)
+	if err != nil || postGit != job.preGit {
+		s.finishIdleKeepAlive(job, turn.TurnID, state, note+"。工作区状态无法确认或已变化，本次未撤回", "", true, false)
+		return
+	}
+	// Recheck the whole latest turn after hashing Git. The official undo endpoint
+	// targets a turn ID, and the verified tail must still contain only our prompt.
+	latest, err := s.readSession(ctx, job.sessionID)
 	if err != nil {
-		s.failIdleKeepAliveUndo(job, "撤回前无法确认最新回合："+err.Error())
+		s.finishIdleKeepAlive(job, turn.TurnID, state, note+"。暂时无法复核会话，本次未撤回", "", true, false)
 		return
 	}
-	if len(latestTurns) == 0 || latestTurns[len(latestTurns)-1].TurnID != keepAliveTurn.TurnID {
-		s.finishIdleKeepAliveWithoutUndo(job, verdict.State, verdict.Note+"；保活期间出现新回合，已跳过撤回", false, "")
+	tail, isLast := findIdleKeepAliveTurn(latest.turns, job)
+	latestSnapshot := snapshotFromCache(latest)
+	if !isLast || tail.TurnID != turn.TurnID || !latest.goalKnown || latest.session.CWD != job.cwd || sessionIsArchivedOrDone(latest.session) || idleKeepAliveBlocked(latestSnapshot, s.automationLive(ctx, latestSnapshot)) {
+		s.finishIdleKeepAlive(job, turn.TurnID, state, note+"。会话已变化，本次未撤回", "", true, false)
 		return
 	}
-	finalTurn := latestTurns[len(latestTurns)-1]
-	if turnHasToolCall(finalTurn) {
-		s.finishIdleKeepAliveWithoutUndo(job, "failed", "保活回合意外触发工具调用，未自动撤回", true, "undo_skipped")
+	if turnHasToolCall(tail) || !turnHasSettledOutput(tail) {
+		s.finishIdleKeepAlive(job, turn.TurnID, state, note+"。回合状态已变化，本次未撤回", "undo_failed", false, false)
 		return
 	}
-	if job.preGitErr != nil {
-		s.finishIdleKeepAliveWithoutUndo(job, "failed", "无法确认保活前的工作区状态，未自动撤回："+job.preGitErr.Error(), true, "undo_skipped")
+	rawSession, readErr := s.kap.Request(ctx, http.MethodGet, "/sessions/"+url.PathEscape(job.sessionID), nil)
+	current, mapErr := mapNativeSession(rawSession)
+	latestSnapshot.session = current
+	if readErr != nil || mapErr != nil || current.CWD != job.cwd || current.UpdatedAt != latest.session.UpdatedAt || sessionIsArchivedOrDone(current) || idleKeepAliveBlocked(latestSnapshot, s.automationLive(ctx, latestSnapshot)) {
+		s.finishIdleKeepAlive(job, turn.TurnID, state, note+"。会话已恢复活动，本次未撤回", "", true, false)
 		return
 	}
-	if job.preGit != "" {
-		postGit, err := gitStatusFingerprint(checkCtx, job.cwd)
-		if err == nil && postGit == "" {
-			err = errors.New("工作目录已不是 Git 仓库")
-		}
-		if err != nil {
-			s.finishIdleKeepAliveWithoutUndo(job, "failed", "无法确认撤回前的工作区状态，未自动撤回："+err.Error(), true, "undo_skipped")
-			return
-		}
-		if postGit != job.preGit {
-			s.finishIdleKeepAliveWithoutUndo(job, "failed", "保活期间工作区文件发生变化，未自动撤回", true, "undo_skipped")
-			return
-		}
-	}
-
-	// The Git scan can take seconds. Re-read the turn list and the session after
-	// it so a prompt the user sent in that window is never undone.
-	latestTurns, err = s.nativeTurns(checkCtx, job.sessionID, 20)
-	if err != nil {
-		s.failIdleKeepAliveUndo(job, "撤回前无法确认最新回合："+err.Error())
-		return
-	}
-	if len(latestTurns) == 0 || latestTurns[len(latestTurns)-1].TurnID != keepAliveTurn.TurnID {
-		s.finishIdleKeepAliveWithoutUndo(job, verdict.State, verdict.Note+"；保活期间出现新回合，已跳过撤回", false, "")
-		return
-	}
-	finalTurn = latestTurns[len(latestTurns)-1]
-	if turnHasToolCall(finalTurn) {
-		s.finishIdleKeepAliveWithoutUndo(job, "failed", "保活回合意外触发工具调用，未自动撤回", true, "undo_skipped")
-		return
-	}
-	rawSession, err := s.kap.Request(checkCtx, http.MethodGet, "/sessions/"+url.PathEscape(job.sessionID), nil)
-	if err != nil {
-		s.failIdleKeepAliveUndo(job, "撤回前无法确认会话状态："+err.Error())
-		return
-	}
-	session, mapErr := mapNativeSession(rawSession)
-	if mapErr != nil {
-		s.failIdleKeepAliveUndo(job, "撤回前无法确认会话状态："+mapErr.Error())
-		return
-	}
-	if session.Busy || session.MainTurnActive || (session.PendingInteraction != "" && session.PendingInteraction != "none") {
-		s.finishIdleKeepAliveWithoutUndo(job, verdict.State, verdict.Note+"；会话已恢复活动，已跳过撤回", false, "")
+	removed, err := s.kap.UndoSession(ctx, job.sessionID, turn.TurnID, "")
+	if err != nil || len(removed) != 1 || removed[0] != turn.TurnID {
+		s.finishIdleKeepAlive(job, turn.TurnID, state, note+"。未能确认官方仅撤回了保活回合", "undo_failed", false, false)
 		return
 	}
 
-	if _, err := s.kap.UndoSession(checkCtx, job.sessionID, keepAliveTurn.TurnID, ""); err != nil {
-		s.failIdleKeepAliveUndo(job, "保活回合撤回失败："+err.Error())
-		return
-	}
-
-	// Prune the undone turn from local cache as well so listeners see the clean history promptly.
 	s.mu.Lock()
 	if cached, ok := s.cache[job.sessionID]; ok {
-		kept := cached.turns[:0]
-		for _, turn := range cached.turns {
-			if turn.TurnID != keepAliveTurn.TurnID {
-				kept = append(kept, turn)
-			}
-		}
-		cached.turns = kept
+		cached.turns = slices.DeleteFunc(cached.turns, func(item NativeTurn) bool { return item.TurnID == turn.TurnID })
 		s.cache[job.sessionID] = cached
 	}
 	s.mu.Unlock()
-
-	now := time.Now().UTC()
-	note := verdict.Note + "；已自动撤回保活回合"
-	finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer finishCancel()
-	if record, loadErr := s.loadSessionKeepAlive(finishCtx, job.sessionID); loadErr == nil {
-		record.LastKeepAliveTurnID = keepAliveTurn.TurnID
-		record.LastResult = verdict.State
-		record.LastNote = note
-		_ = s.saveSessionKeepAlive(finishCtx, record, now)
-	}
-	_ = s.updateAutomation(finishCtx, job.intentID, verdict.State, note, now)
-	s.publishAutomationReceipt("idle_keepalive", job.sessionID, verdict.State, note)
-	s.publishSessionKeepAliveUpdate(finishCtx, job.sessionID, now)
+	s.finishIdleKeepAlive(job, turn.TurnID, state, note+"。已撤回保活回合", "", false, false)
 }
 
-func (s *NativeService) finishIdleKeepAliveWithoutUndo(job idleKeepAliveJob, state, note string, stop bool, stopReason string) {
+func (s *NativeService) finishIdleKeepAlive(job idleKeepAliveJob, turnID, state, note, stopReason string, retry, release bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	now := time.Now().UTC()
-	finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer finishCancel()
-	if record, err := s.loadSessionKeepAlive(finishCtx, job.sessionID); err == nil {
-		record.LastResult = state
-		record.LastNote = note
-		if stop {
-			s.stopIdleKeepAlive(finishCtx, &record, stopReason, note, true, now)
-		} else {
-			_ = s.saveSessionKeepAlive(finishCtx, record, now)
+	var alert string
+	s.idleStateMu.Lock()
+	record, err := s.loadSessionKeepAlive(ctx, job.sessionID)
+	if err == nil && record.LastPrompt == job.message {
+		if turnID != "" {
+			record.LastKeepAliveTurnID = turnID
 		}
+		if record.AnchorAt == job.before.AnchorAt {
+			record.LastResult, record.LastNote = state, note
+			switch state {
+			case keepAliveHit:
+				record.Misses = 0
+				record.LastRequestAt = storage.SortableTime(job.sentAt)
+			case keepAliveMiss:
+				record.Misses++
+				record.LastRequestAt = storage.SortableTime(job.sentAt)
+				if record.Misses >= 2 && stopReason == "" {
+					stopReason = "consecutive_misses"
+					note += "。连续两次保活未命中缓存，等待下一次真实请求"
+					record.LastNote = note
+				}
+			}
+			if release {
+				record.UsedCount = job.before.UsedCount
+				record.SpentTokens = job.before.SpentTokens
+				record.LastPrompt, record.LastKeepAliveAt = job.before.LastPrompt, job.before.LastKeepAliveAt
+			} else {
+				record.SpentTokens = job.before.SpentTokens + max(job.estimate, job.actualTokens)
+			}
+			if retry || release || state == keepAliveUnknown {
+				record.RetryAt = storage.SortableTime(maxTime(now, job.sentAt).Add(idleKeepAliveRetryDelay))
+			}
+			if stopReason != "" && record.StoppedReason != stopReason {
+				record.StoppedReason, record.StoppedDetail = stopReason, note
+				alert = stopReason
+			}
+		}
+		err = s.saveSessionKeepAlive(ctx, record, now)
 	}
-	_ = s.updateAutomation(finishCtx, job.intentID, state, note, now)
+	s.idleStateMu.Unlock()
+	if err == nil && alert != "" {
+		s.publishKeepAliveAlert(job.sessionID, alert, note)
+	}
+	_ = s.updateAutomation(ctx, job.intentID, state, note, now)
 	s.publishAutomationReceipt("idle_keepalive", job.sessionID, state, note)
-	s.publishSessionKeepAliveUpdate(finishCtx, job.sessionID, now)
 }
 
-func (s *NativeService) failIdleKeepAliveUndo(job idleKeepAliveJob, detail string) {
-	now := time.Now().UTC()
-	finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer finishCancel()
-	if record, err := s.loadSessionKeepAlive(finishCtx, job.sessionID); err == nil {
-		s.stopIdleKeepAlive(finishCtx, &record, "undo_failed", detail, true, now)
-	}
-	_ = s.updateAutomation(finishCtx, job.intentID, "failed", detail, now)
-	s.publishAutomationReceipt("idle_keepalive", job.sessionID, "failed", detail)
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
 		return a
 	}
 	return b
 }
 
 func (s *NativeService) sessionKeepAliveView(ctx context.Context, sessionID string, now time.Time) (SessionKeepAliveView, error) {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
+	id := strings.TrimSpace(sessionID)
+	if id == "" {
 		return SessionKeepAliveView{}, errors.New("缺少会话 ID")
 	}
 	settings, err := s.automationSettings(ctx)
 	if err != nil {
-		settings = defaultAutomationSettings()
-	}
-	record, err := s.loadSessionKeepAlive(ctx, sessionID)
-	if err != nil {
 		return SessionKeepAliveView{}, err
 	}
-	snapshot, ok := s.automationSnapshot(sessionID)
-	if !ok {
-		if loaded, readErr := s.readSession(ctx, sessionID); readErr == nil {
-			snapshot = snapshotFromCache(loaded)
-			ok = true
-		}
-	}
-	var live cache.LiveSignals
-	var lastStep cache.Step
-	var lastStepSeen bool
-	if store, storeErr := s.cacheStore(); storeErr == nil {
-		_, _ = store.Scan(ctx, now, false)
-		live, _ = store.Live(ctx, sessionID)
-		lastStep, lastStepSeen, _ = store.LastMainStep(ctx, sessionID)
-	}
-	s.syncUserActivityReset(ctx, &record, live, lastStep, lastStepSeen, now)
-	policy := s.resolveSessionPolicy(ctx, sessionID, snapshot, lastStep, lastStepSeen, settings, now)
-
-	enabled, limit, until, exhausted, _ := effectiveIdleConfig(settings, record, now)
-	inFlight := s.isIdleKeepAliveInFlight(sessionID)
-
-	state := KeepAliveStateStopped
-	switch {
-	case live.OpenBackground > 0:
-		state = KeepAliveStateWaitingSubagent
-	case ok && (snapshot.session.Busy || snapshot.session.MainTurnActive):
-		state = KeepAliveStateActive
-	case enabled && !exhausted && policy.IntervalMinutes > 0 && record.StoppedReason == "" && !(ok && sessionIsArchivedOrDone(snapshot.session)):
-		state = KeepAliveStateIdleKeepAlive
-	case settings.Compaction.Enabled && !(ok && sessionIsArchivedOrDone(snapshot.session)):
-		state = KeepAliveStateIdleCompaction
-	default:
-		state = KeepAliveStateStopped
-	}
-
-	var remainingPtr *int
-	if enabled && (record.Mode == IdleModeDefault || record.Mode == IdleModeCount) {
-		rem := limit - record.UsedCount
-		if rem < 0 {
-			rem = 0
-		}
-		remainingPtr = &rem
-	}
-
-	statusLabel, statusTone := formatKeepAliveStatus(record, settings, policy, state, enabled, remainingPtr, until, exhausted, inFlight)
-	estimatedCost := formatKeepAliveEstimatedCost(snapshot, policy)
-
-	return SessionKeepAliveView{
-		SessionID:        sessionID,
-		State:            state,
-		Mode:             record.Mode,
-		TargetCount:      record.TargetCount,
-		UntilAt:          record.UntilAt,
-		EffectiveEnabled: enabled,
-		EffectiveLimit:   limit,
-		UsedCount:        record.UsedCount,
-		RemainingCount:   remainingPtr,
-		StatusLabel:      statusLabel,
-		StatusTone:       statusTone,
-		LastResult:       record.LastResult,
-		LastResultLabel:  formatKeepAliveResultLabel(record.LastResult),
-		LastNote:         record.LastNote,
-		LastKeepAliveAt:  record.LastKeepAliveAt,
-		StoppedReason:    record.StoppedReason,
-		StoppedDetail:    record.StoppedDetail,
-		EstimatedCost:    estimatedCost,
-		Policy:           policy,
-		InFlight:         inFlight,
-		GlobalEnabled:    settings.IdleKeepAlive.Enabled,
-		GlobalCount:      settings.IdleKeepAlive.DefaultCount,
-	}, nil
-}
-
-func formatKeepAliveStatus(
-	record sessionKeepAliveRecord,
-	settings AutomationSettings,
-	policy ResolvedCachePolicy,
-	state string,
-	enabled bool,
-	remaining *int,
-	until time.Time,
-	exhausted bool,
-	inFlight bool,
-) (string, string) {
-	if inFlight {
-		return "保活中…", "active"
-	}
-	if state == KeepAliveStateWaitingSubagent {
-		if settings.KeepAlive.Enabled {
-			return "等待子代理 · 自动保活", "active"
-		}
-		return "等待子代理", "muted"
-	}
-	if record.Mode == IdleModeOff {
-		return "已关闭", "muted"
-	}
-	if !enabled {
-		return "跟随默认 · 已关闭", "muted"
-	}
-	switch record.StoppedReason {
-	case "quota_low":
-		return "已停止：额度不足", "warn"
-	case "undo_failed":
-		return "已停止：撤回失败", "error"
-	case "undo_skipped":
-		return "已停止：未自动撤回", "warn"
-	case "archived":
-		return "已停止：会话已归档", "muted"
-	case "provider_unknown":
-		return "未保活：缓存时长未知", "muted"
-	case "expired":
-		return "已停止：缓存已过期", "muted"
-	case "error":
-		return "已停止：发送失败", "error"
-	}
-	if policy.IntervalMinutes <= 0 {
-		return "未保活：缓存时长未知", "muted"
-	}
-	if exhausted {
-		if record.Mode == IdleModeUntil {
-			return "已结束：已到截止时刻", "muted"
-		}
-		return "已结束：次数已用完", "muted"
-	}
-	if record.Mode == IdleModeUntil && !until.IsZero() {
-		return "保活至 " + until.Local().Format("15:04"), "ok"
-	}
-	rem := 0
-	if remaining != nil {
-		rem = *remaining
-	}
-	if record.Mode == IdleModeCount {
-		return fmt.Sprintf("保活 %d 次 · 还剩 %d 次", record.TargetCount, rem), "ok"
-	}
-	return fmt.Sprintf("跟随默认 · 还剩 %d 次", rem), "ok"
-}
-
-func formatKeepAliveResultLabel(result string) string {
-	switch result {
-	case keepAliveVerified:
-		return "后续请求命中"
-	case keepAliveInvalid:
-		return "保活无效"
-	case keepAliveUnknown:
-		return "结果未知"
-	case "acknowledged":
-		return "等待回合完成"
-	case "completed":
-		return "已完成"
-	case "undo_failed":
-		return "撤回失败"
-	case "failed":
-		return "发送失败"
-	default:
-		return "尚未触发"
-	}
-}
-
-func formatKeepAliveEstimatedCost(snapshot automationSnapshot, policy ResolvedCachePolicy) string {
-	ctxTokens := int64(0)
-	if snapshot.session.Usage != nil && snapshot.session.Usage.ContextTokens > 0 {
-		ctxTokens = snapshot.session.Usage.ContextTokens
-	}
-	if policy.ProviderType == ProviderTypeSubscription {
-		if ctxTokens > 0 {
-			return fmt.Sprintf("每次约 1 次极短对话（按缓存读取计费，当前上下文约 %s tokens）", formatCompactTokens(ctxTokens))
-		}
-		return "每次约 1 次极短对话（按缓存读取计费，输出约 1–3 tokens）"
-	}
-	if policy.ProviderType == ProviderTypeOpenPlatform {
-		if ctxTokens > 0 {
-			return fmt.Sprintf("每次按开放平台缓存命中计费（当前上下文约 %s tokens，输出极少）", formatCompactTokens(ctxTokens))
-		}
-		return "每次按开放平台缓存命中计费（输出约 1–3 tokens）"
-	}
-	return "按所选供应商的缓存读取价格计费（输出约 1–3 tokens）"
-}
-
-func formatCompactTokens(n int64) string {
-	if n >= 1_000_000 {
-		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
-	}
-	if n >= 1_000 {
-		return fmt.Sprintf("%.1fK", float64(n)/1_000)
-	}
-	return fmt.Sprintf("%d", n)
-}
-
-func (s *NativeService) setSessionKeepAlive(ctx context.Context, input map[string]any) (SessionKeepAliveView, error) {
-	id := stringInput(input, "id")
-	if id == "" {
-		return SessionKeepAliveView{}, errors.New("缺少会话 ID")
-	}
-	mode := stringInput(input, "mode")
-	if mode != IdleModeDefault && mode != IdleModeOff && mode != IdleModeCount && mode != IdleModeUntil {
-		return SessionKeepAliveView{}, errors.New("保活模式无效")
-	}
-
-	now := time.Now().UTC()
 	record, err := s.loadSessionKeepAlive(ctx, id)
 	if err != nil {
 		return SessionKeepAliveView{}, err
 	}
-	record.Mode = mode
-	if mode == IdleModeCount {
-		count := intInput(input, "targetCount", record.TargetCount)
-		if count < idleKeepAliveMinCount || count > idleKeepAliveMaxCount {
-			return SessionKeepAliveView{}, errors.New("单会话保活次数须为 1–20 次")
-		}
-		record.TargetCount = count
-		record.UntilAt = ""
-	} else if mode == IdleModeUntil {
-		rawUntil := stringInput(input, "untilAt")
-		parsed := parseSortableOrRFC3339(rawUntil)
-		if parsed.IsZero() {
-			return SessionKeepAliveView{}, errors.New("请提供有效的截止时间")
-		}
-		if !parsed.After(now) {
-			return SessionKeepAliveView{}, errors.New("截止时间必须晚于当前时间")
-		}
-		record.UntilAt = parsed.UTC().Format(time.RFC3339)
-	} else {
-		record.UntilAt = ""
-	}
-	// Changing override explicitly clears prior stop state and starts fresh for the new choice.
-	record.StoppedReason = ""
-	record.StoppedDetail = ""
-	if mode != IdleModeOff {
-		record.UsedCount = 0
-		if record.AnchorAt == "" {
-			record.AnchorAt = storage.SortableTime(now)
+	snapshot, ok := s.automationSnapshot(id)
+	if !ok {
+		if raw, getErr := s.kap.Request(ctx, http.MethodGet, "/sessions/"+url.PathEscape(id), nil); getErr == nil {
+			snapshot.session, _ = mapNativeSession(raw)
 		}
 	}
-	if err := s.saveSessionKeepAlive(ctx, record, now); err != nil {
-		return SessionKeepAliveView{}, err
+	store := s.initializedCacheStore()
+	if store == nil {
+		store = cache.OpenMetrics(s.db)
 	}
-	s.idleMu.Lock()
-	delete(s.idleAlerted, id)
-	s.idleMu.Unlock()
+	var step cache.Step
+	if store != nil {
+		step, _, _ = store.LastMainStep(ctx, id)
+	}
+	enabled, limit := effectiveIdleConfig(settings, record)
+	inFlight := s.isIdleKeepAliveInFlight(id)
+	policy := s.resolveSessionPolicy(ctx, snapshot, step, store, now)
+	estimate := keepAliveTokenEstimate(snapshot.session, step)
+	state, label, tone := KeepAliveStateDisabled, "未启用", "muted"
+	var remaining *int
+	reason, detail := "", ""
+	if enabled {
+		if !inFlight {
+			s.observeRealStep(ctx, &record, step)
+		}
+		count := max(0, limit-record.UsedCount)
+		remaining = &count
+		state, label, tone = KeepAliveStateActive, "保活中", "ok"
+		decision := decideIdleKeepAlive(record, policy, now, limit, estimate)
+		reason, detail = decision.reason, decision.detail
+		if record.StoppedReason == "quota_low" {
+			reason, detail = record.StoppedReason, record.StoppedDetail
+		}
+		if sessionIsArchivedOrDone(snapshot.session) {
+			reason, detail = "archived", "会话已归档或完成"
+		}
+		if inFlight {
+			reason, detail = "", "正在核对本次保活请求"
+		}
+	} else if record.StoppedReason == "legacy_until_removed" {
+		reason, detail = record.StoppedReason, record.StoppedDetail
+	}
+	if reason != "" {
+		state, label, tone = KeepAliveStateStopped, "已停止", "warn"
+	}
+	return SessionKeepAliveView{
+		SessionID: id, State: state, Mode: record.Mode, TargetCount: record.TargetCount,
+		EffectiveEnabled: enabled, EffectiveLimit: limit, UsedCount: record.UsedCount, RemainingCount: remaining,
+		StatusLabel: label, StatusTone: tone, LastResult: record.LastResult, LastResultLabel: formatKeepAliveResultLabel(record.LastResult),
+		LastNote: record.LastNote, LastKeepAliveAt: record.LastKeepAliveAt, StoppedReason: reason, StoppedDetail: detail,
+		EstimatedTokens: estimate, BudgetTokens: idleKeepAliveTokenBudget, SpentTokens: record.SpentTokens, Policy: policy, InFlight: inFlight,
+		GlobalEnabled: settings.IdleKeepAlive.Enabled, GlobalCount: settings.IdleKeepAlive.DefaultCount,
+	}, nil
+}
 
-	view, err := s.sessionKeepAliveView(ctx, id, now)
+func formatKeepAliveResultLabel(state string) string {
+	switch state {
+	case keepAliveSent, "acknowledged":
+		return "已发送"
+	case keepAliveHit, "verified":
+		return "命中"
+	case keepAliveMiss, "invalid":
+		return "未命中"
+	case "":
+		return "尚未发送"
+	default:
+		return "未确认"
+	}
+}
+
+func (s *NativeService) setSessionKeepAlive(ctx context.Context, input map[string]any) (SessionKeepAliveView, error) {
+	id, mode := stringInput(input, "id"), stringInput(input, "mode")
+	if id == "" {
+		return SessionKeepAliveView{}, errors.New("缺少会话 ID")
+	}
+	if mode != IdleModeDefault && mode != IdleModeOff && mode != IdleModeCount {
+		return SessionKeepAliveView{}, errors.New("保活模式无效")
+	}
+	now := time.Now().UTC()
+	s.idleStateMu.Lock()
+	record, err := s.loadSessionKeepAlive(ctx, id)
+	if err == nil {
+		if mode == IdleModeCount {
+			record.TargetCount = intInput(input, "targetCount", record.TargetCount)
+			if record.TargetCount < idleKeepAliveMinCount || record.TargetCount > idleKeepAliveMaxCount {
+				s.idleStateMu.Unlock()
+				return SessionKeepAliveView{}, errors.New("单会话保活次数须为 1–20 次")
+			}
+		}
+		record.Mode = mode
+		if record.StoppedReason == "legacy_until_removed" {
+			record.StoppedReason, record.StoppedDetail = "", ""
+		}
+		err = s.saveSessionKeepAlive(ctx, record, now)
+	}
+	s.idleStateMu.Unlock()
 	if err != nil {
 		return SessionKeepAliveView{}, err
 	}
-	s.bus.Publish("keepalive", map[string]any{
-		"type":      "keepalive.session",
-		"sessionId": id,
-		"view":      view,
-	})
-	return view, nil
+	view, err := s.sessionKeepAliveView(ctx, id, now)
+	if err == nil {
+		s.bus.Publish("keepalive", map[string]any{"type": "keepalive.session", "sessionId": id, "view": view})
+	}
+	return view, err
 }
