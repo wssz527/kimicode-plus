@@ -22,6 +22,10 @@ type NativeItem struct {
 	Attachments   []NativeAttachment `json:"attachments,omitempty"`
 	Type          string             `json:"type"`
 	Text          string             `json:"text"`
+	Reasoning     string             `json:"reasoning,omitempty"`
+	Thinking      string             `json:"thinking,omitempty"`
+	ToolCalls     []NativeToolCall   `json:"tool_calls,omitempty"`
+	Duration      *int64             `json:"duration_ms,omitempty"`
 	Output        any                `json:"output"`
 	Error         any                `json:"error"`
 	Name          string             `json:"name"`
@@ -32,6 +36,35 @@ type NativeItem struct {
 	Input         any                `json:"input"`
 	InputText     string             `json:"input_text"`
 	Display       json.RawMessage    `json:"display"`
+}
+
+func (item NativeItem) reasoningText() string {
+	if (item.Type == "reasoning" || item.Type == "thinking") && item.Text != "" {
+		return item.Text
+	}
+	if item.Reasoning != "" {
+		return item.Reasoning
+	}
+	return item.Thinking
+}
+
+func (item *NativeItem) appendDelta(field, delta string) {
+	switch field {
+	case "text", "thinking", "reasoning":
+		if item.Type == "reasoning" || item.Type == "thinking" {
+			item.Text = item.reasoningText() + delta
+		} else if field == "text" {
+			item.Text += delta
+		} else {
+			item.Reasoning = item.reasoningText() + delta
+		}
+	case "input_text":
+		item.InputText += delta
+	case "output":
+		if output, ok := item.Output.(string); ok || item.Output == nil {
+			item.Output = output + delta
+		}
+	}
 }
 
 type NativeTurn struct {
@@ -57,6 +90,19 @@ type NativeFrame struct {
 	Delta     string          `json:"delta"`
 	TurnIDs   []string        `json:"turn_ids"`
 	Goal      json.RawMessage `json:"goal"`
+	NativeInteraction
+}
+
+type NativeInteraction struct {
+	ID      string `json:"interaction_id"`
+	Kind    string `json:"kind"`
+	Status  string `json:"status"`
+	Request struct {
+		ToolName  string           `json:"tool_name"`
+		Action    string           `json:"action"`
+		Display   json.RawMessage  `json:"tool_input_display"`
+		Questions []NativeQuestion `json:"questions"`
+	} `json:"request"`
 }
 
 func (k *KAPClient) sendFrame(value any) error {

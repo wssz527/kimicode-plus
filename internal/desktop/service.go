@@ -3,15 +3,19 @@ package desktop
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +48,7 @@ type AddonFeatureState struct {
 type cachedSession struct {
 	session      NativeSession
 	turns        []NativeTurn
+	interactions map[string]NativeInteraction
 	goal         json.RawMessage
 	goalKnown    bool
 	revision     uint64
@@ -70,6 +75,8 @@ type NativeService struct {
 	// reference for a subscription the official side has not accepted yet, and
 	// answer "watching" for a stream that never opened.
 	watchOpMu sync.Mutex
+	promptMu  sync.Mutex
+	prompts   map[promptKey]*promptReceipt
 	wg        sync.WaitGroup
 	cache     map[string]cachedSession
 	// watchRefs counts the consumers of each session's official event stream.
@@ -456,8 +463,7 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 	case "session.create":
 		return s.createSession(ctx, input)
 	case "session.send":
-		_, err := s.sendPrompt(ctx, input)
-		return map[string]any{"sessionId": stringInput(input, "id")}, err
+		return s.sendSessionPrompt(ctx, input)
 	case "session.abort":
 		id := stringInput(input, "id")
 		if id == "" {
@@ -715,7 +721,7 @@ func (s *NativeService) sessionHistory(ctx context.Context, input map[string]any
 	for _, turn := range page.Turns {
 		messages = append(messages, turnMessages(turn)...)
 		if turn.Error != nil {
-			messages = append(messages, NativeMessage{ID: turn.TurnID + "-error", Role: "error", Text: turn.Error.Message})
+			messages = append(messages, NativeMessage{ID: turn.TurnID + "-error", TurnID: turn.TurnID, Role: "error", Text: turn.Error.Message})
 		}
 	}
 	var nextBefore *int64
@@ -784,6 +790,7 @@ func (s *NativeService) sessionView(ctx context.Context, id string) (SessionView
 	s.mu.Lock()
 	previous := s.cache[id]
 	loaded.revision = previous.revision + 1
+	loaded.interactions = previous.interactions
 	loaded.lastActivity = time.Now().UTC()
 	s.cache[id] = loaded
 	s.mu.Unlock()
@@ -942,13 +949,20 @@ func (s *NativeService) sessionHeld(id string) bool {
 
 func sessionViewFromCache(cache cachedSession) SessionView {
 	messages := []NativeMessage{}
-	for _, turn := range cache.turns {
-		messages = append(messages, turnMessages(turn)...)
+	for index, turn := range cache.turns {
+		current := turnMessages(turn)
+		if index != len(cache.turns)-1 || !cache.session.MainTurnActive && !cache.session.Busy {
+			for i := range current {
+				current[i].Streaming = false
+			}
+		}
+		messages = append(messages, current...)
 		if turn.Error != nil {
-			messages = append(messages, NativeMessage{ID: turn.TurnID + "-error", Role: "error", Text: turn.Error.Message})
+			messages = append(messages, NativeMessage{ID: turn.TurnID + "-error", TurnID: turn.TurnID, Role: "error", Text: turn.Error.Message})
 		}
 	}
-	return SessionView{Session: cache.session, Messages: messages, Approvals: turnApprovals(cache.turns), Goal: cache.goal}
+	approvals := turnApprovalsWithInteractions(cache.turns, cache.interactions)
+	return SessionView{Session: cache.session, Messages: messages, Approvals: approvals, Goal: cache.goal}
 }
 
 func boundedText(value any, limit int) string {
@@ -962,6 +976,9 @@ func boundedText(value any, limit int) string {
 		text = string(data)
 	}
 	if len(text) > limit {
+		for limit > 0 && !utf8.RuneStart(text[limit]) {
+			limit--
+		}
 		return text[:limit] + "\n…（内容已截断）"
 	}
 	return text
@@ -974,30 +991,81 @@ func turnMessages(turn NativeTurn) []NativeMessage {
 		if id == "" {
 			id = fmt.Sprintf("%s-item-%d", turn.TurnID, index)
 		}
+		message := NativeMessage{ID: id, TurnID: turn.TurnID, At: item.CreatedAt}
+		reasoning := item.reasoningText()
 		switch item.Type {
 		case "user_message", "assistant_message":
-			role := "user"
+			message.Role = "user"
 			if item.Type == "assistant_message" {
-				role = "assistant"
+				message.Role = "assistant"
 			}
-			messages = append(messages, NativeMessage{ID: id, Role: role, Text: boundedText(item.Text, 20000), At: item.CreatedAt, Attachments: item.Attachments})
+			message.Text = boundedText(item.Text, 20000)
+			message.Attachments = item.Attachments
+			message.ToolCalls = item.ToolCalls
+		case "reasoning", "thinking":
+			message.Role = "assistant"
 		case "tool_call":
-			text := boundedText(item.Output, 20000)
+			message.Role, message.Tool = "tool", item.Name
+			message.Text = boundedText(item.Output, 20000)
 			if item.Error != nil {
-				text = "错误：" + boundedText(item.Error, 4000)
+				message.Text = "错误：" + boundedText(item.Error, 4000)
 			}
-			if text == "" {
-				text = "（" + item.Stage + "）"
+			if message.Text == "" {
+				message.Text = "（" + item.Stage + "）"
 			}
-			messages = append(messages, NativeMessage{ID: id, Role: "tool", Text: text, Tool: item.Name})
+			message.ToolCalls = []NativeToolCall{toolCallFromItem(id, item)}
 		case "notification":
-			messages = append(messages, NativeMessage{ID: id, Role: "system", Text: boundedText(item.Text, 4000)})
+			message.Role, message.Text = "system", boundedText(item.Text, 4000)
+		default:
+			continue
 		}
+		message.Reasoning = boundedText(reasoning, 20000)
+		message.Streaming = reasoning != "" && item.Status != "ended"
+		messages = append(messages, message)
 	}
 	return messages
 }
 
+func toolCallFromItem(id string, item NativeItem) NativeToolCall {
+	status := item.Status
+	switch {
+	case item.Stage == "awaiting_approval" && item.Status != "ended":
+		status = "waiting"
+	case item.Outcome != "":
+		status = item.Outcome
+	case item.Error != nil:
+		status = "failed"
+	case item.Status == "ended":
+		status = "completed"
+	case status == "":
+		status = "running"
+	}
+	input, output := item.Input, item.Output
+	if input == nil && item.InputText != "" {
+		input = item.InputText
+	}
+	if item.Error != nil {
+		output = item.Error
+	}
+	return NativeToolCall{ID: id, Name: item.Name, Status: status, Input: boundedToolValue(input), Output: boundedToolValue(output), Duration: item.Duration}
+}
+
+func boundedToolValue(value any) any {
+	const limit = 20000
+	if text, ok := value.(string); ok {
+		return boundedText(text, limit)
+	}
+	if data, err := json.Marshal(value); err == nil && len(data) > limit {
+		return boundedText(string(data), limit)
+	}
+	return value
+}
+
 func turnApprovals(turns []NativeTurn) []NativeApproval {
+	return turnApprovalsWithInteractions(turns, nil)
+}
+
+func turnApprovalsWithInteractions(turns []NativeTurn, interactions map[string]NativeInteraction) []NativeApproval {
 	approvals := []NativeApproval{}
 	seen := map[string]bool{}
 	for _, turn := range turns {
@@ -1005,38 +1073,81 @@ func turnApprovals(turns []NativeTurn) []NativeApproval {
 			if item.Type != "tool_call" || item.InteractionID == "" || item.Status == "ended" || seen[item.InteractionID] {
 				continue
 			}
-			var display struct {
-				Kind   string `json:"kind"`
-				Plan   string `json:"plan"`
-				Review struct {
-					State string `json:"state"`
-				} `json:"review"`
-				Options []struct {
-					Label string `json:"label"`
-				} `json:"options"`
-			}
-			_ = json.Unmarshal(item.Display, &display)
-			if item.Stage != "awaiting_approval" && !(display.Kind == "plan_review" && display.Review.State == "pending") {
+			interaction := interactions[item.InteractionID]
+			if interaction.Status == "ended" || interaction.Kind == "question" {
 				continue
 			}
-			seen[item.InteractionID] = true
-			approval := NativeApproval{ID: item.InteractionID, Title: item.Name, Detail: boundedText(item.Input, 4000)}
-			if item.InputText != "" {
+			approval := nativeApproval(item.InteractionID, item.Name, boundedText(item.Input, 4000), item.Display)
+			if item.Stage != "awaiting_approval" && !approval.pendingPlan {
+				continue
+			}
+			if item.InputText != "" && !approval.pendingPlan {
 				approval.Detail = boundedText(item.InputText, 4000)
 			}
-			if display.Kind == "plan_review" {
-				approval.Detail = boundedText(display.Plan, 4000)
-				for _, option := range display.Options {
-					approval.Options = append(approval.Options, NativeOption{Label: option.Label, Value: option.Label})
-				}
+			seen[item.InteractionID] = true
+			approvals = append(approvals, approval.NativeApproval)
+		}
+	}
+	ids := make([]string, 0, len(interactions))
+	for id := range interactions {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	for _, id := range ids {
+		item := interactions[id]
+		if seen[id] || item.Status == "ended" {
+			continue
+		}
+		switch item.Kind {
+		case "question":
+			if len(item.Request.Questions) > 0 {
+				approvals = append(approvals, NativeApproval{ID: id, Title: "需要你的回答", Questions: item.Request.Questions})
 			}
-			if len(approval.Options) == 0 {
-				approval.Options = []NativeOption{{Label: "批准", Value: "approved"}, {Label: "拒绝", Value: "rejected"}}
-			}
-			approvals = append(approvals, approval)
+		case "approval":
+			approvals = append(approvals, nativeApproval(id, item.Request.ToolName, item.Request.Action, item.Request.Display).NativeApproval)
 		}
 	}
 	return approvals
+}
+
+type approvalDisplay struct {
+	NativeApproval
+	pendingPlan bool
+}
+
+func nativeApproval(id, title, detail string, raw json.RawMessage) approvalDisplay {
+	var display struct {
+		Kind   string `json:"kind"`
+		Plan   string `json:"plan"`
+		Review struct {
+			State string `json:"state"`
+		} `json:"review"`
+		Options []NativeOption `json:"options"`
+	}
+	_ = json.Unmarshal(raw, &display)
+	approval := NativeApproval{ID: id, Title: title, Detail: detail}
+	if display.Kind == "plan_review" {
+		approval.Detail = boundedText(display.Plan, 4000)
+	}
+	for _, option := range display.Options {
+		if option.Label == "" {
+			continue
+		}
+		if option.Value == "" {
+			option.Value = option.Label
+		}
+		if option.Decision == "" && display.Kind == "plan_review" {
+			switch option.Value {
+			case "Revise", "Reject and Exit":
+				option.Decision = "rejected"
+			}
+		}
+		approval.Options = append(approval.Options, option)
+	}
+	if len(approval.Options) == 0 {
+		approval.Options = []NativeOption{{Label: "批准", Value: "approved"}, {Label: "拒绝", Value: "rejected"}}
+	}
+	return approvalDisplay{NativeApproval: approval, pendingPlan: display.Kind == "plan_review" && display.Review.State == "pending"}
 }
 
 func (s *NativeService) applyFrame(frame NativeFrame) {
@@ -1056,6 +1167,7 @@ func (s *NativeService) applyFrame(frame NativeFrame) {
 		case "turns":
 			cache.turns = frame.Turns
 		case "turn.started", "turn.ended":
+			cache.turns = slices.Clone(cache.turns)
 			found := false
 			for index := range cache.turns {
 				if cache.turns[index].TurnID == frame.Turn.TurnID {
@@ -1078,16 +1190,32 @@ func (s *NativeService) applyFrame(frame NativeFrame) {
 			cache.session.MainTurnActive = cache.session.Busy
 			if frame.Type == "turn.ended" {
 				cache.session.PendingInteraction = "none"
+				cache.interactions = nil
 			}
-		case "item.started", "item.ended", "item.updated", "item.delta", "item.removed":
+		case "interaction":
+			if frame.NativeInteraction.ID != "" {
+				if cache.interactions == nil {
+					cache.interactions = make(map[string]NativeInteraction)
+				} else {
+					cache.interactions = maps.Clone(cache.interactions)
+				}
+				cache.interactions[frame.NativeInteraction.ID] = frame.NativeInteraction
+			}
+		case "item.started", "item.ended", "item.updated", "item.delta", "item.removed", "reasoning.delta", "thinking.delta":
 			for turnIndex := range cache.turns {
 				if cache.turns[turnIndex].TurnID != frame.TurnID {
 					continue
 				}
-				items := cache.turns[turnIndex].Items
+				cache.turns = slices.Clone(cache.turns)
+				items := slices.Clone(cache.turns[turnIndex].Items)
+				cache.turns[turnIndex].Items = items
 				index := -1
+				itemID := frame.ItemID
+				if itemID == "" {
+					itemID = frame.Item.ItemID
+				}
 				for itemIndex := range items {
-					if items[itemIndex].ItemID == frame.Item.ItemID || frame.ItemID != "" && items[itemIndex].ItemID == frame.ItemID {
+					if itemID != "" && items[itemIndex].ItemID == itemID {
 						index = itemIndex
 						break
 					}
@@ -1116,9 +1244,13 @@ func (s *NativeService) applyFrame(frame NativeFrame) {
 						raw, _ = json.Marshal(merged)
 						_ = json.Unmarshal(raw, &cache.turns[turnIndex].Items[index])
 					}
-				case "item.delta":
-					if index >= 0 && frame.Field == "text" {
-						cache.turns[turnIndex].Items[index].Text += frame.Delta
+				case "item.delta", "reasoning.delta", "thinking.delta":
+					if index >= 0 {
+						field := frame.Field
+						if field == "" && frame.Type != "item.delta" {
+							field = strings.TrimSuffix(frame.Type, ".delta")
+						}
+						items[index].appendDelta(field, frame.Delta)
 					}
 				}
 			}
@@ -1127,7 +1259,7 @@ func (s *NativeService) applyFrame(frame NativeFrame) {
 			for _, id := range frame.TurnIDs {
 				removed[id] = true
 			}
-			kept := cache.turns[:0]
+			kept := make([]NativeTurn, 0, len(cache.turns))
 			for _, turn := range cache.turns {
 				if !removed[turn.TurnID] {
 					kept = append(kept, turn)
@@ -1170,6 +1302,108 @@ func (s *NativeService) createSession(ctx context.Context, input map[string]any)
 	return mapNativeSession(raw)
 }
 
+const promptReplayWindow = 2 * time.Minute
+const inlineImageLimit = 1 << 20
+
+type promptKey struct {
+	sessionID string
+	messageID string
+}
+
+type promptReceipt struct {
+	digest  [sha256.Size]byte
+	done    chan struct{}
+	expires time.Time
+	err     error
+}
+
+func (s *NativeService) sendSessionPrompt(ctx context.Context, input map[string]any) (any, error) {
+	id := stringInput(input, "id")
+	result := map[string]any{"sessionId": id}
+	value, keyed := input["clientMessageId"]
+	if !keyed {
+		_, err := s.sendPrompt(ctx, input)
+		return result, err
+	}
+	messageID, valid := value.(string)
+	if !valid || strings.TrimSpace(messageID) == "" || len(messageID) > 128 {
+		return nil, errors.New("消息去重标识无效")
+	}
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return nil, err
+	}
+	key := promptKey{sessionID: id, messageID: messageID}
+	digest := sha256.Sum256(encoded)
+	entry := &promptReceipt{digest: digest, done: make(chan struct{})}
+	now := time.Now()
+	s.promptMu.Lock()
+	for candidate, receipt := range s.prompts {
+		if !receipt.expires.IsZero() && !receipt.expires.After(now) {
+			delete(s.prompts, candidate)
+		}
+	}
+	if existing := s.prompts[key]; existing != nil {
+		s.promptMu.Unlock()
+		if existing.digest != digest {
+			return nil, errors.New("同一消息标识不能用于不同内容")
+		}
+		select {
+		case <-existing.done:
+			return result, existing.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if len(s.prompts) >= 1024 {
+		s.promptMu.Unlock()
+		return nil, errors.New("近期消息过多，请稍后再试")
+	}
+	if s.prompts == nil {
+		s.prompts = make(map[promptKey]*promptReceipt)
+	}
+	s.prompts[key] = entry
+	s.promptMu.Unlock()
+
+	_, err = s.sendPrompt(ctx, input)
+	var transport *kapTransportError
+	var native *NativeError
+	uncertain := errors.As(err, &transport) && transport.sent || errors.As(err, &native) && native.Status >= 500
+	s.promptMu.Lock()
+	entry.err = err
+	if err == nil || uncertain {
+		entry.expires = time.Now().Add(promptReplayWindow)
+	} else {
+		delete(s.prompts, key)
+	}
+	close(entry.done)
+	s.promptMu.Unlock()
+	return result, err
+}
+
+func inlineImagePart(value map[string]any, remaining int) (map[string]any, int, error) {
+	data := stringInput(value, "data")
+	mediaType := stringInput(value, "mediaType")
+	switch mediaType {
+	case "image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp":
+	default:
+		return nil, 0, errors.New("附件图片格式不受支持")
+	}
+	if data == "" || len(data) > base64.StdEncoding.EncodedLen(remaining) {
+		return nil, 0, errors.New("剪贴板图片合计不能超过 1 MiB，请保存为文件后添加")
+	}
+	decoded, err := base64.StdEncoding.Strict().DecodeString(data)
+	if err != nil || len(decoded) > remaining || http.DetectContentType(decoded) != mediaType {
+		return nil, 0, errors.New("附件图片内容无效或超过大小限制")
+	}
+	name := stringInput(value, "name")
+	if name == "" || len(name) > 255 || strings.ContainsAny(name, "/\\") {
+		return nil, 0, errors.New("附件文件名无效")
+	}
+	part := map[string]any{"type": "image", "name": name, "source": map[string]string{"kind": "base64", "media_type": mediaType, "data": data}}
+	return part, len(decoded), nil
+}
+
 func (s *NativeService) sendPrompt(ctx context.Context, input map[string]any) (any, error) {
 	id, text := stringInput(input, "id"), stringInput(input, "text")
 	attachments, _ := input["attachments"].([]any)
@@ -1183,7 +1417,17 @@ func (s *NativeService) sendPrompt(ctx context.Context, input map[string]any) (a
 	if text != "" {
 		content = append(content, map[string]string{"type": "text", "text": text})
 	}
+	remaining := inlineImageLimit
 	for _, value := range attachments {
+		if image, ok := value.(map[string]any); ok {
+			part, size, err := inlineImagePart(image, remaining)
+			if err != nil {
+				return nil, err
+			}
+			remaining -= size
+			content = append(content, part)
+			continue
+		}
 		path, ok := value.(string)
 		if !ok || !filepath.IsAbs(path) {
 			return nil, errors.New("附件必须是本机文件的绝对路径")
@@ -1269,8 +1513,6 @@ func (s *NativeService) reply(ctx context.Context, input map[string]any) (any, e
 			body = map[string]any{"kind": "question", "answers": object["answers"]}
 		} else if dismissed, _ := object["dismissed"].(bool); dismissed {
 			body = map[string]any{"kind": "question", "dismissed": true}
-		} else if label, ok := object["selectedLabel"].(string); ok {
-			body = map[string]any{"kind": "approval", "decision": "approved", "selected_label": label}
 		}
 	}
 	if body == nil {

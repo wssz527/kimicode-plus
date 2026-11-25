@@ -181,6 +181,7 @@ const paths: Record<IconName, ReactNode> = {
     </>
   ),
   play: <path d="M8 5.5 18 12 8 18.5v-13Z" />,
+  stop: <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none" />,
   reconcile: (
     <>
       <path d="M4 9a8 8 0 0 1 14-3" />

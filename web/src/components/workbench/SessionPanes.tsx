@@ -1,53 +1,22 @@
-import { createContext, useContext, useEffect, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
 import { createSessionWatchBinding, type SessionWatchOutcome } from "../../api";
 import type { DemoHost, NativeSession, SessionView } from "../../native";
 import { Icon } from "../Icon";
-import { EmptyState, Spinner } from "../ui";
-import { Composer, ExecMessage, errorText, fmtClock, statusTone } from "./pieces";
+import { Spinner } from "../ui";
+import { ConversationTurn, errorText, fmtClock, groupThread, statusTone } from "./pieces";
 import { ControlMenu } from "./ControlMenu";
+import { ApprovalCard, type InteractionReply } from "./ApprovalCard";
+import { addComposerAttachments, attachmentPayload, browserAttachment, NativeComposer, newClientMessageId,
+  type Attachment, type PermissionMode, type SendMode, type Thinking } from "./NativeComposer";
 
-type Attachment = { path: string; name: string };
-type PermissionMode = "" | "manual" | "auto" | "yolo";
 type SessionRecoveryHint = { enabled: boolean; nextAt?: string; note?: string };
+type SessionInput = { draft?: string; model?: string; permission?: PermissionMode; mode?: SendMode; thinking?: Thinking; attachments?: Attachment[] };
+const NO_ATTACHMENTS: Attachment[] = [];
 
-type ApprovalOption = { label: string; value: string };
-
-const DEFAULT_APPROVAL_OPTIONS: ApprovalOption[] = [
-  { label: "允许", value: "approved" },
-  { label: "拒绝", value: "rejected" },
-];
-
-// Both spellings reach this pane: the core sends `approved`/`rejected` while an
-// older reply path used `allow`/`deny`.
-const APPROVAL_DECISIONS: Record<string, string> = {
-  approved: "approved",
-  allow: "approved",
-  rejected: "rejected",
-  deny: "rejected",
-  denied: "rejected",
-  cancelled: "cancelled",
-  cancel: "cancelled",
-};
-
-/** Values that read as a refusal, whatever spelling the core used. */
-export const DENIED_APPROVAL_VALUES = new Set(["rejected", "deny", "denied", "cancelled", "cancel"]);
-
-/** What a reply click sends. A value we do not recognize is never guessed into
- * an approval; only a label the server itself listed keeps its own copy. */
-export function approvalDecision(value: string, fromServer: boolean): string | { decision: string; selectedLabel: string } | null {
-  if (typeof value !== "string" || value === "") return null;
-  const decision = APPROVAL_DECISIONS[value];
-  if (decision) return decision;
-  return fromServer ? { decision: "approved", selectedLabel: value } : null;
+export function isNearThreadEnd(scroll: Pick<HTMLElement, "scrollHeight" | "scrollTop" | "clientHeight">) {
+  return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80;
 }
 
-/** The fallback list must not depend on the core sending a non-empty one: an
- * empty `options` array would otherwise render a card with no buttons. */
-export function approvalOptions(options?: ApprovalOption[] | null): ApprovalOption[] {
-  return options?.length ? options : DEFAULT_APPROVAL_OPTIONS;
-}
-
-type SessionInput = { draft?: string; model?: string; permission?: PermissionMode; attachments?: Attachment[] };
 type SessionInputs = Record<string, SessionInput>;
 const SessionInputContext = createContext<[SessionInputs, Dispatch<SetStateAction<SessionInputs>>] | null>(null);
 export function SessionInputProvider({ children }: { children: ReactNode }) {
@@ -90,6 +59,15 @@ export function SessionPane({
   const [inputs, setInputs] = sharedInputs ?? localInputs;
   const [pickingFiles, setPickingFiles] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [awaitingStart, setAwaitingStart] = useState("");
+  const sendAttempt = useRef<{ sid: string; key: string; id: string } | null>(null);
+  const actionInFlight = useRef(false);
+  const replyInFlight = useRef(false);
+  const lastViewEvent = useRef(0);
+  const inputRef = useRef(inputs);
+  inputRef.current = inputs;
   const [error, setError] = useState<string | null>(null);
   // A live subscription that is not established is not an error: the history is
   // already on screen, and the pane says so in its own banner with a retry.
@@ -101,12 +79,20 @@ export function SessionPane({
   const draft = inputs[sid]?.draft ?? "";
   const model = inputs[sid]?.model ?? "";
   const permission = inputs[sid]?.permission ?? "";
-  const attachments = inputs[sid]?.attachments ?? [];
+  const attachments = inputs[sid]?.attachments ?? NO_ATTACHMENTS;
+  const mode = inputs[sid]?.mode ?? "inherit";
+  const thinking = inputs[sid]?.thinking ?? "";
   const updateInput = (value: Partial<SessionInput>) => setInputs(current => ({ ...current, [sid]: { ...current[sid], ...value } }));
-  const setAttachments = (value: Attachment[]) => updateInput({ attachments: value });
-  const setDraft = (value: string) => updateInput({ draft: value });
-  const setModel = (value: string) => updateInput({ model: value });
+  const quoteReply = useCallback((text: string) => setInputs(current => {
+    const draft = current[sid]?.draft ?? "";
+    const quote = text.split("\n").map(line => `> ${line}`).join("\n");
+    return { ...current, [sid]: { ...current[sid], draft: `${draft}${draft ? "\n\n" : ""}${quote}\n\n` } };
+  }), [setInputs, sid]);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const threadRef = useRef<HTMLOListElement>(null);
+  const stickToBottom = useRef(true);
+  const [showJump, setShowJump] = useState(false);
+  const turns = useMemo(() => groupThread(view?.messages ?? []), [view?.messages]);
 
   // A session change is the only thing that empties the pane. A retry of the
   // live link keeps whatever history is already on screen.
@@ -123,6 +109,8 @@ export function SessionPane({
     const unsubscribe = host.subscribe<SessionView>(`session:${sid}`, next => {
       if (!alive || next.session.id !== sid) return;
       receivedEvent = true;
+      lastViewEvent.current++;
+      setAwaitingStart(current => current === sid ? "" : current);
       setView(next);
       setSyncNote(null);
     });
@@ -157,10 +145,53 @@ export function SessionPane({
     };
   }, [host, sid, recoverTicket]);
 
+  useLayoutEffect(() => {
+    stickToBottom.current = true;
+    setShowJump(false);
+  }, [sid]);
+  useLayoutEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    const follow = () => {
+      if (stickToBottom.current) scroll.scrollTop = scroll.scrollHeight;
+      setShowJump(!stickToBottom.current && !isNearThreadEnd(scroll));
+    };
+    follow();
+    if (typeof ResizeObserver !== "function") return;
+    const observer = new ResizeObserver(follow);
+    observer.observe(scroll);
+    if (threadRef.current) observer.observe(threadRef.current);
+    return () => observer.disconnect();
+  }, [sid, turns]);
   useEffect(() => {
-    if (!view) return;
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [view?.messages, view?.session.busy]);
+    if (awaitingStart !== sid || !sid) return;
+    let active = true;
+    const timer = window.setTimeout(async () => {
+      try {
+        const next = await host.request<SessionView>("session.view", { id: sid });
+        if (active && next.session.id === sid) setView(next);
+      } catch (cause) {
+        if (active) setError(errorText(cause));
+      } finally {
+        if (active) setAwaitingStart("");
+      }
+    }, 1000);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [awaitingStart, host, sid]);
+
+  function onThreadScroll() {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    stickToBottom.current = isNearThreadEnd(scroll);
+    setShowJump(!stickToBottom.current);
+  }
+
+  function jumpToBottom() {
+    stickToBottom.current = true;
+    const scroll = scrollRef.current;
+    if (scroll) scroll.scrollTop = scroll.scrollHeight;
+    setShowJump(false);
+  }
 
   function retryLiveSync() {
     if (!sid || syncing) return;
@@ -183,70 +214,102 @@ export function SessionPane({
     }
   }
 
+  function addAttachments(next: Attachment[]) {
+    if (!sid || !next.length) return;
+    const current = inputRef.current[sid]?.attachments ?? NO_ATTACHMENTS;
+    updateInput({ attachments: addComposerAttachments(current, next) });
+    setError(null);
+  }
+
+  function attachFiles(files: File[]) {
+    try {
+      addAttachments(files.map(file => browserAttachment(file, host.localFilePath)));
+    } catch (cause) {
+      setError(errorText(cause));
+    }
+  }
+
   async function pickFiles() {
     setPickingFiles(true);
     setError(null);
     try {
-      const next = await host.request<Attachment[]>("host.pickFiles");
-      setInputs(current => ({ ...current, [sid]: { ...current[sid], attachments: [...(current[sid]?.attachments ?? []), ...next].filter((item, index, all) => all.findIndex(other => other.path === item.path) === index) } }));
-    } catch (cause) { setError(errorText(cause)); }
-    finally { setPickingFiles(false); }
+      const picked = await host.request<{ path: string; name: string }[]>("host.pickFiles");
+      addAttachments(picked.map(item => ({ ...item, id: item.path })));
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setPickingFiles(false);
+    }
   }
 
   async function send() {
     const text = draft.trim();
-    if ((!text && !attachments.length) || !sid) return;
-    setBusy(true);
+    if ((!text && !attachments.length) || !sid || running || actionInFlight.current) return;
+    actionInFlight.current = true;
+    setSending(true);
     setError(null);
-    setDraft("");
-    setAttachments([]);
+    const key = JSON.stringify([text, model, mode, permission, thinking, attachments.map(item => item.id)]);
+    if (sendAttempt.current?.sid !== sid || sendAttempt.current.key !== key) {
+      sendAttempt.current = { sid, key, id: newClientMessageId() };
+    }
+    const startedAt = lastViewEvent.current;
     try {
       await host.request("session.send", {
-        id: sid,
-        text,
-        mode: "normal",
+        id: sid, text, mode, clientMessageId: sendAttempt.current.id,
         ...(model ? { model } : {}),
         ...(permission ? { permissionMode: permission } : {}),
-        ...(attachments.length ? { attachments: attachments.map(item => item.path) } : {}),
+        ...(thinking ? { thinking } : {}),
+        ...(attachments.length ? { attachments: await Promise.all(attachments.map(attachmentPayload)) } : {}),
       });
+      sendAttempt.current = null;
+      setInputs(current => {
+        const input = current[sid] ?? {};
+        return { ...current, [sid]: { ...input, draft: input.draft === draft ? "" : input.draft,
+          attachments: input.attachments?.filter(item => !attachments.includes(item)) } };
+      });
+      if (startedAt === lastViewEvent.current) setAwaitingStart(sid);
     } catch (cause) {
       setError(errorText(cause));
-      setDraft(text);
-      setAttachments(attachments);
     } finally {
-      setBusy(false);
+      setSending(false);
+      actionInFlight.current = false;
     }
   }
 
   async function abort() {
-    if (!sid) return;
+    if (!sid || actionInFlight.current) return;
+    actionInFlight.current = true;
+    setStopping(true);
+    setError(null);
     try {
       await host.request("session.abort", { id: sid });
     } catch (cause) {
       setError(errorText(cause));
+    } finally {
+      setStopping(false);
+      actionInFlight.current = false;
     }
   }
 
-  async function reply(interactionId: string, value: string, fromServer: boolean) {
-    if (!sid) return;
-    const payload = approvalDecision(value, fromServer);
-    if (!payload) {
-      setError("这个审批选项无法识别，请在官方窗口中处理。");
-      return;
-    }
+  async function reply(interactionId: string, value: InteractionReply) {
+    if (!sid || replyInFlight.current) return;
+    replyInFlight.current = true;
     setReplying(interactionId);
+    setError(null);
     try {
-      await host.request("session.reply", { id: sid, interactionId, value: payload });
+      await host.request("session.reply", { id: sid, interactionId, value });
+      setView(current => current?.session.id === sid ? { ...current, approvals: current.approvals.filter(item => item.id !== interactionId) } : current);
     } catch (cause) {
       setError(errorText(cause));
     } finally {
       setReplying(null);
+      replyInFlight.current = false;
     }
   }
 
-  const session = view?.session ?? sessions.find((item) => item.id === sid) ?? null;
-  const waiting = !!session?.pending_interaction && session.pending_interaction !== "none";
-  const running = Boolean(session?.busy || session?.main_turn_active || waiting);
+  const session = view?.session.id === sid ? view.session : sessions.find(item => item.id === sid) ?? null;
+  const waiting = Boolean(view?.approvals.length || session?.pending_interaction && session.pending_interaction !== "none");
+  const running = Boolean(session?.busy || session?.main_turn_active || waiting || awaitingStart && awaitingStart === sid);
   const approvals = view?.approvals ?? [];
 
   return (
@@ -293,60 +356,23 @@ export function SessionPane({
         </p>
       ) : null}
 
-      <div className="wb-scroll wb-exec-body" ref={scrollRef}>
-        {!sid ? (
-          <EmptyState compact title="选择或新建会话" icon="play">
-            执行会话由官方 Agent 运行，这里的输入会作为真实 prompt 发出去。
-          </EmptyState>
-        ) : view && view.messages.length === 0 ? (
-          <EmptyState compact title="会话还没有消息" icon="play">
-            在下方输入任务，或从规划页导入。
-          </EmptyState>
-        ) : (
-          <ol className="wb-exec-thread">
-            {(view?.messages ?? []).map((message) => (
-              <ExecMessage key={message.id} message={message} onReply={text => setDraft(`${draft}${draft ? "\n\n" : ""}${text.split("\n").map(line => `> ${line}`).join("\n")}\n\n`)} />
-            ))}
-            {running ? (
-              <li className="wb-typing">
-                <Spinner size={12} /> {waiting ? "等待你的确认" : "执行中"}
-              </li>
-            ) : null}
-          </ol>
-        )}
+      <div className="wb-exec-timeline">
+        <div className="wb-scroll wb-exec-body" ref={scrollRef} onScroll={onThreadScroll}>
+          {!sid || view && turns.length === 0 && !running ? <div className="wb-session-welcome">
+            <Icon name="chat" size={28} />
+            <h2>{sid ? "开始对话" : "选择或新建会话"}</h2>
+            {sid ? <p>在下方输入任务，即可开始这次会话。</p> : null}
+          </div> : !view && !running && !error ? <div className="wb-session-welcome" role="status"><Spinner size={16} /><p>正在读取消息</p></div> : <ol className="wb-exec-thread" ref={threadRef}>
+            {turns.map(turn => <ConversationTurn key={turn.id} messages={turn.messages} onReply={quoteReply} />)}
+            {running && !view?.messages.some(message => message.streaming) ? <li className="wb-typing"><Spinner size={12} /> {waiting ? "等待你的确认" : "执行中"}</li> : null}
+          </ol>}
+        </div>
+        {showJump ? <button type="button" className="wb-jump-bottom" onClick={jumpToBottom}><Icon name="chevronDown" size={15} />回到底部</button> : null}
       </div>
 
-      {approvals.length > 0 ? (
-        <div className="wb-approvals">
-          {approvals.map((approval) => (
-            <div className="wb-approval" key={approval.id}>
-              <div className="wb-approval-head">
-                <Icon name="shield" size={14} />
-                <span>{approval.title}</span>
-              </div>
-              {approval.detail ? <pre className="wb-approval-detail">{approval.detail}</pre> : null}
-              <div className="wb-approval-actions">
-                {(approvalOptions(approval.options)).map((option) => {
-                  const fromServer = Boolean(approval.options?.length);
-                  const denied = DENIED_APPROVAL_VALUES.has(option.value);
-                  return (
-                    <button
-                      key={option.value}
-                      type="button"
-                      className={`wb-btn ${denied ? "is-quiet" : ""}`}
-                      disabled={replying !== null}
-                      onClick={() => void reply(approval.id, option.value, fromServer)}
-                    >
-                      {replying === approval.id ? <Spinner size={12} /> : null}
-                      {option.label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          ))}
-        </div>
-      ) : null}
+      {approvals.length > 0 ? <div className="wb-approvals">{approvals.map(approval =>
+        <ApprovalCard key={approval.id} approval={approval} active={replying === approval.id} busy={replying !== null} onReply={value => void reply(approval.id, value)} />
+      )}</div> : null}
       {error ? (
         <p className="wb-error" role="alert">
           {error}
@@ -354,42 +380,13 @@ export function SessionPane({
       ) : null}
 
       <div className="wb-exec-composer">
-        <Composer
-          value={draft}
-          onChange={setDraft}
-          onSend={() => void send()}
-          busy={busy}
-          disabled={!sid || pickingFiles}
-          allowEmpty={attachments.length > 0}
-          leading={<button type="button" className="wb-attach" aria-label="添加附件" title="添加附件" disabled={!sid || busy || pickingFiles} onClick={() => void pickFiles()}>{pickingFiles ? <Spinner size={14} /> : <Icon name="plus" size={17} />}</button>}
-          attachments={attachments.length ? <ul className="wb-attachments" aria-label="待发送附件">{attachments.map(item => <li key={item.path}><Icon name="file" size={13} /><span title={item.path}>{item.name}</span><button type="button" className="wb-icon-btn" aria-label={`移除附件 ${item.name}`} onClick={() => setAttachments(attachments.filter(other => other.path !== item.path))}><Icon name="close" size={12} /></button></li>)}</ul> : null}
-          placeholder={sid ? "输入任务，发送给官方会话" : "先选择或新建一个会话"}
-          action={
-            running ? (
-              <button type="button" className="wb-link" onClick={() => void abort()}>
-                取消执行
-              </button>
-            ) : null
-          }
-          hint={
-            <>
-              <label className="wb-permission" title="发送时应用所选权限；跟随权限会保留会话当前设置"><Icon name="shield" size={13} /><select className="wb-select wb-select-inline" aria-label="发送权限" value={permission} onChange={event => updateInput({ permission: event.target.value as PermissionMode })}><option value="">跟随权限</option><option value="manual">始终询问</option><option value="auto">自动判断</option><option value="yolo">始终允许</option></select></label>
-              <label className="wb-model"><Icon name="models" size={13} /><select
-                className="wb-select wb-select-inline"
-                aria-label="会话模型"
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-              >
-                <option value="">跟随会话</option>
-                {models.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.name}
-                  </option>
-                ))}
-              </select></label>
-            </>
-          }
-        />
+        <NativeComposer draft={draft} model={model} permission={permission} mode={mode} thinking={thinking}
+          models={models} attachments={attachments} disabled={!sid} sending={sending} running={running}
+          stopping={stopping} picking={pickingFiles} useFileInput={Boolean(host.localFilePath)}
+          onDraft={value => updateInput({ draft: value })} onModel={value => updateInput({ model: value })}
+          onPermission={value => updateInput({ permission: value })} onMode={value => updateInput({ mode: value })}
+          onThinking={value => updateInput({ thinking: value })} onSend={() => void send()} onStop={() => void abort()}
+          onPick={() => void pickFiles()} onFiles={attachFiles} onRemove={id => updateInput({ attachments: attachments.filter(item => item.id !== id) })} />
       </div>
     </section>
   );

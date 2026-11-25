@@ -1,9 +1,9 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { isValidElement, memo, useEffect, useRef, useState, type ReactNode } from "react";
 import { BRIDGE_RECONNECT_TEXT, isBridgeCredentialError } from "../../api";
-import type { DemoMessage } from "../../native";
+import type { NativeMessage, NativeToolCall } from "../../native";
 import { Icon } from "../Icon";
 import { Badge, Spinner } from "../ui";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 export { BRIDGE_RECONNECT_TEXT, isBridgeCredentialError } from "../../api";
@@ -91,113 +91,139 @@ export function safeHref(href?: string): string | null {
   return SAFE_LINK_PROTOCOLS.has(protocol) ? raw : null;
 }
 
-export function MessageBody({ text }: { text: string }) {
-  return <div className="wb-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ({ children, href, ...props }) => {
+const markdownComponents: Components = {
+  a: ({ children, href }) => {
     const safe = safeHref(href);
     return safe
-      ? <a {...props} href={safe} target="_blank" rel="noopener noreferrer">{children}</a>
+      ? <a href={safe} target="_blank" rel="noopener noreferrer">{children}</a>
       : <span className="wb-link-blocked" title={href ? `已拦截不安全的链接协议：${href}` : undefined}>{children}</span>;
-  }, img: ({ alt }) => <span>{alt || "图片"}</span> }}>{text}</ReactMarkdown></div>;
-}
+  },
+  img: ({ alt }) => <span>{alt || "图片"}</span>,
+  pre: ({ children }) => {
+    if (!isValidElement<{ className?: string; children?: ReactNode }>(children) || typeof children.props.children !== "string") {
+      return <pre>{children}</pre>;
+    }
+    const language = /(?:^|\s)language-([^\s]+)/.exec(children.props.className ?? "")?.[1];
+    return <MarkdownCode language={language} text={children.props.children.replace(/\n$/, "")} />;
+  },
+};
 
-function MessageActions({ message, onReply }: { message: DemoMessage; onReply?: (text: string) => void }) {
+export const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: string }) {
+  return <div className="wb-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{text}</ReactMarkdown></div>;
+});
+
+function useCopyStatus(text: string) {
   const [status, setStatus] = useState("");
   const timer = useRef<number | null>(null);
   useEffect(() => () => { if (timer.current !== null) window.clearTimeout(timer.current); }, []);
-  function flash(text: string) {
-    setStatus(text);
-    if (timer.current !== null) window.clearTimeout(timer.current);
-    timer.current = window.setTimeout(() => { timer.current = null; setStatus(""); }, 2400);
-  }
   async function copy() {
-    try { await navigator.clipboard.writeText(message.text); flash("已复制"); }
-    catch { flash("复制失败，请选择文字后复制"); }
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus("已复制");
+    } catch {
+      setStatus("复制失败，请选择文字后复制");
+    }
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => setStatus(""), 2400);
   }
+  return { status, copy };
+}
+
+function MarkdownCode({ language, text }: { language?: string; text: string }) {
+  const [wrap, setWrap] = useState(false);
+  const { status, copy } = useCopyStatus(text);
+  return <div className="wb-code-block">
+    <div className="wb-code-head">
+      <span>{language || "纯文本"}</span>
+      <span role="status">{status}</span>
+      <button type="button" aria-pressed={wrap} onClick={() => setWrap(value => !value)}>自动换行</button>
+      <button type="button" aria-label="复制代码" title="复制代码" onClick={() => void copy()}><Icon name="copy" size={14} /></button>
+    </div>
+    <pre className={wrap ? "is-wrapped" : undefined}><code>{text}</code></pre>
+  </div>;
+}
+
+export function ReasoningBlock({ text, streaming }: { text: string; streaming: boolean }) {
+  return <details className="wb-reasoning">
+    <summary><Icon name="chevronDown" size={14} /><span>{streaming ? "思考中" : "思考过程"}</span>
+      {streaming ? <span className="wb-breath" aria-hidden="true" /> : null}
+    </summary>
+    <MarkdownBlock text={text} />
+  </details>;
+}
+
+const toolStatuses: Record<string, { tone: string; label: string }> = {
+  running: { tone: "info", label: "运行中" },
+  waiting: { tone: "warn", label: "等待确认" },
+  completed: { tone: "success", label: "已完成" },
+  failed: { tone: "danger", label: "失败" },
+  error: { tone: "danger", label: "失败" },
+  cancelled: { tone: "muted", label: "已取消" },
+  interrupted: { tone: "muted", label: "已中断" },
+};
+
+function toolValue(value: unknown) {
+  return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+
+export function ToolCallCard({ tool }: { tool: NativeToolCall }) {
+  const { tone, label } = toolStatuses[tool.status] ?? { tone: "muted", label: tool.status || "状态未知" };
+  const duration = tool.duration === undefined ? "" : tool.duration < 1000 ? `${tool.duration} ms` : `${(tool.duration / 1000).toLocaleString("zh-CN", { maximumFractionDigits: 1 })} 秒`;
+  return <details className="wb-tool">
+    <summary><Icon name="chevronDown" size={14} /><span className="wb-tool-name">{tool.name || "工具调用"}</span>
+      <span className="wb-tool-state" data-tone={tone}>{label}</span>{duration ? <span>{duration}</span> : null}
+    </summary>
+    {tool.input !== undefined ? <div className="wb-tool-detail"><span>输入</span><pre>{toolValue(tool.input)}</pre></div> : null}
+    {tool.output !== undefined ? <div className="wb-tool-detail"><span>输出</span><pre>{toolValue(tool.output)}</pre></div> : null}
+  </details>;
+}
+
+function MessageActions({ message, onReply }: { message: NativeMessage; onReply: (text: string) => void }) {
+  const { status, copy } = useCopyStatus(message.text);
   return <div className="wb-message-actions">
-    <button type="button" className="wb-icon-btn" aria-label="复制消息" title="复制消息" onClick={() => void copy()}><Icon name="copy" size={14} /></button>
-    {onReply ? <button type="button" className="wb-icon-btn" aria-label="引用回复" title="引用回复" onClick={() => onReply(message.text)}><Icon name="handoff" size={14} /></button> : null}
+    {message.text ? <>
+      <button type="button" className="wb-icon-btn" aria-label="复制消息" title="复制消息" onClick={() => void copy()}><Icon name="copy" size={14} /></button>
+      <button type="button" className="wb-icon-btn" aria-label="引用回复" title="引用回复" onClick={() => onReply(message.text)}><Icon name="handoff" size={14} /></button>
+    </> : null}
     {message.at ? <time dateTime={message.at}>{fmtClock(message.at)}</time> : null}
     {status ? <span role="status">{status}</span> : null}
   </div>;
 }
 
-function MessageAttachments({ message }: { message: DemoMessage }) {
-  return message.attachments?.length ? <ul className="wb-attachments" aria-label="消息附件">{message.attachments.map((item, index) => <li key={index}><Icon name="file" size={13} /><span>{item.name || item.kind}</span></li>)}</ul> : null;
+function ThreadMessage({ message, onReply }: { message: NativeMessage; onReply: (text: string) => void }) {
+  const tools = message.toolCalls ?? (message.tool ? [{ id: message.id, name: message.tool, status: "", output: message.text }] : []);
+  return <div className={`wb-exec-msg${message.role === "user" ? " is-mine" : ""}`}>
+    {message.attachments?.length ? <ul className="wb-attachments" aria-label="消息附件">
+      {message.attachments.map((item, index) => <li key={index}><Icon name="file" size={13} /><span>{item.name || item.kind}</span></li>)}
+    </ul> : null}
+    {message.reasoning ? <ReasoningBlock text={message.reasoning} streaming={Boolean(message.streaming)} /> : null}
+    {tools.map(tool => <ToolCallCard key={tool.id} tool={tool} />)}
+    {message.text && !message.tool ? <div className="wb-msg-text"><MarkdownBlock text={message.text} /></div> : null}
+    {!message.tool && (message.text || message.attachments?.length) ? <MessageActions message={message} onReply={onReply} /> : null}
+  </div>;
 }
 
-export function ExecMessage({ message, onReply }: { message: DemoMessage; onReply?: (text: string) => void }) {
-  const mine = message.role === "user";
-  return <li className={`wb-exec-msg ${mine ? "is-mine" : ""}`}>
-    <MessageAttachments message={message} />
-    {message.tool ? <details className="wb-tool"><summary><Icon name="file" size={14} /><span>{message.tool}</span><span className="wb-hint">工具输出</span></summary><pre>{message.text}</pre></details> : <div className="wb-msg-text"><MessageBody text={message.text} /></div>}
-    {!message.tool ? <MessageActions message={message} onReply={onReply} /> : null}
-  </li>;
+export function groupThread(messages: NativeMessage[]) {
+  const turns: { id: string; messages: NativeMessage[] }[] = [];
+  for (const message of messages) {
+    const id = message.turnId ?? message.id;
+    const last = turns.at(-1);
+    if (last?.id === id) last.messages.push(message);
+    else turns.push({ id, messages: [message] });
+  }
+  return turns;
 }
 
-export function Composer({
-  value,
-  onChange,
-  onSend,
-  busy,
-  disabled,
-  placeholder,
-  hint,
-  action,
-  leading,
-  attachments,
-  allowEmpty,
-}: {
-  value: string;
-  onChange: (next: string) => void;
-  onSend: () => void;
-  busy?: boolean;
-  disabled?: boolean;
-  placeholder: string;
-  hint?: ReactNode;
-  action?: ReactNode;
-  leading?: ReactNode;
-  attachments?: ReactNode;
-  allowEmpty?: boolean;
+function equalMessage(a: NativeMessage, b: NativeMessage) {
+  return a === b || a.id === b.id && a.role === b.role && a.text === b.text && a.at === b.at
+    && a.tool === b.tool && a.reasoning === b.reasoning && a.streaming === b.streaming
+    && JSON.stringify(a.attachments) === JSON.stringify(b.attachments)
+    && JSON.stringify(a.toolCalls) === JSON.stringify(b.toolCalls);
+}
+
+export const ConversationTurn = memo(function ConversationTurn({ messages, onReply }: {
+  messages: NativeMessage[]; onReply: (text: string) => void;
 }) {
-  const id = useId();
-  return (
-    <div className="wb-composer">
-      {attachments}
-      <label className="wb-sr" htmlFor={id}>
-        输入消息
-      </label>
-      <textarea
-        id={id}
-        className="wb-textarea"
-        rows={3}
-        value={value}
-        placeholder={placeholder}
-        disabled={disabled}
-        onChange={(event) => onChange(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
-          event.preventDefault();
-          if ((value.trim() || allowEmpty) && !busy && !disabled) onSend();
-        }}
-      />
-      <div className="wb-composer-foot">
-        <div className="wb-composer-controls">{leading}{hint}</div>
-        <div className="wb-composer-actions">
-          {action}
-          <button
-            type="button"
-            className="wb-send"
-            onClick={onSend}
-            disabled={disabled || busy || (!value.trim() && !allowEmpty)}
-            aria-busy={busy || undefined}
-            aria-label="发送"
-            title="发送"
-          >
-            {busy ? <Spinner size={13} /> : <Icon name="arrowUp" size={16} />}
-            <span className="wb-sr">发送</span>
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
+  return <li className="wb-conversation-turn">{messages.map(message => <ThreadMessage key={message.id} message={message} onReply={onReply} />)}</li>;
+}, (previous, next) => previous.onReply === next.onReply && previous.messages.length === next.messages.length
+  && previous.messages.every((message, index) => equalMessage(message, next.messages[index]!)));

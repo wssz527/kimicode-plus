@@ -51,23 +51,52 @@ type NativeAttachment struct {
 
 type NativeMessage struct {
 	ID          string             `json:"id"`
+	TurnID      string             `json:"turnId,omitempty"`
 	Role        string             `json:"role"`
 	Text        string             `json:"text"`
 	Tool        string             `json:"tool,omitempty"`
+	Reasoning   string             `json:"reasoning,omitempty"`
+	Streaming   bool               `json:"streaming,omitempty"`
+	ToolCalls   []NativeToolCall   `json:"toolCalls,omitempty"`
 	At          string             `json:"at,omitempty"`
 	Attachments []NativeAttachment `json:"attachments,omitempty"`
 }
 
+type NativeToolCall struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	Input    any    `json:"input,omitempty"`
+	Output   any    `json:"output,omitempty"`
+	Duration *int64 `json:"duration,omitempty"`
+}
+
 type NativeOption struct {
-	Label string `json:"label"`
-	Value string `json:"value"`
+	Label    string `json:"label"`
+	Value    string `json:"value"`
+	Decision string `json:"decision,omitempty"`
+}
+
+type NativeQuestion struct {
+	ID       string `json:"id"`
+	Question string `json:"question"`
+	Header   string `json:"header,omitempty"`
+	Body     string `json:"body,omitempty"`
+	Options  []struct {
+		ID    string `json:"id"`
+		Label string `json:"label"`
+	} `json:"options"`
+	MultiSelect bool   `json:"multi_select,omitempty"`
+	AllowOther  bool   `json:"allow_other,omitempty"`
+	OtherLabel  string `json:"other_label,omitempty"`
 }
 
 type NativeApproval struct {
-	ID      string         `json:"id"`
-	Title   string         `json:"title"`
-	Detail  string         `json:"detail,omitempty"`
-	Options []NativeOption `json:"options,omitempty"`
+	ID        string           `json:"id"`
+	Title     string           `json:"title"`
+	Detail    string           `json:"detail,omitempty"`
+	Options   []NativeOption   `json:"options,omitempty"`
+	Questions []NativeQuestion `json:"questions,omitempty"`
 }
 
 type SessionView struct {

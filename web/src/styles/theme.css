@@ -1,7 +1,7 @@
 :root,.ekd-root {
   --paper:var(--color-bg,#fff);--surface:var(--color-bg,#fff);--surface-raised:var(--color-bg,#fff);--surface-sunken:var(--panel,#f5f5f5);
   --ink:var(--color-text,rgba(0,0,0,.9));--ink-strong:var(--color-text,rgba(0,0,0,.95));--ink-muted:var(--color-text-secondary,#626262);--ink-faint:var(--color-text-secondary,#686868);
-  --line:var(--color-line,rgba(0,0,0,.16));--line-strong:var(--color-line,rgba(0,0,0,.2));
+  --line:var(--color-line,rgba(0,0,0,.16));--line-strong:var(--color-line-strong,color-mix(in srgb,var(--line) 94%,var(--ink)));
   --accent:var(--blue,#1783ff);--accent-hover:#0870e8;--accent-ink:#0767d5;--accent-soft:var(--soft,#e8f3ff);
   --warning:var(--color-warning,#b4761f);--danger:var(--color-danger,#c64b52);--success:var(--color-success,#27865a);--info:var(--color-info,#2563eb);
   --warning-soft:#fdf3e2;--danger-soft:#fdeceb;--success-soft:#e8f7ee;--info-soft:#e8f1fd;
@@ -13,7 +13,7 @@ html[data-color-scheme=dark],html[data-color-scheme=dark] .ekd-root,
 .ekd-root[data-color-scheme=dark],.ekd-root[data-color-scheme=dark] .ekd-root {
   --paper:var(--color-bg,#121212);--surface:var(--color-bg,#121212);--surface-raised:var(--panel,#1f1f1f);--surface-sunken:var(--panel2,#1a1a1a);
   --ink:var(--color-text,rgba(255,255,255,.84));--ink-strong:var(--color-text,rgba(255,255,255,.9));--ink-muted:#b4b4b4;--ink-faint:#aaa;
-  --line:var(--color-line,rgba(255,255,255,.14));--line-strong:var(--color-line,rgba(255,255,255,.18));
+  --line:var(--color-line,rgba(255,255,255,.14));--line-strong:var(--color-line-strong,color-mix(in srgb,var(--line) 94%,var(--ink)));
   --accent:#1a88ff;--accent-ink:#76b6ff;--accent-hover:#459fff;--accent-soft:rgba(26,136,255,.13);
   --success:#67ca8c;--success-soft:#153522;--success-line:#2f6b45;--warn:#e3b654;--warn-soft:#342c18;--warn-line:#6b5a2c;--danger:#ff8a8c;--danger-soft:#3a1c1f;--danger-line:#74343a;--info:#8bc5df;--info-soft:#18313c;--info-line:#2f5b6b;--accent-line:rgba(26,136,255,.42);--notice-danger-ink:#ffb3b5;--notice-warn-ink:#f0cd7e;--notice-info-ink:#a9d8ea;color-scheme:dark;
   --warning:#e3b654;--warning-soft:#342c18;--danger-soft:#3a1c1f;--success-soft:#153522;--info-soft:#18313c;
