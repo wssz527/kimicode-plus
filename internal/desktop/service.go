@@ -64,11 +64,13 @@ type NativeService struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu           sync.Mutex
-	automationMu sync.Mutex
-	featureMu    sync.Mutex
-	cacheMu      sync.Mutex
-	watchMu      sync.Mutex
+	mu                 sync.Mutex
+	automationMu       sync.Mutex
+	featureMu          sync.Mutex
+	cacheMu            sync.Mutex
+	providerModelsMu   sync.Mutex
+	publicModelCatalog publicModelCatalog
+	watchMu            sync.Mutex
 	// watchOpMu serializes subscribe and unsubscribe transitions. It is separate
 	// from watchMu because one transition includes a network call: holding the
 	// reference map only while it is read would let a second caller see a
@@ -494,7 +496,10 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.handoff(ctx, input)
 	case "config.get":
 		raw, err := s.kap.Request(ctx, http.MethodGet, "/config", nil)
-		return rawJSON(raw), err
+		if err != nil {
+			return nil, err
+		}
+		return visibleConfig(raw)
 	case "config.save":
 		var wrapper struct {
 			Patch json.RawMessage `json:"patch"`
@@ -507,12 +512,20 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 			return nil, errors.New("需要非空配置补丁")
 		}
 		raw, err := s.kap.Request(ctx, http.MethodPost, "/config", wrapper.Patch)
-		if err == nil {
-			s.invalidateOfficialConfigCache()
+		if err != nil {
+			return nil, err
 		}
-		return rawJSON(raw), err
+		s.invalidateOfficialConfigCache()
+		if rawJSON(raw) == nil {
+			return nil, nil
+		}
+		return visibleConfig(raw)
 	case "providers.updateModel":
 		return s.updateProviderModel(ctx, input)
+	case "providers.updateModels":
+		return s.updateProviderModels(ctx, input)
+	case "providers.modelSuggestion":
+		return s.providerModelSuggestion(ctx, input)
 	case "managed.usage":
 		raw, err := s.kap.Request(ctx, http.MethodGet, "/oauth/usage", nil)
 		return rawAsAny(raw), err

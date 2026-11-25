@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"enhancedkimi/internal/registry"
 	"enhancedkimi/internal/storage"
 )
 
@@ -117,5 +118,43 @@ func TestModelsListPublishesTheWholeCatalogEntry(t *testing.T) {
 	item := items[0]
 	if item.Provider != "team" || item.Capabilities[0] != "image_in" || item.SupportEfforts[0] != "low" {
 		t.Fatalf("models.list dropped catalog fields: %#v", item)
+	}
+}
+
+type testPublicModelCatalog func(context.Context, string, string, string) (map[string]registry.Capability, error)
+
+func (lookup testPublicModelCatalog) FindPublicModel(ctx context.Context, provider, endpoint, model string) (map[string]registry.Capability, error) {
+	return lookup(ctx, provider, endpoint, model)
+}
+
+func TestModelSuggestionUsesSavedProviderEndpointAndExactModel(t *testing.T) {
+	store := newOfficialModelStore(map[string]modelConfig{
+		"r2-inspect/family/beta": {Provider: "r2-inspect", Model: "family/beta", MaxContextSize: 65536},
+	})
+	service, _ := newAutomationTestService(t, store.handler())
+	called := 0
+	service.UsePublicModelCatalog(testPublicModelCatalog(func(ctx context.Context, provider, endpoint, model string) (map[string]registry.Capability, error) {
+		called++
+		if provider != "r2-inspect" || endpoint != "https://example.invalid/v1" || model != "family/beta" {
+			t.Fatalf("catalog lookup received %q %q %q", provider, endpoint, model)
+		}
+		return map[string]registry.Capability{
+			"vision": {Value: true}, "video": {Value: false}, "tools": {Value: true},
+			"thinking": {Value: true}, "output": {Value: float64(4096)}, "context": {Value: float64(8192)},
+		}, nil
+	}))
+	for _, model := range []string{"other/family/beta", "r2-inspect/beta", "r2-inspect/family/BETA"} {
+		_, err := service.Action(context.Background(), "providers.modelSuggestion", json.RawMessage(`{"providerId":"r2-inspect","model":"`+model+`"}`))
+		if err == nil {
+			t.Fatalf("accepted inexact model %q", model)
+		}
+	}
+	value, err := service.Action(context.Background(), "providers.modelSuggestion", json.RawMessage(`{"providerId":"r2-inspect","model":"r2-inspect/family/beta","baseUrl":"https://ignored.invalid/v1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(value)
+	if err != nil || string(raw) != `{"suggestion":{"image_in":true,"max_output_size":4096,"thinking":true,"tool_use":true,"video_in":false}}` || called != 1 || len(store.bodies) != 0 {
+		t.Fatalf("catalog result = %s, requests = %d, writes = %d, error = %v", raw, called, len(store.bodies), err)
 	}
 }

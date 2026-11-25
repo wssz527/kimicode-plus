@@ -94,6 +94,46 @@ func TestPublicCatalogCacheFailureAndImport(t *testing.T) {
 	}
 }
 
+func TestFindPublicModelMatchesEndpointAndModelID(t *testing.T) {
+	const fixture = `{
+		"exact": {"api":"https://example.com/v1", "models":{"family/model":{"id":"family/model","tool_call":true,"reasoning":false,"modalities":{"input":["text","image"]},"limit":{"output":512}}}},
+		"alias": {"api":"https://example.com/v1", "models":{"family/model":{"id":"family/model","tool_call":false}}},
+		"wrong-key": {"api":"https://example.org/v1", "models":{"family/model":{"id":"different","tool_call":true}}},
+		"openai": {"models":{"test-model":{"id":"test-model","tool_call":true}}}
+	}`
+	host := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(fixture)) }))
+	defer host.Close()
+	s, db := newTestService(t)
+	ctx := context.Background()
+	if _, err := s.refreshCatalog(ctx, host.Client(), host.URL); err != nil {
+		t.Fatal(err)
+	}
+	before := revision(t, s)
+	caps, err := s.FindPublicModel(ctx, "exact", "https://EXAMPLE.com:443/v1/", "family/model")
+	if err != nil || caps["tools"].Value != true || caps["vision"].Value != true || caps["video"].Value != false || caps["thinking"].Value != false || caps["output"].Value != float64(512) {
+		t.Fatalf("exact metadata = %#v, %v", caps, err)
+	}
+	for _, tc := range []struct{ id, endpoint, model string }{
+		{"custom", "https://example.com/v1", "family/model"},
+		{"exact", "https://example.com/v2", "family/model"},
+		{"exact", "https://example.com/v1", "MODEL"},
+		{"wrong-key", "https://example.org/v1", "family/model"},
+		{"exact", "https://example.com/v1?credential=value", "family/model"},
+	} {
+		if caps, err = s.FindPublicModel(ctx, tc.id, tc.endpoint, tc.model); err != nil || caps != nil {
+			t.Fatalf("accepted %v: %#v, %v", tc, caps, err)
+		}
+	}
+	caps, err = s.FindPublicModel(ctx, "local-openai", "https://api.openai.com/v1", "test-model")
+	if err != nil || caps["tools"].Value != true {
+		t.Fatalf("exact preset endpoint without catalog api = %#v, %v", caps, err)
+	}
+	var providers int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM registry_providers`).Scan(&providers); err != nil || providers != 0 || revision(t, s) != before {
+		t.Fatalf("catalog lookup changed registry config: %d, %v", providers, err)
+	}
+}
+
 func TestPublicCatalogRedirectAndMalformedBody(t *testing.T) {
 	targetHit := false
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { targetHit = true }))

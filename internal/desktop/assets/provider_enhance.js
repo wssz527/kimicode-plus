@@ -1,1304 +1,719 @@
-// Adds inline expandable model capability & limit controls to the official
-// provider form: capabilities, direct-click thinking efforts (no / low / medium /
-// high / xhigh / max), and single-row context/output limits with K/M support.
-//
-// Loaded by renderer.js as an independent unit (`provider_enhance.js`) and
-// instantiated with the native transport. It owns no globals, installs one
-// observer, and every write goes through `providers.updateModel`, so an api_key
-// never reaches this script.
-function createProviderEnhance(options) {
-  const request = options.request;
-  const state = {
-    observer: null,
-    removed: false,
-    panel: null,
-    panelRow: null,
-    panelButton: null,
-    style: null,
-    props: null,
-  };
-
+function createProviderEnhance({ request }) {
   const CAPABILITIES = [
-    { key: 'image_in', label: '图片输入' },
-    { key: 'video_in', label: '视频输入' },
-    { key: 'tool_use', label: '工具调用' },
+    ['image_in', '图片输入', '图片'],
+    ['video_in', '视频输入', '视频'],
+    ['tool_use', '工具调用', '工具'],
   ];
+  const MODES = [['none', '关闭'], ['toggle', '可切换'], ['always', '始终思考']];
+  const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+  const PANEL_ID = 'ekd-px-inspector';
+  const state = { panel: null, style: null, table: null };
+  let enabled = true;
+  let removed = false;
+  let observer;
+  let timer;
+  let generation = 0;
+  let snapshot;
+  let pending;
 
-  const THINKING_OPTIONS = [
-    { value: 'no', label: 'no', title: '关闭思考' },
-    { value: 'low', label: 'low', title: '低推理强度 (low)' },
-    { value: 'medium', label: 'medium', title: '中等推理强度 (medium)' },
-    { value: 'high', label: 'high', title: '高推理强度 (high)' },
-    { value: 'xhigh', label: 'xhigh', title: '超高推理强度 (xhigh)' },
-    { value: 'max', label: 'max', title: '最大推理强度 (max)' },
-  ];
-
-  const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
-
-  const CONTEXT_PRESETS = [
-    { label: '256K', value: 262144 },
-    { label: '350K', value: 358400 },
-    { label: '500K', value: 512000 },
-    { label: '600K', value: 614400 },
-    { label: '1M', value: 1048576 },
-  ];
-
-  const CONFIG_TTL_MS = 2000;
-  // `generation` guards an in-flight read: invalidating the cache while a
-  // request is in flight must keep that stale answer from being written back.
-  const configCache = { value: null, at: 0, promise: null, generation: 0 };
-
-  // ---------------------------------------------------------------- rendering
-
-  function el(tag, props, children) {
+  function el(tag, props = {}, children = []) {
     const node = document.createElement(tag);
-    for (const [key, value] of Object.entries(props || {})) {
-      if (value === undefined || value === null) continue;
+    for (const [key, value] of Object.entries(props)) {
       if (key === 'class') node.className = value;
-      else if (key === 'text') node.textContent = String(value);
-      else if (key === 'dataset') Object.assign(node.dataset, value);
-      else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2).toLowerCase(), value);
+      else if (key === 'text') node.textContent = value;
+      else if (key.startsWith('on')) node.addEventListener(key.slice(2).toLowerCase(), value);
       else node.setAttribute(key, String(value));
     }
-    for (const child of children || []) {
-      if (child === null || child === undefined) continue;
-      node.append(typeof child === 'string' ? document.createTextNode(child) : child);
-    }
+    node.append(...children);
     return node;
   }
 
-  function icon(paths, size) {
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.setAttribute('width', String(size || 14));
-    svg.setAttribute('height', String(size || 14));
-    svg.setAttribute('viewBox', '0 0 24 24');
-    svg.setAttribute('fill', 'currentColor');
-    svg.setAttribute('class', 'kw-icon');
-    svg.setAttribute('aria-hidden', 'true');
-    for (const d of paths) {
-      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      path.setAttribute('d', d);
-      svg.append(path);
-    }
-    return svg;
+  function button(text, onClick, props = {}) {
+    return el('button', { type: 'button', class: 'ekd-px-button', text, onClick, ...props });
   }
 
-  const SLIDERS = [
-    'M3.7 5.1h6.4a1 1 0 0 1 0 2H3.7a1 1 0 0 1 0-2Z',
-    'M15.5 4.2a3.7 3.7 0 1 0 0 7.4 3.7 3.7 0 0 0 0-7.4Zm0 2a1.7 1.7 0 1 1 0 3.4 1.7 1.7 0 0 1 0-3.4Z',
-    'M13.9 15.1h6.4a1 1 0 0 1 0 2h-6.4a1 1 0 0 1 0-2Z',
-    'M8.5 12.4a3.7 3.7 0 1 0 0 7.4 3.7 3.7 0 0 0 0-7.4Zm0 2a1.7 1.7 0 1 1 0 3.4 1.7 1.7 0 0 1 0-3.4Z',
-  ];
-
-  const CHEVRON_DOWN = ['M6.7 9.3a1 1 0 0 1 1.4 0L12 13.2l3.9-3.9a1 1 0 1 1 1.4 1.4l-4.6 4.6a1 1 0 0 1-1.4 0l-4.6-4.6a1 1 0 0 1 0-1.4Z'];
-
-  // ------------------------------------------------------------------- config
-
-  function modelPart(key) {
-    const index = String(key).indexOf('/');
-    return index === -1 ? String(key) : String(key).slice(index + 1);
+  function formatSize(size) {
+    if (!Number.isSafeInteger(size) || size < 1) return '';
+    if (size % 1048576 === 0) return `${size / 1048576}M`;
+    if (size % 1024 === 0) return `${size / 1024}K`;
+    return String(size);
   }
 
-  function providerPart(key) {
-    const index = String(key).indexOf('/');
-    return index === -1 ? '' : String(key).slice(0, index);
+  function parseSize(raw) {
+    const text = raw.trim().replace(/[,\s_]/g, '');
+    if (!text) return { value: null, error: '' };
+    const match = /^(\d+(?:\.\d+)?)([KM])B?$/i.exec(text);
+    const unit = match?.[2].toUpperCase();
+    const value = match ? Number(match[1]) * (unit === 'K' ? 1024 : 1048576) : (/^\d+$/.test(text) ? Number(text) : 0);
+    if (!Number.isSafeInteger(value) || value < 1) return { value: null, error: '请输入正整数或等效的 K、M 值。' };
+    return { value, error: '' };
   }
 
-  function normalizeEfforts(list) {
-    const raw = Array.isArray(list) ? list : [];
-    const seen = new Set();
-    const valid = [];
-    for (const item of raw) {
-      const trimmed = typeof item === 'string' ? item.trim() : '';
-      if (!trimmed || trimmed.toLowerCase() === 'no' || seen.has(trimmed)) continue;
-      seen.add(trimmed);
-      valid.push(trimmed);
-    }
-    const preset = EFFORT_ORDER.filter(effort => seen.has(effort));
-    const custom = valid.filter(effort => !EFFORT_ORDER.includes(effort));
-    return [...preset, ...custom];
+  function uniqueEfforts(raw) {
+    const entries = Array.isArray(raw) ? raw.filter(value => typeof value === 'string') : [];
+    return [...new Set(entries.map(value => value.trim()).filter(value => value && value.toLowerCase() !== 'no'))];
   }
 
-  function thinkingMode(model) {
-    const capabilities = Array.isArray(model?.capabilities) ? model.capabilities : [];
-    if (capabilities.includes('always_thinking')) return 'always';
-    const efforts = normalizeEfforts(
-      Array.isArray(model?.supportEfforts)
-        ? model.supportEfforts
-        : (Array.isArray(model?.support_efforts) ? model.support_efforts : []),
-    );
-    if (
-      capabilities.includes('thinking') ||
-      model?.adaptiveThinking === true ||
-      model?.adaptive_thinking === true ||
-      efforts.length > 0
-    ) {
-      return 'toggle';
-    }
-    return 'none';
-  }
-
-  function readThinkingState(model) {
-    const thinking = thinkingMode(model);
-    const adaptive = model?.adaptiveThinking === true || model?.adaptive_thinking === true;
+  function modelFields(model = {}) {
+    const capabilities = new Set(Array.isArray(model.capabilities) ? model.capabilities.filter(value => typeof value === 'string') : []);
+    const supportEfforts = uniqueEfforts(model.supportEfforts ?? model.support_efforts ?? []);
+    const adaptive = model.adaptiveThinking ?? model.adaptive_thinking ?? false;
+    const thinking = capabilities.has('always_thinking') ? 'always'
+      : capabilities.has('thinking') || adaptive || supportEfforts.length ? 'toggle' : 'none';
+    capabilities.delete('always_thinking');
+    capabilities.delete('thinking');
     return {
-      thinking,
-      adaptiveThinking: thinking === 'toggle' && adaptive,
+      capabilities, supportEfforts, thinking, adaptive,
+      context: model.maxContextSize ?? model.max_context_size ?? 0,
+      output: model.maxOutputSize ?? model.max_output_size ?? null,
     };
   }
 
-  function applyThinkingState(baseCapabilities, thinking, adaptiveThinking = false) {
-    const input = new Set(Array.isArray(baseCapabilities) ? baseCapabilities : []);
-    const capabilities = CAPABILITIES.map(item => item.key).filter(key => input.has(key));
-    const mode = thinking === 'always' || thinking === 'toggle' ? thinking : 'none';
-    if (mode === 'toggle') capabilities.push('thinking');
-    else if (mode === 'always') capabilities.push('always_thinking');
-    return {
-      capabilities,
-      thinking: mode,
-      adaptive_thinking: mode === 'toggle' && Boolean(adaptiveThinking),
-    };
+  function summary(model, managed) {
+    if (managed) return '只读';
+    if (!model) return '未保存';
+    const fields = modelFields(model);
+    const labels = CAPABILITIES.filter(([key]) => fields.capabilities.has(key)).map(([, , label]) => label);
+    if (fields.thinking !== 'none') labels.push(fields.thinking === 'always' ? '始终思考' : '思考');
+    const custom = [...fields.capabilities].filter(key => !CAPABILITIES.some(([known]) => known === key));
+    if (custom.length) labels.push(`其他 ${custom.length} 项`);
+    if (!labels.length) labels.push('未配置');
+    if (fields.context > 0) labels.push(formatSize(fields.context));
+    return labels.join(' · ');
   }
 
-  function selectThinkingOption(draft, option) {
-    if (option === 'no') {
-      draft.thinking = 'none';
-      draft.adaptiveThinking = false;
-      draft.supportEfforts = [];
-      return;
-    }
-    const current = new Set(normalizeEfforts(draft.supportEfforts));
-    if (current.has(option)) current.delete(option);
-    else current.add(option);
-    draft.supportEfforts = normalizeEfforts([...current]);
-    if (draft.supportEfforts.length === 0) {
-      draft.thinking = 'none';
-      draft.adaptiveThinking = false;
-    } else {
-      if (draft.thinking === 'none') draft.thinking = 'toggle';
-      const preserved = typeof draft.preservedAdaptiveThinking === 'boolean'
-        ? draft.preservedAdaptiveThinking
-        : draft.adaptiveThinking === true;
-      draft.adaptiveThinking = draft.thinking === 'toggle' && preserved;
-    }
+  function readConfig() {
+    if (pending) return pending;
+    const readGeneration = generation;
+    pending = request('config.get').then(config => {
+      if (readGeneration === generation) snapshot = config;
+      return config;
+    }).finally(() => {
+      if (readGeneration === generation) pending = null;
+    });
+    return pending;
   }
 
-  /** Explicit off / toggle / always. Keeping `always` separate from the effort
-   * pills is what lets an `always_thinking` model be downgraded and restored
-   * without losing the stored adaptive_thinking flag. */
-  function setThinkingMode(draft, mode) {
-    const next = mode === 'always' ? 'always' : (mode === 'toggle' || mode === 'on') ? 'toggle' : 'none';
-    draft.thinking = next;
-    if (next === 'none') {
-      draft.adaptiveThinking = false;
-      draft.supportEfforts = [];
-      return;
-    }
-    if (next === 'toggle') {
-      const preserved = typeof draft.preservedAdaptiveThinking === 'boolean'
-        ? draft.preservedAdaptiveThinking
-        : draft.adaptiveThinking === true;
-      draft.adaptiveThinking = preserved;
-      return;
-    }
-    draft.adaptiveThinking = false;
+  function invalidate() {
+    generation += 1;
+    snapshot = null;
+    pending = null;
+    scan();
   }
 
-  /** Turns one stored model into the editable draft the inline panel starts from. */
-  function draftOf(model) {
-    const capabilities = Array.isArray(model?.capabilities) ? model.capabilities : [];
-    const thinkingState = readThinkingState(model);
-    const rawEfforts = Array.isArray(model?.supportEfforts)
-      ? model.supportEfforts
-      : (Array.isArray(model?.support_efforts) ? model.support_efforts : []);
-    const preservedAdaptiveThinking = typeof model?.adaptiveThinking === 'boolean'
-      ? model.adaptiveThinking
-      : (typeof model?.adaptive_thinking === 'boolean' ? model.adaptive_thinking : undefined);
-    return {
-      capabilities: new Set(CAPABILITIES.map(item => item.key).filter(key => capabilities.includes(key))),
-      thinking: thinkingState.thinking,
-      adaptiveThinking: thinkingState.adaptiveThinking,
-      preservedAdaptiveThinking,
-      maxContextSize: typeof model?.maxContextSize === 'number'
-        ? model.maxContextSize
-        : (typeof model?.max_context_size === 'number' ? model.max_context_size : 0),
-      maxOutputSize: typeof model?.maxOutputSize === 'number'
-        ? model.maxOutputSize
-        : (typeof model?.max_output_size === 'number' ? model.max_output_size : null),
-      supportEfforts: normalizeEfforts(rawEfforts),
-    };
+  function findForm() {
+    return document.querySelector('.settings-dialog .pf, .ui-dialog .pf, [role="dialog"] .pf');
   }
 
-  async function readConfig() {
-    const now = Date.now();
-    if (configCache.value && now - configCache.at < CONFIG_TTL_MS) return configCache.value;
-    if (configCache.promise) return configCache.promise;
-    const generation = configCache.generation;
-    configCache.promise = request('config.get')
-      .then(config => {
-        const next = config && typeof config === 'object' ? config : {};
-        // A save that landed mid-flight already invalidated this generation;
-        // writing the older answer back would resurrect the pre-save config.
-        if (generation === configCache.generation) {
-          configCache.value = next;
-          configCache.at = Date.now();
-        }
-        return next;
-      })
-      .finally(() => {
-        if (generation === configCache.generation) configCache.promise = null;
-      });
-    return configCache.promise;
+  function modelInputs(row) {
+    const inputs = [...row.children].filter(child => child.tagName === 'INPUT');
+    return inputs.length ? inputs : [...row.querySelectorAll('input.ui-input')];
   }
 
-  function invalidateConfig() {
-    configCache.generation += 1;
-    configCache.value = null;
-    configCache.at = 0;
-    configCache.promise = null;
+  function modelInput(row) {
+    return modelInputs(row)[0];
   }
 
-  function rowInputs(row) {
-    return [...row.children].filter(child => child && child.tagName === 'INPUT');
+  function savedModel(config, providerId, modelId) {
+    const key = `${providerId}/${modelId}`;
+    const models = config.models || {};
+    if (Object.hasOwn(models, key)) return models[key];
+    const bare = Object.hasOwn(models, modelId) ? models[modelId] : null;
+    return bare?.provider === providerId && (bare.model || modelId) === modelId ? bare : null;
   }
 
   function resolveProvider(form, config) {
     const providers = config.providers || {};
-    const models = config.models || {};
-    const type = form.querySelector('.pf-field .ui-select__value-text')?.textContent.trim().toLowerCase() || '';
-    const inputs = [...form.querySelectorAll('.pf-field input.ui-input')];
-    const firstName = inputs.length > 0 ? inputs[0].value.trim() : '';
-    const urlInput = inputs.find(input => /^https?:\/\//i.test(input.value.trim()));
-    const baseUrl = urlInput ? urlInput.value.trim() : (inputs.length > 1 ? inputs[1].value.trim() : '');
-    const ids = Object.keys(providers);
-    if (baseUrl) {
-      const byBase = ids.filter(id => {
-        const entry = providers[id] || {};
-        const storedBase = String(entry.base_url || entry.baseUrl || '').trim();
-        return storedBase === baseUrl && (!type || String(entry.type || '').toLowerCase() === type);
-      });
-      if (byBase.length === 1) return byBase[0];
-      const byBaseAnyType = ids.filter(id => {
-        const entry = providers[id] || {};
-        const storedBase = String(entry.base_url || entry.baseUrl || '').trim();
-        return storedBase === baseUrl;
-      });
-      if (byBaseAnyType.length === 1) return byBaseAnyType[0];
-      if (byBaseAnyType.length > 1 && firstName && byBaseAnyType.includes(firstName)) return firstName;
+    const inputs = [...form.querySelectorAll('.pf-field input.ui-input')]
+      .filter(input => input.type !== 'password' && !input.closest('.pf-key-wrap'));
+    const name = inputs[0]?.value.trim();
+    const url = inputs.find(input => /^https?:\/\//i.test(input.value.trim()))?.value.trim();
+    if (name && Object.hasOwn(providers, name)) {
+      const stored = providers[name].base_url ?? providers[name].baseUrl;
+      return !url || url === stored ? name : '';
     }
-    if (firstName && Object.prototype.hasOwnProperty.call(providers, firstName)) {
-      return firstName;
+    if (url) {
+      const matching = Object.entries(providers).filter(([, provider]) => (provider.base_url ?? provider.baseUrl) === url);
+      return matching.length === 1 ? matching[0][0] : '';
     }
-    const rows = [...form.querySelectorAll('.pmt .pmt-grid')].filter(row => !row.classList.contains('pmt-head'));
-    const owners = new Set();
-    for (const row of rows) {
-      const firstInput = rowInputs(row)[0] || row.querySelector('input');
-      const modelId = firstInput ? firstInput.value.trim() : '';
-      if (!modelId) continue;
-      for (const key of Object.keys(models)) {
-        if (modelPart(key) === modelId) owners.add(providerPart(key));
-      }
-    }
-    owners.delete('');
-    return owners.size === 1 ? [...owners][0] : '';
+    const rows = [...form.querySelectorAll('.pmt-grid')];
+    const ids = new Set(rows.map(row => modelInput(row)?.value.trim()).filter(Boolean));
+    const matching = Object.keys(providers).filter(providerId => [...ids].some(id => savedModel(config, providerId, id)));
+    return matching.length === 1 ? matching[0] : '';
   }
 
-  // ---------------------------------------------------------------------- DOM
-
-  function findProviderForm() {
-    return document.querySelector('.settings-dialog .pf, .ui-dialog .pf, [role="dialog"] .pf');
-  }
-
-  function styleText() {
-    return `
-      .settings-dialog .pf .pmt[data-ekd-px-table="1"] .pmt-grid.pmt-head,
-      .settings-dialog .pf .pmt[data-ekd-px-table="1"] .pmt-grid[data-ekd-px-row="1"],
-      .ui-dialog .pf .pmt[data-ekd-px-table="1"] .pmt-grid.pmt-head,
-      .ui-dialog .pf .pmt[data-ekd-px-table="1"] .pmt-grid[data-ekd-px-row="1"],
-      [role="dialog"] .pf .pmt[data-ekd-px-table="1"] .pmt-grid.pmt-head,
-      [role="dialog"] .pf .pmt[data-ekd-px-table="1"] .pmt-grid[data-ekd-px-row="1"]{
-        grid-template-columns:minmax(0,1.35fr) minmax(0,.68fr) minmax(0,1fr) auto auto;
-        row-gap:8px;
-      }
-      .ekd-px-head-pad{display:inline-block;width:96px;height:1px;pointer-events:none}
-      .ekd-px-btn{
-        display:inline-flex;align-items:center;justify-content:center;gap:4px;flex:none;
-        height:28px;padding:0 9px;
-        border:1px solid color-mix(in srgb,currentColor 18%,transparent);
-        border-radius:7px;
-        background:color-mix(in srgb,currentColor 5%,transparent);
-        color:inherit;font:inherit;font-size:12px;font-weight:500;line-height:1;
-        white-space:nowrap;cursor:pointer;
-        transition:border-color .14s ease,background .14s ease,color .14s ease;
-      }
-      .ekd-px-btn:hover{
-        border-color:color-mix(in srgb,var(--color-accent,#3b82f6) 62%,transparent);
-        background:color-mix(in srgb,var(--color-accent,#3b82f6) 13%,transparent);
-        color:var(--color-accent,#3b82f6);
-      }
-      .ekd-px-btn[aria-expanded="true"]{
-        border-color:var(--color-accent,#3b82f6);
-        background:color-mix(in srgb,var(--color-accent,#3b82f6) 16%,transparent);
-        color:var(--color-accent,#3b82f6);
-      }
-      .ekd-px-btn:focus-visible{outline:2px solid var(--color-accent,#3b82f6);outline-offset:2px}
-      .ekd-px-caret{display:inline-flex;transition:transform .16s ease}
-      .ekd-px-btn[aria-expanded="true"] .ekd-px-caret{transform:rotate(180deg)}
-
-      .ekd-px-drawer{
-        grid-column:1 / -1;
-        display:flex;flex-direction:column;gap:12px;
-        margin:2px 0 6px;padding:13px 14px;
-        border:1px solid color-mix(in srgb,currentColor 15%,transparent);
-        border-radius:10px;
-        background:color-mix(in srgb,currentColor 4%,var(--color-bg,transparent));
-        color:inherit;font:13px/1.5 var(--font-ui,system-ui,-apple-system,sans-serif);
-        cursor:default;
-      }
-      .ekd-px-top-grid{
-        display:grid;grid-template-columns:minmax(0,auto) minmax(0,1fr);
-        gap:12px 18px;align-items:start;
-      }
-      @media(max-width:640px){
-        .ekd-px-top-grid{grid-template-columns:1fr}
-      }
-      .ekd-px-section{display:flex;flex-direction:column;gap:6px;min-width:0}
-      .ekd-px-title{
-        font-size:11.5px;font-weight:600;letter-spacing:.01em;
-        color:color-mix(in srgb,currentColor 64%,transparent);
-      }
-      .ekd-px-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
-      .ekd-px-pill{
-        display:inline-flex;align-items:center;gap:6px;
-        height:27px;padding:0 10px;
-        border:1px solid color-mix(in srgb,currentColor 18%,transparent);
-        border-radius:7px;
-        background:color-mix(in srgb,currentColor 3%,transparent);
-        color:color-mix(in srgb,currentColor 84%,transparent);
-        font:inherit;font-size:12px;font-weight:500;line-height:1;
-        cursor:pointer;transition:border-color .12s ease,background .12s ease,color .12s ease;
-      }
-      .ekd-px-pill:hover:not([disabled]){
-        border-color:color-mix(in srgb,currentColor 34%,transparent);
-        background:color-mix(in srgb,currentColor 8%,transparent);
-        color:inherit;
-      }
-      .ekd-px-pill[aria-pressed="true"]{
-        border-color:var(--color-accent,#3b82f6);
-        background:color-mix(in srgb,var(--color-accent,#3b82f6) 17%,transparent);
-        color:var(--color-accent,#60a5fa);
-        font-weight:600;
-      }
-      .ekd-px-pill[data-kind="no"][aria-pressed="true"]{
-        border-color:color-mix(in srgb,currentColor 42%,transparent);
-        background:color-mix(in srgb,currentColor 14%,transparent);
-        color:inherit;
-      }
-      .ekd-px-pill[disabled]{opacity:.45;cursor:not-allowed}
-      .ekd-px-pill:focus-visible{outline:2px solid var(--color-accent,#3b82f6);outline-offset:2px}
-      .ekd-px-dot{
-        width:6px;height:6px;border-radius:50%;
-        background:color-mix(in srgb,currentColor 32%,transparent);
-      }
-      .ekd-px-pill[aria-pressed="true"] .ekd-px-dot{background:currentColor}
-      .ekd-px-divider{
-        width:1px;height:16px;margin:0 2px;
-        background:color-mix(in srgb,currentColor 16%,transparent);
-      }
-
-      .ekd-px-limits{
-        display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
-        gap:12px;align-items:start;
-      }
-      @media(max-width:560px){
-        .ekd-px-limits{grid-template-columns:1fr}
-      }
-      .ekd-px-input-wrap{display:flex;align-items:center;gap:6px;min-width:0}
-      .ekd-px-input{
-        width:100%;min-width:0;height:30px;padding:0 10px;
-        border:1px solid color-mix(in srgb,currentColor 20%,transparent);
-        border-radius:7px;
-        background:color-mix(in srgb,var(--color-bg,#18181b) 82%,currentColor 4%);
-        color:inherit;font:inherit;font-size:12.5px;
-        font-variant-numeric:tabular-nums;
-        outline:none;transition:border-color .12s ease,box-shadow .12s ease;
-      }
-      .ekd-px-input::placeholder{color:color-mix(in srgb,currentColor 40%,transparent)}
-      .ekd-px-input:focus{
-        border-color:var(--color-accent,#3b82f6);
-        box-shadow:0 0 0 2px color-mix(in srgb,var(--color-accent,#3b82f6) 20%,transparent);
-      }
-      .ekd-px-input[aria-invalid="true"]{border-color:var(--color-danger,#ef4444)}
-      .ekd-px-input[disabled]{opacity:.5;cursor:not-allowed}
-
-      .ekd-px-presets{display:flex;flex-wrap:wrap;gap:5px;align-items:center}
-      .ekd-px-preset{
-        height:22px;padding:0 8px;
-        border:1px solid color-mix(in srgb,currentColor 16%,transparent);
-        border-radius:999px;
-        background:transparent;
-        color:color-mix(in srgb,currentColor 68%,transparent);
-        font:inherit;font-size:11px;font-weight:500;
-        font-variant-numeric:tabular-nums;
-        cursor:pointer;transition:border-color .12s ease,background .12s ease,color .12s ease;
-      }
-      .ekd-px-preset:hover:not([disabled]){
-        border-color:color-mix(in srgb,currentColor 34%,transparent);
-        color:inherit;
-      }
-      .ekd-px-preset[aria-pressed="true"]{
-        border-color:var(--color-accent,#3b82f6);
-        background:color-mix(in srgb,var(--color-accent,#3b82f6) 16%,transparent);
-        color:var(--color-accent,#60a5fa);
-        font-weight:600;
-      }
-      .ekd-px-preset[disabled]{opacity:.45;cursor:not-allowed}
-      .ekd-px-preset:focus-visible{outline:2px solid var(--color-accent,#3b82f6);outline-offset:1px}
-
-      .ekd-px-meta{font-size:11.5px;color:color-mix(in srgb,currentColor 54%,transparent);line-height:1.4}
-      .ekd-px-hint{color:color-mix(in srgb,currentColor 56%,transparent);font-size:12px;margin:4px 0 0}
-      .ekd-px-hint[data-tone="error"],.ekd-px-issue{color:var(--color-danger,#ef4444);font-size:11.5px;line-height:1.4}
-
-      .ekd-px-foot{
-        display:flex;flex-wrap:wrap;gap:8px;align-items:center;
-        padding-top:9px;
-        border-top:1px solid color-mix(in srgb,currentColor 12%,transparent);
-      }
-      .ekd-px-status{margin-right:auto;font-size:12px;color:color-mix(in srgb,currentColor 60%,transparent)}
-      .ekd-px-status[data-tone="ok"]{color:var(--color-done,#22c55e)}
-      .ekd-px-status[data-tone="error"]{color:var(--color-danger,#ef4444)}
-      .ekd-px-primary{
-        height:28px;padding:0 14px;border:0;border-radius:7px;
-        background:var(--color-accent,#3b82f6);color:var(--color-text-on-accent,#fff);
-        font:inherit;font-size:12.5px;font-weight:500;cursor:pointer;
-      }
-      .ekd-px-primary:hover:not([disabled]){filter:brightness(1.06)}
-      .ekd-px-primary[disabled]{opacity:.5;cursor:not-allowed}
-      .ekd-px-primary:focus-visible{outline:2px solid var(--color-accent,#3b82f6);outline-offset:2px}
-      .ekd-px-quiet{
-        height:28px;padding:0 11px;
-        border:1px solid color-mix(in srgb,currentColor 18%,transparent);
-        border-radius:7px;background:transparent;color:inherit;
-        font:inherit;font-size:12.5px;cursor:pointer;
-      }
-      .ekd-px-quiet:hover{background:color-mix(in srgb,currentColor 8%,transparent)}
-      .ekd-px-readonly{
-        padding:8px 10px;border-radius:7px;
-        border:1px solid color-mix(in srgb,currentColor 16%,transparent);
-        background:color-mix(in srgb,currentColor 4%,transparent);
-        color:color-mix(in srgb,currentColor 68%,transparent);font-size:12px;
-      }
-      @media(prefers-reduced-motion:reduce){
-        .ekd-px-btn,.ekd-px-caret,.ekd-px-pill,.ekd-px-input,.ekd-px-preset{transition:none}
-      }
-    `;
+  function hasOfficialModelEdits(current, config, providerId) {
+    return [...current.table.querySelectorAll('.pmt-grid')].some(row => {
+      const [id, context, name] = modelInputs(row);
+      if (!id) return false;
+      const model = savedModel(config, providerId, id.value.trim());
+      if (!model) return Boolean(id.value.trim() || context?.value.trim() || name?.value.trim());
+      const fields = modelFields(model);
+      return (context && Number(context.value.trim()) !== fields.context)
+        || (name && name.value.trim() !== (model.displayName ?? model.display_name ?? ''));
+    });
   }
 
   function ensureStyle() {
-    if (state.style && state.style.isConnected) return;
-    const style = document.createElement('style');
-    style.dataset.ekdProviderEnhance = '1';
-    style.textContent = styleText();
-    document.head.append(style);
-    state.style = style;
-  }
-
-  function note(text, tone) {
-    const form = findProviderForm();
-    if (!form) return;
-    let line = form.querySelector('[data-ekd-px-note]');
-    if (!line) {
-      line = el('p', { class: 'ekd-px-hint', role: 'status', 'data-ekd-px-note': '1' });
-      form.prepend(line);
-    }
-    line.textContent = text;
-    if (tone) line.dataset.tone = tone;
-    else delete line.dataset.tone;
-  }
-
-  // -------------------------------------------------------------- row buttons
-
-  async function decorate() {
-    if (state.removed) return;
-    const form = findProviderForm();
-    if (!form) return;
-    const table = form.querySelector('.pmt');
-    if (!table) return;
-    const allGrids = [...table.querySelectorAll('.pmt-grid')];
-    const head = allGrids.find(row => row.classList.contains('pmt-head'));
-    const rows = allGrids.filter(row => !row.classList.contains('pmt-head'));
-    const editMode = Boolean(form.querySelector('.pf-back'));
-    if (!editMode) {
-      if (!form.querySelector('[data-ekd-px-hint]')) {
-        const foot = form.querySelector('.pf-foot');
-        const hint = el('p', { class: 'ekd-px-hint', 'data-ekd-px-hint': '1', text: '保存供应商后，可在每一行展开设置模型能力、思考强度与上下文。' });
-        if (foot) foot.before(hint);
-        else form.append(hint);
+    if (state.style?.isConnected) return;
+    state.style = el('style', { 'data-ekd-provider-enhance-style': '1', text: `
+      .ekd-px-row,.ekd-px-toolbar,.ekd-px-dialog{
+        --px-bg:var(--color-bg,light-dark(#fff,#1f1f1f));
+        --px-ink:var(--color-text,light-dark(#1a1a1a,#ededed));
+        --px-muted:color-mix(in srgb,var(--px-ink) 86%,var(--px-bg));
+        --px-line:var(--color-line,color-mix(in srgb,var(--px-ink) 22%,var(--px-bg)));
+        --px-fill:color-mix(in srgb,var(--px-ink) 8%,var(--px-bg));
+        --px-accent:var(--color-accent,var(--blue,#1783ff));
+        color:var(--px-ink);font-family:var(--font-ui,system-ui,sans-serif);
+        -webkit-app-region:no-drag;
       }
-      return;
-    }
-    let config;
-    try {
-      config = await readConfig();
-    } catch {
-      return;
-    }
-    // The await can outlive an uninstall, a disable, or the dialog closing; the
-    // caller has no cancellation channel, so the settings are re-checked here.
-    // Comparing against a fresh lookup is the honest test: a replaced dialog is
-    // a different form even if the old node still claims to be connected.
-    if (!enabled || state.removed || findProviderForm() !== form) return;
-    const providerId = resolveProvider(form, config);
-    if (!providerId) return;
-    const managed = providerId.startsWith('managed:');
-    state.props = { providerId, managed };
-    table.dataset.ekdPxTable = '1';
-    if (head && !head.querySelector('[data-ekd-px-head-pad]')) {
-      head.append(el('span', { class: 'ekd-px-head-pad', 'data-ekd-px-head-pad': '1', 'aria-hidden': 'true' }));
-    }
-    for (const row of rows) {
-      row.dataset.ekdPxRow = '1';
-      if (row.querySelector('[data-ekd-px-button]')) continue;
-      const remove = row.querySelector('button[aria-label="移除模型"], button[aria-label="Remove model"]')
-        || [...row.querySelectorAll('button')].filter(b => !b.hasAttribute('data-ekd-px-button')).at(-1);
-      if (!remove) continue;
-      const button = el('button', {
-        type: 'button',
-        class: 'ekd-px-btn',
-        'aria-label': '能力与限制',
-        'aria-expanded': 'false',
-        title: '展开设置模型能力、思考强度与上下文限制',
-        'data-ekd-px-button': '1',
-        'data-ekd-enhance': '1',
-      }, [
-        icon(SLIDERS, 12),
-        el('span', { text: '能力与限制' }),
-        el('span', { class: 'ekd-px-caret', 'aria-hidden': 'true' }, [icon(CHEVRON_DOWN, 12)]),
-      ]);
-      if (managed) button.dataset.state = 'active';
-      button.addEventListener('click', event => {
-        event.preventDefault();
-        event.stopPropagation();
-        void toggleForRow(row, button, providerId, managed);
+      [data-ekd-px-mount][hidden],[data-ekd-px-mount] [hidden]{display:none}
+      .ekd-px-row{grid-column:1 / -1;display:flex;align-items:center;gap:8px;min-inline-size:0}
+      .ekd-px-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-block:0 8px}
+      .ekd-px-toolbar [role="status"]{margin-inline-end:auto;font-size:12px}
+      .ekd-px-button{
+        min-block-size:30px;padding:4px 9px;border:1px solid var(--px-line);border-radius:6px;
+        background:var(--px-bg);color:var(--px-ink);font:inherit;cursor:pointer;
+      }
+      .ekd-px-button:hover:not(:disabled){background:var(--px-fill)}
+      .ekd-px-button:disabled{cursor:default;color:var(--px-muted)}
+      .ekd-px-summary{
+        border-color:transparent;background:transparent;max-inline-size:100%;min-inline-size:0;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;text-align:start;
+      }
+      .ekd-px-dialog{
+        box-sizing:border-box;position:fixed;inset-block:12px;inset-inline:auto 12px;margin:0;
+        inline-size:min(408px,calc(100% - 24px));max-block-size:calc(100% - 24px);max-inline-size:none;
+        overflow:hidden;padding:0;border:1px solid var(--px-line);border-radius:8px;
+        background:var(--px-bg);font-size:13px;line-height:1.5;
+        --px-error:light-dark(#9b2325,#ffb4ab);
+      }
+      .ekd-px-dialog[open]{display:flex;flex-direction:column}
+      .ekd-px-dialog::backdrop{background:rgba(0,0,0,.32)}
+      .ekd-px-header,.ekd-px-footer{flex:none;padding:14px 18px;background:var(--px-bg)}
+      .ekd-px-header{border-block-end:1px solid var(--px-line)}
+      .ekd-px-header h2{font-size:16px;font-weight:600;margin:0}
+      .ekd-px-identity,.ekd-px-status,.ekd-px-hint{color:var(--px-muted);overflow-wrap:anywhere;margin:0}
+      .ekd-px-identity,.ekd-px-hint{font-size:12px}
+      .ekd-px-body{min-block-size:0;overflow:auto;overscroll-behavior:contain;padding:14px 18px;display:flex;flex-direction:column;gap:14px}
+      .ekd-px-body > *{flex:none}
+      .ekd-px-group{border:0;margin:0;padding:0;min-inline-size:0}
+      .ekd-px-group legend{font-weight:600;padding:0;margin-block-end:6px}
+      .ekd-px-options,.ekd-px-actions{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+      .ekd-px-check,.ekd-px-mode,.ekd-px-switch{display:inline-flex;align-items:center;gap:5px;padding:4px 6px;overflow-wrap:anywhere}
+      .ekd-px-check input,.ekd-px-mode input,.ekd-px-row input{margin:0;accent-color:var(--px-accent)}
+      .ekd-px-mode{border:1px solid var(--px-line);border-radius:6px}
+      .ekd-px-mode:has(:checked){background:var(--px-fill);color:var(--px-ink);border-color:var(--px-accent);font-weight:600}
+      .ekd-px-check:has(:checked){color:var(--px-ink);font-weight:600}
+      .ekd-px-switch{margin-top:5px;padding-inline:0;cursor:pointer}
+      .ekd-px-switch [role="switch"]{appearance:none;inline-size:30px;block-size:17px;border:1px solid var(--px-muted);border-radius:var(--radius-sm,8px);margin:0;background:var(--px-fill);padding:2px}
+      .ekd-px-switch [role="switch"]::before{content:'';display:block;inline-size:11px;block-size:11px;border-radius:50%;background:var(--px-ink)}
+      .ekd-px-switch [role="switch"]:checked{background:var(--px-accent);border-color:var(--px-ink)}
+      .ekd-px-switch [role="switch"]:checked::before{margin-inline-start:auto;background:#fff}
+      .ekd-px-limits{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+      .ekd-px-limits label{display:grid;gap:4px;font-weight:600}
+      .ekd-px-input{
+        box-sizing:border-box;inline-size:100%;min-inline-size:0;min-block-size:32px;padding:4px 8px;
+        border:1px solid var(--px-line);border-radius:6px;color:var(--px-ink);
+        background:var(--px-bg);font:inherit;font-variant-numeric:tabular-nums;
+      }
+      .ekd-px-input::placeholder{color:var(--px-muted);opacity:1}
+      .ekd-px-input[aria-invalid="true"]{border-color:var(--px-error)}
+      .ekd-px-footer{border-block-start:1px solid var(--px-line);display:grid;gap:8px}
+      .ekd-px-actions{justify-content:flex-end}
+      .ekd-px-primary:not(:disabled){background:var(--px-ink);color:var(--px-bg);border-color:var(--px-ink);font-weight:600}
+      .ekd-px-primary:hover:not(:disabled){background:var(--px-muted)}
+      .ekd-px-status[data-tone="error"]{color:var(--px-error)}
+      .ekd-px-dialog :focus-visible,.ekd-px-row :focus-visible,.ekd-px-toolbar :focus-visible{outline:2px solid var(--px-accent);outline-offset:2px}
+      @media(forced-colors:active){.ekd-px-switch [role="switch"]{appearance:auto;inline-size:auto;block-size:auto}}
+      @media(max-width:360px){.ekd-px-limits{grid-template-columns:1fr}}
+    ` });
+    document.head.append(state.style);
+  }
+
+  function setText(node, value) {
+    if (node.textContent !== value) node.textContent = value;
+  }
+
+  function updateSelection(current) {
+    const selectable = [...current.rows.values()].filter(row => row.model);
+    const count = new Set(selectable.filter(row => row.select.checked).map(row => row.modelId)).size;
+    for (const row of current.rows.values()) row.selection.hidden = !current.selecting || !row.model;
+    setText(current.count, current.selecting ? `已选 ${count} 个模型` : (current.feedback || ''));
+    setText(current.toggle, current.selecting ? '退出批量配置' : '批量配置');
+    current.all.hidden = !current.selecting;
+    current.apply.hidden = !current.selecting;
+    current.all.disabled = selectable.length === 0;
+    current.apply.disabled = count === 0;
+  }
+
+  function decorateToolbar(current) {
+    current.count = el('span', { role: 'status' });
+    current.toggle = button('批量配置', () => {
+      current.feedback = '';
+      current.selecting = !current.selecting;
+      if (!current.selecting) for (const row of current.rows.values()) row.select.checked = false;
+      updateSelection(current);
+    });
+    current.all = button('全选已保存模型', () => {
+      for (const row of current.rows.values()) row.select.checked = Boolean(row.model);
+      updateSelection(current);
+    });
+    current.apply = button('编辑能力模板', async () => {
+      const selected = [...current.rows.values()].filter(row => row.select.checked).map(row => row.modelId);
+      const shown = current.apply;
+      await withFreshConfig(current, shown, (config, providerId) => {
+        const ids = [...new Set(selected)];
+        if (!ids.length || providerId !== current.providerId || providerId.startsWith('managed:') || !ids.every(id => savedModel(config, providerId, id))) {
+          showMessage(current, shown, '所选模型已变化，请重新选择后再应用模板。');
+          return;
+        }
+        openPanel({ current, button: shown, providerId, ids, officialDirty: hasOfficialModelEdits(current, config, providerId) });
       });
-      remove.after(button);
+    }, { 'aria-haspopup': 'dialog', 'aria-controls': PANEL_ID, 'aria-expanded': 'false' });
+    current.toolbar = el('div', { class: 'ekd-px-toolbar', 'data-ekd-px-mount': '1', role: 'group', 'aria-label': '模型批量配置' }, [current.count, current.toggle, current.all, current.apply]);
+    current.table.before(current.toolbar);
+  }
+
+  async function withFreshConfig(current, trigger, callback) {
+    if (state.panel || trigger.getAttribute('aria-busy') === 'true') return;
+    const startGeneration = generation;
+    trigger.setAttribute('aria-busy', 'true');
+    try {
+      const config = await readConfig();
+      if (startGeneration !== generation || state.table !== current || !trigger.isConnected || state.panel) return;
+      callback(config, resolveProvider(current.form, config));
+      render(current, config);
+    } catch (error) {
+      if (state.table === current && trigger.isConnected && !state.panel) {
+        showMessage(current, trigger, `模型配置读取失败。${error.message || '请重试。'}`);
+      }
+    } finally {
+      trigger.removeAttribute('aria-busy');
     }
   }
 
-  // ----------------------------------------------------------- inline drawer
-
-  function closePanel() {
-    if (state.panelButton) {
-      state.panelButton.setAttribute('aria-expanded', 'false');
-      state.panelButton = null;
+  function render(current, config) {
+    const providerId = resolveProvider(current.form, config);
+    if (current.providerId !== providerId) {
+      current.selecting = false;
+      for (const row of current.rows.values()) row.select.checked = false;
     }
-    state.panelRow = null;
+    current.providerId = providerId;
+    const managed = providerId.startsWith('managed:');
+    current.toolbar.hidden = !providerId || managed;
+    const rows = [...current.table.querySelectorAll('.pmt-grid')].filter(row => !row.classList.contains('pmt-head'));
+    for (const [node, row] of current.rows) {
+      if (!rows.includes(node) || modelInput(node) !== row.input) {
+        row.mount.remove();
+        current.rows.delete(node);
+      }
+    }
+    for (const node of rows) {
+      const input = modelInput(node);
+      if (!input) continue;
+      let row = current.rows.get(node);
+      if (!row) {
+        const select = el('input', { type: 'checkbox', onChange: () => updateSelection(current) });
+        const selection = el('label', { class: 'ekd-px-options' }, [select]);
+        const trigger = button('', () => {
+          const idAtClick = input.value.trim();
+          void withFreshConfig(current, trigger, (latest, providerId) => {
+            if (input.value.trim() !== idAtClick) return;
+            const model = savedModel(latest, providerId, idAtClick);
+            if (!model) {
+              showMessage(current, trigger, '请先在官方供应商表单中保存这个模型。');
+              return;
+            }
+            openPanel({ current, button: trigger, providerId, ids: [idAtClick], model, officialDirty: hasOfficialModelEdits(current, latest, providerId) });
+          });
+        }, { class: 'ekd-px-button ekd-px-summary', 'data-ekd-px-button': '1', 'data-ekd-enhance': '1', 'aria-haspopup': 'dialog', 'aria-controls': PANEL_ID, 'aria-expanded': 'false' });
+        const mount = el('div', { class: 'ekd-px-row', 'data-ekd-px-mount': '1' }, [selection, trigger]);
+        node.append(mount);
+        row = { input, mount, trigger, selection, select };
+        current.rows.set(node, row);
+      }
+      const id = input.value.trim();
+      if (row.modelId !== id) row.select.checked = false;
+      row.modelId = id;
+      row.model = savedModel(config, providerId, id);
+      if (!row.model) row.select.checked = false;
+      const text = summary(row.model, managed);
+      setText(row.trigger, text);
+      row.trigger.setAttribute('title', text);
+      row.trigger.setAttribute('aria-label', `${id || '新模型'}的能力与限制，${text}`);
+      row.select.setAttribute('aria-label', `选择模型 ${id}`);
+    }
+    updateSelection(current);
+  }
+
+  function nativeInput(event) {
+    const current = state.table;
+    if (!current || !snapshot || event.target.tagName !== 'INPUT') return;
+    const row = event.target.closest('.pmt-grid');
+    if (current.rows.get(row)?.input === event.target) render(current, snapshot);
+  }
+
+  function showMessage(current, trigger, message) {
+    const panel = showDialog(current, trigger, '能力与限制', '');
+    panel.body.append(el('p', { class: 'ekd-px-hint', text: message }));
+    panel.close.focus();
+  }
+
+  function showDialog(current, trigger, title, identity) {
+    const status = el('p', { class: 'ekd-px-status', role: 'status' });
+    const discard = button('放弃修改', () => closePanel(true));
+    discard.hidden = true;
+    const close = button('关闭', () => closePanel());
+    const actions = el('div', { class: 'ekd-px-actions' }, [discard, close]);
+    const body = el('div', { class: 'ekd-px-body' });
+    const node = el('dialog', {
+      id: PANEL_ID, class: 'ekd-px-dialog', 'aria-labelledby': `${PANEL_ID}-title`, 'aria-modal': 'true',
+      'data-ekd-px-mount': '1', onCancel: event => { event.preventDefault(); closePanel(); },
+    }, [
+      el('header', { class: 'ekd-px-header' }, [
+        el('h2', { id: `${PANEL_ID}-title`, text: title }),
+        ...(identity ? [el('p', { class: 'ekd-px-identity', text: identity })] : []),
+      ]),
+      body,
+      el('footer', { class: 'ekd-px-footer' }, [status, actions]),
+    ]);
+    const panel = { node, current, trigger, status, discard, close, actions, body, dirty: () => false, saving: false };
+    state.panel = panel;
+    current.form.append(node);
+    trigger.setAttribute('aria-expanded', 'true');
+    node.showModal();
+    return panel;
+  }
+
+  function statusOf(panel, text, error = false) {
+    setText(panel.status, text);
+    panel.status.dataset.tone = error ? 'error' : '';
+  }
+
+  function closePanel(force = false) {
+    const panel = state.panel;
+    if (!panel || (panel.saving && !force)) return;
+    if (!force && panel.dirty()) {
+      statusOf(panel, '有未保存的修改。可继续编辑，或放弃修改后关闭。');
+      panel.discard.hidden = false;
+      panel.discard.focus();
+      return;
+    }
+    state.panel = null;
+    panel.trigger.setAttribute('aria-expanded', 'false');
+    panel.node.close();
+    panel.node.remove();
+    if (panel.trigger.isConnected) panel.trigger.focus();
+  }
+
+  function onKeyDown(event) {
     const panel = state.panel;
     if (!panel) return;
-    state.panel = null;
-    if (typeof panel.close === 'function') {
-      try { panel.close(); } catch {}
-    }
-    panel.remove();
-  }
-
-  function openUnsavedDrawer(row, button, message) {
-    closePanel();
-    ensureStyle();
-    const drawer = el('div', {
-      class: 'ekd-px-drawer',
-      role: 'region',
-      'aria-label': '能力与限制提示',
-      'data-ekd-provider-enhance': '1',
-      draggable: 'false',
-      onDragstart: event => {
-        event.preventDefault();
-        event.stopPropagation();
-      },
-    }, [
-      el('div', { class: 'ekd-px-readonly', text: message }),
-      el('div', { class: 'ekd-px-foot' }, [
-        el('span', { class: 'ekd-px-status', text: '保存供应商后即可直接在此行展开编辑。' }),
-        el('button', { type: 'button', class: 'ekd-px-quiet', text: '收起', onClick: closePanel }),
-      ]),
-    ]);
-    row.append(drawer);
-    button.setAttribute('aria-expanded', 'true');
-    state.panel = drawer;
-    state.panelRow = row;
-    state.panelButton = button;
-  }
-
-  async function toggleForRow(row, button, providerId, managed) {
-    if (state.removed) return;
-    if (state.panel && state.panelRow === row) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopImmediatePropagation();
       closePanel();
-      return;
-    }
-    const inputs = rowInputs(row);
-    const firstInput = inputs[0] || row.querySelector('input');
-    const modelId = firstInput ? firstInput.value.trim() : '';
-    if (!modelId) {
-      openUnsavedDrawer(row, button, '请先填写模型 ID 并点击底部「保存」，再展开配置能力与思考强度。');
-      return;
-    }
-    let config;
-    try {
-      config = await readConfig();
-    } catch (error) {
-      note('读不到模型配置：' + messageOf(error), 'error');
-      return;
-    }
-    const models = config.models || {};
-    const exactKey = providerId + '/' + modelId;
-    let key = exactKey;
-    let model = models[exactKey];
-    if (!model) {
-      const found = Object.entries(models).find(([k, item]) => {
-        const p = providerPart(k) || (item && typeof item.provider === 'string' ? item.provider.trim() : '');
-        const m = providerPart(k) ? modelPart(k) : (item && typeof item.model === 'string' && item.model.trim() ? item.model.trim() : k);
-        return p === providerId && m === modelId;
-      });
-      if (found) {
-        key = found[0];
-        model = found[1];
-      }
-    }
-    if (!model) {
-      openUnsavedDrawer(row, button, '该模型尚未写入配置。请先点击右下角「保存」保存供应商，再展开设置能力与思考强度。');
-      return;
-    }
-    openPanel({ providerId, key, model, managed, row, button });
-  }
-
-  function messageOf(error) {
-    return error && typeof error.message === 'string' && error.message ? error.message : '未知错误';
-  }
-
-  function syncOfficialRowContextInput(row, nextSize) {
-    if (!row || !Number.isFinite(nextSize) || nextSize <= 0) return;
-    const inputs = rowInputs(row);
-    const ctxInput = inputs[1];
-    if (!ctxInput) return;
-    const nextText = String(nextSize);
-    if (ctxInput.value === nextText) return;
-    try {
-      const descriptor = typeof HTMLInputElement !== 'undefined'
-        ? Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
-        : null;
-      if (descriptor && typeof descriptor.set === 'function') {
-        descriptor.set.call(ctxInput, nextText);
-      } else {
-        ctxInput.value = nextText;
-      }
-      if (typeof Event === 'function') {
-        ctxInput.dispatchEvent(new Event('input', { bubbles: true }));
-        ctxInput.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-    } catch {
-      ctxInput.value = nextText;
-    }
-  }
-
-  function openPanel(context) {
-    closePanel();
-    ensureStyle();
-    const draft = draftOf(context.model);
-    const managed = Boolean(context.managed);
-    const status = el('span', {
-      class: 'ekd-px-status',
-      role: 'status',
-      text: managed ? '内置订阅模型只读' : '保存后立即生效，新会话与模型切换即刻可用。',
-    });
-    const save = el('button', { type: 'button', class: 'ekd-px-primary', text: '保存' });
-    save.disabled = managed;
-
-    // 1. 输入与调用能力
-    const capabilityPills = el('div', { class: 'ekd-px-pills', role: 'group', 'aria-label': '输入与调用能力' });
-    for (const item of CAPABILITIES) {
-      const pressed = draft.capabilities.has(item.key);
-      const button = el('button', {
-        type: 'button',
-        class: 'ekd-px-pill',
-        'aria-pressed': pressed ? 'true' : 'false',
-      }, [
-        el('span', { class: 'ekd-px-dot', 'aria-hidden': 'true' }),
-        item.label,
-      ]);
-      button.disabled = managed;
-      button.addEventListener('click', () => {
-        const on = button.getAttribute('aria-pressed') === 'true';
-        button.setAttribute('aria-pressed', on ? 'false' : 'true');
-        if (on) draft.capabilities.delete(item.key);
-        else draft.capabilities.add(item.key);
-      });
-      capabilityPills.append(button);
-    }
-
-    // 2. 思考强度（直接点选：no / low / medium / high / xhigh / max）
-    const modePills = el('div', { class: 'ekd-px-pills', role: 'group', 'aria-label': '思考模式' });
-    const modeButtons = new Map();
-    const THINKING_MODES = [
-      { value: 'none', label: '关闭', title: '不声明思考能力，也不发送任何思考强度' },
-      { value: 'toggle', label: '可切换', title: '声明 thinking 能力，由思考强度决定本次请求是否思考' },
-      { value: 'always', label: '始终思考', title: '声明 always_thinking，每次请求都开启思考' },
-    ];
-    for (const mode of THINKING_MODES) {
-      const button = el('button', {
-        type: 'button',
-        class: 'ekd-px-pill',
-        'data-kind': 'mode',
-        'data-mode': mode.value,
-        'aria-pressed': 'false',
-        title: mode.title,
-        text: mode.label,
-      });
-      button.disabled = managed;
-      button.addEventListener('click', () => {
-        setThinkingMode(draft, mode.value);
-        syncThinkingUI();
-      });
-      modeButtons.set(mode.value, button);
-      modePills.append(button);
-    }
-
-    // The switch exists for every editable model. The core's `omitempty` drops
-    // an unset `adaptive_thinking`, so a model that never wrote it answers with
-    // no field at all — that must still offer the switch, not hide it.
-    const adaptiveButton = el('button', {
-      type: 'button',
-      class: 'ekd-px-pill',
-      'data-kind': 'adaptive',
-      'aria-pressed': draft.adaptiveThinking === true ? 'true' : 'false',
-      title: '向核心声明 adaptive_thinking，由服务端按难度决定思考深度',
-      text: '自适应思考（adaptive_thinking）',
-    });
-    adaptiveButton.disabled = managed;
-    adaptiveButton.addEventListener('click', () => {
-      // Enabling adaptive thinking is meaningless without a togglable mode, so
-      // the click moves the mode there instead of silently doing nothing.
-      if (draft.thinking !== 'toggle') setThinkingMode(draft, 'toggle');
-      draft.adaptiveThinking = !(draft.adaptiveThinking === true);
-      draft.preservedAdaptiveThinking = draft.adaptiveThinking;
-      draft.adaptiveTouched = true;
-      syncThinkingUI();
-    });
-    const adaptiveRow = el('div', { class: 'ekd-px-pills', role: 'group', 'aria-label': '自适应思考' }, [adaptiveButton]);
-
-    const thinkingPills = el('div', { class: 'ekd-px-pills', role: 'group', 'aria-label': '思考强度' });
-    const thinkingHint = el('span', { class: 'ekd-px-meta' });
-    const modeHint = el('span', { class: 'ekd-px-meta' });
-    const optionButtons = new Map();
-
-    function syncThinkingUI() {
-      const isNo = draft.thinking === 'none' && draft.supportEfforts.length === 0;
-      for (const [value, button] of modeButtons) {
-        button.setAttribute('aria-pressed', draft.thinking === value ? 'true' : 'false');
-      }
-      for (const [value, button] of optionButtons) {
-        if (value === 'no') {
-          button.setAttribute('aria-pressed', isNo ? 'true' : 'false');
-        } else {
-          button.setAttribute('aria-pressed', draft.supportEfforts.includes(value) ? 'true' : 'false');
-        }
-      }
-      if (adaptiveButton) {
-        const on = draft.thinking === 'toggle' && draft.adaptiveThinking === true;
-        adaptiveButton.setAttribute('aria-pressed', on ? 'true' : 'false');
-        adaptiveButton.disabled = managed;
-        adaptiveButton.dataset.state = draft.thinking === 'toggle' ? 'active' : 'linked';
-      }
-      modeHint.textContent = draft.thinking === 'always'
-        ? '始终思考：保存后写入 always_thinking，每次请求都开启思考'
-        : draft.thinking === 'toggle'
-          ? '可切换：思考能力已声明，是否思考由下面的强度决定'
-          : '关闭：保存后不声明思考能力';
-      if (isNo) {
-        thinkingHint.textContent = '已选 no（不开启思考）';
-      } else if (draft.supportEfforts.length === 0) {
-        thinkingHint.textContent = draft.thinking === 'always'
-          ? '始终思考，未指定强度；可点选 low–max 补充可用档位'
-          : '当前开启默认思考；可点选 low–max 指定可用强度，或点 no 关闭思考';
-      } else {
-        thinkingHint.textContent = '已启用思考强度：' + draft.supportEfforts.join(' / ') + '（可多选，点 no 关闭思考）';
-      }
-    }
-
-    for (const option of THINKING_OPTIONS) {
-      const button = el('button', {
-        type: 'button',
-        class: 'ekd-px-pill',
-        'data-kind': option.value === 'no' ? 'no' : 'effort',
-        'data-effort': option.value,
-        'aria-pressed': 'false',
-        title: option.title,
-        text: option.label,
-      });
-      button.disabled = managed;
-      button.addEventListener('click', () => {
-        selectThinkingOption(draft, option.value);
-        syncThinkingUI();
-      });
-      optionButtons.set(option.value, button);
-      thinkingPills.append(button);
-      if (option.value === 'no') {
-        thinkingPills.append(el('span', { class: 'ekd-px-divider', 'aria-hidden': 'true' }));
-      }
-    }
-
-    // Preserve visibility & removal for any pre-existing custom effort tags in config.toml
-    const customEfforts = draft.supportEfforts.filter(item => !EFFORT_ORDER.includes(item));
-    for (const customValue of customEfforts) {
-      const chip = el('button', {
-        type: 'button',
-        class: 'ekd-px-pill',
-        'data-kind': 'effort',
-        'data-effort': customValue,
-        'aria-pressed': 'true',
-        title: '点击移除自定义思考强度 ' + customValue,
-        text: customValue,
-      });
-      chip.disabled = managed;
-      chip.addEventListener('click', () => {
-        selectThinkingOption(draft, customValue);
-        syncThinkingUI();
-      });
-      optionButtons.set(customValue, chip);
-      thinkingPills.append(chip);
-    }
-    syncThinkingUI();
-
-    // 3. 同行双列：上下文长度（含 256K–1M 快捷预设）+ 最大输出长度
-    function createContextField(initial) {
-      const input = el('input', {
-        class: 'ekd-px-input',
-        type: 'text',
-        autocomplete: 'off',
-        spellcheck: 'false',
-        value: formatSize(initial),
-        placeholder: '如 256K、1M 或 128000',
-        'aria-label': '上下文长度',
-      });
-      input.disabled = managed;
-      const presetsRow = el('div', { class: 'ekd-px-presets', role: 'group', 'aria-label': '上下文快捷档位' });
-      const presetButtons = [];
-      const meta = el('span', { class: 'ekd-px-meta' });
-      const issue = el('span', { class: 'ekd-px-issue' });
-
-      function sync() {
-        const parsed = parseSize(input.value, false);
-        issue.textContent = parsed.error || '';
-        meta.textContent = parsed.error || parsed.value === null
-          ? ''
-          : parsed.value.toLocaleString('zh-CN') + ' tokens · 支持 1K=1024、1M=1024K 或直接填整数';
-        input.setAttribute('aria-invalid', parsed.error ? 'true' : 'false');
-        for (const item of presetButtons) {
-          item.button.setAttribute('aria-pressed', parsed.value === item.value ? 'true' : 'false');
-        }
-        return parsed;
-      }
-
-      for (const preset of CONTEXT_PRESETS) {
-        const btn = el('button', {
-          type: 'button',
-          class: 'ekd-px-preset',
-          'aria-pressed': 'false',
-          text: preset.label,
-        });
-        btn.disabled = managed;
-        btn.addEventListener('click', () => {
-          input.value = preset.label;
-          sync();
-        });
-        presetButtons.push({ value: preset.value, button: btn });
-        presetsRow.append(btn);
-      }
-
-      input.addEventListener('input', sync);
-      sync();
-
-      return {
-        node: el('div', { class: 'ekd-px-section' }, [
-          el('span', { class: 'ekd-px-title', text: '上下文长度' }),
-          el('div', { class: 'ekd-px-input-wrap' }, [input]),
-          presetsRow,
-          issue,
-          meta,
-        ]),
-        read: sync,
-      };
-    }
-
-    function createOutputField(initial) {
-      const input = el('input', {
-        class: 'ekd-px-input',
-        type: 'text',
-        autocomplete: 'off',
-        spellcheck: 'false',
-        value: initial === null ? '' : formatSize(initial),
-        placeholder: '如 32K、64K，留空不限制',
-        'aria-label': '最大输出长度',
-      });
-      input.disabled = managed;
-      const presetsRow = el('div', { class: 'ekd-px-presets', role: 'group', 'aria-label': '最大输出快捷档位' });
-      const outputPresets = [
-        { label: '32K', value: 32768 },
-        { label: '64K', value: 65536 },
-        { label: '128K', value: 131072 },
-      ];
-      const presetButtons = [];
-      const clearBtn = el('button', {
-        type: 'button',
-        class: 'ekd-px-preset',
-        'aria-pressed': 'false',
-        text: '不限制',
-      });
-      clearBtn.disabled = managed;
-      const meta = el('span', { class: 'ekd-px-meta' });
-      const issue = el('span', { class: 'ekd-px-issue' });
-
-      function sync() {
-        const parsed = parseSize(input.value, true);
-        issue.textContent = parsed.error || '';
-        meta.textContent = parsed.error
-          ? ''
-          : parsed.value === null
-            ? '留空表示不声明上限（使用模型默认输出限制）'
-            : parsed.value.toLocaleString('zh-CN') + ' tokens · 清空或点「不限制」恢复默认';
-        input.setAttribute('aria-invalid', parsed.error ? 'true' : 'false');
-        clearBtn.setAttribute('aria-pressed', !parsed.error && parsed.value === null ? 'true' : 'false');
-        for (const item of presetButtons) {
-          item.button.setAttribute('aria-pressed', parsed.value === item.value ? 'true' : 'false');
-        }
-        return parsed;
-      }
-
-      for (const preset of outputPresets) {
-        const btn = el('button', {
-          type: 'button',
-          class: 'ekd-px-preset',
-          'aria-pressed': 'false',
-          text: preset.label,
-        });
-        btn.disabled = managed;
-        btn.addEventListener('click', () => {
-          input.value = preset.label;
-          sync();
-        });
-        presetButtons.push({ value: preset.value, button: btn });
-        presetsRow.append(btn);
-      }
-      clearBtn.addEventListener('click', () => {
-        input.value = '';
-        sync();
-      });
-      presetsRow.append(clearBtn);
-
-      input.addEventListener('input', sync);
-      sync();
-
-      return {
-        node: el('div', { class: 'ekd-px-section' }, [
-          el('span', { class: 'ekd-px-title', text: '最大输出长度' }),
-          el('div', { class: 'ekd-px-input-wrap' }, [input]),
-          presetsRow,
-          issue,
-          meta,
-        ]),
-        read: sync,
-      };
-    }
-
-    const contextField = createContextField(draft.maxContextSize);
-    const outputField = createOutputField(draft.maxOutputSize);
-
-    save.addEventListener('click', async () => {
-      if (managed) return;
-      const contextParsed = contextField.read();
-      const outputParsed = outputField.read();
-      if (contextParsed.error || contextParsed.value === null) {
-        status.textContent = '上下文长度：' + contextParsed.error;
-        status.dataset.tone = 'error';
-        return;
-      }
-      if (outputParsed.error) {
-        status.textContent = '最大输出长度：' + outputParsed.error;
-        status.dataset.tone = 'error';
-        return;
-      }
-      save.disabled = true;
-      status.textContent = '正在保存…';
-      delete status.dataset.tone;
-      try {
-        const mapped = applyThinkingState([...draft.capabilities], draft.thinking, draft.adaptiveThinking);
-        const edit = {
-          capabilities: mapped.capabilities,
-          thinking: mapped.thinking,
-          max_context_size: contextParsed.value,
-          max_output_size: outputParsed.value,
-          support_efforts: mapped.thinking === 'none' ? [] : normalizeEfforts(draft.supportEfforts),
-        };
-        if (mapped.thinking === 'toggle') {
-          if (draft.adaptiveThinking === true) {
-            edit.adaptive_thinking = true;
-          } else if (typeof draft.preservedAdaptiveThinking === 'boolean' || draft.adaptiveTouched === true) {
-            edit.adaptive_thinking = false;
-          }
-        } else if (mapped.thinking === 'always' && draft.preservedAdaptiveThinking === true) {
-          edit.adaptive_thinking = false;
-        } else if (mapped.thinking === 'none' && draft.preservedAdaptiveThinking === false) {
-          edit.adaptive_thinking = false;
-        }
-        await request('providers.updateModel', {
-          providerId: context.providerId,
-          model: context.key,
-          edit,
-        });
-        invalidateConfig();
-        if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
-          window.dispatchEvent(new CustomEvent('ekd:config-saved', { detail: { key: context.key } }));
-        }
-        syncOfficialRowContextInput(context.row, contextParsed.value);
-        status.textContent = '已保存并读回核对，当前窗口立即生效。';
-        status.dataset.tone = 'ok';
-      } catch (error) {
-        status.textContent = '保存失败：' + messageOf(error);
-        status.dataset.tone = 'error';
-      } finally {
-        save.disabled = managed;
-      }
-    });
-
-    const drawer = el('div', {
-      class: 'ekd-px-drawer',
-      role: 'region',
-      'aria-label': '能力与限制',
-      'data-ekd-provider-enhance': '1',
-      draggable: 'false',
-      onDragstart: event => {
+    } else if (event.key === 'Tab') {
+      event.stopImmediatePropagation();
+      const controls = [...panel.node.querySelectorAll('button,input')].filter(node => !node.disabled && node.getClientRects().length && (node.type !== 'radio' || node.checked));
+      const first = controls[0];
+      const last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
         event.preventDefault();
-        event.stopPropagation();
-      },
-    });
-
-    if (managed) {
-      drawer.append(el('div', { class: 'ekd-px-readonly', text: '内置订阅供应商由官方托管，模型能力与限制为只读。' }));
-    }
-
-    drawer.append(
-      el('div', { class: 'ekd-px-top-grid' }, [
-        el('div', { class: 'ekd-px-section' }, [
-          el('span', { class: 'ekd-px-title', text: '输入与调用能力' }),
-          capabilityPills,
-        ]),
-        el('div', { class: 'ekd-px-section' }, [
-          el('span', { class: 'ekd-px-title', text: '思考模式' }),
-          modePills,
-          modeHint,
-          el('span', { class: 'ekd-px-title', text: '思考强度' }),
-          thinkingPills,
-          thinkingHint,
-          adaptiveRow,
-        ]),
-      ]),
-      el('div', { class: 'ekd-px-limits' }, [
-        contextField.node,
-        outputField.node,
-      ]),
-      el('div', { class: 'ekd-px-foot' }, [
-        status,
-        el('button', { type: 'button', class: 'ekd-px-quiet', text: '收起', onClick: closePanel }),
-        save,
-      ]),
-    );
-
-    if (context.row) {
-      context.row.append(drawer);
-      if (context.button) {
-        context.button.setAttribute('aria-expanded', 'true');
-        state.panelButton = context.button;
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first?.focus();
       }
-      state.panelRow = context.row;
-    } else {
-      document.body.append(drawer);
     }
-    drawer.shown = true;
-    state.panel = drawer;
   }
 
-  /**
-   * Formats stored token integers into concise K/M notation when exact (262144 -> 256K,
-   * 1048576 -> 1M), keeping arbitrary numbers (128000) intact.
-   */
-  function formatSize(num) {
-    if (typeof num !== 'number' || !Number.isFinite(num) || num <= 0) return '';
-    if (num % (1024 * 1024) === 0) return String(num / (1024 * 1024)) + 'M';
-    if (num % 1024 === 0) return String(num / 1024) + 'K';
-    return String(num);
+  function optionsGroup(title, choices) {
+    return el('fieldset', { class: 'ekd-px-group' }, [
+      el('legend', { text: title }), el('div', { class: 'ekd-px-options' }, choices),
+    ]);
   }
 
-  /**
-   * Accepts plain digits or K/KB/M/MB suffixes (1K = 1024, 1M = 1024 * 1024).
-   * A cleared output size stays null so the core omits the field; a cleared
-   * context size is an error.
-   */
-  function parseSize(raw, allowEmpty) {
-    const text = String(raw || '').trim().replace(/[,\s_]/g, '');
-    if (text === '') return allowEmpty ? { value: null, error: '' } : { value: null, error: '不能为空' };
-    const match = text.match(/^(\d+(?:\.\d+)?)([kKmM])(?:[bB])?$/);
-    const plain = !match ? text.match(/^(\d+(?:\.\d+)?)$/) : null;
-    if (!match && !plain) return { value: null, error: '只接受数字，或以 K、M 结尾（如 256K、1M）' };
-    const base = Number((match || plain)[1]);
-    const unit = match ? match[2].toUpperCase() : '';
-    const value = Math.round(unit === 'K' ? base * 1024 : unit === 'M' ? base * 1024 * 1024 : base);
-    if (!Number.isFinite(value) || value < 1) return { value: null, error: '需要正整数' };
-    if (value > 10000000) return { value: null, error: '超出上限（10M）' };
-    return { value, error: '' };
+  function labelledInput(label, kind, props = {}) {
+    const input = el('input', props);
+    return { input, label: el('label', { class: `ekd-px-${kind}` }, [input, label]) };
   }
 
-  // ---------------------------------------------------------------- lifecycle
-
-  let scanning = false;
-  let scanAgain = false;
-  let scanTimer = null;
-  let configListener = null;
-  let enabled = true;
-
-  function startObserver() {
-    if (!state.observer || state.removed) return;
-    state.observer.observe(document.body, { childList: true, subtree: true });
+  async function loadSuggestion(providerId, id) {
+    const key = `${providerId}/${id}`;
+    const [official, publicCatalog] = await Promise.allSettled([
+      request('models.list'), request('providers.modelSuggestion', { providerId, model: key }),
+    ]);
+    const items = official.value?.items;
+    const exact = Array.isArray(items) ? items.find(item => item.provider === providerId && (item.id === key || (item.id === id && item.model === id))) : null;
+    const metadata = publicCatalog.value?.suggestion;
+    const fields = modelFields(exact ?? {});
+    const known = new Map();
+    for (const [capability] of CAPABILITIES) {
+      if (fields.capabilities.has(capability)) known.set(capability, true);
+      else if (typeof metadata?.[capability] === 'boolean') known.set(capability, metadata[capability]);
+    }
+    const thinking = fields.thinking !== 'none' ? fields.thinking : metadata?.thinking === true ? 'toggle' : null;
+    const output = Number.isSafeInteger(metadata?.max_output_size) && metadata.max_output_size > 0 ? metadata.max_output_size : null;
+    const fromOfficial = fields.thinking !== 'none' || CAPABILITIES.some(([capability]) => fields.capabilities.has(capability));
+    const source = [fromOfficial && '官方模型目录', metadata && 'models.dev'].filter(Boolean).join('、');
+    if (!known.size && !thinking && !output) {
+      const error = official.status === 'rejected' || publicCatalog.status === 'rejected';
+      return { empty: error ? '部分目录暂时无法读取，也没有可用的建议。可以重试。' : '目录没有此模型的可用建议。' };
+    }
+    return { known, thinking, output, adaptive: fields.adaptive, efforts: fields.supportEfforts, source };
   }
 
-  function stopObserver() {
-    state.observer?.disconnect();
+  function openPanel({ current, button: trigger, providerId, ids, model, officialDirty }) {
+    const batch = !model;
+    const managed = providerId.startsWith('managed:');
+    const initial = modelFields(model);
+    const panel = showDialog(current, trigger, batch ? '批量能力模板' : '能力与限制', batch ? `${providerId} · ${ids.length} 个模型` : `${providerId} / ${ids[0]}`);
+    const capabilities = CAPABILITIES.map(([key, label]) => [key, labelledInput(label, 'check', { type: 'checkbox' })]);
+    const modes = MODES.map(([mode, label]) => [mode, labelledInput(label, 'mode', { type: 'radio', name: 'ekd-px-thinking', value: mode })]);
+    const adaptive = labelledInput('自适应思考', 'switch', { type: 'checkbox', role: 'switch' });
+    const efforts = [...new Set([...EFFORTS, ...initial.supportEfforts])].map(value => [value, labelledInput(value, 'check', { type: 'checkbox' })]);
+    for (const [key, field] of capabilities) field.input.checked = initial.capabilities.has(key);
+    for (const [mode, field] of modes) field.input.checked = mode === initial.thinking;
+    adaptive.input.checked = initial.adaptive;
+    for (const [value, field] of efforts) field.input.checked = initial.supportEfforts.includes(value);
+    const output = el('input', { class: 'ekd-px-input', type: 'text', value: formatSize(initial.output), placeholder: '留空使用默认值', autocomplete: 'off', 'aria-describedby': `${PANEL_ID}-limits` });
+    const context = el('input', { class: 'ekd-px-input', type: 'text', value: formatSize(initial.context), placeholder: '如 256K', autocomplete: 'off', 'aria-describedby': `${PANEL_ID}-limits` });
+    const allFields = [...capabilities, ...modes, ...efforts].map(([, field]) => field.input).concat(adaptive.input, output, context);
+    const inputMode = () => modes.find(([, field]) => field.input.checked)?.[0] || 'none';
+    const checkedValues = fields => fields.filter(([, field]) => field.input.checked).map(([value]) => value);
+    const readFields = () => ({
+      caps: checkedValues(capabilities), thinking: inputMode(), adaptive: adaptive.input.checked,
+      efforts: checkedValues(efforts), context: context.value.trim(), output: output.value.trim(),
+    });
+    const custom = [...initial.capabilities].filter(key => !CAPABILITIES.some(([value]) => value === key));
+    let baseline = readFields();
+    const save = button(batch ? `保存到 ${ids.length} 个模型` : '保存', () => void saveDraft(), { class: 'ekd-px-button ekd-px-primary' });
+    const limitHint = el('p', { id: `${PANEL_ID}-limits`, class: 'ekd-px-hint', text: '支持整数、K 和 M。留空输出上限将使用模型默认值。' });
+    const limitIssue = el('p', { class: 'ekd-px-status', 'data-tone': 'error', role: 'status' });
+    panel.dirty = () => !managed && JSON.stringify(readFields()) !== JSON.stringify(baseline);
+
+    function patch() {
+      const draft = readFields();
+      const edit = {};
+      if (batch || JSON.stringify(baseline.caps) !== JSON.stringify(draft.caps)) edit.capabilities = draft.caps;
+      if (batch || baseline.thinking !== draft.thinking) edit.thinking = draft.thinking;
+      if (draft.thinking === 'toggle' && (batch || baseline.adaptive !== draft.adaptive)) edit.adaptive_thinking = draft.adaptive;
+      if (draft.thinking !== 'none' && (batch || JSON.stringify(baseline.efforts) !== JSON.stringify(draft.efforts))) edit.support_efforts = draft.efforts;
+      if (!batch) {
+        const storedContext = parseSize(baseline.context).value ?? initial.context;
+        const storedOutput = parseSize(baseline.output).value;
+        const nextContext = draft.context !== baseline.context ? parseSize(draft.context) : { value: storedContext };
+        const nextOutput = draft.output !== baseline.output ? parseSize(draft.output) : { value: storedOutput };
+        if (draft.context !== baseline.context && (nextContext.error || nextContext.value === null)) {
+          return { contextMessage: nextContext.error || '上下文长度需要正整数。' };
+        }
+        if (nextOutput.error) return { outputMessage: nextOutput.error };
+        if (nextContext.value !== storedContext || nextOutput.value !== storedOutput) {
+          if (nextOutput.value !== null && nextOutput.value > nextContext.value) {
+            return { outputMessage: '最大输出长度不能超过上下文长度。' };
+          }
+          if (nextContext.value !== storedContext) edit.max_context_size = nextContext.value;
+          if (nextOutput.value !== storedOutput) edit.max_output_size = nextOutput.value;
+        }
+      }
+      return { edit };
+    }
+
+    function sync(showDirty = true) {
+      for (const field of allFields) field.disabled = managed || panel.saving;
+      adaptive.input.disabled ||= inputMode() !== 'toggle';
+      for (const [, field] of efforts) field.input.disabled ||= inputMode() === 'none';
+      panel.close.disabled = panel.saving;
+      panel.discard.disabled = panel.saving;
+      const { edit, contextMessage, outputMessage } = patch();
+      context.setAttribute('aria-invalid', contextMessage ? 'true' : 'false');
+      output.setAttribute('aria-invalid', outputMessage ? 'true' : 'false');
+      setText(limitIssue, contextMessage || outputMessage || '');
+      save.disabled = managed || panel.saving || !edit || !Object.keys(edit).length;
+      if (showDirty && !panel.saving) {
+        panel.discard.hidden = true;
+        statusOf(panel, panel.dirty() && !batch ? '有未保存的修改。' : '');
+      }
+    }
+
+    async function saveDraft() {
+      const { edit } = patch();
+      if (managed || panel.saving || !edit || !Object.keys(edit).length) return;
+      panel.saving = true;
+      sync(false);
+      statusOf(panel, '正在保存…');
+      try {
+        if (batch) {
+          await request('providers.updateModels', { providerId, models: ids.map(id => ({ model: `${providerId}/${id}`, edit })) });
+        } else {
+          await request('providers.updateModel', { providerId, model: `${providerId}/${ids[0]}`, edit });
+        }
+        invalidate();
+        window.dispatchEvent(new CustomEvent('ekd:config-saved'));
+        if (state.panel !== panel) return;
+        if (batch) {
+          current.selecting = false;
+          current.feedback = `已保存 ${ids.length} 个模型。再次编辑官方表单前，请返回列表并重新打开。`;
+          for (const row of current.rows.values()) row.select.checked = false;
+          updateSelection(current);
+          const templateTrigger = panel.trigger;
+          panel.trigger = current.toggle;
+          templateTrigger.setAttribute('aria-expanded', 'false');
+          closePanel(true);
+          return;
+        }
+        baseline = readFields();
+        panel.discard.hidden = true;
+        statusOf(panel, '已保存并核对。再次编辑官方表单前，请返回列表并重新打开。');
+      } catch (error) {
+        if (state.panel === panel) statusOf(panel, `保存未确认。${error.message || '请重试。'}`, true);
+      } finally {
+        panel.saving = false;
+        if (state.panel === panel) {
+          sync(false);
+          if (save.disabled && document.activeElement === document.body) panel.close.focus();
+        }
+      }
+    }
+
+    if (!managed && officialDirty) panel.body.append(el('p', { class: 'ekd-px-hint', text: '官方表单有未保存的模型改动。可先保存官方改动，或在此保存后返回列表，避免提交旧表单。' }));
+    if (managed) panel.body.append(el('p', { class: 'ekd-px-hint', text: '此模型由内置订阅供应商维护。' }));
+    if (batch) panel.body.append(el('p', { class: 'ekd-px-hint', text: '同一模板会替换所选模型的输入、工具与思考配置。' }), el('p', { class: 'ekd-px-identity', text: ids.join('、') }));
+    let suggesting = false;
+    if (!batch && !managed) {
+      const note = el('p', { class: 'ekd-px-hint', role: 'status' });
+      const suggest = button('填入目录建议', async () => {
+        if (suggesting || panel.saving) return;
+        suggesting = true;
+        const draftAtRequest = JSON.stringify(readFields());
+        setText(note, '正在查询匹配的模型…');
+        try {
+          const found = await loadSuggestion(providerId, ids[0]);
+          if (state.panel !== panel) return;
+          if (panel.saving || JSON.stringify(readFields()) !== draftAtRequest) {
+            setText(note, '草稿已更改。再次点击可填入目录建议。');
+            return;
+          }
+          if (found.empty) {
+            setText(note, found.empty);
+            return;
+          }
+          for (const [key, field] of capabilities) if (found.known.has(key)) field.input.checked = found.known.get(key);
+          if (found.thinking) {
+            for (const [mode, field] of modes) field.input.checked = found.thinking === mode;
+            if (found.adaptive) adaptive.input.checked = true;
+            if (found.efforts.length) for (const [value, field] of efforts) field.input.checked = found.efforts.includes(value);
+          }
+          const draftContext = parseSize(context.value).value ?? initial.context;
+          const oversized = found.output !== null && found.output > draftContext;
+          if (found.output !== null && !oversized) output.value = formatSize(found.output);
+          setText(note, `${found.source}建议已填入，确认后保存。${oversized ? '目录输出长度超过当前上下文，已保留原值。' : ''}`);
+          sync();
+        } catch {
+          if (state.panel === panel) setText(note, '目录暂时无法读取，可以重试。');
+        } finally {
+          suggesting = false;
+        }
+      });
+      panel.body.append(el('div', { class: 'ekd-px-options' }, [suggest, note]));
+    }
+    panel.body.append(optionsGroup('输入与调用', capabilities.map(([, field]) => field.label)));
+    if (custom.length) panel.body.append(el('p', { class: 'ekd-px-hint', text: `已保留的自定义能力 · ${custom.join('、')}` }));
+    panel.body.append(optionsGroup('思考模式', modes.map(([, field]) => field.label).concat(adaptive.label)));
+    panel.body.append(optionsGroup('支持的思考强度', efforts.map(([, field]) => field.label)));
+    if (!batch) {
+      panel.body.append(el('div', { class: 'ekd-px-limits' }, [
+        el('label', {}, ['上下文长度', context]),
+        el('label', {}, ['最大输出长度', output]),
+      ]), limitHint, limitIssue);
+    }
+    panel.body.addEventListener('input', () => sync());
+    if (!managed) panel.actions.append(save);
+    sync(false);
+    panel.close.focus();
   }
 
-  /** Coalesces a burst of unrelated DOM mutations into one decoration pass. The
-   * pass itself is guarded, so a mutation caused by our own injection cannot
-   * start a second concurrent scan. */
+  async function refresh() {
+    if (!enabled || removed) return;
+    const form = findForm();
+    const table = form?.querySelector('.pmt');
+    if (state.table?.table !== table || state.table?.form !== form || (state.table && !form.querySelector('.pf-back'))) {
+      clearDecorations();
+      if (!table || !form.querySelector('.pf-back')) return;
+      state.table = { form, table, rows: new Map(), providerId: '', selecting: false };
+      decorateToolbar(state.table);
+      state.table.toolbar.hidden = true;
+    }
+    const current = state.table;
+    if (!current) return;
+    const startGeneration = generation;
+    try {
+      const hasNewRows = [...current.table.querySelectorAll('.pmt-grid')].some(row => !row.classList.contains('pmt-head') && modelInput(row) && !current.rows.has(row));
+      const config = snapshot && !hasNewRows ? snapshot : await readConfig();
+      if (startGeneration === generation && state.table === current && findForm() === form) render(current, config);
+    } catch {
+      // The next official change or interaction retries the read.
+    }
+  }
+
   function scan() {
-    if (state.removed || !enabled) return;
-    if (scanTimer !== null) return;
-    // The unit-test harness runs this factory in a bare VM context without
-    // timers; both scheduling paths must be optional.
-    if (typeof setTimeout !== 'function') {
-      void runScan();
-      return;
-    }
-    scanTimer = setTimeout(() => {
-      scanTimer = null;
-      if (state.removed || !enabled) return;
-      void runScan();
+    if (!enabled || removed || timer !== undefined) return;
+    timer = setTimeout(() => {
+      timer = undefined;
+      void refresh();
     }, 0);
   }
 
-  async function runScan() {
-    if (scanning) {
-      scanAgain = true;
-      return;
-    }
-    scanning = true;
-    ensureStyle();
-    try {
-      await decorate();
-    } catch {
-      // A transient contract miss is retried by the next observer pass.
-    } finally {
-      scanning = false;
-      if (scanAgain) {
-        scanAgain = false;
-        scan();
-      }
-    }
+  function clearDecorations() {
+    closePanel(true);
+    state.table = null;
+    snapshot = null;
+    generation += 1;
+    pending = null;
+    for (const node of document.querySelectorAll('[data-ekd-px-mount]')) node.remove();
   }
 
-  /** Called by the renderer when `dom.settings_providers` flips. Removing the
-   * decorations while the observer is disconnected is what keeps clearDecorations
-   * from re-decorating in an endless loop. */
+  function observe() {
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
   function setEnabled(next) {
-    const value = Boolean(next);
-    if (value === enabled) return;
-    enabled = value;
-    if (!value) {
-      stopObserver();
-      if (scanTimer !== null) {
-        clearTimeout(scanTimer);
-        scanTimer = null;
-      }
+    if (removed || enabled === Boolean(next)) return;
+    enabled = Boolean(next);
+    if (enabled) {
+      if (observer) observe();
+      scan();
+    } else {
+      observer?.disconnect();
+      clearTimeout(timer);
+      timer = undefined;
       clearDecorations();
-      return;
     }
-    if (state.removed) return;
-    startObserver();
-    scan();
   }
 
   function install() {
     ensureStyle();
-    state.observer = new MutationObserver(() => scan());
-    startObserver();
-    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-      configListener = () => invalidateConfig();
-      window.addEventListener('ekd:config-saved', configListener);
-      window.addEventListener('ekd:official-config-changed', configListener);
-    }
+    observer = new MutationObserver(scan);
+    window.addEventListener('ekd:config-saved', invalidate);
+    window.addEventListener('ekd:official-config-changed', invalidate);
+    window.addEventListener('keydown', onKeyDown, true);
+    document.addEventListener('input', nativeInput);
+    if (enabled) observe();
     scan();
   }
 
-  function clearDecorations() {
-    const wasObserving = enabled && Boolean(state.observer);
-    if (wasObserving) stopObserver();
-    closePanel();
-    for (const node of document.querySelectorAll('[data-ekd-px-button],[data-ekd-px-head-pad],[data-ekd-px-hint],[data-ekd-px-note],[data-ekd-provider-enhance]')) {
-      node.remove();
-    }
-    for (const table of document.querySelectorAll('[data-ekd-px-table]')) {
-      delete table.dataset.ekdPxTable;
-    }
-    for (const row of document.querySelectorAll('[data-ekd-px-row]')) {
-      delete row.dataset.ekdPxRow;
-    }
-    if (wasObserving && enabled && !state.removed) startObserver();
-  }
-
   function remove() {
-    if (state.removed) return;
-    state.removed = true;
-    if (scanTimer !== null) {
-      clearTimeout(scanTimer);
-      scanTimer = null;
-    }
-    state.observer?.disconnect();
-    state.observer = null;
-    if (configListener && typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
-      window.removeEventListener('ekd:config-saved', configListener);
-      window.removeEventListener('ekd:official-config-changed', configListener);
-    }
-    configListener = null;
-    clearDecorations();
+    setEnabled(false);
+    removed = true;
+    observer = null;
+    window.removeEventListener('ekd:config-saved', invalidate);
+    window.removeEventListener('ekd:official-config-changed', invalidate);
+    window.removeEventListener('keydown', onKeyDown, true);
+    document.removeEventListener('input', nativeInput);
     state.style?.remove();
-    state.style = null;
   }
 
-  return {
-    install,
-    remove,
-    clearDecorations,
-    setEnabled,
-    scan,
-    formatSize,
-    parseSize,
-    thinkingMode,
-    readThinkingState,
-    applyThinkingState,
-    selectThinkingOption,
-    setThinkingMode,
-    draftOf,
-    resolveProvider,
-    openPanel,
-    closePanel,
-    CONTEXT_PRESETS,
-    THINKING_OPTIONS,
-    state,
-  };
+  return { install, remove, clearDecorations, setEnabled, scan };
 }

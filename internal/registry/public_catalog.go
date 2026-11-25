@@ -10,9 +10,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
+	"strings"
 	"time"
-
 )
 
 const PublicCatalogURL = "https://models.dev/api.json"
@@ -185,6 +186,71 @@ func (s *Service) refreshCatalog(ctx context.Context, client *http.Client, sourc
 	return status, err
 }
 
+// FindPublicModel matches an official provider endpoint and model ID to the public catalog.
+func (s *Service) FindPublicModel(ctx context.Context, providerID, baseURL, modelID string) (map[string]Capability, error) {
+	endpoint := publicCatalogEndpoint(baseURL)
+	if endpoint == "" || modelID == "" {
+		return nil, nil
+	}
+	cached, err := s.cachedCatalog(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(cached.raw) == 0 {
+		if _, err := s.RefreshCatalog(ctx); err != nil {
+			return nil, err
+		}
+		cached, err = s.cachedCatalog(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	matches := make(map[string]modelsDevProvider)
+	for id, provider := range cached.providers {
+		model, ok := provider.Models[modelID]
+		if !ok || (model.ID != "" && model.ID != modelID) || catalogProviderEndpoint(id, provider.API) != endpoint {
+			continue
+		}
+		matches[id] = modelsDevProvider{ID: provider.ID, Models: map[string]modelsDevModel{modelID: model}}
+	}
+	if exact, ok := matches[providerID]; ok {
+		matches = map[string]modelsDevProvider{providerID: exact}
+	}
+	if len(matches) != 1 {
+		return nil, nil
+	}
+	models, err := parseModelsDev(ModelsDevCatalog{Source: PublicCatalogURL, RetrievedAt: cached.status.RetrievedAt, Providers: matches})
+	if err != nil {
+		return nil, err
+	}
+	return models[0].Capabilities, nil
+}
+
+func catalogProviderEndpoint(providerID, raw string) string {
+	if raw == "" {
+		for _, preset := range providerPresets {
+			if preset.Official && preset.ID == providerID {
+				raw = preset.BaseURL
+				break
+			}
+		}
+	}
+	return publicCatalogEndpoint(raw)
+}
+
+func publicCatalogEndpoint(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return ""
+	}
+	host := strings.ToLower(u.Host)
+	if u.Port() == "443" {
+		host = strings.TrimSuffix(host, ":443")
+	}
+	return "https://" + host + strings.TrimRight(u.EscapedPath(), "/")
+}
+
 func (s *Service) catalogInputs(ctx context.Context, sourceProvider, targetProvider string) ([]modelInput, error) {
 	if !providerIDPattern.MatchString(targetProvider) {
 		return nil, badRequest("INVALID_PROVIDER_ID", "目标供应商 ID 无效")
@@ -218,4 +284,3 @@ func (s *Service) catalogInputs(ctx context.Context, sourceProvider, targetProvi
 	}
 	return records, nil
 }
-

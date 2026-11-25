@@ -1,28 +1,31 @@
 package desktop
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
+	"net/url"
+	"slices"
 	"sort"
 	"strings"
+
+	"enhancedkimi/internal/registry"
 )
 
 // Official capability tokens, in the order the official model table lists them.
 var capabilityOrder = []string{"image_in", "video_in", "tool_use", "thinking", "always_thinking"}
 
-// ModelEdit carries the model fields the official provider form does not expose.
-// MaxOutputSize and AdaptiveThinking are pointers because the official endpoint
-// distinguishes an omitted field from an explicit value, and the inline drawer
-// must not overwrite a stored adaptive_thinking flag when saving other edits.
 type ModelEdit struct {
 	Capabilities     []string
 	Thinking         string
 	AdaptiveThinking *bool
 	MaxContextSize   int64
 	MaxOutputSize    *int64
+	OutputChanged    bool
 	SupportEfforts   []string
 }
 
@@ -34,6 +37,101 @@ var redactedProviderKeys = map[string]bool{
 	"has_api_key": true,
 	"hasApiKey":   true,
 	"oauth":       true,
+}
+
+var credentialKeyNormalizer = strings.NewReplacer("_", "", "-", "")
+
+func isConfigCredential(key string) bool {
+	key = credentialKeyNormalizer.Replace(strings.ToLower(key))
+	switch key {
+	case "apikey", "apikeyenv", "oauth", "authorization", "proxyauthorization", "cookie", "setcookie",
+		"token", "accesstoken", "refreshtoken", "idtoken", "authtoken", "bearertoken", "password",
+		"secret", "clientsecret", "privatekey", "credentials", "env", "customheaders", "headers":
+		return true
+	}
+	return false
+}
+
+func visibleConfig(raw json.RawMessage) (json.RawMessage, error) {
+	if !json.Valid(raw) {
+		return nil, errors.New("官方配置响应无效")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var result bytes.Buffer
+	if err := writeVisibleConfigValue(&result, decoder, configRoot); err != nil {
+		return nil, err
+	}
+	return json.RawMessage(result.Bytes()), nil
+}
+
+type configObjectKind uint8
+
+const (
+	configValue configObjectKind = iota
+	configRoot
+	configSecondaryModel
+	configIdentityMap
+)
+
+// Read config objects in their original order: secondary_model uses that order as priority.
+func writeVisibleConfigValue(out *bytes.Buffer, decoder *json.Decoder, kind configObjectKind) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token != json.Delim('{') && token != json.Delim('[') {
+		encoded, err := json.Marshal(token)
+		if err != nil {
+			return err
+		}
+		out.Write(encoded)
+		return nil
+	}
+	out.WriteByte(byte(token.(json.Delim)))
+	comma := false
+	for decoder.More() {
+		var key string
+		childKind := configValue
+		if token == json.Delim('{') {
+			field, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key = field.(string)
+			if kind != configIdentityMap && isConfigCredential(key) {
+				var skipped json.RawMessage
+				if err := decoder.Decode(&skipped); err != nil {
+					return err
+				}
+				continue
+			}
+			switch {
+			case kind == configRoot && key == "secondary_model":
+				childKind = configSecondaryModel
+			case kind == configRoot && key == "providers", (kind == configRoot || kind == configSecondaryModel) && key == "models":
+				childKind = configIdentityMap
+			}
+		}
+		if comma {
+			out.WriteByte(',')
+		}
+		if token == json.Delim('{') {
+			encoded, _ := json.Marshal(key)
+			out.Write(encoded)
+			out.WriteByte(':')
+		}
+		if err := writeVisibleConfigValue(out, decoder, childKind); err != nil {
+			return err
+		}
+		comma = true
+	}
+	end, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	out.WriteByte(byte(end.(json.Delim)))
+	return nil
 }
 
 func decodeJSONValue(raw json.RawMessage) (any, error) {
@@ -51,17 +149,6 @@ func cloneStringMap(in map[string]string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-
-func cloneAnyMap(in map[string]any) map[string]any {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make(map[string]any, len(in))
 	for k, v := range in {
 		out[k] = v
 	}
@@ -384,88 +471,77 @@ func splitModelKey(key string) (string, string) {
 
 func isManagedProvider(id string) bool { return strings.HasPrefix(id, "managed:") }
 
-// mergeModel applies an edit onto a model read from the official config. Fields
-// the dialog owns are always written, because the official endpoint clears any
-// optional field that a PUT omits rather than preserving it.
 func mergeModel(base modelConfig, edit ModelEdit) modelConfig {
 	next := base
-	next.CustomHeaders = cloneStringMap(base.CustomHeaders)
-	next.Env = cloneStringMap(base.Env)
-	next.Extra = cloneAnyMap(base.Extra)
+	if edit.Capabilities != nil || edit.Thinking != "" {
+		known := make(map[string]bool, len(capabilityOrder))
+		for _, capability := range capabilityOrder {
+			known[capability] = true
+		}
+		selected := map[string]bool{}
+		input := edit.Capabilities
+		if input == nil {
+			input = base.Capabilities
+		}
+		for _, capability := range input {
+			if known[capability] && capability != "thinking" && capability != "always_thinking" {
+				selected[capability] = true
+			}
+		}
+		switch edit.Thinking {
+		case "toggle":
+			selected["thinking"] = true
+		case "always":
+			selected["always_thinking"] = true
+		case "":
+			for _, capability := range base.Capabilities {
+				if capability == "thinking" || capability == "always_thinking" {
+					selected[capability] = true
+				}
+			}
+		}
+		next.Capabilities = nil
+		for _, capability := range capabilityOrder {
+			if selected[capability] {
+				next.Capabilities = append(next.Capabilities, capability)
+			}
+		}
+		for _, capability := range base.Capabilities {
+			if capability != "" && !known[capability] && !selected[capability] {
+				selected[capability] = true
+				next.Capabilities = append(next.Capabilities, capability)
+			}
+		}
+	}
 
-	knownCap := make(map[string]bool, len(capabilityOrder))
-	for _, allowed := range capabilityOrder {
-		knownCap[allowed] = true
-	}
-	keep := map[string]bool{}
-	for _, capability := range edit.Capabilities {
-		if knownCap[capability] {
-			keep[capability] = true
-		}
-	}
 	switch edit.Thinking {
-	case "always":
-		keep["always_thinking"] = true
-		delete(keep, "thinking")
-	case "toggle":
-		keep["thinking"] = true
-		delete(keep, "always_thinking")
-	default:
-		delete(keep, "thinking")
-		delete(keep, "always_thinking")
-	}
-	capabilities := []string{}
-	for _, capability := range capabilityOrder {
-		if keep[capability] {
-			capabilities = append(capabilities, capability)
-		}
-	}
-	seenExtraCap := map[string]bool{}
-	for _, capability := range base.Capabilities {
-		if knownCap[capability] || capability == "" || seenExtraCap[capability] {
-			continue
-		}
-		seenExtraCap[capability] = true
-		capabilities = append(capabilities, capability)
-	}
-	next.Capabilities = capabilities
-
-	switch edit.Thinking {
-	case "toggle":
+	case "toggle", "":
 		if edit.AdaptiveThinking != nil {
-			next.AdaptiveThinking = cloneBoolPtr(edit.AdaptiveThinking)
-		} else {
-			next.AdaptiveThinking = cloneBoolPtr(base.AdaptiveThinking)
+			next.AdaptiveThinking = edit.AdaptiveThinking
 		}
 	case "always":
 		next.AdaptiveThinking = nil
-	default:
+	case "none":
 		if edit.AdaptiveThinking != nil && !*edit.AdaptiveThinking {
-			next.AdaptiveThinking = cloneBoolPtr(edit.AdaptiveThinking)
-		} else if base.AdaptiveThinking != nil && !*base.AdaptiveThinking {
-			next.AdaptiveThinking = cloneBoolPtr(base.AdaptiveThinking)
-		} else {
+			next.AdaptiveThinking = edit.AdaptiveThinking
+		} else if base.AdaptiveThinking == nil || *base.AdaptiveThinking {
 			next.AdaptiveThinking = nil
 		}
 	}
-
-	next.MaxContextSize = edit.MaxContextSize
-	next.MaxOutputSize = cloneInt64Ptr(edit.MaxOutputSize)
-
-	if edit.Thinking == "none" || (edit.Thinking != "toggle" && edit.Thinking != "always") {
+	if edit.Thinking == "none" {
 		next.SupportEfforts = nil
-	} else {
-		efforts := []string{}
-		seen := map[string]bool{}
-		for _, effort := range edit.SupportEfforts {
-			trimmed := strings.TrimSpace(effort)
-			if trimmed == "" || strings.EqualFold(trimmed, "no") || seen[trimmed] {
-				continue
-			}
-			seen[trimmed] = true
-			efforts = append(efforts, trimmed)
+		next.DefaultEffort = ""
+	} else if edit.SupportEfforts != nil {
+		next.SupportEfforts = edit.SupportEfforts
+		if !slices.Contains(edit.SupportEfforts, next.DefaultEffort) {
+			next.DefaultEffort = ""
 		}
-		next.SupportEfforts = efforts
+	}
+	if edit.MaxContextSize > 0 {
+		next.MaxContextSize = edit.MaxContextSize
+	}
+	if edit.OutputChanged {
+		next.MaxOutputSize = edit.MaxOutputSize
 	}
 	return next
 }
@@ -562,100 +638,193 @@ func (s *NativeService) readConfig(ctx context.Context) (configSnapshot, error) 
 	return snapshot, nil
 }
 
-// updateProviderModel writes one model of one provider. The body carries every
-// model of that provider because the official endpoint replaces the array as a
-// whole; models of other providers are not included and stay untouched.
-// api_key is never part of the body, and the official endpoint keeps the stored
-// key when the field is absent.
-func (s *NativeService) updateProviderModel(ctx context.Context, input map[string]any) (any, error) {
-	providerID := strings.TrimSpace(stringInput(input, "providerId"))
-	key := strings.TrimSpace(stringInput(input, "model"))
-	if providerID == "" || key == "" {
-		return nil, errors.New("缺少供应商或模型")
+type publicModelCatalog interface {
+	FindPublicModel(ctx context.Context, providerID, baseURL, modelID string) (map[string]registry.Capability, error)
+}
+
+func (s *NativeService) UsePublicModelCatalog(catalog publicModelCatalog) {
+	s.publicModelCatalog = catalog
+}
+
+func (s *NativeService) providerModelSuggestion(ctx context.Context, input map[string]any) (any, error) {
+	providerID := stringInput(input, "providerId")
+	owner, modelID := splitModelKey(stringInput(input, "model"))
+	if providerID == "" || owner != providerID || isManagedProvider(providerID) {
+		return nil, errors.New("请选择已保存的自定义供应商模型")
 	}
-	if isManagedProvider(providerID) || isManagedProvider(strings.SplitN(key, "/", 2)[0]) {
-		return nil, errors.New("Kimi 订阅的内置供应商是只读的，不能修改模型能力")
+	if s.publicModelCatalog == nil {
+		return map[string]any{}, nil
 	}
-	fromKey, targetModelID := splitModelKey(key)
-	if fromKey == "" {
-		targetModelID = key
-	} else if fromKey != providerID {
-		return nil, fmt.Errorf("模型键 %s 不属于供应商 %s", key, providerID)
-	}
-	canonicalKey := providerModelKey(providerID, targetModelID)
-	edit, err := decodeModelEdit(input["edit"])
+	config, err := s.readConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if edit.MaxContextSize < 1 {
-		return nil, errors.New("上下文长度需要正整数")
+	provider, ok := config.Providers[providerID]
+	if !ok {
+		return nil, errors.New("找不到已保存的供应商")
 	}
-	if edit.MaxOutputSize != nil && *edit.MaxOutputSize < 1 {
-		return nil, errors.New("最大输出长度需要正整数，或留空")
+	if _, _, ok := lookupProviderModel(config.Models, providerID, modelID); !ok {
+		return nil, errors.New("找不到已保存的模型")
+	}
+	capabilities, err := s.publicModelCatalog.FindPublicModel(ctx, providerID, provider.BaseURL, modelID)
+	if err != nil {
+		return nil, err
+	}
+	suggestion := map[string]any{}
+	for source, field := range map[string]string{"vision": "image_in", "video": "video_in", "tools": "tool_use", "thinking": "thinking", "output": "max_output_size"} {
+		if capability, known := capabilities[source]; known {
+			suggestion[field] = capability.Value
+		}
+	}
+	if len(suggestion) == 0 {
+		return map[string]any{}, nil
+	}
+	return map[string]any{"suggestion": suggestion}, nil
+}
+
+type providerModelUpdate struct {
+	Key   string          `json:"key"`
+	Model json.RawMessage `json:"model"`
+}
+
+func (s *NativeService) updateProviderModel(ctx context.Context, input map[string]any) (any, error) {
+	providerID := stringInput(input, "providerId")
+	updates, err := s.saveProviderModels(ctx, providerID, []any{input})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"model": updates[0].Model, "provider": providerID, "key": updates[0].Key}, nil
+}
+
+func (s *NativeService) updateProviderModels(ctx context.Context, input map[string]any) (any, error) {
+	providerID := stringInput(input, "providerId")
+	items, ok := input["models"].([]any)
+	if !ok || len(items) == 0 {
+		return nil, errors.New("请至少选择一个模型")
+	}
+	updates, err := s.saveProviderModels(ctx, providerID, items)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"provider": providerID, "models": updates}, nil
+}
+
+// The official PUT replaces the provider's complete model array. Serialize the
+// read/merge/write/read cycle so concurrent enhancement saves retain each other's edits.
+func (s *NativeService) saveProviderModels(ctx context.Context, providerID string, items []any) ([]providerModelUpdate, error) {
+	if providerID == "" {
+		return nil, errors.New("缺少供应商")
+	}
+	if isManagedProvider(providerID) {
+		return nil, errors.New("Kimi 订阅的内置供应商是只读的，不能修改模型能力")
+	}
+	modelIDs := make([]string, 0, len(items))
+	edits := make(map[string]ModelEdit, len(items))
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		key := stringInput(item, "model")
+		if key == "" {
+			return nil, errors.New("缺少模型")
+		}
+		owner, modelID := splitModelKey(key)
+		if owner == "" {
+			modelID = key
+		} else if owner != providerID {
+			return nil, fmt.Errorf("模型键 %s 不属于供应商 %s", key, providerID)
+		}
+		if _, duplicate := edits[modelID]; duplicate {
+			return nil, fmt.Errorf("模型 %s 重复", modelID)
+		}
+		edit, err := decodeModelEdit(item["edit"])
+		if err != nil {
+			return nil, fmt.Errorf("模型 %s：%w", modelID, err)
+		}
+		modelIDs = append(modelIDs, modelID)
+		edits[modelID] = edit
 	}
 
+	s.providerModelsMu.Lock()
+	defer s.providerModelsMu.Unlock()
 	before, err := s.readConfig(ctx)
 	if err != nil {
 		return nil, err
-	}
-	base, matchedKey, ok := lookupProviderModel(before.Models, providerID, targetModelID)
-	if !ok {
-		return nil, fmt.Errorf("模型 %s 不在官方配置里，先保存供应商", canonicalKey)
 	}
 	provider, ok := before.Providers[providerID]
 	if !ok {
 		return nil, fmt.Errorf("供应商 %s 不在官方配置里", providerID)
 	}
-	edited := mergeModel(base, edit)
-
-	chosenByModelID := make(map[string]string, len(before.Models))
-	for candidate, item := range before.Models {
-		owner, modelID := resolveProviderAndModelID(candidate, item)
+	chosen := make(map[string]string)
+	for key, item := range before.Models {
+		owner, modelID := resolveProviderAndModelID(key, item)
 		if owner != providerID || modelID == "" {
 			continue
 		}
-		qualifiedCandidate := providerModelKey(providerID, modelID)
-		prev, exists := chosenByModelID[modelID]
-		if !exists || candidate == qualifiedCandidate || (prev != qualifiedCandidate && candidate < prev) {
-			chosenByModelID[modelID] = candidate
+		qualified := providerModelKey(providerID, modelID)
+		prev, exists := chosen[modelID]
+		if !exists || key == qualified || (prev != qualified && key < prev) {
+			chosen[modelID] = key
 		}
 	}
-	keys := make([]string, 0, len(chosenByModelID))
-	for _, candidate := range chosenByModelID {
-		keys = append(keys, candidate)
+	edited := make(map[string]modelConfig, len(edits))
+	for _, modelID := range modelIDs {
+		key, ok := chosen[modelID]
+		if !ok {
+			return nil, fmt.Errorf("模型 %s 不在官方配置里，先保存供应商", modelID)
+		}
+		edit := edits[modelID]
+		next := mergeModel(before.Models[key], edit)
+		if (edit.OutputChanged || edit.MaxContextSize > 0) && next.MaxOutputSize != nil && *next.MaxOutputSize > next.MaxContextSize {
+			return nil, fmt.Errorf("模型 %s 的最大输出长度不能超过上下文长度", modelID)
+		}
+		edited[modelID] = next
 	}
-	sort.Strings(keys)
-	models := make([]any, 0, len(keys))
-	includedModels := make(map[string]bool, len(keys))
-	for _, candidate := range keys {
-		model := before.Models[candidate]
-		_, modelID := resolveProviderAndModelID(candidate, model)
-		if candidate == matchedKey || modelID == targetModelID {
-			model = edited
+
+	orderedIDs := make([]string, 0, len(chosen))
+	for modelID := range chosen {
+		orderedIDs = append(orderedIDs, modelID)
+	}
+	sort.Strings(orderedIDs)
+	models := make([]any, 0, len(chosen))
+	includedModels := make(map[string]bool, len(chosen))
+	for _, modelID := range orderedIDs {
+		model, changed := edited[modelID]
+		if !changed {
+			model = before.Models[chosen[modelID]]
 		}
-		if modelID != "" {
-			model.Model = modelID
-			includedModels[modelID] = true
-		}
+		model.Model = modelID
+		includedModels[modelID] = true
 		models = append(models, modelBody(model))
 	}
 	body := providerBody(providerID, provider, models, includedModels)
 	if _, err = s.kap.Request(ctx, http.MethodPut, "/providers/"+urlPathValue(providerID), body); err != nil {
 		return nil, err
 	}
+	s.invalidateOfficialConfigCache()
 
 	after, err := s.readConfig(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("已提交，无法读回核对：%w", err)
 	}
-	actual, _, ok := lookupProviderModel(after.Models, providerID, targetModelID)
-	if !ok {
-		return nil, errors.New("保存后读不到这个模型，官方可能没有接受这次修改")
+	updates := make([]providerModelUpdate, 0, len(edited))
+	for _, modelID := range modelIDs {
+		actual, _, ok := lookupProviderModel(after.Models, providerID, modelID)
+		if !ok {
+			return nil, fmt.Errorf("保存后读不到模型 %s", modelID)
+		}
+		if err = compareModel(edited[modelID], actual); err != nil {
+			return nil, fmt.Errorf("模型 %s：%w", modelID, err)
+		}
+		encoded, err := json.Marshal(actual)
+		if err != nil {
+			return nil, err
+		}
+		model, err := visibleConfig(encoded)
+		if err != nil {
+			return nil, err
+		}
+		updates = append(updates, providerModelUpdate{Key: providerModelKey(providerID, modelID), Model: model})
 	}
-	if err = compareModel(edited, actual); err != nil {
-		return nil, err
-	}
-	return map[string]any{"model": actual, "provider": providerID, "key": canonicalKey}, nil
+	return updates, nil
 }
 
 func resolveProviderAndModelID(mapKey string, item modelConfig) (string, string) {
@@ -690,11 +859,8 @@ func lookupProviderModel(models map[string]modelConfig, providerID, targetModelI
 	return modelConfig{}, "", false
 }
 
-// urlPathValue escapes a provider id for the official path segment. Ids allow
-// letters, digits, dashes, underscores and spaces, so only space needs escaping;
-// managed ids contain a colon but never reach this function.
 func urlPathValue(value string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(value, "%", "%25"), " ", "%20")
+	return url.PathEscape(value)
 }
 
 func decodeModelEdit(raw any) (ModelEdit, error) {
@@ -702,8 +868,9 @@ func decodeModelEdit(raw any) (ModelEdit, error) {
 	if !ok {
 		return ModelEdit{}, errors.New("缺少模型字段")
 	}
-	edit := ModelEdit{Thinking: "none"}
-	if value, ok := object["thinking"].(string); ok {
+	var edit ModelEdit
+	if rawThinking, present := object["thinking"]; present {
+		value, _ := rawThinking.(string)
 		switch value {
 		case "none", "toggle", "always":
 			edit.Thinking = value
@@ -711,46 +878,74 @@ func decodeModelEdit(raw any) (ModelEdit, error) {
 			return ModelEdit{}, errors.New("思考模式只能是 none、toggle 或 always")
 		}
 	}
-	if rawAdaptive, present := object["adaptive_thinking"]; present && rawAdaptive != nil {
-		if value, ok := rawAdaptive.(bool); ok {
-			edit.AdaptiveThinking = boolPtr(value)
-		}
-	} else if rawAdaptive, present := object["adaptiveThinking"]; present && rawAdaptive != nil {
-		if value, ok := rawAdaptive.(bool); ok {
-			edit.AdaptiveThinking = boolPtr(value)
-		}
+	adaptive, present := object["adaptive_thinking"]
+	if !present {
+		adaptive = object["adaptiveThinking"]
 	}
-	for _, capability := range stringSlice(object["capabilities"]) {
-		edit.Capabilities = append(edit.Capabilities, capability)
+	if adaptive != nil {
+		flag, ok := adaptive.(bool)
+		if !ok {
+			return ModelEdit{}, errors.New("自适应思考需要布尔值")
+		}
+		edit.AdaptiveThinking = &flag
 	}
-	edit.SupportEfforts = stringSlice(object["support_efforts"])
-	size, err := numberValue(object["max_context_size"])
+	capabilities, err := modelEditStrings(object["capabilities"])
 	if err != nil {
-		return ModelEdit{}, fmt.Errorf("上下文长度：%w", err)
+		return ModelEdit{}, fmt.Errorf("模型能力：%w", err)
 	}
-	edit.MaxContextSize = size
-	if rawOutput, present := object["max_output_size"]; present && rawOutput != nil {
-		value, err := numberValue(rawOutput)
-		if err != nil {
-			return ModelEdit{}, fmt.Errorf("最大输出长度：%w", err)
+	edit.Capabilities = capabilities
+	efforts, err := modelEditStrings(object["support_efforts"])
+	if err != nil {
+		return ModelEdit{}, fmt.Errorf("思考强度：%w", err)
+	}
+	if efforts != nil {
+		edit.SupportEfforts = make([]string, 0, len(efforts))
+		seen := map[string]bool{}
+		for _, effort := range efforts {
+			effort = strings.TrimSpace(effort)
+			if effort != "" && !strings.EqualFold(effort, "no") && !seen[effort] {
+				seen[effort] = true
+				edit.SupportEfforts = append(edit.SupportEfforts, effort)
+			}
 		}
-		edit.MaxOutputSize = &value
+	}
+	if rawContext, present := object["max_context_size"]; present {
+		value, err := numberValue(rawContext)
+		if err != nil || value < 1 {
+			return ModelEdit{}, errors.New("上下文长度需要正整数")
+		}
+		edit.MaxContextSize = value
+	}
+	if rawOutput, present := object["max_output_size"]; present {
+		edit.OutputChanged = true
+		if rawOutput != nil {
+			value, err := numberValue(rawOutput)
+			if err != nil || value < 1 {
+				return ModelEdit{}, errors.New("最大输出长度需要正整数，或留空")
+			}
+			edit.MaxOutputSize = &value
+		}
 	}
 	return edit, nil
 }
 
-func stringSlice(raw any) []string {
+func modelEditStrings(raw any) ([]string, error) {
+	if raw == nil {
+		return nil, nil
+	}
 	items, ok := raw.([]any)
 	if !ok {
-		return nil
+		return nil, errors.New("需要字符串列表")
 	}
 	out := make([]string, 0, len(items))
 	for _, item := range items {
-		if value, ok := item.(string); ok {
-			out = append(out, value)
+		value, ok := item.(string)
+		if !ok {
+			return nil, errors.New("需要字符串列表")
 		}
+		out = append(out, value)
 	}
-	return out
+	return out, nil
 }
 
 func numberValue(raw any) (int64, error) {
@@ -776,7 +971,7 @@ func numberValue(raw any) (int64, error) {
 // write the server silently dropped.
 func compareModel(expected, actual modelConfig) error {
 	mismatched := []string{}
-	if !sameStrings(expected.Capabilities, actual.Capabilities) {
+	if !sameCapabilitySet(expected.Capabilities, actual.Capabilities) {
 		mismatched = append(mismatched, "capabilities")
 	}
 	if !sameOptionalBool(expected.AdaptiveThinking, actual.AdaptiveThinking) {
@@ -795,6 +990,17 @@ func compareModel(expected, actual modelConfig) error {
 		return fmt.Errorf("官方读回的值和提交的不一致：%s", strings.Join(mismatched, "、"))
 	}
 	return nil
+}
+
+func sameCapabilitySet(left, right []string) bool {
+	set := func(values []string) map[string]bool {
+		result := make(map[string]bool, len(values))
+		for _, value := range values {
+			result[value] = true
+		}
+		return result
+	}
+	return maps.Equal(set(left), set(right))
 }
 
 func sameStrings(left, right []string) bool {
