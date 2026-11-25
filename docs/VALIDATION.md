@@ -12,7 +12,7 @@
 | v0.2.7 | 修复自更新后 Kimi Code 渲染进程卡死：注入改为全局重入串行队列 + 代际淘汰，卸载单飞幂等，跨进程 `host-attach.lock` 串行化接入 | 双端升级后重连、旧实例回收、9229 端口冲突消除的实机复现与回归 | 频繁连续升级的压力场景未长期跑测 |
 | v0.2.8 | KCT 译文恢复官方 `.think-text` 浅灰样式；新增官方插件独立在线热更新（`plugins-latest` + Ed25519 验签 + 扩权二次确认） | 签名校验、`minCoreVersion` 拒绝、能力差异确认、重启后仍按内置公钥复核；插件列表/详情与实验室页的检查与一键更新 | 真实线上插件新版热替换的长期观察；真实账号长周期缓存 TTL 对比 |
 
-三条诚实边界保留如下，不因发布而改写：**真实线上插件新版热替换**目前只完成发布通道与本地签名流程验证，尚未经历一次真实的线上插件版本迭代并观察客户端热替换；**真实账号长周期缓存 TTL 对比**仍缺同账号有/无保活的跨小时对照，现有 `verified` 回执只证明命中归属，不证明缓存寿命被延长；**8 个站点（ChatGPT、Claude、Gemini、DeepSeek、Perplexity、豆包、通义千问、元宝）的登录态提取与回填**仍待实机 E2E 闭环，现有证据是合成 DOM 单测与本地合成网页的选区提取。
+三条诚实边界保留如下，不因发布而改写：**真实线上插件新版热替换**目前只完成发布通道与本地签名流程验证，尚未经历一次真实的线上插件版本迭代并观察客户端热替换；**真实账号长周期缓存 TTL 对比**仍缺同账号有/无保活的跨小时对照，现有 `hit` 回执证明该探测回合读取了缓存，真实缓存寿命需要有无保活对照；**8 个站点（ChatGPT、Claude、Gemini、DeepSeek、Perplexity、豆包、通义千问、元宝）的登录态提取与回填**仍待实机 E2E 闭环，现有证据是合成 DOM 单测与本地合成网页的选区提取。
 
 ## v0.2.3 会话审查修复与发布验收
 
@@ -119,7 +119,7 @@ Windows 重启时，若有读句柄短暂占用 `runtime.json`，核心会等待
 | N1 契约注入（Mac） | 移除官方版本号白名单拦截，改为安全门槛 + 11 项 DOM/API 探针按功能点降级，覆盖普通/多标签双模式侧栏及官方「账户」「智能体与会话」「实验室」内容区；隔离 1.3.7 与伪装版本探针验收及深/浅色诊断页截图通过（`work/next-round-20261119/n1-acceptance-report.json`）。 |
 | N6 设置层级归位 | 「KimiCode+」标签页改为「缓存」「增强插件」「状态与诊断」三节平铺；账号、权限规则/子代理池、会话并排分别挂载至官方「账户」「智能体与会话」「实验室」页并在探针失效时回落；界面统一称「增强插件」且不注入官方「插件」页；隔离 1.3.7 深/浅色逐页截图核验通过（`work/next-round-20261119/n6-acceptance-report.json`）。 |
 | N3 多账号一键切换 | macOS 隔离 1.3.7 实测同进程切换，K2.8 有额度账号正常回复，无额度账号收到官方 429。用户亲自切换三次成功。官方额度读数有延迟，有额度账号的最后可用快照早于模型请求，额度归因未得到证明。本轮未消耗真实额度补测。详见 `work/next-round-20261119/n3-real-accounts-report.json`。 |
-| N4 空闲会话保活 | 供应商缓存时长推导、五态状态机、空闲回合发送后经 `:undo` 撤回、等待子代理短文案插话、保活期间禁压缩、全局缓存设置与会话信息单行菜单全部完成；隔离 1.3.7 + 合成上游逐字节前缀对比验证撤回不破坏缓存前缀，深/浅色截图通过（`work/next-round-20261119/n4-acceptance-report.json`）。 |
+| N4 空闲会话保活（历史） | 隔离 1.3.7 与合成上游的前缀比对及深浅色截图见 `work/next-round-20261119/n4-acceptance-report.json`。当前统一空闲保活策略和回归证据见下方。 |
 | N2 Windows 原生注入与跨版本兼容 | 完成 Windows 原生 CDP 注入、固定路径启动器、快捷方式备份/恢复、进程签名校验与主进程回环桥接；在 Windows 11 x64 实机完成 1.3.2（无 `.settings-dialog` 类）、从更新包隔离解包的 1.3.7（复用 Core 升级切换、探针重置、多标签侧栏切换与 DOM 故障隔离）及模拟未来版本 1.9.9 三阶段跨版本验收，并修复 Windows `kimi-code-app/1.3.x` UA 版本解析、升级探针重置、1.3.2 设置弹层选择器和 API 探针独立并发超时（`work/next-round-20261119/win-acceptance/`、`work/next-round-20261119/win-reverify/`、`work/next-round-20261119/win-cross-version/`）。 |
 | N5 定时任务补强 | 完成启用时未开自动接入弹窗提醒、休眠/通知说明条与跳转官方「通用」页、`[定时] ` 无表情前缀、已读后走官方 `POST /sessions/{id}:archive` 归档、仅补缺运行失败/校验失败/被跳过且遵循官方「系统通知」开关、任务与全局成本护栏、运行前校验、提示词变量插入预览与 `yolo` 脏 Git 工作区二次确认。隔离 1.3.7 实测全链路 12 项断言通过，并修复自定义非托管供应商在 `/oauth/userinfo` 返回 401 时的误拦问题，深/浅色截图已逐张读回核验（`work/next-round-20261119/n5-final-report.json`、`work/next-round-20261119/n5-final-shots/`）。 |
 
@@ -208,15 +208,18 @@ Windows 重启时，若有读句柄短暂占用 `runtime.json`，核心会等待
 | 未上报判定 | read/creation 双零记 NOT_REPORTED 且不显示 0%；有非零 read 的真实低命中（3%）给数字 | `TestNotReportedVersusLowHitRate` |
 | 命中率与保留时长 | 命中率公式、retention 按空闲时长分桶均通过 | `TestHitRateFormula`、`TestRetentionBuckets` |
 | 保活时钟 | "距上次请求"只跟主代理，子代理更新的步骤不刷新 | `TestSessionsIgnoreSubagentActivity` |
-| 保活策略 | 子代理活跃时仍触发、审批阻断、空闲不触发、无后台子代理不触发、阈值以下不触发、阻塞等待记 skipped | `internal/desktop/cache_keepalive_test.go` |
-| 保活闭环判定 | cacheRead>0 判成功；双零判 unknown（不伪造）；有上报但命中 0 判无效；窗口内被后续保活接手时记 invalid 而不是冒领对方步骤 | `TestJudgeKeepAliveVerdicts`、`TestSupersededKeepAliveDoesNotClaimTheNewerStep`、`TestSupersedeQueryScopesToSession` |
+| 保活策略 | 总开关优先、历史冷会话等待真实请求、后台等待期间没有保活提示或压缩请求 | `TestKeepAliveGlobalSwitchAndColdActivation`、`TestAutomationSkipsLegacySteerAndProtectsBackgroundWait` |
+| 保活回执及护栏 | 分桶观测驱动间隔；同回合用量判定发送、命中、未命中；三类供应商预算、未命中熔断、退避和慢回合 | `TestKeepAliveRetentionPolicy`、`TestJudgeKeepAliveVerdicts`、`TestKeepAliveBudgetAndMissFuseAcrossProviders`、`TestKeepAliveSlowTurnAndTransientRejection` |
+| 设置与撤回 | 查询不写历史设置或初始化缓存表；旧截止模式显示停用原因；工作区变化和新活动时跳过撤回 | `TestKeepAliveReadDoesNotWriteAndLegacyModeStops`、`TestIdleKeepAliveUndoSafetyChecks`、`TestIdleKeepAliveRechecksActivityAfterGitScan` |
 | 真实会话手算 | 3 个会话与手算一致（含 931657/0.990900 的重合） | 见下方实测记录 |
 | 前端 | typecheck 通过、81 项测试全绿、build 成功 | `web/` |
-| 真实二进制端到端 | 隔离宿主上 `cache.summary`/`sessions`/`history`/`retention`/`receipts` 返回真实值；`monitor.summary` 已删除，调用返回未知动作；阈值 5–60 校验生效；设置写入读回一致 | 隔离宿主运行日志、`TestMonitorSummaryActionIsGone` |
-| 保活自动闭环 | 隔离宿主上由调度器自动触发，两次连续保活分别落 `invalid` 与 `verified`，回执在页面上按时间排列可见 | 见下方"保活闭环实测" |
+| 真实二进制端到端 | 隔离宿主上 `cache.summary`/`sessions`/`history`/`retention`/`receipts` 返回真实值；`monitor.summary` 已删除，调用返回未知动作；历史设置写入可读回 | 隔离宿主运行日志、`TestMonitorSummaryActionIsGone` |
+
 | 页面截图 | 深浅两种配色均渲染正确：四张指标卡并排、会话表格三列、策略开关、留存条、实际用量柱状图、最近执行记录三种回执状态 | `work/ab/shots/cache-light.png`、`cache-dark.png` |
 
-### 保活闭环实测（隔离宿主，合成上游）
+### 历史后台插话实测（隔离宿主，合成上游）
+
+下列记录用于追溯已移除的后台插话路径。当前保活只在空闲时发出独立请求，并使用精确回合归属。
 
 前提状态：主代理已派发 `run_in_background: true` 的后台子代理并结束回合，官方报 `busy=true / main_turn_active=false`，`cache_live.open_background=1`，主代理上一次模型请求在 30 分钟前。
 
@@ -235,12 +238,12 @@ Windows 重启时，若有读句柄短暂占用 `runtime.json`，核心会等待
 
 限制：本次合成上游在保活请求上返回 `cached_tokens=1100`，所以 `verified` 证明的是"闭环能把下一步的 `input_cache_read` 正确归属到对应的保活"，**不证明**保活真的延长了官方缓存的存活时间。后者需要同会话有/无保活的中断对比，本轮未做。
 
-### 隔离宿主 A/B 实测（D8 发现阶段）
+### 历史后台等待 A/B 实测（D8 发现阶段）
 
 环境：`../work/ekd-native-acceptance` 隔离宿主（官方 2.6.0，独立 `KIMI_CODE_HOME` 与独立 Electron profile），合成 OpenAI 兼容上游记录每次请求并上报 `cached_tokens`。provider `base_url` 经官方 `/config` 热改并在结束后还原。未接管日常实例、未安装真实 LaunchAgent、未调用付费模型。
 
-- **状态 A（后台等待）可保活**：首条消息产生请求 → 回合结束 `busy=false` → 保活消息 HTTP 200 → 上游记录到携带保活标记的新请求（4 次请求中 2 次命中标记）。
-- **状态 B（阻塞等待）不可保活**：合成上游返回真实 `Bash` 工具调用执行 `sleep 75`，阻塞窗口内发送保活消息被接收，但阻塞期间与工具结束后均**没有**新增请求，保活标记未出现在任何请求里。实现因此记 `skipped` 并说明原因。
+- **旧版状态 A（后台等待）可发送插话**：首条消息产生请求 → 回合结束 `busy=false` → 保活消息 HTTP 200 → 上游记录到携带保活标记的新请求（4 次请求中 2 次命中标记）。
+- **旧版状态 B（阻塞等待）未产生新请求**：合成上游返回真实 `Bash` 工具调用执行 `sleep 75`，阻塞窗口内发送保活消息被接收，但阻塞期间与工具结束后均**没有**新增请求，保活标记未出现在任何请求里。旧版实现因此记 `skipped`。
 
 方法论修正：最初通过改写 `config.toml` 指向合成上游，上游收到 0 个请求——宿主只在启动时读配置。必须用官方 `/config` 热改才能验证。
 

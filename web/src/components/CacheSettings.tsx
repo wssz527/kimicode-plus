@@ -6,14 +6,13 @@ import type {
   CacheRetention,
   CacheSessionRow,
   CacheSummary,
+  KeepAliveEvent,
   NativeHost,
 } from "../native";
 import {
-  cacheIntervalForTTL,
   commitNumberField,
   CACHE_NOT_REPORTED as NOT_REPORTED,
   hitRateLabel,
-  idleKeepAliveCoverageMinutes,
   idleLabel,
   mergePolicy,
   shouldApplyPolicyEvent,
@@ -30,11 +29,6 @@ const DEFAULTS: CachePolicySettings = {
     enabled: false,
     defaultCount: 2,
     minQuotaPercent: 10,
-    providerTTL: {
-      subscriptionMinutes: 30,
-      openPlatformMinutes: 5,
-      otherMinutes: 0,
-    },
   },
   compaction: { enabled: false, idleMinutes: 25, contextThreshold: 60 },
   recovery: { enabled: false, intervalSeconds: 60, entries: [] },
@@ -54,7 +48,10 @@ const RECOVERY_STATUS: Record<string, string> = {
  * official client finished it". Plan M2 section 5 requires the distinction.
  */
 const RECEIPT_STATE: Record<string, { label: string; tone: "ok" | "pending" | "bad" | "muted" }> = {
-  verified: { label: "后续请求命中", tone: "ok" },
+  sent: { label: "已发送", tone: "pending" },
+  hit: { label: "命中", tone: "ok" },
+  miss: { label: "未命中", tone: "bad" },
+  verified: { label: "历史命中", tone: "ok" },
   completed: { label: "官方已完成", tone: "ok" },
   acknowledged: { label: "官方已接收，等待完成", tone: "pending" },
   invalid: { label: "保活无效", tone: "bad" },
@@ -66,7 +63,7 @@ const RECEIPT_STATE: Record<string, { label: string; tone: "ok" | "pending" | "b
 
 const KIND_LABEL: Record<string, string> = {
   keepalive: "后台保活",
-  idle_keepalive: "空闲保活",
+  idle_keepalive: "缓存保活",
   compaction: "压缩",
   recovery: "额度恢复",
 };
@@ -88,13 +85,6 @@ function policyPatch(base: CachePolicySettings, next: CachePolicySettings): Reco
   if (nextIdle.enabled !== baseIdle.enabled) idle.enabled = nextIdle.enabled;
   if (nextIdle.defaultCount !== baseIdle.defaultCount) idle.defaultCount = nextIdle.defaultCount;
   if (nextIdle.minQuotaPercent !== baseIdle.minQuotaPercent) idle.minQuotaPercent = nextIdle.minQuotaPercent;
-  if (
-    nextIdle.providerTTL.subscriptionMinutes !== baseIdle.providerTTL.subscriptionMinutes
-    || nextIdle.providerTTL.openPlatformMinutes !== baseIdle.providerTTL.openPlatformMinutes
-    || nextIdle.providerTTL.otherMinutes !== baseIdle.providerTTL.otherMinutes
-  ) {
-    idle.providerTTL = { ...nextIdle.providerTTL };
-  }
   if (Object.keys(idle).length > 0) patch.idleKeepAlive = idle;
   const baseCompaction = base.compaction;
   const nextCompaction = next.compaction;
@@ -200,6 +190,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
   const [policyReady, setPolicyReady] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [keepAliveAlert, setKeepAliveAlert] = useState("");
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   // While a policy write is in flight, incoming automation events are ignored so the
@@ -272,6 +263,21 @@ export function CacheSettings({ host }: { host: NativeHost }) {
     }
   }), [host]);
 
+  useEffect(() => host.subscribe<KeepAliveEvent>("keepalive", event => {
+    if (event?.type === "keepalive.alert") setKeepAliveAlert(event.message);
+  }), [host]);
+
+  useEffect(() => {
+    let alive = true;
+    const unsubscribe = host.subscribe<{ kind?: string }>("automation", event => {
+      if (event?.kind !== "idle_keepalive") return;
+      void host.request<CacheReceipt[]>("cache.receipts", { limit: 20 })
+        .then(next => { if (alive && Array.isArray(next)) setReceipts(next); })
+        .catch(() => {});
+    });
+    return () => { alive = false; unsubscribe(); };
+  }, [host]);
+
   const policyRef = useRef(policy);
   policyRef.current = policy;
   const policyReadyRef = useRef(policyReady);
@@ -302,19 +308,10 @@ export function CacheSettings({ host }: { host: NativeHost }) {
     return <div className="eks-loading"><Spinner size={15} />正在读取缓存数据</div>;
   }
 
-  const keepAliveOff = !policy.keepAlive.enabled;
   const idleKeepAlive = policy.idleKeepAlive;
   const idleKeepAliveOff = !idleKeepAlive.enabled;
   const compactionOff = !policy.compaction.enabled;
   const recoveryOff = !policy.recovery.enabled;
-  const subTTL = idleKeepAlive.providerTTL.subscriptionMinutes;
-  const openTTL = idleKeepAlive.providerTTL.openPlatformMinutes;
-  const otherTTL = idleKeepAlive.providerTTL.otherMinutes;
-  const subInterval = cacheIntervalForTTL(subTTL).interval;
-  const openInterval = cacheIntervalForTTL(openTTL).interval;
-  const otherInterval = cacheIntervalForTTL(otherTTL).interval;
-  const subCoverage = idleKeepAliveCoverageMinutes(subTTL, idleKeepAlive.defaultCount);
-  const openCoverage = idleKeepAliveCoverageMinutes(openTTL, idleKeepAlive.defaultCount);
   const modelRetention = retention?.byModel?.find(item => item.model === retentionModel);
   const retentionBuckets = modelRetention?.idleBuckets ?? retention?.idleBuckets;
   const historyPoints = history?.points ?? [];
@@ -389,169 +386,66 @@ export function CacheSettings({ host }: { host: NativeHost }) {
         </div>}
     </Group>
 
-    <Group title="策略" hint="各项分别授权，默认关闭。保活与压缩互斥：等待子代理与空闲保活期间绝不压缩，空闲保活结束后仍然空闲再进入压缩。">
+    <Group title="策略" hint="各项分别开启。会话运行或等待后台任务时，压缩与缓存保活暂停。">
       <div className="eks-row">
         <span className="eks-row-label">
-          <strong>后台等待保活</strong>
-          <small>主会话等待后台子代理、且主代理超过设定时间未发模型请求时，插入极短提示（[保活]无需操作，继续等待）。不受保活次数限制。</small>
+          <strong>缓存保活</strong>
+          <small>只在空闲会话发送。间隔取自该模型的缓存观测，样本不足时使用默认值。</small>
         </span>
         <Toggle
-          label="启用后台等待保活"
-          checked={policy.keepAlive.enabled}
-          disabled={!policyReady || saving}
-          onChange={value => void savePolicy({ ...policy, keepAlive: { ...policy.keepAlive, enabled: value } }, value ? "后台等待保活已开启。" : "后台等待保活已关闭。")}
-        />
-      </div>
-      {!keepAliveOff ? <div className="eks-row is-sub">
-        <span className="eks-row-label"><strong>主代理静默阈值</strong><small>主代理距上一次模型请求达到这个时长才保活。5–60 分钟。</small></span>
-        <NumberField label="主代理静默阈值" hideLabel value={policy.keepAlive.minutes} min={5} max={60} unit="分钟"
-              disabled={!policyReady || saving}
-          onEditingChange={value => { editing.current = value; }} onCommit={value => { if (value !== null) void savePolicy(mergePolicy(policy, { keepAlive: { ...policy.keepAlive, minutes: value } }), "保活阈值已保存。"); }} />
-      </div> : null}
-
-      <div className="eks-row">
-        <span className="eks-row-label">
-          <strong>空闲会话保活</strong>
-          <small>
-            会话空闲时按供应商缓存时长自动发送极短保活并撤回该轮，不拉长上下文；单个会话可在「会话信息 → 缓存保活」单独覆盖。
-            {` 订阅模型：离开后约 ${subCoverage} 分钟内回来仍可命中缓存（前提：命中会重新计时）。`}
-          </small>
-        </span>
-        <Toggle
-          label="启用空闲会话保活"
+          label="启用缓存保活"
           checked={idleKeepAlive.enabled}
           disabled={!policyReady || saving}
           onChange={value => void savePolicy(
             mergePolicy(policy, { idleKeepAlive: { ...idleKeepAlive, enabled: value } }),
-            value ? "空闲会话保活已开启。" : "空闲会话保活已关闭。",
+            value ? "缓存保活已开启。" : "缓存保活已关闭。",
           )}
         />
       </div>
-      {!idleKeepAliveOff ? <div className="eks-row is-sub">
-        <span className="eks-row-label">
-          <strong>默认保活次数</strong>
-          <small>
-            {`订阅（${subTTL} 分钟缓存 / 每 ${subInterval} 分钟保活）：离开后约 ${subCoverage} 分钟内仍可命中；开放平台（${openTTL} 分钟 / 每 ${openInterval} 分钟）：约 ${openCoverage} 分钟（前提：每次保活命中会重新计时）。`}
-          </small>
-        </span>
-        <NumberField
-          label="默认保活次数"
-          hideLabel
-          value={idleKeepAlive.defaultCount}
-          min={1}
-          max={20}
-          unit="次"
-              disabled={!policyReady || saving}
-          onEditingChange={value => { editing.current = value; }}
-          onCommit={value => {
-            if (value !== null) {
-              void savePolicy(mergePolicy(policy, { idleKeepAlive: { ...idleKeepAlive, defaultCount: value } }), "默认保活次数已保存。");
-            }
-          }}
-        />
-      </div> : null}
-      <details className="eks-advanced">
-        <summary className="eks-advanced-summary">高级：各供应商缓存时长与额度停止阈值</summary>
-        <div className="eks-advanced-body">
-          <div className="eks-row is-sub">
-            <span className="eks-row-label">
-              <strong>订阅模型缓存时长</strong>
-              <small>{`官方托管账号与 api.kimi.com/coding；当前推导保活间隔为 ${subInterval} 分钟。`}</small>
-            </span>
-            <NumberField
-              label="订阅模型缓存时长"
-              hideLabel
-              value={subTTL}
-              min={2}
-              max={240}
-              unit="分钟"
-              disabled={!policyReady || saving}
-              onEditingChange={value => { editing.current = value; }}
-              onCommit={value => {
-                if (value !== null) {
-                  void savePolicy(
-                    mergePolicy(policy, { idleKeepAlive: { ...idleKeepAlive, providerTTL: { ...idleKeepAlive.providerTTL, subscriptionMinutes: value } } }),
-                    "订阅缓存时长已保存。",
-                  );
-                }
-              }}
-            />
-          </div>
-          <div className="eks-row is-sub">
-            <span className="eks-row-label">
-              <strong>开放平台缓存时长</strong>
-              <small>{`api.moonshot.cn / api.moonshot.ai；当前推导保活间隔为 ${openInterval} 分钟。`}</small>
-            </span>
-            <NumberField
-              label="开放平台缓存时长"
-              hideLabel
-              value={openTTL}
-              min={2}
-              max={240}
-              unit="分钟"
-              disabled={!policyReady || saving}
-              onEditingChange={value => { editing.current = value; }}
-              onCommit={value => {
-                if (value !== null) {
-                  void savePolicy(
-                    mergePolicy(policy, { idleKeepAlive: { ...idleKeepAlive, providerTTL: { ...idleKeepAlive.providerTTL, openPlatformMinutes: value } } }),
-                    "开放平台缓存时长已保存。",
-                  );
-                }
-              }}
-            />
-          </div>
-          <div className="eks-row is-sub">
-            <span className="eks-row-label">
-              <strong>其他供应商缓存时长</strong>
-              <small>{otherTTL > 0 ? `当前推导保活间隔为 ${otherInterval} 分钟；填 0 表示未知且不自动保活。` : "默认 0（未知），不自动保活；填入 2–240 分钟后启用。"}</small>
-            </span>
-            <NumberField
-              label="其他供应商缓存时长"
-              hideLabel
-              value={otherTTL}
-              min={0}
-              max={240}
-              unit="分钟"
-              disabled={!policyReady || saving}
-              validate={value => (value === 0 || value >= 2 ? null : "只接受 0（未知，不自动保活）或 2–240 分钟；填 1 没有可推导的保活间隔。")}
-              onEditingChange={value => { editing.current = value; }}
-              onCommit={value => {
-                if (value !== null && (value === 0 || value >= 2)) {
-                  void savePolicy(
-                    mergePolicy(policy, { idleKeepAlive: { ...idleKeepAlive, providerTTL: { ...idleKeepAlive.providerTTL, otherMinutes: value } } }),
-                    "其他供应商缓存时长已保存。",
-                  );
-                }
-              }}
-            />
-          </div>
-          <div className="eks-row is-sub">
-            <span className="eks-row-label">
-              <strong>额度停止阈值</strong>
-              <small>订阅剩余额度低于此百分比时自动停止空闲保活，并发出应用内提示。</small>
-            </span>
-            <NumberField
-              label="额度停止阈值"
-              hideLabel
-              value={idleKeepAlive.minQuotaPercent}
-              min={0}
-              max={100}
-              unit="%"
-              disabled={!policyReady || saving}
-              onEditingChange={value => { editing.current = value; }}
-              onCommit={value => {
-                if (value !== null) {
-                  void savePolicy(mergePolicy(policy, { idleKeepAlive: { ...idleKeepAlive, minQuotaPercent: value } }), "额度停止阈值已保存。");
-                }
-              }}
-            />
-          </div>
+      {!idleKeepAliveOff ? <>
+        <div className="eks-row is-sub">
+          <span className="eks-row-label">
+            <strong>默认保活次数</strong>
+            <small>每次真实请求后重新计数。可在会话信息中单独调整次数或关闭。</small>
+          </span>
+          <NumberField
+            label="默认保活次数"
+            hideLabel
+            value={idleKeepAlive.defaultCount}
+            min={1}
+            max={20}
+            unit="次"
+            disabled={!policyReady || saving}
+            onEditingChange={value => { editing.current = value; }}
+            onCommit={value => {
+              if (value !== null) void savePolicy(mergePolicy(policy, { idleKeepAlive: { ...idleKeepAlive, defaultCount: value } }), "默认保活次数已保存。");
+            }}
+          />
         </div>
-      </details>
-      <p className="eks-row is-sub is-note">
-        空闲保活发送后会用官方撤回接口移除该轮，不改变模型或思考参数；会触发 config.toml 中配置的提交与结束钩子；已抑制官方「回合完成」系统通知，但官方服务端仍可能刷新会话的最近更新时间。
-      </p>
+        <div className="eks-row is-sub">
+          <span className="eks-row-label">
+            <strong>订阅额度停止阈值</strong>
+            <small>剩余额度低于阈值时停止。设为 0 则关闭这一项检查。</small>
+          </span>
+          <NumberField
+            label="订阅额度停止阈值"
+            hideLabel
+            value={idleKeepAlive.minQuotaPercent}
+            min={0}
+            max={100}
+            unit="%"
+            disabled={!policyReady || saving}
+            onEditingChange={value => { editing.current = value; }}
+            onCommit={value => {
+              if (value !== null) void savePolicy(mergePolicy(policy, { idleKeepAlive: { ...idleKeepAlive, minQuotaPercent: value } }), "额度停止阈值已保存。");
+            }}
+          />
+        </div>
+        <p className="eks-row is-sub is-note">
+          所有供应商都受 Token 预算限制，连续两次未命中会停止。保活回合仅在安全检查通过后自动撤回，仍可能触发官方通知及会话钩子。
+        </p>
+      </> : null}
+      {keepAliveAlert ? <p className="eks-row is-sub is-note" role="status">{keepAliveAlert}</p> : null}
       <div className="eks-row is-sub is-stacked">
         <span className="eks-row-label">
           <strong>可参考的实测保留情况</strong>
@@ -579,7 +473,6 @@ export function CacheSettings({ host }: { host: NativeHost }) {
         </div> : null}
         <p className="eks-inline-note">这些历史记录反映请求命中情况。估算保活的实际收益需要对照实验。</p>
       </div>
-      {!keepAliveOff ? <p className="eks-row is-sub is-note">主代理处于阻塞式等待时跳过保活，执行记录会说明原因。</p> : null}
 
       <div className="eks-row">
         <span className="eks-row-label">
@@ -670,7 +563,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
       </div> : null}
     </Group>
 
-    <Group title="最近执行记录" hint="“官方已接收”不等于“官方已完成”；保活是否成功以下一步 input_cache_read 为准。">
+    <Group title="最近执行记录" hint="保活按探测回合的缓存用量记录发送、命中或未命中。压缩单独记录官方接收与完成。">
       {receipts.length === 0
         ? <p className="eks-empty">还没有执行记录。策略开启后，每次保活、压缩和恢复都会记录在这里。</p>
         : <div className="eks-receipts">

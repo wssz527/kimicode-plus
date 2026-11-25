@@ -166,17 +166,10 @@ export interface CacheReceipt {
   at: string;
 }
 
-export interface ProviderTTLPolicy {
-  subscriptionMinutes: number;
-  openPlatformMinutes: number;
-  otherMinutes: number;
-}
-
 export interface IdleKeepAlivePolicy {
   enabled: boolean;
   defaultCount: number;
   minQuotaPercent: number;
-  providerTTL: ProviderTTLPolicy;
 }
 
 export interface ResolvedCachePolicy {
@@ -184,18 +177,16 @@ export interface ResolvedCachePolicy {
   provider: string;
   providerType: "subscription" | "open_platform" | "other";
   providerLabel: string;
-  baseUrl?: string;
-  ttlMinutes: number;
+  windowMinutes: number;
   intervalMinutes: number;
-  marginMinutes: number;
+  source: "observed" | "fallback";
 }
 
 export interface SessionKeepAliveView {
   sessionId: string;
-  state: "active" | "waiting_subagent" | "idle_keepalive" | "idle_compaction" | "stopped";
-  mode: "default" | "off" | "count" | "until";
+  state: "disabled" | "keeping_alive" | "stopped";
+  mode: "default" | "off" | "count";
   targetCount: number;
-  untilAt?: string;
   effectiveEnabled: boolean;
   effectiveLimit: number;
   usedCount: number;
@@ -208,7 +199,9 @@ export interface SessionKeepAliveView {
   lastKeepAliveAt?: string;
   stoppedReason?: string;
   stoppedDetail?: string;
-  estimatedCost: string;
+  estimatedTokens: number;
+  budgetTokens: number;
+  spentTokens: number;
   policy: ResolvedCachePolicy;
   inFlight: boolean;
   globalEnabled: boolean;
@@ -222,20 +215,9 @@ export interface CachePolicySettings {
   recovery: { enabled: boolean; intervalSeconds: number; entries: { id: string; title: string; status: string; nextAt?: string; note?: string }[] };
 }
 
-export function cacheIntervalForTTL(ttlMinutes: number): { interval: number; margin: number } {
-  if (!Number.isFinite(ttlMinutes) || ttlMinutes < 2) return { interval: 0, margin: 0 };
-  const ttl = Math.floor(ttlMinutes);
-  let margin = Math.floor((ttl + 2) / 6);
-  if (margin < 1) margin = 1;
-  if (margin >= ttl) margin = ttl - 1;
-  return { interval: ttl - margin, margin };
-}
-
-export function idleKeepAliveCoverageMinutes(ttlMinutes: number, count: number): number {
-  const { interval } = cacheIntervalForTTL(ttlMinutes);
-  if (interval <= 0) return 0;
-  return Math.floor(ttlMinutes) + Math.max(0, Math.floor(count)) * interval;
-}
+export type KeepAliveEvent =
+  | { type: "keepalive.session"; sessionId: string; view: SessionKeepAliveView }
+  | { type: "keepalive.alert"; sessionId: string; reason: string; title: string; message: string };
 
 /** A provider that never reported cache fields must never render as 0%. */
 export const CACHE_NOT_REPORTED = "NOT_REPORTED";
@@ -451,12 +433,9 @@ export function mergePolicy(base: CachePolicyDraft, incoming: unknown): CachePol
   return {
     keepAlive: { ...base.keepAlive, ...(source.keepAlive ?? {}) },
     idleKeepAlive: {
-      ...base.idleKeepAlive,
-      ...(incomingIdle ?? {}),
-      providerTTL: {
-        ...base.idleKeepAlive.providerTTL,
-        ...(incomingIdle?.providerTTL ?? {}),
-      },
+      enabled: incomingIdle?.enabled ?? base.idleKeepAlive.enabled,
+      defaultCount: incomingIdle?.defaultCount ?? base.idleKeepAlive.defaultCount,
+      minQuotaPercent: incomingIdle?.minQuotaPercent ?? base.idleKeepAlive.minQuotaPercent,
     },
     compaction: { ...base.compaction, ...(source.compaction ?? {}) },
     recovery: {

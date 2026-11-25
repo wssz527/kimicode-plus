@@ -125,12 +125,15 @@ type NativeService struct {
 	hostPIDProvider           func() int
 	codeUsageEndpointOverride string
 
+	idleStateMu     sync.Mutex
 	idleMu          sync.Mutex
 	idleInFlight    map[string]idleInFlightState
-	idleAlerted     map[string]string
 	idleConfigCache map[string]any
 	idleConfigAt    time.Time
 	idleVerifyPoll  time.Duration
+	idleRetentionAt time.Time
+	idleRetention   cache.Retention
+	intentPrunedAt  time.Time
 }
 
 const addonFeaturesKey = "features"
@@ -186,6 +189,15 @@ func NewNativeService(db *sql.DB, kap *KAPClient, cwd string, safe func() bool) 
 		`CREATE TABLE automation_intents(id TEXT PRIMARY KEY,kind TEXT NOT NULL,host_id TEXT NOT NULL,session_id TEXT NOT NULL,model_id TEXT NOT NULL,context_revision TEXT NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,result TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE kimi_accounts(id TEXT PRIMARY KEY,user_id TEXT NOT NULL UNIQUE,label TEXT NOT NULL DEFAULT '',nickname TEXT NOT NULL DEFAULT '',avatar TEXT NOT NULL DEFAULT '',plan TEXT NOT NULL DEFAULT '',region TEXT NOT NULL DEFAULT '',oauth_key TEXT NOT NULL DEFAULT 'kimi-code',oauth_host TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'ready',status_reason TEXT NOT NULL DEFAULT '',quota_json TEXT NOT NULL DEFAULT '',models_json TEXT NOT NULL DEFAULT '',last_seen_at TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL)`,
 		`CREATE TABLE session_keepalive_state(session_id TEXT PRIMARY KEY,mode TEXT NOT NULL DEFAULT 'default',target_count INTEGER NOT NULL DEFAULT 2,until_at TEXT NOT NULL DEFAULT '',used_count INTEGER NOT NULL DEFAULT 0,anchor_at TEXT NOT NULL DEFAULT '',last_keepalive_at TEXT NOT NULL DEFAULT '',last_keepalive_turn_id TEXT NOT NULL DEFAULT '',last_result TEXT NOT NULL DEFAULT '',last_note TEXT NOT NULL DEFAULT '',stopped_reason TEXT NOT NULL DEFAULT '',stopped_detail TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL DEFAULT '')`,
+		`ALTER TABLE session_keepalive_state ADD COLUMN retry_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE session_keepalive_state ADD COLUMN spent_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE session_keepalive_state ADD COLUMN misses INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE session_keepalive_state ADD COLUMN last_prompt TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE session_keepalive_state ADD COLUMN last_request_at TEXT NOT NULL DEFAULT ''`,
+		`UPDATE session_keepalive_state SET mode='off', until_at='', stopped_reason='legacy_until_removed', stopped_detail='旧版截止时刻保活已停用，请重新选择保活次数' WHERE mode='until'`,
+		`CREATE INDEX automation_intents_session_created ON automation_intents(kind,session_id,created_at)`,
+		`CREATE INDEX automation_intents_kind_state_updated ON automation_intents(kind,state,updated_at)`,
+		`CREATE INDEX automation_intents_updated ON automation_intents(updated_at)`,
 	}); err != nil {
 		return nil, err
 	}
@@ -200,7 +212,11 @@ func NewNativeService(db *sql.DB, kap *KAPClient, cwd string, safe func() bool) 
 	ctx, cancel := context.WithCancel(context.Background())
 	service := &NativeService{db: db, kap: kap, bus: NewEventBus(), cwd: cwd, safe: safe, ctx: ctx, cancel: cancel, cache: map[string]cachedSession{}}
 	service.quota = newQuotaService(service)
-	if _, err := db.ExecContext(ctx, `UPDATE automation_intents SET state='unknown',result='核心重启后无法确认原请求结果，不会自动重发',updated_at=? WHERE state IN ('pending','acknowledged')`, storage.SortableTime(time.Now().UTC())); err != nil {
+	if _, err := db.ExecContext(ctx, `UPDATE automation_intents SET state='unknown',result='核心重启后无法确认原请求结果，不会自动重发',updated_at=? WHERE state IN ('pending','acknowledged') OR (kind='idle_keepalive' AND state='sent')`, storage.SortableTime(time.Now().UTC())); err != nil {
+		cancel()
+		return nil, err
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE session_keepalive_state SET last_result='unknown',last_note='核心重启后等待下一次真实请求',stopped_reason='unconfirmed',stopped_detail='重启前的保活请求尚未核实，等待下一次真实请求' WHERE last_result IN ('sent','acknowledged')`); err != nil {
 		cancel()
 		return nil, err
 	}
@@ -1475,10 +1491,11 @@ func (s *NativeService) sendPrompt(ctx context.Context, input map[string]any) (a
 	if thinking := stringInput(input, "thinking"); thinking != "" {
 		body["thinking"] = thinking
 	}
+	sentAt := time.Now().UTC()
 	s.touchSession(id)
 	raw, err := s.kap.Request(ctx, http.MethodPost, "/sessions/"+id+"/prompts", body)
-	if err == nil && text != keepAlivePrompt && text != idleKeepAlivePrompt {
-		s.noteUserMessage(ctx, id, time.Now().UTC())
+	if err == nil && !isKeepAlivePrompt(text) {
+		s.noteUserMessage(ctx, id, sentAt)
 	}
 	return rawAsAny(raw), err
 }

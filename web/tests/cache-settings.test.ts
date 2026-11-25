@@ -3,10 +3,8 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
   CACHE_NOT_REPORTED,
-  cacheIntervalForTTL,
   commitNumberField,
   hitRateLabel,
-  idleKeepAliveCoverageMinutes,
   idleLabel,
   mergePolicy,
   shouldApplyPolicyEvent,
@@ -22,11 +20,6 @@ const policy = {
     enabled: false,
     defaultCount: 2,
     minQuotaPercent: 10,
-    providerTTL: {
-      subscriptionMinutes: 30,
-      openPlatformMinutes: 5,
-      otherMinutes: 0,
-    },
   },
   compaction: { enabled: false, idleMinutes: 25, contextThreshold: 60 },
   recovery: { enabled: false, intervalSeconds: 60, entries: [] },
@@ -110,29 +103,30 @@ test("keepalive policy defaults stay off", () => {
   assert.equal(policy.recovery.enabled, false);
 });
 
-test("idle keepalive TTL interval and coverage derivation matches N4", () => {
-  assert.deepEqual(cacheIntervalForTTL(30), { interval: 25, margin: 5 });
-  assert.deepEqual(cacheIntervalForTTL(5), { interval: 4, margin: 1 });
-  assert.deepEqual(cacheIntervalForTTL(2), { interval: 1, margin: 1 });
-  assert.deepEqual(cacheIntervalForTTL(0), { interval: 0, margin: 0 });
-  assert.equal(idleKeepAliveCoverageMinutes(30, 2), 80);
-  assert.equal(idleKeepAliveCoverageMinutes(5, 2), 13);
-  assert.equal(idleKeepAliveCoverageMinutes(0, 2), 0);
-});
-
-test("merging idleKeepAlive preserves nested providerTTL fields", () => {
+test("merging keepalive settings drops old manual TTL values and retains partial updates", () => {
   const merged = mergePolicy(policy, {
     idleKeepAlive: {
       enabled: true,
       defaultCount: 3,
-      minQuotaPercent: 10,
-      providerTTL: { subscriptionMinutes: 40, openPlatformMinutes: 5, otherMinutes: 12 },
+      providerTTL: { subscriptionMinutes: 40, otherMinutes: 12 },
     },
   });
-  assert.equal(merged.idleKeepAlive.enabled, true);
-  assert.equal(merged.idleKeepAlive.defaultCount, 3);
-  assert.equal(merged.idleKeepAlive.providerTTL.subscriptionMinutes, 40);
-  assert.equal(merged.idleKeepAlive.providerTTL.otherMinutes, 12);
+  assert.deepEqual(merged.idleKeepAlive, { enabled: true, defaultCount: 3, minQuotaPercent: 10 });
+});
+
+test("keepalive surfaces display the observed interval, budget, and stop events", () => {
+  const menu = readFileSync("src/components/SessionKeepAliveMenu.tsx", "utf8");
+  assert.match(menu, /view\.policy\.intervalMinutes/);
+  assert.match(menu, /view\.policy\.source === "observed" \? "模型实测" : "样本不足，默认值"/);
+  assert.match(menu, /view\.estimatedTokens/);
+  assert.match(menu, /view\.spentTokens.*view\.budgetTokens/);
+  assert.match(menu, /view\.stoppedDetail/);
+  assert.doesNotMatch(menu, /untilAt|截止时刻/);
+  assert.match(cacheSource, /event\?\.type === "keepalive\.alert"/);
+  assert.match(cacheSource, /sent:.*已发送/);
+  assert.match(cacheSource, /hit:.*命中/);
+  assert.match(cacheSource, /miss:.*未命中/);
+  assert.doesNotMatch(cacheSource, /providerTTL|80 分钟|已抑制官方通知/);
 });
 
 test("the model retention dropdown resets to 全部模型 when the selected model disappears", () => {

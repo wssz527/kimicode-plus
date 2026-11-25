@@ -238,9 +238,7 @@ test("a policy patch carries only the fields the edit actually changed", () => {
 
   const other = basePolicy();
   other.idleKeepAlive.providerTTL.otherMinutes = 12;
-  assert.deepEqual(policyHelpers.policyPatch(base, other), {
-    idleKeepAlive: { providerTTL: { subscriptionMinutes: 30, openPlatformMinutes: 5, otherMinutes: 12 } },
-  });
+  assert.equal(policyHelpers.policyPatch(base, other), null);
 
   // A switch carries only its own flag, never the neighbours it was built from.
   const compaction = basePolicy();

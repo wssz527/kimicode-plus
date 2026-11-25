@@ -46,6 +46,11 @@ type Store struct {
 	scanMu sync.Mutex
 }
 
+// OpenMetrics reads already indexed data without migrations or a record scan.
+func OpenMetrics(db *sql.DB) *Store {
+	return &Store{db: db}
+}
+
 // NewStore migrates the schema and returns a store bound to home.
 func NewStore(db *sql.DB, home string) (*Store, error) {
 	if err := storage.Migrate(db, "cache_metrics", []string{
@@ -84,6 +89,7 @@ func NewStore(db *sql.DB, home string) (*Store, error) {
 			blocked INTEGER NOT NULL DEFAULT 0,
 			last_user_prompt TEXT NOT NULL DEFAULT '',
 			updated_at TEXT NOT NULL DEFAULT '')`,
+		`CREATE INDEX cache_steps_session_turn ON cache_steps(session_id,agent,turn_id,time)`,
 	}); err != nil {
 		return nil, err
 	}
@@ -478,6 +484,19 @@ func (s *Store) LastMainStep(ctx context.Context, sessionID string) (Step, bool,
 	}
 	step.At, _ = time.Parse(time.RFC3339Nano, at)
 	return step, true, nil
+}
+
+// FirstMainStepForTurn attributes usage to the exact official turn that incurred it.
+func (s *Store) FirstMainStepForTurn(ctx context.Context, sessionID, turnID string) (Step, bool, error) {
+	step := Step{SessionID: sessionID, Agent: "main", TurnID: turnID}
+	var at string
+	err := s.db.QueryRowContext(ctx, `SELECT step_uuid,model,time,input_other,input_cache_read,input_cache_creation,output FROM cache_steps WHERE session_id=? AND agent='main' AND turn_id=? ORDER BY time,rowid LIMIT 1`, sessionID, turnID).
+		Scan(&step.StepUUID, &step.Model, &at, &step.InputOther, &step.InputCacheRead, &step.InputCacheCreation, &step.Output)
+	if errors.Is(err, sql.ErrNoRows) {
+		return step, false, nil
+	}
+	step.At = parseTime(at)
+	return step, err == nil, err
 }
 
 // StepAfter returns the first main-agent step newer than after. keepalive uses it

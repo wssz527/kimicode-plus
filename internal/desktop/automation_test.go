@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -252,74 +251,30 @@ func TestCompactionRestartDoesNotReplayAcknowledged(t *testing.T) {
 	}
 }
 
-// TestKeepAliveSendsOnceAndPreservesMode keeps the original guarantees of the
-// pre-M2 keepalive (send once, never change plan/tower mode, respect approvals)
-// while satisfying the D8 preconditions: a running session with an open background
-// subagent and a quiet main agent.
-func TestKeepAliveSendsOnceAndPreservesMode(t *testing.T) {
+func TestAutomationSkipsLegacySteerAndProtectsBackgroundWait(t *testing.T) {
 	home := t.TempDir()
-	keepAliveFixture{home: home, mainAge: 40 * time.Minute, background: true}.write(t, "synthetic/model")
-	var prompts atomic.Int32
-	var bodyMu sync.Mutex
-	bodies := []map[string]any{}
-	session := nativeTestSession("s1", 0, nil)
-	session["busy"] = true
-	session["main_turn_active"] = true
-	handler := &syncHandler{session: session}
-	handler.inner = automationTestSessionHandler(t, session, []NativeTurn{}, nil, nil, func(path string, body map[string]any) {
-		if path == "/api/v1/sessions/s1/prompts" {
-			prompts.Add(1)
-			bodyMu.Lock()
-			bodies = append(bodies, body)
-			bodyMu.Unlock()
-		}
-	})
-	service, _ := newAutomationTestServiceWithHome(t, handler, home)
-	service.verifyPoll = 20 * time.Millisecond
-	service.verifyWindow = 500 * time.Millisecond
+	keepAliveFixture{home: home, mainAge: 26 * time.Minute, background: true, blocked: true}.write(t, "kimi-code/kimi-for-coding")
+	h := newIdleTestHarness("kimi-code/kimi-for-coding")
+	h.session["activity"] = "background"
 	now := time.Now().UTC()
-	mapped, _ := mapNativeSession(json.RawMessage(`{"id":"s1","updated_at":"2026-11-16T00:00:00Z","busy":true,"main_turn_active":true,"pending_interaction":"none"}`))
-	service.cache["s1"] = automationTestCache(mapped, now)
+	s := startIdleKeepAliveService(t, h, home, now.Add(-26*time.Minute))
 	settings := defaultAutomationSettings()
-	settings.KeepAlive.Enabled = true
-	settings.KeepAlive.Minutes = 5
-	if err := service.storeAutomationSettings(context.Background(), settings); err != nil {
+	settings.KeepAlive = KeepAliveSettings{Enabled: true, Minutes: 5}
+	settings.IdleKeepAlive.Enabled = true
+	settings.Compaction.Enabled = true
+	ctx := context.Background()
+	if err := s.storeAutomationSettings(ctx, settings); err != nil {
 		t.Fatal(err)
 	}
-	// The session's own activity is recent, so only the main agent's request time can
-	// justify a keepalive.
-	service.mu.Lock()
-	recent := service.cache["s1"]
-	recent.lastActivity = now
-	service.cache["s1"] = recent
-	service.mu.Unlock()
-
-	if err := service.automationTick(context.Background(), now); err != nil {
-		t.Fatal(err)
+	for _, tick := range []time.Time{now, now.Add(time.Minute), now.Add(2 * time.Minute)} {
+		if err := s.automationTick(ctx, tick); err != nil {
+			t.Fatal(err)
+		}
 	}
-	// Wait for the asynchronous closed-loop verifier to settle the intent.
-	waitForKeepAliveState(t, service, keepAliveInvalid)
-	if prompts.Load() != 1 || len(bodies) != 1 {
-		t.Fatalf("keepalive calls = %d", prompts.Load())
-	}
-	bodyMu.Lock()
-	first := bodies[0]
-	bodyMu.Unlock()
-	if _, exists := first["plan_mode"]; exists {
-		t.Fatal("keepalive changed plan mode")
-	}
-	if _, exists := first["tower_mode"]; exists {
-		t.Fatal("keepalive changed tower mode")
-	}
-	// A pending approval must block the next candidate even after the cooldown. The
-	// official session is the source of truth here: automationTick re-reads it, so the
-	// approval has to be visible in the synthetic provider too.
-	handler.setPending("approval")
-	if err := service.automationTick(context.Background(), now.Add(30*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	if prompts.Load() != 1 {
-		t.Fatal("pending approval did not block keepalive")
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.prompts) != 0 || h.compactions != 0 {
+		t.Fatalf("background wait produced %d prompts and %d compactions", len(h.prompts), h.compactions)
 	}
 }
 
@@ -551,31 +506,6 @@ func TestNativeRecoveryUsesOfficialQuotaAndRemovesWaiter(t *testing.T) {
 	}
 }
 
-// syncHandler lets a test change the synthetic official session between ticks, so the
-// service's re-read sees the same state a real client would report.
-type syncHandler struct {
-	mu      sync.Mutex
-	inner   http.Handler
-	session map[string]any
-}
-
-func (h *syncHandler) setPending(value string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.session["pending_interaction"] = value
-}
-
-func (h *syncHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.mu.Lock()
-	pending := h.session["pending_interaction"]
-	h.mu.Unlock()
-	_ = pending
-	h.inner.ServeHTTP(w, r)
-}
-
-// TestAutomationIntentsLegacyTimestampsAreBackfilled covers the table the reviewer
-// asked about: its cooldown, supersede and expire queries all compare timestamps as
-// text, so a legacy variable-width row must not survive a restart.
 func TestAutomationIntentsLegacyTimestampsAreBackfilled(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "intents.db")
 	db, err := storage.Open(path)
@@ -638,5 +568,39 @@ func TestAutomationIntentsLegacyTimestampsAreBackfilled(t *testing.T) {
 	}
 	if err = rows.Err(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAutomationIntentRetentionPreservesState(t *testing.T) {
+	s, _ := newAutomationTestService(t, http.NotFoundHandler())
+	ctx := context.Background()
+	now := time.Now().UTC()
+	old := now.Add(-31 * 24 * time.Hour)
+	rows := []struct {
+		kind, id string
+		at       time.Time
+		retain   bool
+	}{
+		{"keepalive", "old_steer", old, false},
+		{"idle_keepalive", "old_probe", old, false},
+		{"idle_keepalive", "recent_probe", now, true},
+		{"compaction", "old_compaction", old.Add(-time.Hour), false},
+		{"compaction", "latest_compaction", old, true},
+		{"recovery", "recovery_state", old, true},
+	}
+	for _, row := range rows {
+		if _, err := s.db.Exec(`INSERT INTO automation_intents(id,kind,host_id,session_id,model_id,context_revision,state,created_at,updated_at,result) VALUES(?,?,'native','s1','','r1','completed',?,?,'')`,
+			row.id, row.kind, storage.SortableTime(row.at), storage.SortableTime(row.at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.pruneAutomationIntents(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		var found bool
+		if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM automation_intents WHERE id=?)`, row.id).Scan(&found); err != nil || found != row.retain {
+			t.Errorf("intent %q retained=%v, want %v, error=%v", row.id, found, row.retain, err)
+		}
 	}
 }
