@@ -409,13 +409,13 @@ export function createPluginRuntime(options: RuntimeOptions) {
           const page = await call.call<{ items: Array<{ id: string; name: string; providerId?: string }> }>("planner.models");
           return page?.items ?? [];
         },
-        async create(input: { title?: string; model: string; options?: Record<string, boolean> }) {
+        async create(input: { title?: string; model: string; preset?: string; sourceSessionId?: string; options?: Record<string, boolean> }) {
           return map(await call.call<PlannerThread>("planner.create", input));
         },
         async get(threadId: string) {
           return call.call<PlannerThread>("planner.get", { id: threadId });
         },
-        async configure(threadId: string, input: { model: string; options?: Record<string, boolean> }) {
+        async configure(threadId: string, input: { model: string; preset?: string; options?: Record<string, boolean> }) {
           return call.call<PlannerThread>("planner.configure", { id: threadId, ...input });
         },
         async rename(threadId: string, title: string) {
@@ -829,6 +829,18 @@ function createEventPump(reportFailure: (id: string, error: unknown, code: strin
     return [...wanted];
   }
 
+  function deliver(id: string, group: PumpGroup, scope: string, value: unknown): void {
+    for (const subscription of [...group.subscriptions]) {
+      if (subscription.scope !== scope) continue;
+      try {
+        subscription.listener(value);
+      } catch (error) {
+        reportFailure(id, error, "PLUGIN_EVENT_FAILED", `处理 ${scope} 事件失败`);
+        group.subscriptions.delete(subscription);
+      }
+    }
+  }
+
   async function runGroup(id: string, group: PumpGroup) {
     if (group.running || stopped) return;
     group.running = true;
@@ -842,21 +854,23 @@ function createEventPump(reportFailure: (id: string, error: unknown, code: strin
           const page = await group.bridge.call<{
             events: Array<{ sequence: number; scope: string; value: unknown }>;
             next: number;
+            reset?: boolean;
           }>("events.poll", { after: group.cursor, scopes: wanted, waitMs: 5000 });
           if (stopped || groups.get(id) !== group) break;
           group.cursor = page.next;
           group.failures = 0;
-          for (const event of page.events) {
-            for (const subscription of [...group.subscriptions]) {
-              if (subscription.scope !== event.scope) continue;
-              try {
-                subscription.listener(event.value);
-              } catch (error) {
-                // A throwing listener stops only its own subscription; the other
-                // plugins and the remaining subscriptions keep running.
-                reportFailure(id, error, "PLUGIN_EVENT_FAILED", `处理 ${event.scope} 事件失败`);
-                group.subscriptions.delete(subscription);
-              }
+          for (const event of page.events) deliver(id, group, event.scope, event.value);
+          if (page.reset) {
+            for (const scope of wanted) {
+              if (!scope.startsWith("planner:")) continue;
+              // A planner snapshot is authoritative even if the ring lost its final event.
+              void group.bridge.call<PlannerThread>("planner.get", { id: scope.slice("planner:".length) }).then(snapshot => {
+                if (!stopped && groups.get(id) === group) deliver(id, group, scope, snapshot);
+              }).catch(error => {
+                if (!stopped && groups.get(id) === group) {
+                  reportFailure(id, error, "PLUGIN_EVENT_RESET_FAILED", `恢复 ${scope} 状态失败`);
+                }
+              });
             }
           }
           // The core long-polls, so a fast answer means the wait was cut short

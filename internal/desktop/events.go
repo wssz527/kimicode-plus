@@ -67,7 +67,7 @@ func (b *EventBus) Poll(ctx context.Context, after int64, scopes []string, wait 
 		if after < 0 {
 			after = b.next
 		}
-		page := EventPage{Events: []Event{}, Next: after, Reset: after > 0 && after < oldest-1}
+		page := EventPage{Events: []Event{}, Next: min(after, b.next), Reset: after < oldest-1 || after > b.next}
 		allowed := map[string]bool{}
 		for _, scope := range scopes {
 			allowed[scope] = true

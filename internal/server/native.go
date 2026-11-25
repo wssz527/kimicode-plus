@@ -57,15 +57,11 @@ func (g *nativePlannerGenerator) Stream(
 	}
 	if g.gateway != nil {
 		err := g.gateway.Stream(ctx, model, messages, tools, sessionID, emit)
-		if err == nil || preferKAP || g.native == nil {
+		if !errors.Is(err, gateway.ErrPlannerModelNotFound) || preferKAP || g.native == nil {
 			return err
 		}
-		if handled, kapErr := g.streamKAP(ctx, model, messages, tools, emit); handled {
-			return kapErr
-		}
-		return err
 	}
-	if g.native != nil {
+	if g.native != nil && !preferKAP {
 		if handled, err := g.streamKAP(ctx, model, messages, tools, emit); handled {
 			return err
 		}

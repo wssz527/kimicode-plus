@@ -254,16 +254,12 @@ func (m *Manager) runAction(ctx context.Context, id, token, action string, param
 			return nil, err
 		}
 		targetID, text, mode := stringValue(input["targetId"]), stringValue(input["text"]), stringValue(input["mode"])
-		if _, err := handoffPreview(targetID, mode, text, stringValue(input["cwd"]), stringValue(input["model"]), stringValue(input["title"])); err != nil {
+		preview, err := handoffPreview(targetID, mode, text, stringValue(input["cwd"]), stringValue(input["model"]), stringValue(input["title"]))
+		if err != nil {
 			return nil, err
 		}
-		// Preview already normalized the mode; forwarding the raw empty string
-		// would leave the core to invent a default a second time.
-		if mode == "" {
-			mode = "normal"
-		}
 		native = "handoff"
-		body := map[string]any{"text": text, "mode": mode}
+		body := map[string]any{"text": text, "mode": preview.(map[string]any)["mode"]}
 		if targetID != "" {
 			body["targetId"] = targetID
 		}

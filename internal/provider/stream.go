@@ -33,13 +33,14 @@ type ToolCallDelta struct {
 // StreamEvent is one decoded upstream delta. Text, Reasoning and ToolCalls are
 // independent: a chunk may carry any combination, or only usage.
 type StreamEvent struct {
-	ID        string
-	Model     string
-	Text      string
-	Reasoning string
-	ToolCalls []ToolCallDelta
-	Usage     json.RawMessage
-	Finish    string
+	ID             string
+	Model          string
+	Text           string
+	Reasoning      string
+	ToolCalls      []ToolCallDelta
+	Usage          json.RawMessage
+	Finish         string
+	PlannerContext *PlannerContext
 	// Role is present on the first delta of an OpenAI-compatible stream.
 	Role string
 }

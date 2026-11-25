@@ -26,15 +26,17 @@ type Source struct {
 	AdapterStatus string `json:"adapterStatus"`
 }
 type Message struct {
-	ID         string              `json:"id"`
-	Role       string              `json:"role"`
-	Text       string              `json:"text"`
-	At         string              `json:"at"`
-	Tool       string              `json:"tool,omitempty"`
-	Reasoning  string              `json:"reasoning,omitempty"`
-	ToolCalls  []provider.ToolCall `json:"toolCalls,omitempty"`
-	ToolCallID string              `json:"toolCallId,omitempty"`
-	Failed     bool                `json:"failed,omitempty"`
+	ID             string                   `json:"id"`
+	Role           string                   `json:"role"`
+	Text           string                   `json:"text"`
+	At             string                   `json:"at"`
+	Tool           string                   `json:"tool,omitempty"`
+	Reasoning      string                   `json:"reasoning,omitempty"`
+	ToolCalls      []provider.ToolCall      `json:"toolCalls,omitempty"`
+	ToolCallID     string                   `json:"toolCallId,omitempty"`
+	Failed         bool                     `json:"failed,omitempty"`
+	Truncated      bool                     `json:"truncated,omitempty"`
+	PlannerContext *provider.PlannerContext `json:"plannerContext,omitempty"`
 }
 type Thread struct {
 	ID          string        `json:"id"`

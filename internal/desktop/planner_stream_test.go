@@ -13,14 +13,18 @@ import (
 )
 
 func TestStreamKAPModelStreamsOfficialCatalogModelWithoutPersistingSecret(t *testing.T) {
-	var seenAuth, seenModel string
+	var seenAuth, seenModel, seenProvider, seenOverride string
+	var seenOptions map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenAuth = r.Header.Get("Authorization")
+		seenProvider = r.Header.Get("X-Provider")
+		seenOverride = r.Header.Get("X-Override")
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("decode body: %v", err)
 		}
 		seenModel, _ = body["model"].(string)
+		seenOptions = body
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = fmt.Fprint(w, "data: {\"id\":\"1\",\"model\":\"synthetic-fast\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"# 规划摘要\\n- 步骤一\"}}]}\n\n")
 		_, _ = fmt.Fprint(w, "data: {\"id\":\"1\",\"model\":\"synthetic-fast\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
@@ -34,15 +38,21 @@ func TestStreamKAPModelStreamsOfficialCatalogModelWithoutPersistingSecret(t *tes
 			writeNativeTestEnvelope(w, map[string]any{
 				"providers": map[string]any{
 					"synthetic_official": map[string]any{
-						"type":     "openai",
-						"base_url": upstream.URL + "/v1",
+						"type":           "openai",
+						"base_url":       upstream.URL + "/v1",
+						"custom_headers": map[string]string{"X-Provider": "provider", "X-Override": "provider"},
 					},
 				},
 				"models": map[string]any{
 					"synthetic_official/synthetic-fast": map[string]any{
-						"provider":       "synthetic_official",
-						"model":          "synthetic-fast",
-						"maxContextSize": 262144,
+						"provider":          "synthetic_official",
+						"model":             "synthetic-fast",
+						"maxContextSize":    262144,
+						"maxOutputSize":     16000,
+						"adaptive_thinking": true,
+						"support_efforts":   []string{"low", "high"},
+						"default_effort":    "low",
+						"customHeaders":     map[string]string{"x-override": "model"},
 					},
 				},
 			})
@@ -76,6 +86,9 @@ func TestStreamKAPModelStreamsOfficialCatalogModelWithoutPersistingSecret(t *tes
 	}
 	if seenModel != "synthetic-fast" {
 		t.Fatalf("unexpected upstream model: %q", seenModel)
+	}
+	if seenProvider != "provider" || seenOverride != "model" || seenOptions["max_tokens"] != float64(16000) || seenOptions["reasoning_effort"] != "low" || seenOptions["thinking"].(map[string]any)["type"] != "enabled" {
+		t.Fatalf("planner ignored model settings: %#v provider=%q override=%q", seenOptions, seenProvider, seenOverride)
 	}
 	if !strings.Contains(collected.String(), "规划摘要") {
 		t.Fatalf("unexpected streamed text: %q", collected.String())

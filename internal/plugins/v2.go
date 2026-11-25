@@ -681,14 +681,22 @@ func handoffPreview(targetID, mode, text, cwd, model, title string) (any, error)
 	if text == "" || len(text) > 200000 {
 		return nil, apiError(http.StatusBadRequest, "PLUGIN_HANDOFF_TEXT", "交接内容必须为 1–200000 字节")
 	}
-	mode = strings.TrimSpace(mode)
-	if mode == "" {
-		mode = "normal"
-	}
-	if mode != "normal" && mode != "plan" && mode != "tower" {
-		return nil, apiError(http.StatusBadRequest, "PLUGIN_HANDOFF_MODE", "交接模式必须是 normal、plan 或 tower")
-	}
 	targetID = strings.TrimSpace(targetID)
+	mode = strings.TrimSpace(mode)
+	switch mode {
+	case "":
+		mode = "inherit"
+		if targetID == "" {
+			mode = "plan"
+		}
+	case "inherit":
+		if targetID == "" {
+			return nil, apiError(http.StatusBadRequest, "PLUGIN_HANDOFF_MODE", "仅已有会话可以保留原模式")
+		}
+	case "normal", "plan", "tower":
+	default:
+		return nil, apiError(http.StatusBadRequest, "PLUGIN_HANDOFF_MODE", "交接模式必须是 inherit、normal、plan 或 tower")
+	}
 	preview := map[string]any{
 		"targetId":   targetID,
 		"mode":       mode,

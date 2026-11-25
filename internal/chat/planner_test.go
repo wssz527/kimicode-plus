@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -328,12 +329,15 @@ func TestPluginPlannerThreadKeepsItsFirstWorkspace(t *testing.T) {
 	})
 	const owner = "kimicode-plus.planner"
 	ctx := context.Background()
-	value, err := planner.PlannerAction(ctx, "planner.create", []byte(mustPlannerJSON(map[string]string{"model": "synthetic", "pluginOwner": owner})))
+	value, err := planner.PlannerAction(ctx, "planner.create", []byte(mustPlannerJSON(map[string]string{"model": "synthetic", "pluginOwner": owner, "sourceSessionId": "first"})))
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := value.(PlannerThread).ID
-	for _, source := range []string{"first", "second"} {
+	if value.(PlannerThread).Workspace != first {
+		t.Fatalf("workspace not locked at creation: %+v", value)
+	}
+	for _, source := range []string{"second", "first"} {
 		payload := map[string]string{"id": id, "text": source, "sourceSessionId": source, "pluginOwner": owner}
 		if _, err := planner.PlannerAction(ctx, "planner.send", []byte(mustPlannerJSON(payload))); err != nil {
 			t.Fatal(err)
@@ -445,5 +449,124 @@ func TestPlannerOwnerComesFromTheCallingPlugin(t *testing.T) {
 	}
 	if stopped, err := planner.StopPluginThreads(context.Background(), ""); err != nil || stopped != 0 {
 		t.Fatalf("an empty owner stopped %d threads (%v)", stopped, err)
+	}
+}
+
+func TestPlannerLengthCanContinueFromPartialReply(t *testing.T) {
+	var requests atomic.Int32
+	planner, _, _ := newTestPlanner(t, plannerGeneratorFunc(func(_ context.Context, _ string, messages []provider.Message, _ []map[string]any, _ string, emit func(provider.StreamEvent) error) error {
+		if requests.Add(1) == 1 {
+			return emit(provider.StreamEvent{Text: "前半段", Reasoning: "当前思考", Finish: "length"})
+		}
+		if len(messages) != 4 || messages[2].Content != "前半段" || messages[2].ReasoningContent != "" || !strings.Contains(messages[3].Content, "截断处继续") {
+			t.Errorf("continuation request lost context or replayed reasoning: %+v", messages)
+		}
+		return emit(provider.StreamEvent{Text: "后半段", Finish: "stop"})
+	}))
+	id := createPlannerThread(t, planner, PlannerOptions{})
+	sendPlanner(t, planner, id)
+	cut := waitPlanner(t, planner, id, func(thread PlannerThread) bool { return thread.Status == "truncated" })
+	if !cut.CanContinue || len(cut.Messages) != 2 || !cut.Messages[1].Truncated || cut.Messages[1].Reasoning != "当前思考" {
+		t.Fatalf("truncated state lost content: %+v", cut)
+	}
+	if _, err := planner.PlannerAction(context.Background(), "planner.retry", []byte(mustPlannerJSON(map[string]any{"id": id, "revision": cut.Revision}))); err != nil {
+		t.Fatal(err)
+	}
+	done := waitPlanner(t, planner, id, func(thread PlannerThread) bool { return thread.Status == "idle" })
+	if done.CanContinue || len(done.Messages) != 3 || done.Messages[2].Text != "后半段" {
+		t.Fatalf("continuation did not complete: %+v", done)
+	}
+}
+
+func TestPlannerStopsAndPairsEveryPendingToolCall(t *testing.T) {
+	var requests atomic.Int32
+	planner, _, root := newTestPlanner(t, plannerGeneratorFunc(func(_ context.Context, _ string, messages []provider.Message, _ []map[string]any, _ string, emit func(provider.StreamEvent) error) error {
+		if requests.Add(1) == 1 {
+			first := plannerCall("write_file", `{"path":"first.txt","content":"never"}`)
+			second := plannerCall("write_file", `{"path":"second.txt","content":"never"}`)
+			index := 1
+			second.Index, second.ID = &index, "call-2"
+			return emit(provider.StreamEvent{ToolCalls: []provider.ToolCallDelta{first, second}, Finish: "tool_calls"})
+		}
+		if len(messages) != 5 || len(messages[2].ToolCalls) != 2 || messages[3].ToolCallID != "call-1" || messages[4].ToolCallID != "call-2" {
+			t.Errorf("continued with unpaired messages: %+v", messages)
+		}
+		return emit(provider.StreamEvent{Text: "恢复完成", Finish: "stop"})
+	}))
+	id := createPlannerThread(t, planner, PlannerOptions{Tools: true})
+	sendPlanner(t, planner, id)
+	waitPlanner(t, planner, id, func(thread PlannerThread) bool { return thread.Approval != nil })
+	value, err := planner.PlannerAction(context.Background(), "planner.stop", []byte(mustPlannerJSON(map[string]any{"id": id})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped := value.(PlannerThread)
+	if !stopped.CanContinue || stopped.Approval != nil || len(stopped.Messages) != 4 || !strings.Contains(stopped.Messages[2].Text, "中断") || !strings.Contains(stopped.Messages[3].Text, "中断") {
+		t.Fatalf("stop did not pair every tool call: %+v", stopped)
+	}
+	for _, name := range []string{"first.txt", "second.txt"} {
+		if _, err := os.Stat(filepath.Join(root, name)); !os.IsNotExist(err) {
+			t.Fatalf("canceled write %s exists", name)
+		}
+	}
+	if _, err := planner.PlannerAction(context.Background(), "planner.retry", []byte(mustPlannerJSON(map[string]any{"id": id, "revision": stopped.Revision}))); err != nil {
+		t.Fatal(err)
+	}
+	waitPlanner(t, planner, id, func(thread PlannerThread) bool { return thread.Status == "idle" && !thread.CanContinue })
+}
+
+func TestPlannerRetriesOrdinaryErrorsWithoutEmptyAssistant(t *testing.T) {
+	var calls atomic.Int32
+	planner, _, _ := newTestPlanner(t, plannerGeneratorFunc(func(_ context.Context, _ string, messages []provider.Message, _ []map[string]any, _ string, emit func(provider.StreamEvent) error) error {
+		if calls.Add(1) == 1 {
+			return &provider.StatusError{Status: 502}
+		}
+		if len(messages) != 2 || messages[1].Role != "user" {
+			t.Errorf("retry duplicated messages: %+v", messages)
+		}
+		return emit(provider.StreamEvent{Text: "成功", Finish: "stop"})
+	}))
+	id := createPlannerThread(t, planner, PlannerOptions{})
+	sendPlanner(t, planner, id)
+	failed := waitPlanner(t, planner, id, func(thread PlannerThread) bool { return thread.Status == "error" })
+	if !failed.CanContinue || len(failed.Messages) != 1 {
+		t.Fatalf("failure left an empty reply: %+v", failed)
+	}
+	if _, err := planner.PlannerAction(context.Background(), "planner.retry", []byte(mustPlannerJSON(map[string]any{"id": id, "revision": failed.Revision}))); err != nil {
+		t.Fatal(err)
+	}
+	waitPlanner(t, planner, id, func(thread PlannerThread) bool { return thread.Status == "idle" })
+}
+
+func TestPlannerGitStatusIsScopedAndReadOnly(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("Git unavailable")
+	}
+	root := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	git("init", "--quiet")
+	workspace := filepath.Join(root, "project")
+	if err := os.Mkdir(workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"project/go.mod", "sibling.txt"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("new"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	status, err := plannerGitStatus(context.Background(), workspace)
+	if err != nil || !strings.Contains(status, "project/") || strings.Contains(status, "sibling.txt") {
+		t.Fatalf("workspace status %q: %v", status, err)
+	}
+	git("config", "filter.planner-test.clean", "false")
+	if _, err = plannerGitStatus(context.Background(), workspace); err == nil || !strings.Contains(err.Error(), "可执行 Git 过滤器") {
+		t.Fatalf("unsafe Git configuration was accepted: %v", err)
 	}
 }

@@ -282,6 +282,40 @@ test("each plugin polls on its own loop, so an idle plugin never blocks another"
   assert.equal(runtime.eventLoops(), 0, "dispose left a loop running");
 });
 
+test("a reset fetches the latest planner thread even when its final event was lost", async () => {
+  const reads: string[] = [];
+  const states: string[] = [];
+  let polls = 0;
+  const runtime = createPluginRuntime({
+    slots: {},
+    request: async (path, body) => {
+      if (path === "/plugin-runtime/events.poll") {
+        polls++;
+        if (polls === 1) return { value: { events: [{ sequence: 1, scope: "planner:p1", value: { status: "running" } }], next: 1 } };
+        if (polls === 2) return { value: { events: [], next: 2400, reset: true } };
+        return { value: { events: [], next: 2400 } };
+      }
+      if (path === "/plugin-runtime/planner.get") {
+        reads.push((body as { params: { id: string } }).params.id);
+        return { value: { id: "p1", revision: 8, status: "truncated" } };
+      }
+      return { value: {} };
+    },
+  });
+  try {
+    await runtime.activate(
+      { activate: context => { context.events.on("planner:p1", value => states.push((value as { status: string }).status)); } },
+      { id: "plugin.planner", version: "1.0.0", granted: ["planner:run"], token: "t" },
+    );
+    const deadline = Date.now() + 1000;
+    while (states.length < 2 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.deepEqual(reads, ["p1"]);
+    assert.deepEqual(states, ["running", "truncated"]);
+  } finally {
+    runtime.dispose();
+  }
+});
+
 test("deactivating one plugin leaves the other plugin's event subscription working", async () => {
   const delivered: Array<{ token: string; value: unknown }> = [];
   let releaseTwo: (() => void) | null = null;
