@@ -23,9 +23,31 @@ const (
 )
 
 const (
-	winCreateNewProcessGroup = 0x00000200
-	winDetachedProcess       = 0x00000008
+	winCreateNewProcessGroup          = 0x00000200
+	winDetachedProcess                = 0x00000008
+	winProcessQueryLimitedInformation = 0x1000
+	winStillActive                    = 259
 )
+
+func init() {
+	coreProcessAlive = windowsCoreProcessAlive
+}
+
+func windowsCoreProcessAlive(_ context.Context, pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	handle, err := syscall.OpenProcess(winProcessQueryLimitedInformation, false, uint32(pid))
+	if err != nil {
+		return false
+	}
+	defer syscall.CloseHandle(handle)
+	var exitCode uint32
+	if err := syscall.GetExitCodeProcess(handle, &exitCode); err != nil {
+		return false
+	}
+	return exitCode == winStillActive
+}
 
 func verifyRuntimeImage(context.Context, ProcessInfo) error {
 	return ErrUnsupportedPlatform
@@ -410,52 +432,38 @@ func attachNativePlatform(ctx context.Context, options AttachOptions) (*AttachRe
 			debugPort = port
 		}
 	}
-	if debugPort <= 0 || (lease != nil && !IsWindowsDebugInstance(proc, lease)) {
-		if binary.supportsLiveAttach() {
-			result, attachErr := attachRunningWindowsMain(ctx, options, proc)
-			if attachErr == nil || debugPort <= 0 {
-				return result, attachErr
-			}
-		}
-		if debugPort <= 0 {
-			return nil, errors.New("当前客户端无法运行中接入，请通过 KimiCode+ 入口重新打开 Kimi Code")
-		}
-	}
-	listeners, err := windowsListListeners(ctx, debugPort)
-	if err != nil {
-		return nil, err
-	}
-	if err := VerifyWindowsDebugPortOwner(listeners, debugPort, proc.PID); err != nil {
-		return nil, err
-	}
-	// Re-check process identity right before connecting.
-	recheck, err := windowsDiscoverRaw(ctx)
-	if err != nil {
-		return nil, err
-	}
-	recheckMatches, err := SelectWindowsMainProcesses(recheck.SID, recheck.desktopProcesses(), kimiExe, options.Profile)
-	if err != nil || len(recheckMatches) != 1 {
-		return nil, errors.New("Windows 宿主进程在接入过程中退出")
-	}
-	if err := VerifyWindowsProcessIdentity(proc, recheckMatches[0]); err != nil {
-		return nil, err
-	}
-	return AttachWindowsCDP(ctx, WindowsCDPAttachOptions{
-		DebugPort:          debugPort,
-		HostPID:            proc.PID,
-		HostStarted:        proc.Started,
-		CoreURL:            options.CoreURL,
-		PairingToken:       options.PairingToken,
-		CoreVersion:        options.CoreVersion,
-		Profile:            options.Profile,
-		Daily:              options.Profile == "",
-		AppVersionOverride: options.AppVersionOverride,
-		AuditClients: func(auditCtx context.Context, port, hostPID int) ([]WindowsDebugClientAlert, error) {
-			conns, cErr := windowsListConnections(auditCtx, port)
-			if cErr != nil {
-				return nil, cErr
-			}
-			return DetectForeignDebugClients(conns, port, hostPID, os.Getpid()), nil
+	tryLive := (debugPort <= 0 || (lease != nil && !IsWindowsDebugInstance(proc, lease))) && binary.supportsLiveAttach()
+	return attachWindowsWithFallback(ctx, options, proc, debugPort, windowsAttachFallbackDeps{
+		tryLive:    tryLive,
+		liveAttach: attachRunningWindowsMainUnlocked,
+		compat: windowsCompatCDPDeps{
+			verifyReady: func(verifyCtx context.Context) error {
+				listeners, err := windowsListListeners(verifyCtx, debugPort)
+				if err != nil {
+					return err
+				}
+				if err := VerifyWindowsDebugPortOwner(listeners, debugPort, proc.PID); err != nil {
+					return err
+				}
+				// Re-check process identity right before connecting.
+				recheck, err := windowsDiscoverRaw(verifyCtx)
+				if err != nil {
+					return err
+				}
+				recheckMatches, err := SelectWindowsMainProcesses(recheck.SID, recheck.desktopProcesses(), kimiExe, options.Profile)
+				if err != nil || len(recheckMatches) != 1 {
+					return errors.New("Windows 宿主进程在接入过程中退出")
+				}
+				return VerifyWindowsProcessIdentity(proc, recheckMatches[0])
+			},
+			attachCDP: AttachWindowsCDP,
+			auditClient: func(auditCtx context.Context, port, hostPID int) ([]WindowsDebugClientAlert, error) {
+				conns, cErr := windowsListConnections(auditCtx, port)
+				if cErr != nil {
+					return nil, cErr
+				}
+				return DetectForeignDebugClients(conns, port, hostPID, os.Getpid()), nil
+			},
 		},
 	})
 }

@@ -64,12 +64,12 @@ EKD 由 `internal/desktop/inject.go`、`cdp.go`、`contracts.go`、`inspector_fu
 - Node inspector 信号 fuse 的**位次是 Electron 源码顺序的属性，不是从二进制里推得出来的**，跨大版本可能移动。因此位次按 Electron 版本显式绑定在 `VerifiedFuseLayouts` 表中（当前仅 `45.1.0`：block version 1、9 个 fuse、信号位次 3），并与宿主契约共用同一个 `SupportedElectron` 常量。
 - 表中没有的 Electron 版本**失败关闭**，返回"该 Electron 版本未经验证 fuse 布局"，不猜测新布局。声明数量、block version 与位次表不一致时同样判为未知布局，而不是照旧读取可能已指向别的 fuse 的位置。
 - 读取不再整文件加载（本机 `Electron Framework` 约 207MB，而 `attach.status` 会被设置页反复轮询）：改为 1MB 分块流式扫描并保留跨块 carry，内存与文件大小无关；同一文件（size + mtime）与同一 Electron 版本的结果缓存，文件变化即失效。
-- 每次运行的结论写入 `attach-state.json`；需要授权时该文件带 `consentRequired: true`，设置页据此给出说明而不是只显示一个失败状态。
+- 每次接入默认启用幂等跳过（`SkipCurrent`）：取到 `host-attach.lock` 后先复核目标宿主进程存活与身份未变（macOS 同时复核 fuse，Windows 兼容接入同时复核调试监听端口归属），再比对 `attach-state.json` 中同一存活核心与同一宿主的有效 `installed` 状态及 `attachKey`（严格核对 `corePid`，`runtime.json` 损坏返回不匹配、缺失时回退比对当前进程 PID，并通过进程存活检查及环回 `/enhance/v1/health` 的 `Bearer` 鉴权确认核心确实存活；CLI 解析 `runtime.json` 时同样始终经 `/enhance/v1/health` 实探通过才采纳）；全部匹配才跳过重复注入并返回既有状态，需要强制重新附着时可显式传入 `--force`。未命中跳过而即将触碰宿主调试端口或拆桥前（Windows 运行中接入会先确认本地临时调试端口空闲），持锁先把磁盘上已有的 `installed`、损坏或因非 `ErrNotExist` 错误不可读的 `attach-state.json` 原子替换为 `status: "attaching"`（替换失败则尝试删除；若替换与删除均失败，则无条件前置中止接入并返回持久化失败，原桥保持完好不受触碰）。Windows 运行中主进程接入失败并回退兼容 CDP 路径时全程共用单次 `host-attach.lock` 事务，中途不释放锁也不提前写盘，直到主进程尝试与必要的兼容回退全部结束后才在持锁期间完成唯一一次状态提交；若主进程尝试在拆桥前失败且回退到兼容路径时 `SkipCurrent` 命中接入前的有效兼容 `installed` 状态，则直接恢复该 `installed` 状态并跳过重复 CDP 注入（已拆桥时则强制重注）。凡经过 `host-attach.lock` 的接入结果均在持锁期间提交状态并标记已提交，外层 CLI 与后台流程不再在锁外二次覆盖；若持锁写盘失败，绝不吞掉错误或伪标 `stateRecorded`，而是标记为持久化失败向上传递（覆盖写入失败时同时尽力移除可能过期的旧 `attach-state.json`，移除亦失败时一并 `errors.Join` 进错误返回），外层亦不再在锁外重复覆盖。未取锁前提前失败的兜底写入先非阻塞尝试 `host-attach.lock`，若锁正被另一活跃接入持有则交由持锁方写出权威状态。未触碰现有桥的瞬时探测或锁竞争错误会保留健康的 `installed` 状态；一旦触碰或拆除旧桥后失败，或宿主/核心换代、退出，则如实更新为 `error`（并清除 `attachKey`）以便后续重新完成注入。需要授权时该文件带 `consentRequired: true`，设置页据此给出说明而不是只显示一个失败状态。
 
 命令行入口：
 
 ```
-enhanced-kimi attach --data-dir <dir> --kimi-home <home> [--host-profile <path>] [--allow-daily-instance]
+enhanced-kimi attach --data-dir <dir> --kimi-home <home> [--host-profile <path>] [--allow-daily-instance] [--force]
 enhanced-kimi attach --data-dir <dir> --kimi-home <home> --install [--host-profile <path>] [--allow-daily-instance]
 enhanced-kimi attach --data-dir <dir> --uninstall
 enhanced-kimi attach --status --data-dir <dir>

@@ -62,6 +62,13 @@ func TestContractAPISnapshotsPassAcrossVersions(t *testing.T) {
 			"/oauth/usage": map[string]any{"kind": "ok", "quota": map[string]any{"usages": map[string]any{"limit5h": map[string]any{"usedRatio": 0.2}}}},
 			"/sessions":    map[string]any{"items": []any{map[string]any{"id": "s-137", "title": "session"}}},
 		},
+		"1.4.3": {
+			"/config":      map[string]any{"providers": map[string]any{}, "models": map[string]any{}},
+			"/providers":   map[string]any{"items": []any{map[string]any{"id": "managed:kimi-code"}}},
+			"/models":      map[string]any{"items": []any{map[string]any{"id": "managed:kimi-code/k2.9", "model": "k2.9"}}},
+			"/oauth/usage": map[string]any{"kind": "ok", "quota": map[string]any{"usages": map[string]any{"limit5h": map[string]any{"usedRatio": 0.1}}}},
+			"/sessions":    map[string]any{"items": []any{map[string]any{"id": "s-143", "title": "session"}}},
+		},
 		"1.9.9": {
 			"/config":      map[string]any{"providers": map[string]any{}, "models": map[string]any{}},
 			"/providers":   map[string]any{"items": []any{map[string]any{"id": "managed:kimi-code"}}},

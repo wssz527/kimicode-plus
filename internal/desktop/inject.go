@@ -7,10 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
+	"net/url"
+	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"enhancedkimi/internal/webassets"
@@ -81,6 +87,7 @@ type AttachResult struct {
 	MainBridgeWarning string `json:"mainBridgeWarning,omitempty"`
 	attachKey         string
 	hostStarted       string
+	stateRecorded     bool
 }
 
 // ErrConsentRequired is returned when the only running client is the user's daily
@@ -161,7 +168,281 @@ func AttachNative(ctx context.Context, options AttachOptions) (*AttachResult, er
 	return attachNativePlatform(ctx, options)
 }
 
-func attachNativeDarwin(ctx context.Context, options AttachOptions) (result *AttachResult, retErr error) {
+type bridgeTornDownError struct {
+	err error
+}
+
+func (e *bridgeTornDownError) Error() string {
+	return e.err.Error()
+}
+
+func (e *bridgeTornDownError) Unwrap() error {
+	return e.err
+}
+
+func markBridgeTornDown(err error) error {
+	if err == nil || isBridgeTornDown(err) {
+		return err
+	}
+	return &bridgeTornDownError{err: err}
+}
+
+func isBridgeTornDown(err error) bool {
+	var target *bridgeTornDownError
+	return errors.As(err, &target)
+}
+
+func MarkBridgeTornDown(err error) error {
+	return markBridgeTornDown(err)
+}
+
+func IsBridgeTornDown(err error) bool {
+	return isBridgeTornDown(err)
+}
+
+type attachStateRecordedError struct {
+	err error
+}
+
+func (e *attachStateRecordedError) Error() string {
+	return e.err.Error()
+}
+
+func (e *attachStateRecordedError) Unwrap() error {
+	return e.err
+}
+
+func markAttachStateRecorded(err error) error {
+	if err == nil || isAttachStateRecorded(err) {
+		return err
+	}
+	return &attachStateRecordedError{err: err}
+}
+
+func isAttachStateRecorded(err error) bool {
+	var target *attachStateRecordedError
+	return errors.As(err, &target)
+}
+
+func MarkAttachStateRecorded(err error) error {
+	return markAttachStateRecorded(err)
+}
+
+func IsAttachStateRecorded(err error) bool {
+	return isAttachStateRecorded(err)
+}
+
+func MarkAttachStateRecordedResult(result *AttachResult) *AttachResult {
+	if result != nil {
+		result.stateRecorded = true
+	}
+	return result
+}
+
+func IsAttachStateRecordedResult(result *AttachResult) bool {
+	return result != nil && result.stateRecorded
+}
+
+type attachStatePersistFailedError struct {
+	err error
+}
+
+func (e *attachStatePersistFailedError) Error() string {
+	return e.err.Error()
+}
+
+func (e *attachStatePersistFailedError) Unwrap() error {
+	return e.err
+}
+
+func markAttachPersistFailed(err error) error {
+	if err == nil || isAttachPersistFailed(err) {
+		return err
+	}
+	return &attachStatePersistFailedError{err: err}
+}
+
+func isAttachPersistFailed(err error) bool {
+	var target *attachStatePersistFailedError
+	return errors.As(err, &target)
+}
+
+func MarkAttachPersistFailed(err error) error {
+	return markAttachPersistFailed(err)
+}
+
+func IsAttachPersistFailed(err error) bool {
+	return isAttachPersistFailed(err)
+}
+
+func commitAttachOutcomeUnlocked(dataDir string, result *AttachResult, retErr error) (*AttachResult, error) {
+	return commitAttachOutcomeWithPreviousUnlocked(dataDir, nil, result, retErr)
+}
+
+func commitAttachOutcomeWithPreviousUnlocked(dataDir string, prevInstalled map[string]any, result *AttachResult, retErr error) (*AttachResult, error) {
+	if dataDir == "" {
+		return result, retErr
+	}
+	if retErr != nil {
+		if !isAttachStateRecorded(retErr) && !isAttachPersistFailed(retErr) {
+			var recordErr error
+			if !isBridgeTornDown(retErr) {
+				currentCore := corePID(dataDir)
+				if shouldPreserveInstalledAttach(dataDir, currentCore) {
+					recordErr = nil
+				} else if prevInstalled != nil && shouldPreserveInstalledAttachState(prevInstalled, currentCore) {
+					recordErr = writeAttachState(dataDir, prevInstalled)
+				} else {
+					recordErr = recordAttachUnlocked(dataDir, retErr)
+				}
+			} else {
+				recordErr = recordAttachUnlocked(dataDir, retErr)
+			}
+			if recordErr != nil {
+				persistErr := fmt.Errorf("写入接入状态文件失败：%w", recordErr)
+				if removeErr := os.Remove(filepath.Join(dataDir, "attach-state.json")); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+					persistErr = errors.Join(persistErr, fmt.Errorf("移除旧接入状态文件失败：%w", removeErr))
+				}
+				retErr = markAttachPersistFailed(errors.Join(retErr, persistErr))
+			} else {
+				retErr = markAttachStateRecorded(retErr)
+			}
+		}
+		return nil, retErr
+	}
+	if result != nil && !result.stateRecorded {
+		if recordErr := recordAttachUnlocked(dataDir, result); recordErr != nil {
+			return nil, markAttachPersistFailed(fmt.Errorf("写入接入状态文件失败：%w", recordErr))
+		}
+		result.stateRecorded = true
+	}
+	return result, nil
+}
+
+func attachStateMatchesCurrentCore(dataDir string, state map[string]any, key string) bool {
+	if dataDir == "" || state == nil || state["status"] != "installed" || key == "" || state["attachKey"] != key {
+		return false
+	}
+	recordedCore, ok := attachStatePID(state["corePid"])
+	if !ok {
+		return false
+	}
+	runtimePID, err := readCoreRuntimePID(dataDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return recordedCore == os.Getpid()
+		}
+		return false
+	}
+	return recordedCore == runtimePID
+}
+
+var (
+	coreProcessAlive      = defaultCoreProcessAlive
+	verifyLiveCoreForSkip = defaultVerifyLiveCoreForSkip
+)
+
+func defaultCoreProcessAlive(ctx context.Context, pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	if pid == os.Getpid() {
+		return true
+	}
+	if runtime.GOOS == "darwin" {
+		info, err := ProcessIdentity(ctx, pid)
+		return err == nil && info.PID == pid
+	}
+	return false
+}
+
+func isStrictLoopbackHTTPURL(raw string) bool {
+	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(raw), "/"))
+	if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.Port() == "" ||
+		parsed.Path != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return false
+	}
+	host := parsed.Hostname()
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
+func defaultVerifyLiveCoreForSkip(ctx context.Context, corePID int, coreURL, pairingToken string) bool {
+	if corePID <= 0 {
+		return false
+	}
+	cleanURL := strings.TrimRight(strings.TrimSpace(coreURL), "/")
+	cleanToken := strings.TrimSpace(pairingToken)
+	if !isStrictLoopbackHTTPURL(cleanURL) || len(cleanToken) < AttachTokenMinLength {
+		return false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if corePID != os.Getpid() && !coreProcessAlive(probeCtx, corePID) {
+		return false
+	}
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, cleanURL+"/enhance/v1/health", nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+cleanToken)
+	client := &http.Client{
+		Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return false
+	}
+	if trimmed := strings.TrimSpace(string(body)); trimmed != "" {
+		var payload struct {
+			Status string `json:"status"`
+		}
+		if json.Unmarshal([]byte(trimmed), &payload) == nil && strings.EqualFold(strings.TrimSpace(payload.Status), "error") {
+			return false
+		}
+	}
+	return true
+}
+
+func attachStateMatchesLiveCore(ctx context.Context, dataDir string, state map[string]any, key string, options AttachOptions) bool {
+	if !attachStateMatchesCurrentCore(dataDir, state, key) {
+		return false
+	}
+	recordedCore, ok := attachStatePID(state["corePid"])
+	if !ok {
+		return false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return verifyLiveCoreForSkip(ctx, recordedCore, options.CoreURL, options.PairingToken)
+}
+
+type darwinCDPSession interface {
+	Evaluate(ctx context.Context, expression string) (json.RawMessage, error)
+	Close(ctx context.Context) error
+}
+
+type darwinAttachDeps struct {
+	checkFuse     func(framework string) error
+	verifyProcess func(ctx context.Context, info ProcessInfo) error
+	attachCDP     func(ctx context.Context, pid int) (darwinCDPSession, error)
+}
+
+func attachNativeDarwin(ctx context.Context, options AttachOptions) (*AttachResult, error) {
 	if options.CoreURL == "" || len(options.PairingToken) < AttachTokenMinLength {
 		return nil, errors.New("缺少增强核心地址或配对凭据")
 	}
@@ -169,6 +450,16 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (result *Att
 	if err != nil {
 		return nil, err
 	}
+	return attachDarwinHost(ctx, info, options, darwinAttachDeps{
+		checkFuse:     CheckInspectorFuse,
+		verifyProcess: VerifyLiveProcess,
+		attachCDP: func(attachCtx context.Context, pid int) (darwinCDPSession, error) {
+			return Attach(attachCtx, pid)
+		},
+	})
+}
+
+func attachDarwinHost(ctx context.Context, info ProcessInfo, options AttachOptions, deps darwinAttachDeps) (result *AttachResult, retErr error) {
 	gate, err := acquireHostAttachLock(ctx, options.DataDir)
 	if err != nil {
 		return nil, err
@@ -176,30 +467,61 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (result *Att
 	if gate != nil {
 		defer gate.Close()
 	}
+	var prevInstalled map[string]any
+	if options.DataDir != "" {
+		defer func() {
+			result, retErr = commitAttachOutcomeWithPreviousUnlocked(options.DataDir, prevInstalled, result, retErr)
+		}()
+	}
+	checkFuse := deps.checkFuse
+	if checkFuse == nil {
+		checkFuse = CheckInspectorFuse
+	}
+	if err := checkFuse(kimiFrameworkFor(info.Executable)); err != nil {
+		return nil, err
+	}
+	verifyProcess := deps.verifyProcess
+	if verifyProcess == nil {
+		verifyProcess = VerifyLiveProcess
+	}
+	if err := verifyProcess(ctx, info); err != nil {
+		return nil, err
+	}
 	key := darwinAttachKey(info, options)
-	if options.SkipCurrent {
-		if state := ReadAttachState(options.DataDir); state["status"] == "installed" && state["attachKey"] == key {
-			return nil, nil
-		}
+	if options.SkipCurrent && attachStateMatchesLiveCore(ctx, options.DataDir, ReadAttachState(options.DataDir), key, options) {
+		return nil, nil
 	}
-	if err := CheckInspectorFuse(kimiFrameworkFor(info.Executable)); err != nil {
-		return nil, err
+	prevInstalled = readInstalledAttachState(options.DataDir)
+	if invalidateErr := invalidateInstalledAttachBeforeInjectUnlocked(options.DataDir); invalidateErr != nil {
+		return nil, markAttachPersistFailed(fmt.Errorf("无法更新接入状态文件，已中止接入以免破坏现有增强桥：%w", invalidateErr))
 	}
-	if err := VerifyLiveProcess(ctx, info); err != nil {
-		return nil, err
-	}
-	pid := info.PID
 	attachCtx, cancel := context.WithTimeout(ctx, 75*time.Second)
 	defer cancel()
-	cdp, err := Attach(attachCtx, pid)
+	attachCDP := deps.attachCDP
+	if attachCDP == nil {
+		attachCDP = func(c context.Context, pid int) (darwinCDPSession, error) {
+			return Attach(c, pid)
+		}
+	}
+	cdp, err := attachCDP(attachCtx, info.PID)
 	if err != nil {
 		return nil, err
 	}
+	return runDarwinCDPAttachWithPrevious(attachCtx, cdp, info, options, key, prevInstalled)
+}
+
+func runDarwinCDPAttach(attachCtx context.Context, cdp darwinCDPSession, info ProcessInfo, options AttachOptions, key string) (result *AttachResult, retErr error) {
+	return runDarwinCDPAttachWithPrevious(attachCtx, cdp, info, options, key, nil)
+}
+
+func runDarwinCDPAttachWithPrevious(attachCtx context.Context, cdp darwinCDPSession, info ProcessInfo, options AttachOptions, key string, prevInstalled map[string]any) (result *AttachResult, retErr error) {
+	pid := info.PID
 	succeeded := false
+	bridgeTouched := false
 	defer func() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer closeCancel()
-		if !succeeded {
+		if !succeeded && bridgeTouched {
 			_, _ = cdp.Evaluate(closeCtx, `(async()=>{if(globalThis.__ekdNative?.cleanup){await globalThis.__ekdNative.cleanup();return true;}return false;})()`)
 		}
 		// A failed detach leaves 9229 listening on the client. That is a
@@ -208,10 +530,12 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (result *Att
 		if closeErr := cdp.Close(closeCtx); closeErr != nil {
 			result = nil
 			retErr = errors.Join(retErr, fmt.Errorf("未能确认关闭宿主临时调试端口，请正常退出并重新打开 Kimi Code：%w", closeErr))
-		} else if succeeded && retErr == nil && result != nil && options.DataDir != "" {
-			// Persist the attachKey before releasing host-attach.lock so a queued
-			// background attach sees the current state and skips redundant injection.
-			_ = RecordAttach(options.DataDir, result)
+		}
+		if retErr != nil && bridgeTouched {
+			retErr = markBridgeTornDown(retErr)
+		}
+		if retErr != nil || (succeeded && result != nil) {
+			result, retErr = commitAttachOutcomeWithPreviousUnlocked(options.DataDir, prevInstalled, result, retErr)
 		}
 	}()
 	raw, err := cdp.Evaluate(attachCtx, `(()=>{const req=typeof require==='function'?require:process.mainModule.require.bind(process.mainModule);return{pid:process.pid,type:process.type,appVersion:req('electron').app.getVersion(),electron:process.versions.electron}})()`)
@@ -286,6 +610,7 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (result *Att
 	if err != nil {
 		return nil, err
 	}
+	bridgeTouched = true
 	raw, err = cdp.Evaluate(attachCtx, "("+bootstrapSource+")("+string(encoded)+")")
 	if err != nil {
 		return nil, err
@@ -306,12 +631,52 @@ func attachNativeDarwin(ctx context.Context, options AttachOptions) (result *Att
 	attached.Daily = options.Profile == ""
 	attached.Platform = "darwin"
 	attached.attachKey = key
+	attached.hostStarted = info.Started
 	succeeded = true
 	return &attached, nil
 }
 
+var (
+	injectBundleHashOnce sync.Once
+	injectBundleHashVal  string
+)
+
+func injectBundleHash() string {
+	injectBundleHashOnce.Do(func() {
+		h := sha256.New()
+		h.Write([]byte(bootstrapSource))
+		h.Write([]byte{0})
+		h.Write([]byte(rendererBundle))
+		h.Write([]byte{0})
+		assets := webassets.FS()
+		for _, name := range []string{"host/enhancement.js", "host/enhancement.css"} {
+			if data, err := fs.ReadFile(assets, name); err == nil {
+				h.Write(data)
+			}
+			h.Write([]byte{0})
+		}
+		injectBundleHashVal = fmt.Sprintf("%x", h.Sum(nil))
+	})
+	return injectBundleHashVal
+}
+
 func darwinAttachKey(info ProcessInfo, options AttachOptions) string {
-	identity := fmt.Sprintf("%d\x00%d\x00%s\x00%s\x00%s\x00%s", info.PID, info.UID, info.Started, info.Executable, options.CoreURL, options.PairingToken)
+	appOverride := ""
+	if options.Profile != "" {
+		appOverride = strings.TrimSpace(options.AppVersionOverride)
+	}
+	identity := fmt.Sprintf(
+		"%d\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s",
+		info.PID,
+		info.UID,
+		info.Started,
+		info.Executable,
+		options.CoreURL,
+		options.PairingToken,
+		options.CoreVersion,
+		appOverride,
+		injectBundleHash(),
+	)
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(identity)))
 }
 

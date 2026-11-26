@@ -3,6 +3,7 @@ package desktop
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -308,4 +309,266 @@ func TestSessionFramesPreserveStructuredThinkingToolsAndQuestions(t *testing.T) 
 	if view.Messages[0].Streaming || view.Messages[0].Reasoning != "first thought" {
 		t.Fatalf("completion lost reasoning or left it streaming: %+v", view.Messages[0])
 	}
+}
+
+func writeInstanceWithHeartbeat(t *testing.T, home, name, host string, port int, heartbeat int64, token string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(home, "server", "instances"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := map[string]any{"port": port, "heartbeat_at": heartbeat}
+	if host != "" {
+		record["host"] = host
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "server", "instances", name), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		if err := os.WriteFile(filepath.Join(home, "server.token"), []byte(token), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestKAPRequestPinnedOrigin(t *testing.T) {
+	t.Run("injected endpoint checks canonical origin and blocks mismatch with zero network calls", func(t *testing.T) {
+		var calls atomic.Int32
+		srv := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			writeNativeTestEnvelope(w, map[string]any{"ok": true})
+		})
+		kap := NewKAPClient(t.TempDir())
+		kap.base = srv.URL
+		kap.token = "injected-token"
+
+		// Matching origin with trailing slash and uppercase scheme succeeds.
+		upperOrigin := strings.Replace(srv.URL, "http://", "HTTP://", 1) + "/"
+		if _, err := kap.RequestPinnedOrigin(context.Background(), upperOrigin, http.MethodGet, "/config", nil); err != nil {
+			t.Fatalf("matching injected origin failed: %v", err)
+		}
+		if calls.Load() != 1 {
+			t.Fatalf("expected 1 call, got %d", calls.Load())
+		}
+
+		// Mismatched port returns KAP_ORIGIN_MISMATCH (409) with 0 network calls.
+		wrongPort := portOf(t, srv) + 1
+		if wrongPort > 65535 {
+			wrongPort = portOf(t, srv) - 1
+		}
+		_, err := kap.RequestPinnedOrigin(context.Background(), "http://127.0.0.1:"+strconv.Itoa(wrongPort), http.MethodGet, "/config", nil)
+		var native *NativeError
+		if !errors.As(err, &native) || native.Code != "KAP_ORIGIN_MISMATCH" || native.Status != http.StatusConflict {
+			t.Fatalf("expected KAP_ORIGIN_MISMATCH 409, got %#v (%v)", native, err)
+		}
+		if calls.Load() != 1 {
+			t.Fatalf("mismatched origin triggered network call: %d", calls.Load())
+		}
+
+		// Invalid origins fail validation with 0 network calls.
+		for _, bad := range []string{
+			"",
+			"http://example.com:8080",
+			"http://127.0.0.1",
+			"ftp://127.0.0.1:8080",
+			"http://user:pass@127.0.0.1:8080",
+			"http://127.0.0.1:8080/api/v1",
+			"http://127.0.0.1:8080?x=1",
+			"http://127.0.0.1:8080#frag",
+			"http://127.0.0.1:8080?",
+			"http://127.0.0.1:8080#",
+		} {
+			if _, err := kap.RequestPinnedOrigin(context.Background(), bad, http.MethodGet, "/config", nil); err == nil {
+				t.Fatalf("expected validation error for %q", bad)
+			}
+		}
+		if calls.Load() != 1 {
+			t.Fatalf("invalid origins triggered network call: %d", calls.Load())
+		}
+	})
+
+	t.Run("disk-backed multi-instance pins to expectedOrigin even when another daemon has newer heartbeat or is cached", func(t *testing.T) {
+		home := t.TempDir()
+		var callsA, callsB atomic.Int32
+		daemonA := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			callsA.Add(1)
+			writeNativeTestEnvelope(w, map[string]any{"from": "A"})
+		})
+		daemonB := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			callsB.Add(1)
+			writeNativeTestEnvelope(w, map[string]any{"from": "B"})
+		})
+		// Empty host defaults to 127.0.0.1; daemon B has much newer heartbeat.
+		writeInstanceWithHeartbeat(t, home, "a-older.json", "", portOf(t, daemonA), 100, "shared-token")
+		writeInstanceWithHeartbeat(t, home, "a-newer.json", "127.0.0.1", portOf(t, daemonA), 200, "shared-token")
+		writeInstanceWithHeartbeat(t, home, "b-latest.json", "127.0.0.1", portOf(t, daemonB), 999999, "shared-token")
+
+		kap := NewKAPClient(home)
+		// Prime default cache: kap.endpoint() picks daemon B (highest heartbeat).
+		cachedBase, _, err := kap.endpoint()
+		if err != nil || cachedBase != daemonB.URL {
+			t.Fatalf("expected default endpoint to cache daemon B (%s), got %q err=%v", daemonB.URL, cachedBase, err)
+		}
+
+		// Pinned request to daemon A must hit ONLY daemon A, ignoring cached daemon B.
+		raw, err := kap.RequestPinnedOrigin(context.Background(), daemonA.URL, http.MethodGet, "/config", nil)
+		if err != nil {
+			t.Fatalf("pinned request to daemon A failed: %v", err)
+		}
+		if !strings.Contains(string(raw), `"A"`) {
+			t.Fatalf("unexpected response from pinned daemon A: %s", raw)
+		}
+		if callsA.Load() != 1 || callsB.Load() != 0 {
+			t.Fatalf("expected callsA=1 callsB=0, got A=%d B=%d", callsA.Load(), callsB.Load())
+		}
+
+		// Unknown port must return KAP_ORIGIN_MISMATCH (409) with zero calls to A or B.
+		unknownPort := 1
+		for unknownPort == portOf(t, daemonA) || unknownPort == portOf(t, daemonB) {
+			unknownPort++
+		}
+		_, err = kap.RequestPinnedOrigin(context.Background(), "http://127.0.0.1:"+strconv.Itoa(unknownPort), http.MethodGet, "/config", nil)
+		var native *NativeError
+		if !errors.As(err, &native) || native.Code != "KAP_ORIGIN_MISMATCH" || native.Status != http.StatusConflict {
+			t.Fatalf("expected KAP_ORIGIN_MISMATCH 409 for unknown port, got %#v (%v)", native, err)
+		}
+		if callsA.Load() != 1 || callsB.Load() != 0 {
+			t.Fatalf("unknown port sent unexpected requests: A=%d B=%d", callsA.Load(), callsB.Load())
+		}
+	})
+
+	t.Run("401 token refresh retry stays pinned to daemon A even when daemon B has newer heartbeat", func(t *testing.T) {
+		home := t.TempDir()
+		var callsA, callsB atomic.Int32
+		daemonA := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			attempt := callsA.Add(1)
+			if attempt == 1 {
+				if got := r.Header.Get("Authorization"); got != "Bearer stale-token" {
+					t.Errorf("attempt 1 expected stale token, got %q", got)
+				}
+				if err := os.WriteFile(filepath.Join(home, "server.token"), []byte("fresh-token"), 0o600); err != nil {
+					t.Errorf("failed rotating token: %v", err)
+				}
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer fresh-token" {
+				t.Errorf("attempt 2 did not reload fresh token: %q", got)
+			}
+			writeNativeTestEnvelope(w, map[string]any{"from": "A-refreshed"})
+		})
+		daemonB := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			callsB.Add(1)
+			writeNativeTestEnvelope(w, map[string]any{"from": "B"})
+		})
+		writeInstanceWithHeartbeat(t, home, "a.json", "127.0.0.1", portOf(t, daemonA), 100, "stale-token")
+		writeInstanceWithHeartbeat(t, home, "b.json", "127.0.0.1", portOf(t, daemonB), 999999, "stale-token")
+
+		kap := NewKAPClient(home)
+		raw, err := kap.RequestPinnedOrigin(context.Background(), daemonA.URL, http.MethodPut, "/providers/team", map[string]any{"models": []any{}})
+		if err != nil {
+			t.Fatalf("401 retry on pinned origin failed: %v", err)
+		}
+		if !strings.Contains(string(raw), "A-refreshed") {
+			t.Fatalf("unexpected retry response: %s", raw)
+		}
+		if callsA.Load() != 2 || callsB.Load() != 0 {
+			t.Fatalf("401 retry drifted from daemon A: callsA=%d callsB=%d", callsA.Load(), callsB.Load())
+		}
+	})
+}
+
+func TestKAPRequestPinnedOriginRejectsRedirects(t *testing.T) {
+	redirectCodes := []int{
+		http.StatusTemporaryRedirect,
+		http.StatusMovedPermanently,
+		http.StatusPermanentRedirect,
+		http.StatusFound,
+		http.StatusSeeOther,
+	}
+
+	for _, code := range redirectCodes {
+		t.Run("disk-backed NewKAPClient rejects HTTP "+strconv.Itoa(code), func(t *testing.T) {
+			home := t.TempDir()
+			var pinnedCalls, targetCalls atomic.Int32
+			target := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+				targetCalls.Add(1)
+				writeNativeTestEnvelope(w, map[string]any{"leaked": true})
+			})
+			pinned := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+				pinnedCalls.Add(1)
+				w.Header().Set("Location", target.URL+r.URL.Path)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(code)
+				_, _ = w.Write([]byte(`{"code":0,"msg":"","data":{"ok":true}}`))
+			})
+			writeInstance(t, home, "pinned.json", portOf(t, pinned), "secret-kap-token")
+
+			kap := NewKAPClient(home)
+			_, err := kap.RequestPinnedOrigin(context.Background(), pinned.URL, http.MethodPut, "/providers/team", map[string]any{
+				"api_key": "sk-synthetic-leak-check",
+				"models":  []any{},
+			})
+			var native *NativeError
+			if !errors.As(err, &native) || native.Code != "NATIVE_REDIRECT" || native.Status != http.StatusBadGateway {
+				t.Fatalf("HTTP %d: expected NATIVE_REDIRECT 502, got %#v (%v)", code, native, err)
+			}
+			if !strings.Contains(native.Message, strconv.Itoa(code)) {
+				t.Fatalf("HTTP %d: error message missing status code: %q", code, native.Message)
+			}
+			if pinnedCalls.Load() != 1 {
+				t.Fatalf("HTTP %d: expected exactly 1 attempt (no retry), got %d", code, pinnedCalls.Load())
+			}
+			if targetCalls.Load() != 0 {
+				t.Fatalf("HTTP %d: redirect target received %d request(s)", code, targetCalls.Load())
+			}
+		})
+	}
+
+	t.Run("injected client with permissive CheckRedirect and nil client both reject 307", func(t *testing.T) {
+		var targetCalls atomic.Int32
+		target := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			targetCalls.Add(1)
+			writeNativeTestEnvelope(w, map[string]any{"leaked": true})
+		})
+		var pinnedCalls atomic.Int32
+		pinned := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			pinnedCalls.Add(1)
+			http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect)
+		})
+
+		clients := []*KAPClient{
+			{
+				client: &http.Client{
+					CheckRedirect: func(*http.Request, []*http.Request) error { return nil },
+				},
+				base:  pinned.URL,
+				token: "secret-kap-token",
+			},
+			{
+				client: nil,
+				base:   pinned.URL,
+				token:  "secret-kap-token",
+			},
+		}
+		for i, kap := range clients {
+			_, err := kap.RequestPinnedOrigin(context.Background(), pinned.URL, http.MethodPut, "/providers/team", map[string]any{
+				"api_key": "sk-synthetic-leak-check",
+				"models":  []any{},
+			})
+			var native *NativeError
+			if !errors.As(err, &native) || native.Code != "NATIVE_REDIRECT" || native.Status != http.StatusBadGateway {
+				t.Fatalf("client[%d]: expected NATIVE_REDIRECT 502, got %#v (%v)", i, native, err)
+			}
+		}
+		if pinnedCalls.Load() != int32(len(clients)) {
+			t.Fatalf("expected %d pinned attempts, got %d", len(clients), pinnedCalls.Load())
+		}
+		if targetCalls.Load() != 0 {
+			t.Fatalf("redirect target received %d request(s)", targetCalls.Load())
+		}
+	})
 }

@@ -5,7 +5,7 @@ export interface Resource<T> {
   data: T | null;
   error: ApiError | Error | null;
   loading: boolean;
-  reload: () => void;
+  reload: () => Promise<void>;
   revision: number;
 }
 
@@ -17,18 +17,51 @@ export function useResource<T>(
   const enabled = options.enabled !== false;
   const loadRef = useRef(load);
   loadRef.current = load;
+  const enabledRef = useRef(enabled);
+  enabledRef.current = enabled;
+  const mountedRef = useRef(true);
+  const reloadSeqRef = useRef(0);
+  const waitersRef = useRef<Array<{ target: number; resolve: () => void }>>([]);
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<ApiError | Error | null>(null);
   const [loading, setLoading] = useState(enabled);
   const [revision, setRevision] = useState(0);
   const [activeKey, setActiveKey] = useState(key);
 
+  const flushWaiters = useCallback((upTo?: number) => {
+    const pending = waitersRef.current;
+    if (pending.length === 0) return;
+    if (upTo === undefined) {
+      waitersRef.current = [];
+      for (const waiter of pending) waiter.resolve();
+      return;
+    }
+    const remaining: Array<{ target: number; resolve: () => void }> = [];
+    const ready: Array<() => void> = [];
+    for (const waiter of pending) {
+      if (waiter.target <= upTo) ready.push(waiter.resolve);
+      else remaining.push(waiter);
+    }
+    waitersRef.current = remaining;
+    for (const resolve of ready) resolve();
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      flushWaiters();
+    };
+  }, [flushWaiters]);
+
   useEffect(() => {
     if (!enabled) {
       setLoading(false);
+      flushWaiters();
       return;
     }
     let cancelled = false;
+    const startedSeq = reloadSeqRef.current;
     setLoading(true);
     setError(null);
     setActiveKey(key);
@@ -41,18 +74,30 @@ export function useResource<T>(
         if (!cancelled) setError(reason instanceof Error ? reason : new Error(String(reason)));
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          flushWaiters(startedSeq);
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [key, enabled, revision]);
+  }, [key, enabled, revision, flushWaiters]);
 
   const stale = activeKey !== key;
 
   // A stable identity keeps consumers from re-running effects that depend on
   // `reload` (pollers, timers) on every render of this hook.
-  const reload = useCallback(() => setRevision((value) => value + 1), []);
+  const reload = useCallback(() => {
+    if (!mountedRef.current || !enabledRef.current) {
+      return Promise.resolve();
+    }
+    const target = ++reloadSeqRef.current;
+    return new Promise<void>((resolve) => {
+      waitersRef.current.push({ target, resolve });
+      setRevision((value) => value + 1);
+    });
+  }, []);
 
   return {
     data,

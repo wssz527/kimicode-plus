@@ -3,6 +3,7 @@ package desktop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -398,4 +399,414 @@ func TestRecordAttachRecordsTheRunningCorePID(t *testing.T) {
 	if state := ReadAttachState(empty); state["corePid"] != float64(os.Getpid()) {
 		t.Fatalf("missing runtime.json did not fall back to the current process: %+v", state)
 	}
+}
+
+func TestRecordAttachPreservesHealthyInstalledStateOnTransientError(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), []byte(`{"pid":4711}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	installed := &AttachResult{
+		Status:      "installed",
+		HostPID:     8801,
+		AppVersion:  "1.4.3",
+		Electron:    SupportedElectron,
+		Verified:    true,
+		Transport:   "main-loopback-rpc",
+		attachKey:   "key-live-host",
+		hostStarted: "Thu Nov 26 10:00:00 2026",
+	}
+	if err := RecordAttach(dir, installed); err != nil {
+		t.Fatal(err)
+	}
+
+	alive := true
+	prevInspector := attachHealthyInstanceAlive
+	attachHealthyInstanceAlive = func(_ context.Context, corePid, hostPid int, hostStarted string) bool {
+		return alive && corePid == 4711 && hostPid == 8801 && hostStarted == "Thu Nov 26 10:00:00 2026"
+	}
+	t.Cleanup(func() { attachHealthyInstanceAlive = prevInspector })
+
+	if err := RecordAttach(dir, errors.New("lock contention")); err != nil {
+		t.Fatal(err)
+	}
+	state := ReadAttachState(dir)
+	if state["status"] != "installed" || state["attachKey"] != "key-live-host" || state["hostStarted"] != "Thu Nov 26 10:00:00 2026" {
+		t.Fatalf("healthy installed state was overwritten by transient error: %+v", state)
+	}
+
+	alive = false
+	if err := RecordAttach(dir, errors.New("host exited")); err != nil {
+		t.Fatal(err)
+	}
+	state = ReadAttachState(dir)
+	if state["status"] != "error" || state["error"] != "host exited" {
+		t.Fatalf("error was not recorded after host exited: %+v", state)
+	}
+}
+
+func TestRecordAttachOverwritesInstalledStateWhenCoreRestarted(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), []byte(`{"pid":4711}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordAttach(dir, &AttachResult{
+		Status:      "installed",
+		HostPID:     8801,
+		attachKey:   "key-old-core",
+		hostStarted: "Thu Nov 26 10:00:00 2026",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	prevInspector := attachHealthyInstanceAlive
+	attachHealthyInstanceAlive = func(_ context.Context, _, _ int, _ string) bool { return true }
+	t.Cleanup(func() { attachHealthyInstanceAlive = prevInspector })
+
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), []byte(`{"pid":5822}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordAttach(dir, errors.New("reattach failed")); err != nil {
+		t.Fatal(err)
+	}
+	state := ReadAttachState(dir)
+	if state["status"] != "error" || state["corePid"] != float64(5822) {
+		t.Fatalf("stale installed state survived core restart: %+v", state)
+	}
+}
+
+func TestDarwinAttachKeyIncludesCoreVersion(t *testing.T) {
+	info := ProcessInfo{PID: 100, UID: 501, Started: "Thu Nov 26 10:00:00 2026", Executable: KimiExecutable}
+	base := AttachOptions{CoreURL: "http://127.0.0.1:8321", PairingToken: strings.Repeat("t", 48), CoreVersion: "0.2.9"}
+	same := darwinAttachKey(info, base)
+	if got := darwinAttachKey(info, base); got != same {
+		t.Fatalf("darwinAttachKey not deterministic: %s vs %s", got, same)
+	}
+	upgraded := base
+	upgraded.CoreVersion = "0.2.10"
+	if got := darwinAttachKey(info, upgraded); got == same {
+		t.Fatal("darwinAttachKey ignored CoreVersion change")
+	}
+}
+
+func TestRecordAttachOverwritesInstalledStateWhenBridgeTornDown(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), []byte(`{"pid":4711}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordAttach(dir, &AttachResult{
+		Status:      "installed",
+		HostPID:     8801,
+		AppVersion:  "1.4.2",
+		Electron:    SupportedElectron,
+		Transport:   "main-loopback-rpc",
+		attachKey:   "key-live-host",
+		hostStarted: "Thu Nov 26 10:00:00 2026",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	prevInspector := attachHealthyInstanceAlive
+	attachHealthyInstanceAlive = func(_ context.Context, corePid, hostPid int, hostStarted string) bool {
+		return corePid == 4711 && hostPid == 8801 && hostStarted == "Thu Nov 26 10:00:00 2026"
+	}
+	t.Cleanup(func() { attachHealthyInstanceAlive = prevInspector })
+
+	// Precheck / lock contention error (bridge untouched) keeps installed state.
+	if err := RecordAttach(dir, errors.New("等待其他 KimiCode+ 接入流程完成超时")); err != nil {
+		t.Fatal(err)
+	}
+	state := ReadAttachState(dir)
+	if state["status"] != "installed" || state["attachKey"] != "key-live-host" {
+		t.Fatalf("precheck error overwrote healthy installed state: %+v", state)
+	}
+
+	// Torn-down error wrapped via fmt.Errorf / errors.Join still forces status=error.
+	root := MarkBridgeTornDown(errors.New("宿主没有确认正式 RPC 已挂载"))
+	joined := errors.Join(fmt.Errorf("reinject: %w", root), errors.New("cleanup detail"))
+	if !IsBridgeTornDown(joined) {
+		t.Fatal("IsBridgeTornDown failed through wrapped/joined error")
+	}
+	if err := RecordAttach(dir, joined); err != nil {
+		t.Fatal(err)
+	}
+	state = ReadAttachState(dir)
+	if state["status"] != "error" || state["attachKey"] != nil {
+		t.Fatalf("bridge torn-down error preserved stale installed state: %+v", state)
+	}
+	if !strings.Contains(state["error"].(string), "宿主没有确认正式 RPC 已挂载") {
+		t.Fatalf("unexpected error text: %+v", state)
+	}
+}
+
+func TestRecordAttachInterleavingNoOutOfLockOverwrite(t *testing.T) {
+	t.Run("torn-down failure recorded in lock does not overwrite later installed state", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "runtime.json"), []byte(`{"pid":4711}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		prevAlive := attachHealthyInstanceAlive
+		attachHealthyInstanceAlive = func(_ context.Context, corePid, hostPid int, hostStarted string) bool {
+			return corePid == 4711 && hostPid == 8801 && hostStarted == "Thu Nov 26 10:00:00 2026"
+		}
+		t.Cleanup(func() { attachHealthyInstanceAlive = prevAlive })
+
+		// Process A holds lock, tears down old bridge, records error in lock, releases lock.
+		gateA, err := acquireHostAttachLock(context.Background(), dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		errA := MarkBridgeTornDown(errors.New("A tore down bridge"))
+		if err := recordAttachUnlocked(dir, errA); err != nil {
+			_ = gateA.Close()
+			t.Fatal(err)
+		}
+		errA = MarkAttachStateRecorded(errA)
+		if err := gateA.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Process B acquires lock immediately, installs cleanly, records installed in lock, releases lock.
+		gateB, err := acquireHostAttachLock(context.Background(), dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resB := &AttachResult{
+			Status:      "installed",
+			HostPID:     8801,
+			AppVersion:  "1.4.2",
+			Transport:   "main-loopback-rpc",
+			attachKey:   "key-B",
+			hostStarted: "Thu Nov 26 10:00:00 2026",
+		}
+		if err := recordAttachUnlocked(dir, resB); err != nil {
+			_ = gateB.Close()
+			t.Fatal(err)
+		}
+		MarkAttachStateRecordedResult(resB)
+		if err := gateB.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Process A now reaches outer RecordAttach: must NOT overwrite B's installed state.
+		if err := RecordAttach(dir, errA); err != nil {
+			t.Fatal(err)
+		}
+		state := ReadAttachState(dir)
+		if state["status"] != "installed" || state["attachKey"] != "key-B" {
+			t.Fatalf("stale torn-down error from A overwrote B's installed state: %+v", state)
+		}
+	})
+
+	t.Run("installed result recorded in lock does not overwrite later torn-down error", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "runtime.json"), []byte(`{"pid":4711}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		// Process B holds lock, succeeds, records installed in lock, releases lock.
+		gateB, err := acquireHostAttachLock(context.Background(), dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resB := &AttachResult{
+			Status:      "installed",
+			HostPID:     8801,
+			AppVersion:  "1.4.2",
+			Transport:   "main-loopback-rpc",
+			attachKey:   "key-B",
+			hostStarted: "Thu Nov 26 10:00:00 2026",
+		}
+		if err := recordAttachUnlocked(dir, resB); err != nil {
+			_ = gateB.Close()
+			t.Fatal(err)
+		}
+		MarkAttachStateRecordedResult(resB)
+		if err := gateB.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Process A (--force) acquires lock, tears down B's bridge, records error in lock, releases lock.
+		gateA, err := acquireHostAttachLock(context.Background(), dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		errA := MarkBridgeTornDown(errors.New("A force teardown failed"))
+		if err := recordAttachUnlocked(dir, errA); err != nil {
+			_ = gateA.Close()
+			t.Fatal(err)
+		}
+		MarkAttachStateRecorded(errA)
+		if err := gateA.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Process B now reaches outer RecordAttach: must NOT mark torn-down bridge back as installed.
+		if err := RecordAttach(dir, resB); err != nil {
+			t.Fatal(err)
+		}
+		state := ReadAttachState(dir)
+		if state["status"] != "error" || state["attachKey"] != nil {
+			t.Fatalf("stale installed result from B overwrote A's error state: %+v", state)
+		}
+	})
+
+	t.Run("unrecorded fallback RecordAttach yields while host-attach.lock is held", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "runtime.json"), []byte(`{"pid":4711}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		gate, err := acquireHostAttachLock(context.Background(), dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := recordAttachUnlocked(dir, &AttachResult{
+			Status:    "installed",
+			HostPID:   8801,
+			attachKey: "active-lock-holder",
+		}); err != nil {
+			_ = gate.Close()
+			t.Fatal(err)
+		}
+
+		// Contended outer fallback write yields without blocking or overwriting.
+		if err := RecordAttach(dir, ErrConsentRequired); err != nil {
+			_ = gate.Close()
+			t.Fatal(err)
+		}
+		state := ReadAttachState(dir)
+		if state["status"] != "installed" || state["attachKey"] != "active-lock-holder" {
+			_ = gate.Close()
+			t.Fatalf("fallback RecordAttach overwrote state while lock was held: %+v", state)
+		}
+		if err := gate.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("persist-failed error from in-lock commit does not re-record out of lock", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "runtime.json"), []byte(`{"pid":4711}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeAttachState(dir, map[string]any{
+			"status":    "installed",
+			"hostPid":   8801,
+			"attachKey": "untouched-by-persist-failed",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := RecordAttach(dir, MarkAttachPersistFailed(errors.New("写入接入状态文件失败：permission denied"))); err != nil {
+			t.Fatal(err)
+		}
+		state := ReadAttachState(dir)
+		if state["status"] != "installed" || state["attachKey"] != "untouched-by-persist-failed" {
+			t.Fatalf("persist-failed error triggered out-of-lock RecordAttach overwrite: %+v", state)
+		}
+	})
+}
+
+func TestInvalidateInstalledAttachBeforeInjectUnlocked(t *testing.T) {
+	t.Run("missing file and non-installed states are untouched", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := invalidateInstalledAttachBeforeInjectUnlocked(dir); err != nil {
+			t.Fatalf("missing file returned error: %v", err)
+		}
+		if ReadAttachState(dir) != nil {
+			t.Fatal("missing file unexpectedly created attach-state.json")
+		}
+		if err := writeAttachState(dir, map[string]any{"status": "error", "error": "prev"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := invalidateInstalledAttachBeforeInjectUnlocked(dir); err != nil {
+			t.Fatalf("error state returned error: %v", err)
+		}
+		if state := ReadAttachState(dir); state["status"] != "error" {
+			t.Fatalf("non-installed error state was overwritten: %+v", state)
+		}
+	})
+
+	t.Run("installed and corrupt files are replaced with attaching", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "runtime.json"), []byte(`{"pid":5123}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeAttachState(dir, map[string]any{"status": "installed", "attachKey": "k1"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := invalidateInstalledAttachBeforeInjectUnlocked(dir); err != nil {
+			t.Fatalf("installed state invalidation failed: %v", err)
+		}
+		state := ReadAttachState(dir)
+		if state == nil || state["status"] != "attaching" || state["corePid"] != float64(5123) || state["attachKey"] != nil {
+			t.Fatalf("unexpected attaching state: %+v", state)
+		}
+
+		if err := os.WriteFile(filepath.Join(dir, "attach-state.json"), []byte(`{corrupt`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := invalidateInstalledAttachBeforeInjectUnlocked(dir); err != nil {
+			t.Fatalf("corrupt state invalidation failed: %v", err)
+		}
+		if state := ReadAttachState(dir); state == nil || state["status"] != "attaching" {
+			t.Fatalf("corrupt file was not replaced with attaching: %+v", state)
+		}
+	})
+
+	t.Run("read-only dir with installed file returns joined write and remove error", func(t *testing.T) {
+		requireReadOnlyDirEnforced(t)
+		dir := t.TempDir()
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		if err := writeAttachState(dir, map[string]any{"status": "installed", "attachKey": "k2"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		err := invalidateInstalledAttachBeforeInjectUnlocked(dir)
+		if err == nil {
+			t.Fatal("expected error when both replace and remove fail on read-only dir")
+		}
+		if !strings.Contains(err.Error(), "移除旧接入状态文件失败") {
+			t.Fatalf("expected joined remove error, got: %v", err)
+		}
+	})
+
+	t.Run("unreadable 0000 attach-state.json in 0500 dir returns non-nil error without silently allowing attach", func(t *testing.T) {
+		requireReadOnlyDirEnforced(t)
+		dir := t.TempDir()
+		statePath := filepath.Join(dir, "attach-state.json")
+		t.Cleanup(func() {
+			_ = os.Chmod(dir, 0o700)
+			_ = os.Chmod(statePath, 0o600)
+		})
+		if err := writeAttachState(dir, map[string]any{"status": "installed", "attachKey": "k-unreadable"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(statePath, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		if _, readErr := os.ReadFile(statePath); readErr == nil {
+			t.Skip("current user can read 0000 file (likely root)")
+		}
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		err := invalidateInstalledAttachBeforeInjectUnlocked(dir)
+		if err == nil {
+			t.Fatal("expected error when attach-state.json is unreadable (0000) inside 0500 dir")
+		}
+		if !strings.Contains(err.Error(), "读取旧接入状态文件失败") || !strings.Contains(err.Error(), "移除旧接入状态文件失败") {
+			t.Fatalf("expected joined read/write/remove error, got: %v", err)
+		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(statePath, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if state := ReadAttachState(dir); state == nil || state["status"] != "installed" || state["attachKey"] != "k-unreadable" {
+			t.Fatalf("original installed state was unexpectedly altered: %+v", state)
+		}
+	})
 }

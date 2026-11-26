@@ -12,6 +12,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"enhancedkimi/internal/registry"
 )
@@ -620,6 +621,88 @@ func providerBody(providerID string, provider providerConfig, models []any, incl
 	return body
 }
 
+func (s *NativeService) providerModelsLockChan() chan struct{} {
+	s.providerModelsSemOnce.Do(func() {
+		s.providerModelsSem = make(chan struct{}, 1)
+	})
+	return s.providerModelsSem
+}
+
+func (s *NativeService) acquireProviderModelsLock(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	sem := s.providerModelsLockChan()
+	select {
+	case sem <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-sem
+			return nil, err
+		}
+		var once sync.Once
+		return func() {
+			once.Do(func() { <-sem })
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func isJSONObject(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' && json.Valid(trimmed)
+}
+
+func decodeAuthoritativeConfig(raw json.RawMessage) (configSnapshot, error) {
+	if !isJSONObject(raw) {
+		return configSnapshot{}, errors.New("官方模型配置响应不完整：根对象无效，已中止写入")
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil || root == nil {
+		return configSnapshot{}, errors.New("官方模型配置响应不完整：无法解析根对象，已中止写入")
+	}
+	rawProviders, hasProviders := root["providers"]
+	if !hasProviders || !isJSONObject(rawProviders) {
+		return configSnapshot{}, errors.New("官方模型配置响应缺少有效的 providers 对象，已中止写入")
+	}
+	rawModels, hasModels := root["models"]
+	if !hasModels || !isJSONObject(rawModels) {
+		return configSnapshot{}, errors.New("官方模型配置响应缺少有效的 models 对象，已中止写入")
+	}
+	var providerEntries map[string]json.RawMessage
+	if err := json.Unmarshal(rawProviders, &providerEntries); err != nil || providerEntries == nil {
+		return configSnapshot{}, errors.New("官方模型配置响应的 providers 对象无效，已中止写入")
+	}
+	for id, entry := range providerEntries {
+		if !isJSONObject(entry) {
+			return configSnapshot{}, fmt.Errorf("官方模型配置响应的供应商 %s 条目无效，已中止写入", id)
+		}
+	}
+	var modelEntries map[string]json.RawMessage
+	if err := json.Unmarshal(rawModels, &modelEntries); err != nil || modelEntries == nil {
+		return configSnapshot{}, errors.New("官方模型配置响应的 models 对象无效，已中止写入")
+	}
+	for id, entry := range modelEntries {
+		if !isJSONObject(entry) {
+			return configSnapshot{}, fmt.Errorf("官方模型配置响应的模型 %s 条目无效，已中止写入", id)
+		}
+	}
+	snapshot, err := decodeNative[configSnapshot](raw, "模型配置")
+	if err != nil {
+		return configSnapshot{}, err
+	}
+	if snapshot.Models == nil {
+		snapshot.Models = map[string]modelConfig{}
+	}
+	if snapshot.Providers == nil {
+		snapshot.Providers = map[string]providerConfig{}
+	}
+	return snapshot, nil
+}
+
 func (s *NativeService) readConfig(ctx context.Context) (configSnapshot, error) {
 	raw, err := s.kap.Request(ctx, http.MethodGet, "/config", nil)
 	if err != nil {
@@ -636,6 +719,22 @@ func (s *NativeService) readConfig(ctx context.Context) (configSnapshot, error) 
 		snapshot.Providers = map[string]providerConfig{}
 	}
 	return snapshot, nil
+}
+
+func (s *NativeService) readAuthoritativeConfig(ctx context.Context) (configSnapshot, error) {
+	raw, err := s.kap.Request(ctx, http.MethodGet, "/config", nil)
+	if err != nil {
+		return configSnapshot{}, err
+	}
+	return decodeAuthoritativeConfig(raw)
+}
+
+func (s *NativeService) readAuthoritativeConfigAtOrigin(ctx context.Context, expectedOrigin string) (configSnapshot, error) {
+	raw, err := s.kap.RequestPinnedOrigin(ctx, expectedOrigin, http.MethodGet, "/config", nil)
+	if err != nil {
+		return configSnapshot{}, err
+	}
+	return decodeAuthoritativeConfig(raw)
 }
 
 type publicModelCatalog interface {
@@ -709,9 +808,331 @@ func (s *NativeService) updateProviderModels(ctx context.Context, input map[stri
 	return map[string]any{"provider": providerID, "models": updates}, nil
 }
 
+type wireCapabilitySnapshot struct {
+	Capabilities     []string `json:"capabilities"`
+	SupportEfforts   []string `json:"support_efforts"`
+	AdaptiveThinking *bool    `json:"adaptive_thinking,omitempty"`
+	DefaultEffort    string   `json:"default_effort"`
+	OffEffort        string   `json:"off_effort"`
+}
+
+type officialFormModelOpening struct {
+	Raw    wireCapabilitySnapshot
+	Merged *wireCapabilitySnapshot
+}
+
+func cleanWireStringList(raw any) []string {
+	out := []string{}
+	switch items := raw.(type) {
+	case []string:
+		for _, value := range items {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+	case []any:
+		for _, item := range items {
+			if value, ok := item.(string); ok {
+				if trimmed := strings.TrimSpace(value); trimmed != "" {
+					out = append(out, trimmed)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func uniqueWireEfforts(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" && !strings.EqualFold(value, "no") && !seen[value] {
+			seen[value] = true
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func extractWireCapabilitySnapshot(itemMap map[string]any) wireCapabilitySnapshot {
+	if itemMap == nil {
+		return wireCapabilitySnapshot{
+			Capabilities:   []string{},
+			SupportEfforts: []string{},
+		}
+	}
+	rawEfforts := itemMap["support_efforts"]
+	if rawEfforts == nil {
+		rawEfforts = itemMap["supportEfforts"]
+	}
+	var adaptive *bool
+	if val, ok := itemMap["adaptive_thinking"]; ok {
+		if flag, isBool := val.(bool); isBool {
+			adaptive = boolPtr(flag)
+		}
+	} else if val, ok := itemMap["adaptiveThinking"]; ok {
+		if flag, isBool := val.(bool); isBool {
+			adaptive = boolPtr(flag)
+		}
+	}
+	rawDefault := itemMap["default_effort"]
+	if rawDefault == nil {
+		rawDefault = itemMap["defaultEffort"]
+	}
+	defaultEffort, _ := rawDefault.(string)
+	rawOff := itemMap["off_effort"]
+	if rawOff == nil {
+		rawOff = itemMap["offEffort"]
+	}
+	offEffort, _ := rawOff.(string)
+	return wireCapabilitySnapshot{
+		Capabilities:     cleanWireStringList(itemMap["capabilities"]),
+		SupportEfforts:   cleanWireStringList(rawEfforts),
+		AdaptiveThinking: adaptive,
+		DefaultEffort:    strings.TrimSpace(defaultEffort),
+		OffEffort:        strings.TrimSpace(offEffort),
+	}
+}
+
+func parseOfficialFormOpening(raw any) map[string]*officialFormModelOpening {
+	root, ok := raw.(map[string]any)
+	if !ok || len(root) == 0 {
+		return nil
+	}
+	result := make(map[string]*officialFormModelOpening, len(root))
+	for key, entryRaw := range root {
+		modelID := strings.TrimSpace(key)
+		entryMap, ok := entryRaw.(map[string]any)
+		if modelID == "" || !ok || entryMap == nil {
+			continue
+		}
+		rawMap, ok := entryMap["raw"].(map[string]any)
+		if !ok || rawMap == nil {
+			continue
+		}
+		entry := &officialFormModelOpening{
+			Raw: extractWireCapabilitySnapshot(rawMap),
+		}
+		if mergedMap, ok := entryMap["merged"].(map[string]any); ok && mergedMap != nil {
+			mergedSnap := extractWireCapabilitySnapshot(mergedMap)
+			entry.Merged = &mergedSnap
+		}
+		result[modelID] = entry
+	}
+	return result
+}
+
+func wireAdaptiveBool(value *bool) bool {
+	return value != nil && *value
+}
+
+func sameWireSnapshotField(field string, left, right wireCapabilitySnapshot) bool {
+	switch field {
+	case "capabilities":
+		return sameStrings(left.Capabilities, right.Capabilities)
+	case "support_efforts":
+		return sameStrings(left.SupportEfforts, right.SupportEfforts) ||
+			sameStrings(uniqueWireEfforts(left.SupportEfforts), uniqueWireEfforts(right.SupportEfforts))
+	case "adaptive_thinking":
+		return wireAdaptiveBool(left.AdaptiveThinking) == wireAdaptiveBool(right.AdaptiveThinking)
+	case "default_effort":
+		return left.DefaultEffort == right.DefaultEffort
+	case "off_effort":
+		return left.OffEffort == right.OffEffort
+	default:
+		return false
+	}
+}
+
+func isUnchangedFromOpening(modelOpening *officialFormModelOpening, field string, rawSnap wireCapabilitySnapshot) bool {
+	if modelOpening == nil {
+		return true
+	}
+	if sameWireSnapshotField(field, rawSnap, modelOpening.Raw) {
+		return true
+	}
+	if modelOpening.Merged != nil && sameWireSnapshotField(field, rawSnap, *modelOpening.Merged) {
+		return true
+	}
+	return false
+}
+
+func hasAnyMapKey(m map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if _, ok := m[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeProviderPutResponse(raw json.RawMessage) any {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || !json.Valid(trimmed) {
+		return nil
+	}
+	value, err := decodeJSONValue(trimmed)
+	if err != nil {
+		return nil
+	}
+	if obj, ok := value.(map[string]any); ok {
+		delete(obj, "api_key")
+		delete(obj, "apiKey")
+		if providerObj, ok := obj["provider"].(map[string]any); ok {
+			delete(providerObj, "api_key")
+			delete(providerObj, "apiKey")
+		}
+		if providersMap, ok := obj["providers"].(map[string]any); ok {
+			for _, entry := range providersMap {
+				if providerObj, ok := entry.(map[string]any); ok {
+					delete(providerObj, "api_key")
+					delete(providerObj, "apiKey")
+				}
+			}
+		}
+	}
+	return value
+}
+
+func (s *NativeService) saveOfficialProviderForm(ctx context.Context, input map[string]any) (any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	providerID := strings.TrimSpace(stringInput(input, "providerId"))
+	if providerID == "" {
+		return nil, errors.New("缺少供应商")
+	}
+	if isManagedProvider(providerID) {
+		return nil, errors.New("Kimi 订阅的内置供应商是只读的，不能修改模型能力")
+	}
+	expectedOrigin, err := canonicalLoopbackOrigin(stringInput(input, "expectedOrigin"))
+	if err != nil {
+		return nil, err
+	}
+	rawPayload, ok := input["payload"].(map[string]any)
+	if !ok || rawPayload == nil {
+		return nil, errors.New("缺少供应商表单数据")
+	}
+	rawModels, ok := rawPayload["models"].([]any)
+	if !ok {
+		return nil, errors.New("供应商表单缺少模型列表")
+	}
+	opening := parseOfficialFormOpening(input["opening"])
+
+	payload := maps.Clone(rawPayload)
+	models := make([]any, len(rawModels))
+	for i, elem := range rawModels {
+		if itemMap, ok := elem.(map[string]any); ok && itemMap != nil {
+			models[i] = maps.Clone(itemMap)
+		} else {
+			models[i] = elem
+		}
+	}
+	payload["models"] = models
+
+	unlock, err := s.acquireProviderModelsLock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	s.invalidateOfficialConfigCache()
+	before, err := s.readAuthoritativeConfigAtOrigin(ctx, expectedOrigin)
+	if err != nil {
+		return nil, err
+	}
+
+	mergedModels := make(map[string]wireCapabilitySnapshot, len(models))
+	for _, elem := range models {
+		itemMap, ok := elem.(map[string]any)
+		if !ok || itemMap == nil {
+			continue
+		}
+		modelID := strings.TrimSpace(stringInput(itemMap, "model"))
+		if modelID == "" {
+			continue
+		}
+		rawSnap := extractWireCapabilitySnapshot(itemMap)
+		if stored, _, hasStored := lookupProviderModel(before.Models, providerID, modelID); hasStored {
+			if !hasAnyMapKey(itemMap, "max_output_size", "maxOutputSize") {
+				rawContext, hasSnakeContext := itemMap["max_context_size"]
+				if !hasSnakeContext || rawContext == nil {
+					rawContext = itemMap["maxContextSize"]
+				}
+				if nextContext, err := numberValue(rawContext); err == nil && nextContext > 0 &&
+					stored.MaxOutputSize != nil && *stored.MaxOutputSize > 0 && *stored.MaxOutputSize <= nextContext {
+					itemMap["max_output_size"] = *stored.MaxOutputSize
+				}
+			}
+			modelOpening := opening[modelID]
+			if modelOpening == nil && opening != nil {
+				modelOpening = opening[providerModelKey(providerID, modelID)]
+			}
+			if !hasAnyMapKey(itemMap, "capabilities") || isUnchangedFromOpening(modelOpening, "capabilities", rawSnap) {
+				if len(stored.Capabilities) > 0 {
+					itemMap["capabilities"] = slices.Clone(stored.Capabilities)
+				} else {
+					delete(itemMap, "capabilities")
+				}
+			}
+			if !hasAnyMapKey(itemMap, "support_efforts", "supportEfforts") || isUnchangedFromOpening(modelOpening, "support_efforts", rawSnap) {
+				delete(itemMap, "supportEfforts")
+				if len(stored.SupportEfforts) > 0 {
+					itemMap["support_efforts"] = slices.Clone(stored.SupportEfforts)
+				} else {
+					delete(itemMap, "support_efforts")
+				}
+			}
+			if !hasAnyMapKey(itemMap, "adaptive_thinking", "adaptiveThinking") || isUnchangedFromOpening(modelOpening, "adaptive_thinking", rawSnap) {
+				delete(itemMap, "adaptiveThinking")
+				if stored.AdaptiveThinking != nil {
+					itemMap["adaptive_thinking"] = *stored.AdaptiveThinking
+				} else {
+					delete(itemMap, "adaptive_thinking")
+				}
+			}
+			if !hasAnyMapKey(itemMap, "default_effort", "defaultEffort") || isUnchangedFromOpening(modelOpening, "default_effort", rawSnap) {
+				delete(itemMap, "defaultEffort")
+				if trimmed := strings.TrimSpace(stored.DefaultEffort); trimmed != "" {
+					itemMap["default_effort"] = trimmed
+				} else {
+					delete(itemMap, "default_effort")
+				}
+			}
+			if !hasAnyMapKey(itemMap, "off_effort", "offEffort") || isUnchangedFromOpening(modelOpening, "off_effort", rawSnap) {
+				delete(itemMap, "offEffort")
+				if trimmed := strings.TrimSpace(stored.OffEffort); trimmed != "" {
+					itemMap["off_effort"] = trimmed
+				} else {
+					delete(itemMap, "off_effort")
+				}
+			}
+		}
+		mergedModels[modelID] = extractWireCapabilitySnapshot(itemMap)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	rawResp, err := s.kap.RequestPinnedOrigin(ctx, expectedOrigin, http.MethodPut, "/providers/"+urlPathValue(providerID), payload)
+	if err != nil {
+		return nil, err
+	}
+	s.invalidateOfficialConfigCache()
+
+	return map[string]any{
+		"data":         sanitizeProviderPutResponse(rawResp),
+		"mergedModels": mergedModels,
+	}, nil
+}
+
 // The official PUT replaces the provider's complete model array. Serialize the
 // read/merge/write/read cycle so concurrent enhancement saves retain each other's edits.
 func (s *NativeService) saveProviderModels(ctx context.Context, providerID string, items []any) ([]providerModelUpdate, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if providerID == "" {
 		return nil, errors.New("缺少供应商")
 	}
@@ -743,9 +1164,12 @@ func (s *NativeService) saveProviderModels(ctx context.Context, providerID strin
 		edits[modelID] = edit
 	}
 
-	s.providerModelsMu.Lock()
-	defer s.providerModelsMu.Unlock()
-	before, err := s.readConfig(ctx)
+	unlock, err := s.acquireProviderModelsLock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	before, err := s.readAuthoritativeConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -796,6 +1220,9 @@ func (s *NativeService) saveProviderModels(ctx context.Context, providerID strin
 		models = append(models, modelBody(model))
 	}
 	body := providerBody(providerID, provider, models, includedModels)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if _, err = s.kap.Request(ctx, http.MethodPut, "/providers/"+urlPathValue(providerID), body); err != nil {
 		return nil, err
 	}
@@ -955,6 +1382,12 @@ func numberValue(raw any) (int64, error) {
 			return 0, errors.New("需要整数")
 		}
 		return int64(value), nil
+	case json.Number:
+		parsed, err := value.Int64()
+		if err != nil {
+			return 0, errors.New("需要整数")
+		}
+		return parsed, nil
 	case int64:
 		return value, nil
 	case int:

@@ -224,3 +224,46 @@ test("embedded plugin settings space actions from list, align row status columns
   assert.ok(surface.includes("自动兼容"));
   assert.ok(surface.includes("无需额外操作"));
 });
+
+test("KCT migration panel always queries migration status and surfaces reappeared standalone loader even when enabled", () => {
+  const pluginSettings = source("src/components/PluginSettings.tsx");
+  assert.ok(pluginSettings.includes("<KctMigrationPanel pluginEnabled={current.enabled}"));
+  assert.equal(
+    pluginSettings.includes('<KctMigrationPanel show={!current.enabled || current.state === "BLOCKED"}'),
+    false,
+    "KctMigrationPanel must not be hidden solely because the plugin is enabled",
+  );
+  assert.ok(pluginSettings.includes("resolveKctMigrationView"));
+  assert.ok(pluginSettings.includes("bindKctMigrationReload"));
+  assert.ok(pluginSettings.includes("重新检测到独立版 KCT"));
+  const panelBlock = pluginSettings.slice(
+    pluginSettings.indexOf("function KctMigrationPanel("),
+    pluginSettings.indexOf("function MonitorMigrationPanel("),
+  );
+  assert.ok(panelBlock.includes("bindKctMigrationReload(window, document, report.reload)"));
+  assert.ok(panelBlock.includes("[pluginEnabled, report.reload]"));
+  const recheckMatches = panelBlock.match(/ActionButton variant="quiet" onClick=\{report\.reload\}[^>]*>\s*重新检测\s*<\/ActionButton>/g) ?? [];
+  assert.equal(recheckMatches.length, 2, "both confirm and migrated cards must expose a quiet 重新检测 action");
+});
+
+test("PluginSettingsPanel binds mountSettings to version, updatedAt, and capabilities", () => {
+  const pluginSettings = source("src/components/PluginSettings.tsx");
+  const panelBlock = pluginSettings.slice(
+    pluginSettings.indexOf("function PluginSettingsPanel("),
+    pluginSettings.indexOf("function resolveKctMigrationView("),
+  );
+  assert.ok(panelBlock.includes("version: plugin.version"));
+  assert.ok(panelBlock.includes("updatedAt: plugin.updatedAt"));
+  assert.ok(panelBlock.includes("capabilities: plugin.capabilities"));
+  assert.ok(panelBlock.includes('(plugin.capabilities ?? []).join(",")'));
+  assert.ok(panelBlock.includes("[plugin.id, plugin.version, plugin.updatedAt, capabilitiesKey, retrySeq]"));
+  assert.ok(panelBlock.includes('code === "PLUGIN_REVISION_MISMATCH"'));
+  assert.ok(panelBlock.includes("bridge.subscribe(() =>"));
+  assert.ok(panelBlock.includes("if (!latest || !latest.enabled)"));
+  assert.ok(panelBlock.includes("sawDisabled = true;"));
+  assert.ok(panelBlock.includes("if (lastTriggeredRev === latestRev) return;"));
+  assert.ok(panelBlock.includes('if (!sawDisabled || stateRef.current !== "failed") return;'));
+  assert.ok(pluginSettings.includes('host?.subscribe("plugins"'));
+  assert.ok(pluginSettings.includes("pluginHostBridge()?.subscribe?.("));
+  assert.ok(pluginSettings.includes("<PluginSettingsPanel plugin={current} onRevisionMismatch={() => plugins.reload()} />"));
+});

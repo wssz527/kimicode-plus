@@ -396,6 +396,11 @@ func TestWindowsBridgeRateLimitAndAllowlist(t *testing.T) {
 	if rec := rpc("schedule.runNow", nil); !strings.Contains(rec.Body.String(), "BRIDGE_ACTION_DENIED") {
 		t.Fatalf("unknown action = %d %s", rec.Code, rec.Body)
 	}
+	for _, action := range []string{"providers.updateModel", "providers.updateModels", "providers.modelSuggestion", "providers.saveOfficialForm"} {
+		if !allowedWindowsBridgeAction(action) {
+			t.Fatalf("expected %s in Windows bridge allowlist", action)
+		}
+	}
 	if dispatched != 0 {
 		t.Fatalf("denied requests were forwarded: %d", dispatched)
 	}
@@ -433,6 +438,9 @@ func TestWindowsBridgeSurfaceTokensDoNotSharePermissions(t *testing.T) {
 		{"GET", "/enhance/v1/plugins", session.nativeToken, http.StatusForbidden},
 		{"POST", "/enhance/v1/desktop/actions/accounts.delete", session.sessionToken, http.StatusForbidden},
 		{"POST", "/enhance/v1/desktop/actions/accounts.delete", session.nativeToken, http.StatusNoContent},
+		{"POST", "/enhance/v1/desktop/actions/providers.modelSuggestion", session.nativeToken, http.StatusNoContent},
+		{"POST", "/enhance/v1/desktop/actions/providers.updateModels", session.nativeToken, http.StatusNoContent},
+		{"POST", "/enhance/v1/desktop/actions/providers.saveOfficialForm", session.nativeToken, http.StatusNoContent},
 		{"POST", "/enhance/v1/desktop/bridge-session", session.nativeToken, http.StatusForbidden},
 		{"POST", "/enhance/v1/desktop/bridge-session", session.sessionToken, http.StatusForbidden},
 	} {
@@ -444,5 +452,59 @@ func TestWindowsBridgeSurfaceTokensDoNotSharePermissions(t *testing.T) {
 		if w.Code != tc.want {
 			t.Errorf("%s %s = %d, want %d", tc.method, tc.path, w.Code, tc.want)
 		}
+	}
+}
+
+func TestWindowsBridgeForwardsPluginAssetRevisionQuery(t *testing.T) {
+	guard := security.New("127.0.0.1:18444")
+	bridge := newWindowsBridge()
+	key, _ := bridge.issue(guard)
+	app := &App{winBridge: bridge}
+
+	var gotPath, gotVersion, gotUpdatedAt, gotCaps string
+	var gotCapsPresent bool
+	handler := app.wrapWindowsBridge(guard, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		q := r.URL.Query()
+		gotVersion = q.Get("version")
+		gotUpdatedAt = q.Get("updatedAt")
+		gotCaps = q.Get("capabilities")
+		gotCapsPresent = q.Has("capabilities")
+		_, _ = w.Write([]byte(`{"path":"settings.js","source":"export function renderSettings(){}","version":"1.0.1","updatedAt":"2026-11-26 22:00:00 +0800 CST","capabilities":["ui:settings","ui:thinking","credentials:api..token"]}`))
+	}))
+
+	targetPath := "/enhance/v1/plugins/kimicode-plus.kct/assets/settings.js?version=1.0.1&updatedAt=2026-11-26%2022%3A00%3A00%20%2B0800%20CST&capabilities=ui%3Asettings%2Cui%3Athinking%2Ccredentials%3Aapi..token"
+	if !allowedWindowsBridgeFetch(http.MethodGet, targetPath) {
+		t.Fatalf("expected asset revision query path to pass allowlist: %s", targetPath)
+	}
+	body, err := json.Marshal(map[string]any{
+		"protocol": 1,
+		"id":       "asset-rev",
+		"action":   "core.fetch",
+		"payload": map[string]string{
+			"method": "GET",
+			"path":   targetPath,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://"+guard.Host()+"/ekd/native/v1", bytes.NewReader(body))
+	req.Header.Set("Origin", "app://renderer")
+	req.Header.Set("X-EKD-Bridge", key)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bridge asset fetch = %d %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "BRIDGE_ROUTE_DENIED") {
+		t.Fatalf("bridge unexpectedly denied asset revision query: %s", rec.Body.String())
+	}
+	if gotPath != "/enhance/v1/plugins/kimicode-plus.kct/assets/settings.js" ||
+		gotVersion != "1.0.1" ||
+		gotUpdatedAt != "2026-11-26 22:00:00 +0800 CST" ||
+		!gotCapsPresent ||
+		gotCaps != "ui:settings,ui:thinking,credentials:api..token" {
+		t.Fatalf("asset query not forwarded intact: path=%q version=%q updatedAt=%q caps=%q hasCaps=%v", gotPath, gotVersion, gotUpdatedAt, gotCaps, gotCapsPresent)
 	}
 }

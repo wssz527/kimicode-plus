@@ -1486,8 +1486,11 @@ func (m *Manager) handleAssets(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	live, ok := m.entries[id]
 	var item entry
+	host := m.host
+	var itemGrants string
 	if ok {
 		item = *live
+		itemGrants = strings.Join(item.grants.Names(), ",")
 	}
 	m.mu.Unlock()
 	if !ok {
@@ -1496,6 +1499,15 @@ func (m *Manager) handleAssets(w http.ResponseWriter, r *http.Request) {
 	}
 	if item.state != StateEnabled {
 		httpx.Fail(w, http.StatusConflict, "PLUGIN_DISABLED", "插件未启用")
+		return
+	}
+	current := m.present(item, host)
+	currentCaps := strings.Join(current.Capabilities, ",")
+	q := r.URL.Query()
+	if (q.Has("version") && q.Get("version") != current.Version) ||
+		(q.Has("updatedAt") && q.Get("updatedAt") != current.UpdatedAt) ||
+		(q.Has("capabilities") && q.Get("capabilities") != currentCaps) {
+		httpx.Fail(w, http.StatusConflict, "PLUGIN_REVISION_MISMATCH", "插件版本已变更，请重新同步")
 		return
 	}
 	entryFile := file != "" && (file == item.manifest.Entry.Renderer || file == item.manifest.Entry.Settings)
@@ -1534,11 +1546,61 @@ func (m *Manager) handleAssets(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if !entryFile && !utf8.Valid(data) {
-		httpx.JSON(w, http.StatusOK, map[string]any{"path": file, "source": base64.StdEncoding.EncodeToString(data), "encoding": "base64"})
+	m.mu.Lock()
+	after, stillOK := m.entries[id]
+	var afterCopy entry
+	afterHost := m.host
+	var afterGrants string
+	if stillOK {
+		afterCopy = *after
+		afterGrants = strings.Join(afterCopy.grants.Names(), ",")
+	}
+	m.mu.Unlock()
+	if !stillOK {
+		httpx.Fail(w, http.StatusNotFound, "PLUGIN_NOT_FOUND", "插件未安装")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"path": file, "source": string(data)})
+	if afterCopy.state != StateEnabled {
+		httpx.Fail(w, http.StatusConflict, "PLUGIN_DISABLED", "插件未启用")
+		return
+	}
+	if afterCopy.manifest.Version != item.manifest.Version ||
+		!afterCopy.updated.Equal(item.updated) ||
+		afterCopy.dir != item.dir ||
+		afterCopy.installDigest != item.installDigest ||
+		afterGrants != itemGrants {
+		httpx.Fail(w, http.StatusConflict, "PLUGIN_REVISION_MISMATCH", "插件版本已变更，请重新同步")
+		return
+	}
+	afterPresent := m.present(afterCopy, afterHost)
+	if afterPresent.Version != current.Version ||
+		afterPresent.UpdatedAt != current.UpdatedAt ||
+		strings.Join(afterPresent.Capabilities, ",") != currentCaps {
+		httpx.Fail(w, http.StatusConflict, "PLUGIN_REVISION_MISMATCH", "插件版本已变更，请重新同步")
+		return
+	}
+	caps := current.Capabilities
+	if caps == nil {
+		caps = []string{}
+	}
+	if !entryFile && !utf8.Valid(data) {
+		httpx.JSON(w, http.StatusOK, map[string]any{
+			"path":         file,
+			"source":       base64.StdEncoding.EncodeToString(data),
+			"encoding":     "base64",
+			"version":      current.Version,
+			"updatedAt":    current.UpdatedAt,
+			"capabilities": caps,
+		})
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"path":         file,
+		"source":       string(data),
+		"version":      current.Version,
+		"updatedAt":    current.UpdatedAt,
+		"capabilities": caps,
+	})
 }
 
 const assetLimit = 8 << 20

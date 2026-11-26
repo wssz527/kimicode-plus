@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { api, ApiError, type KctMigrationResult, type MonitorMigrationResult, type PluginActivity, type PluginPlatformLimitation, type PluginPreview, type PluginRecord, type PluginUpdateItem, type PluginUpdateStatus, type PluginUpstream } from "../api";
+import { api, ApiError, type KctMigrationReport, type KctMigrationResult, type MonitorMigrationResult, type PluginActivity, type PluginPlatformLimitation, type PluginPreview, type PluginRecord, type PluginUpdateItem, type PluginUpdateStatus, type PluginUpstream } from "../api";
 import { pluginHostBridge, syncPluginHost } from "../plugin-runtime/host";
 import type { NativeHost } from "../native";
 import { Icon } from "./Icon";
@@ -175,6 +175,75 @@ function canQuickToggle(plugin: PluginRecord): boolean {
   return plugin.state !== "UNINSTALLED" && plugin.state !== "CORRUPT" && Boolean(plugin.compatible || plugin.enabled);
 }
 
+function canStartQuickToggle(input: {
+  pluginId: string;
+  quickBusyIds: ReadonlySet<string> | readonly string[];
+  updatingPluginId: string | null;
+}): boolean {
+  const busy = "has" in input.quickBusyIds
+    ? input.quickBusyIds.has(input.pluginId)
+    : input.quickBusyIds.includes(input.pluginId);
+  return !busy && input.updatingPluginId !== input.pluginId;
+}
+
+function isPluginToggleDisabled(input: {
+  pluginId: string;
+  enabled: boolean;
+  safeMode: boolean;
+  quickBusyIds: readonly string[];
+  updatingPluginId: string | null;
+  detailBusyForPlugin?: boolean;
+}): boolean {
+  return (
+    input.quickBusyIds.includes(input.pluginId)
+    || input.updatingPluginId === input.pluginId
+    || Boolean(input.detailBusyForPlugin)
+    || (!input.enabled && input.safeMode)
+  );
+}
+
+function createDeferredPluginRefreshController(deps: {
+  isBusy: () => boolean;
+  reloadPlugins: () => unknown;
+  reloadUpdates: () => unknown;
+}): {
+  notify(withUpdates: boolean): void;
+  flushIfIdle(): void;
+  hasPending(): boolean;
+} {
+  let pendingPlugins = false;
+  let pendingUpdates = false;
+  const run = (needPlugins: boolean, needUpdates: boolean) => {
+    if (needPlugins) void deps.reloadPlugins();
+    if (needUpdates) void deps.reloadUpdates();
+  };
+  return {
+    notify(withUpdates: boolean) {
+      if (deps.isBusy()) {
+        pendingPlugins = true;
+        if (withUpdates) pendingUpdates = true;
+        return;
+      }
+      const needUpdates = withUpdates || pendingUpdates;
+      pendingPlugins = false;
+      pendingUpdates = false;
+      run(true, needUpdates);
+    },
+    flushIfIdle() {
+      if (deps.isBusy() || (!pendingPlugins && !pendingUpdates)) return;
+      const needPlugins = pendingPlugins;
+      const needUpdates = pendingUpdates;
+      pendingPlugins = false;
+      pendingUpdates = false;
+      run(needPlugins, needUpdates);
+    },
+    hasPending() {
+      return pendingPlugins || pendingUpdates;
+    },
+  };
+}
+export { createDeferredPluginRefreshController };
+
 function isMigrationGate(error: unknown): boolean {
   return error instanceof ApiError && error.code === "PLUGIN_MIGRATION_REQUIRED";
 }
@@ -186,6 +255,7 @@ const ACTIVITY_LABELS: Record<string, string> = {
   UNINSTALL: "卸载",
   UPGRADE: "升级",
   RESTORE: "恢复",
+  LOG: "运行日志",
   ERROR: "插件日志",
   SESSIONS_SEND: "发送会话",
   CONFIG_WRITE: "修改配置",
@@ -260,10 +330,22 @@ function PluginFaultNotice({ reason }: { reason: string }) {
  * The bridge exists only inside the native host. In a plain web page there is no
  * plugin runtime, so the panel explains that instead of rendering nothing.
  */
-function PluginSettingsPanel({ plugin }: { plugin: PluginRecord }) {
+function PluginSettingsPanel({
+  plugin,
+  onRevisionMismatch,
+}: {
+  plugin: PluginRecord;
+  onRevisionMismatch?: () => Promise<unknown> | void;
+}) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const onRevisionMismatchRef = useRef(onRevisionMismatch);
+  onRevisionMismatchRef.current = onRevisionMismatch;
   const [state, setState] = useState<"loading" | "ready" | "unavailable" | "failed">("loading");
+  const stateRef = useRef(state);
+  stateRef.current = state;
   const [message, setMessage] = useState("");
+  const [retrySeq, setRetrySeq] = useState(0);
+  const capabilitiesKey = (plugin.capabilities ?? []).join(",");
 
   useEffect(() => {
     const bridge = pluginHostBridge();
@@ -272,14 +354,21 @@ function PluginSettingsPanel({ plugin }: { plugin: PluginRecord }) {
       setState("unavailable");
       return;
     }
+    const controller = new AbortController();
     let released = false;
     let dispose: (() => void) | null = null;
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
     setState("loading");
     setMessage("");
     bridge
-      .mountSettings(plugin.id, element)
+      .mountSettings(plugin.id, element, {
+        signal: controller.signal,
+        version: plugin.version,
+        updatedAt: plugin.updatedAt,
+        capabilities: plugin.capabilities,
+      })
       .then(release => {
-        if (released) {
+        if (released || controller.signal.aborted) {
           release();
           return;
         }
@@ -287,15 +376,105 @@ function PluginSettingsPanel({ plugin }: { plugin: PluginRecord }) {
         setState("ready");
       })
       .catch(error => {
-        if (released) return;
+        if (released || controller.signal.aborted) return;
+        const code = (error as { code?: string } | null)?.code;
+        const reload = onRevisionMismatchRef.current;
+        if (code === "PLUGIN_REVISION_MISMATCH" && reload) {
+          const fallbackMessage = error instanceof Error ? error.message : String(error);
+          Promise.resolve()
+            .then(() => reload())
+            .catch(() => {})
+            .finally(() => {
+              if (released || controller.signal.aborted) return;
+              fallbackTimer = setTimeout(() => {
+                fallbackTimer = null;
+                if (released || controller.signal.aborted) return;
+                setState("failed");
+                setMessage(fallbackMessage);
+              }, 50);
+            });
+          return;
+        }
         setState("failed");
         setMessage(error instanceof Error ? error.message : String(error));
       });
     return () => {
       released = true;
+      if (fallbackTimer !== null) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+      controller.abort();
       dispose?.();
     };
-  }, [plugin.id, plugin.version, plugin.updatedAt]);
+  }, [plugin.id, plugin.version, plugin.updatedAt, capabilitiesKey, retrySeq]);
+
+  useEffect(() => {
+    const bridge = pluginHostBridge();
+    if (!bridge?.subscribe) return;
+    let active = true;
+    let recovering = false;
+    let sawDisabled = false;
+    let lastTriggeredRev = "";
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    const unsubscribe = bridge.subscribe(() => {
+      if (!active || recovering) return;
+      const latest = bridge.list?.()?.find(item => item.id === plugin.id);
+      if (!latest || !latest.enabled) {
+        sawDisabled = true;
+        lastTriggeredRev = "";
+        return;
+      }
+      const latestCaps = Array.isArray(latest.capabilities) ? latest.capabilities.join(",") : capabilitiesKey;
+      const revisionChanged = Boolean(
+        (latest.version && latest.version !== plugin.version)
+        || (latest.updatedAt && latest.updatedAt !== plugin.updatedAt)
+        || latestCaps !== capabilitiesKey,
+      );
+      const latestRev = `${latest.version || plugin.version}|${latest.updatedAt || plugin.updatedAt}|${latestCaps}`;
+      if (revisionChanged) {
+        if (lastTriggeredRev === latestRev) return;
+        lastTriggeredRev = latestRev;
+        sawDisabled = false;
+      } else {
+        if (!sawDisabled || stateRef.current !== "failed") return;
+        sawDisabled = false;
+      }
+      recovering = true;
+      if (fallbackTimer !== null) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+      setState("loading");
+      setMessage("");
+      const reload = onRevisionMismatchRef.current;
+      Promise.resolve()
+        .then(() => reload?.())
+        .catch(() => {})
+        .finally(() => {
+          recovering = false;
+          if (!active) return;
+          if (!revisionChanged) {
+            setRetrySeq(v => v + 1);
+            return;
+          }
+          fallbackTimer = setTimeout(() => {
+            fallbackTimer = null;
+            if (!active) return;
+            setState("failed");
+            setMessage("插件版本已更新，请重新打开设置页");
+          }, 50);
+        });
+    });
+    return () => {
+      active = false;
+      if (fallbackTimer !== null) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+      unsubscribe();
+    };
+  }, [plugin.id, plugin.version, plugin.updatedAt, capabilitiesKey]);
 
   return (
     <section className="plugin-settings-section" aria-label="增强插件设置">
@@ -314,39 +493,130 @@ function PluginSettingsPanel({ plugin }: { plugin: PluginRecord }) {
   );
 }
 
-/**
- * The one-time handover from the standalone KCT extension. It is a core route
- * rather than a plugin route: at the moment the page needs it the adapter is
- * still disabled. The panel explains what will be stopped, copies only the two
- * public settings, and keeps the loader untouched until the user confirms.
- */
-function KctMigrationPanel({ show, onMigrated }: { show: boolean; onMigrated?: () => void }) {
-  const report = useResource("plugins/kct/migration", () => api.plugins.kctMigration(), { enabled: show });
-  const action = useAction<KctMigrationResult>();
-  const [result, setResult] = useState<KctMigrationResult | null>(null);
+function resolveKctMigrationView(input: {
+  report: KctMigrationReport | null;
+  confirmResult: KctMigrationResult | null;
+  confirmReportSnapshot: KctMigrationReport | null;
+  pluginEnabled: boolean;
+  loading: boolean;
+  hasError: boolean;
+}): {
+  state: KctMigrationReport | null;
+  mode: "hidden" | "loading" | "error" | "confirm" | "migrated";
+  reappeared: boolean;
+  showConfirmMessage: boolean;
+} {
+  const hasFreshReport =
+    input.report !== null &&
+    (!input.confirmResult || input.report !== input.confirmReportSnapshot);
+  const state = hasFreshReport
+    ? input.report
+    : (input.confirmResult?.report ?? input.report ?? null);
 
-  if (!show) return null;
-  const state = result?.report ?? report.data ?? null;
-  const needsConfirmation = Boolean(state?.needsConfirmation);
-  const migrated = Boolean(state?.migrated);
+  if (!state) {
+    if (input.pluginEnabled) {
+      return { state: null, mode: "hidden", reappeared: false, showConfirmMessage: false };
+    }
+    if (input.loading) {
+      return { state: null, mode: "loading", reappeared: false, showConfirmMessage: false };
+    }
+    if (input.hasError) {
+      return { state: null, mode: "error", reappeared: false, showConfirmMessage: false };
+    }
+    return { state: null, mode: "hidden", reappeared: false, showConfirmMessage: false };
+  }
+
+  if (state.needsConfirmation) {
+    return {
+      state,
+      mode: "confirm",
+      reappeared: Boolean(state.migrated),
+      showConfirmMessage: false,
+    };
+  }
+  if (input.pluginEnabled) {
+    return { state, mode: "hidden", reappeared: false, showConfirmMessage: false };
+  }
+  if (state.migrated) {
+    return {
+      state,
+      mode: "migrated",
+      reappeared: false,
+      showConfirmMessage: Boolean(input.confirmResult?.message),
+    };
+  }
+  return { state, mode: "hidden", reappeared: false, showConfirmMessage: false };
+}
+
+function bindKctMigrationReload(
+  win: Pick<Window, "addEventListener" | "removeEventListener">,
+  doc: Pick<Document, "addEventListener" | "removeEventListener" | "visibilityState">,
+  reload: () => void,
+): () => void {
+  const onFocus = () => {
+    reload();
+  };
+  const onVisibilityChange = () => {
+    if (doc.visibilityState === "visible") reload();
+  };
+  win.addEventListener("focus", onFocus);
+  doc.addEventListener("visibilitychange", onVisibilityChange);
+  return () => {
+    win.removeEventListener("focus", onFocus);
+    doc.removeEventListener("visibilitychange", onVisibilityChange);
+  };
+}
+
+/**
+ * The handover from the standalone KCT extension. It is a core route rather than
+ * a plugin route so it stays available both while the adapter is blocked and if
+ * the standalone launchd loader reappears after an earlier migration.
+ */
+function KctMigrationPanel({ pluginEnabled = false, onMigrated }: { pluginEnabled?: boolean; onMigrated?: () => void }) {
+  const report = useResource("plugins/kct/migration", () => api.plugins.kctMigration());
+  const action = useAction<KctMigrationResult>();
+  const [confirmState, setConfirmState] = useState<{
+    result: KctMigrationResult;
+    reportSnapshot: KctMigrationReport | null;
+  } | null>(null);
+  const prevPluginEnabled = useRef(pluginEnabled);
+
+  useEffect(() => bindKctMigrationReload(window, document, report.reload), [report.reload]);
+
+  useEffect(() => {
+    if (prevPluginEnabled.current === pluginEnabled) return;
+    prevPluginEnabled.current = pluginEnabled;
+    report.reload();
+  }, [pluginEnabled, report.reload]);
+
+  const view = resolveKctMigrationView({
+    report: report.data,
+    confirmResult: confirmState?.result ?? null,
+    confirmReportSnapshot: confirmState?.reportSnapshot ?? null,
+    pluginEnabled,
+    loading: report.loading,
+    hasError: Boolean(report.error),
+  });
+  const state = view.state;
 
   async function confirm() {
+    const snapshotBeforeConfirm = report.data;
     const done = await action.run(() => api.plugins.confirmKctMigration());
     if (done) {
-      setResult(done);
+      setConfirmState({ result: done, reportSnapshot: snapshotBeforeConfirm });
       report.reload();
       onMigrated?.();
     }
   }
 
-  if (report.loading && !state) {
+  if (view.mode === "loading") {
     return (
       <Panel title="独立版迁移">
         <SkeletonRows rows={2} cols={1} />
       </Panel>
     );
   }
-  if (report.error && !state) {
+  if (view.mode === "error") {
     return (
       <Panel title="独立版迁移">
         <ErrorNotice
@@ -356,27 +626,18 @@ function KctMigrationPanel({ show, onMigrated }: { show: boolean; onMigrated?: (
       </Panel>
     );
   }
-  if (!needsConfirmation && !migrated) {
+  if (view.mode === "hidden") {
     return null;
   }
 
   return (
-    <Panel title={migrated ? "独立版迁移" : "先停用独立版 KCT"}>
-      {migrated ? (
-        <>
-          <p className="panel-note">
-            独立版的后台加载器已停用{state?.migratedAt ? `（${fmtDateTime(state.migratedAt)}）` : ""}。继续使用这里的增强插件即可，思考内容只会被注入一次。
-          </p>
-          {state?.dataDirPresent ? (
-            <p className="panel-note">
-              独立版的历史数据仍保留在 <code>{state.dataDir}</code>，增强插件不会读取它。确认不再需要后可以自行删除。
-            </p>
-          ) : null}
-        </>
-      ) : (
+    <Panel title={view.mode === "confirm" ? (view.reappeared ? "重新检测到独立版 KCT" : "先停用独立版 KCT") : "独立版迁移"}>
+      {view.mode === "confirm" ? (
         <>
           <p>
-            检测到独立版 KCT 仍在后台运行。它和这个增强插件都会改写思考内容，两套同时工作会让同一段内容被注入两次。确认迁移后，核心会停用它的后台加载器，并把目标语言和翻译服务带过来。
+            {view.reappeared
+              ? `检测到独立版 KCT 后台加载器重新出现${state?.migratedAt ? `（上次迁移于 ${fmtDateTime(state.migratedAt)}）` : ""}。它和这个增强插件都会改写思考内容，请再次确认停用以避免同一段内容被重复翻译注入。`
+              : "检测到独立版 KCT 仍在后台运行。它和这个增强插件都会改写思考内容，两套同时工作会让同一段内容被注入两次。确认迁移后，核心会停用它的后台加载器，并把目标语言和翻译服务带过来。"}
           </p>
           <dl className="rail-facts">
             <div>
@@ -403,13 +664,33 @@ function KctMigrationPanel({ show, onMigrated }: { show: boolean; onMigrated?: (
           </InfoNote>
           <div className="inline-actions">
             <ActionButton variant="primary" icon="check" onClick={() => void confirm()} busy={action.busy}>
-              确认迁移并停用独立版
+              {view.reappeared ? "确认停用独立版加载器" : "确认迁移并停用独立版"}
             </ActionButton>
             <ActionButton variant="quiet" onClick={report.reload} busy={report.loading}>
               重新检测
             </ActionButton>
           </div>
-          <p className="panel-note">不确认也可以：增强插件保持停用，独立版继续工作，两边不会同时注入。</p>
+          <p className="panel-note">
+            {pluginEnabled
+              ? "当前增强插件已启用。若不立即停用独立版加载器，两套扩展可能同时注入同一段思考内容。"
+              : "不确认也可以：增强插件保持停用，独立版继续工作，两边不会同时注入。"}
+          </p>
+        </>
+      ) : (
+        <>
+          <p className="panel-note">
+            独立版的后台加载器已停用{state?.migratedAt ? `（${fmtDateTime(state.migratedAt)}）` : ""}。继续使用这里的增强插件即可，思考内容只会被注入一次。
+          </p>
+          {state?.dataDirPresent ? (
+            <p className="panel-note">
+              独立版的历史数据仍保留在 <code>{state.dataDir}</code>，增强插件不会读取它。确认不再需要后可以自行删除。
+            </p>
+          ) : null}
+          <div className="inline-actions">
+            <ActionButton variant="quiet" onClick={report.reload} busy={report.loading}>
+              重新检测
+            </ActionButton>
+          </div>
         </>
       )}
       {action.error ? (
@@ -419,7 +700,7 @@ function KctMigrationPanel({ show, onMigrated }: { show: boolean; onMigrated?: (
           onDismiss={action.clearError}
         />
       ) : null}
-      {result?.message ? <p className="panel-note">{result.message}</p> : null}
+      {view.showConfirmMessage && confirmState?.result.message ? <p className="panel-note">{confirmState.result.message}</p> : null}
       {state?.detail ? <p className="panel-note">{state.detail}</p> : null}
     </Panel>
   );
@@ -581,13 +862,55 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
   const action = useAction<PluginRecord | { id: string; uninstalled: boolean }>();
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
-  const [quickBusy, setQuickBusy] = useState<string | null>(null);
+  const [quickBusyIds, setQuickBusyIds] = useState<string[]>([]);
+  const quickBusyRef = useRef<Set<string>>(new Set());
+  const syncCountRef = useRef(0);
   const [quickError, setQuickError] = useState<string | null>(null);
   const [updateSnapshot, setUpdateSnapshot] = useState<PluginUpdateStatus | null>(null);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [updateCheckError, setUpdateCheckError] = useState<string | null>(null);
   const [updatingPluginId, setUpdatingPluginId] = useState<string | null>(null);
   const [confirmUpdatePrivileged, setConfirmUpdatePrivileged] = useState(false);
+  const localOpBusy = action.busy || syncing || Boolean(updatingPluginId) || quickBusyIds.length > 0;
+  const localOpBusyRef = useRef(false);
+  localOpBusyRef.current = localOpBusy;
+  const reloadPluginsRef = useRef(plugins.reload);
+  reloadPluginsRef.current = plugins.reload;
+  const reloadUpdatesRef = useRef(updates.reload);
+  reloadUpdatesRef.current = updates.reload;
+  const refreshCtrlRef = useRef<ReturnType<typeof createDeferredPluginRefreshController> | null>(null);
+  if (!refreshCtrlRef.current) {
+    refreshCtrlRef.current = createDeferredPluginRefreshController({
+      isBusy: () => localOpBusyRef.current || quickBusyRef.current.size > 0,
+      reloadPlugins: () => reloadPluginsRef.current(),
+      reloadUpdates: () => reloadUpdatesRef.current(),
+    });
+  }
+
+  useEffect(() => {
+    const refreshCtrl = refreshCtrlRef.current!;
+    const unsubHost = host?.subscribe("plugins", () => refreshCtrl.notify(true));
+    const unsubBridge = pluginHostBridge()?.subscribe?.(() => refreshCtrl.notify(false));
+    return () => {
+      unsubHost?.();
+      unsubBridge?.();
+    };
+  }, [host]);
+
+  useEffect(() => {
+    refreshCtrlRef.current?.flushIfIdle();
+  }, [localOpBusy, quickBusyIds.length]);
+
+  const isQuickBusy = (id: string) => quickBusyIds.includes(id);
+  const markQuickBusy = (id: string) => {
+    quickBusyRef.current.add(id);
+    setQuickBusyIds(prev => (prev.includes(id) ? prev : [...prev, id]));
+  };
+  const clearQuickBusy = (id: string) => {
+    quickBusyRef.current.delete(id);
+    setQuickBusyIds(prev => prev.filter(item => item !== id));
+    refreshCtrlRef.current?.flushIfIdle();
+  };
 
   useEffect(() => {
     if (!flash) return;
@@ -684,7 +1007,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
   }
 
   async function applyPluginUpdate(plugin: PluginRecord, update: PluginUpdateItem, confirmConsent = false) {
-    if (updatingPluginId !== null || checkingUpdates || syncing || action.busy) return;
+    if (updatingPluginId !== null || checkingUpdates || quickBusyRef.current.has(plugin.id) || (detailActive && selected === plugin.id && action.busy)) return;
     const hasAddedPriv = (update.addedPrivileged?.length ?? 0) > 0;
     if (update.needsConsent && !confirmConsent) {
       openDetail(plugin.id);
@@ -732,12 +1055,14 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
   );
 
   async function syncHost() {
+    syncCountRef.current += 1;
     setSyncing(true);
     setSyncError(null);
     try {
       setSyncError(await syncPluginHost());
     } finally {
-      setSyncing(false);
+      syncCountRef.current = Math.max(0, syncCountRef.current - 1);
+      if (syncCountRef.current === 0) setSyncing(false);
     }
   }
 
@@ -816,7 +1141,12 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
     }
     const result = await action.run(() => (kind === "enable" ? api.plugins.enable(id) : api.plugins.disable(id)));
     if (result && "state" in result) {
-      await afterStateChange(result);
+      markQuickBusy(id);
+      try {
+        await afterStateChange(result);
+      } finally {
+        clearQuickBusy(id);
+      }
       if (kind === "enable") {
         await maybePromptSchedulerAutoAttach(result);
       } else if (id === SCHEDULER_PLUGIN_ID) {
@@ -828,9 +1158,9 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
   /* The list row cannot host a migration panel, so a gated enable lands the user
      on the detail page that owns the confirmation. */
   async function quickToggle(plugin: PluginRecord, next: boolean) {
-    if (quickBusy !== null) return;
+    if (!canStartQuickToggle({ pluginId: plugin.id, quickBusyIds: quickBusyRef.current, updatingPluginId })) return;
     setQuickError(null);
-    setQuickBusy(plugin.id);
+    markQuickBusy(plugin.id);
     try {
       const record = next ? await api.plugins.enable(plugin.id) : await api.plugins.disable(plugin.id);
       await afterStateChange(record);
@@ -853,7 +1183,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
         setQuickError(errorMessage(error));
       }
     } finally {
-      setQuickBusy(null);
+      clearQuickBusy(plugin.id);
     }
   }
 
@@ -1103,13 +1433,13 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                 variant="quiet"
                 onClick={() => void checkUpdates()}
                 busy={checkingUpdates}
-                disabled={updatingPluginId !== null || action.busy || syncing}
+                disabled={updatingPluginId !== null || action.busy}
               >
                 检查更新
               </ActionButton>
             ) : null}
             {current.enabled ? (
-              <ActionButton icon="power" onClick={() => void run(current.id, "disable")} busy={action.busy || syncing} disabled={isUpdatingThis}>
+              <ActionButton icon="power" onClick={() => void run(current.id, "disable")} busy={action.busy || isQuickBusy(current.id)} disabled={isUpdatingThis}>
                 停用增强插件
               </ActionButton>
             ) : (
@@ -1117,14 +1447,14 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                 variant="primary"
                 icon="power"
                 onClick={() => void run(current.id, "enable")}
-                busy={action.busy || syncing}
+                busy={action.busy || isQuickBusy(current.id)}
                 disabled={safeMode || isUpdatingThis}
               >
                 启用增强插件
               </ActionButton>
             )}
             {!current.enabled && !current.compatible ? (
-              <ActionButton icon="alert" onClick={() => setConfirmForce(true)} busy={action.busy || syncing} disabled={safeMode || isUpdatingThis}>
+              <ActionButton icon="alert" onClick={() => setConfirmForce(true)} busy={action.busy || isQuickBusy(current.id)} disabled={safeMode || isUpdatingThis}>
                 强制启用
               </ActionButton>
             ) : null}
@@ -1164,7 +1494,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                   icon="download"
                   onClick={() => void applyPluginUpdate(current, currentUpdate, false)}
                   busy={isUpdatingThis}
-                  disabled={checkingUpdates || action.busy || syncing}
+                  disabled={updatingPluginId !== null || checkingUpdates || action.busy || isQuickBusy(current.id)}
                 >
                   {isUpdatingThis ? "正在更新…" : `更新到 v${currentUpdate.latestVersion}`}
                 </ActionButton>
@@ -1216,7 +1546,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                     icon="download"
                     onClick={() => void applyPluginUpdate(current, currentUpdate, true)}
                     busy={isUpdatingThis}
-                    disabled={checkingUpdates || action.busy || syncing || (addedPrivCaps.length > 0 && !confirmUpdatePrivileged)}
+                    disabled={updatingPluginId !== null || checkingUpdates || action.busy || isQuickBusy(current.id) || (addedPrivCaps.length > 0 && !confirmUpdatePrivileged)}
                   >
                     {isUpdatingThis ? "正在更新…" : `确认新增权限并更新到 v${currentUpdate.latestVersion}`}
                   </ActionButton>
@@ -1250,12 +1580,14 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
         ) : null}
 
         {current.id === KCT_PLUGIN_ID ? (
-          <KctMigrationPanel show={!current.enabled || current.state === "BLOCKED"} onMigrated={() => plugins.reload()} />
+          <KctMigrationPanel pluginEnabled={current.enabled} onMigrated={() => plugins.reload()} />
         ) : null}
         {current.id === MONITOR_PLUGIN_ID ? (
           <MonitorMigrationPanel show={!current.enabled || current.state === "BLOCKED"} onMigrated={() => plugins.reload()} />
         ) : null}
-        {current.hasSettings && current.enabled ? <PluginSettingsPanel plugin={current} /> : null}
+        {current.hasSettings && current.enabled ? (
+          <PluginSettingsPanel plugin={current} onRevisionMismatch={() => plugins.reload()} />
+        ) : null}
         {current.hasSettings && !current.enabled ? (
           <div className="plugin-settings-disabled">
             <p className="panel-note">启用增强插件后即可在这里调整配置。</p>
@@ -1677,7 +2009,7 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                         icon="download"
                         onClick={() => void applyPluginUpdate(plugin, update, false)}
                         busy={isUpdating}
-                        disabled={updatingPluginId !== null || checkingUpdates || quickBusy !== null || syncing}
+                        disabled={updatingPluginId !== null || checkingUpdates || isQuickBusy(plugin.id)}
                       >
                         {isUpdating ? "更新中…" : "更新"}
                       </ActionButton>
@@ -1696,7 +2028,14 @@ export function PluginSettings({ embedded = false, host = null, onDetailChange }
                       hideLabel
                       label={plugin.enabled ? `停用「${name}」` : `启用「${name}」`}
                       checked={Boolean(plugin.enabled)}
-                      disabled={quickBusy !== null || updatingPluginId !== null || (!plugin.enabled && safeMode)}
+                      disabled={isPluginToggleDisabled({
+                        pluginId: plugin.id,
+                        enabled: Boolean(plugin.enabled),
+                        safeMode,
+                        quickBusyIds,
+                        updatingPluginId,
+                        detailBusyForPlugin: detailActive && selected === plugin.id && action.busy,
+                      })}
                       onChange={next => void quickToggle(plugin, next)}
                     />
                   ) : null}

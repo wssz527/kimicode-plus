@@ -378,7 +378,7 @@ const response = await ctx.net.fetch("https://api.example.com/v1/chat", {
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/enhance/v1/plugin-runtime/{action}` | 插件动作。body `{token, params}`；**由令牌决定插件身份**，URL 不能命名插件。 |
-| GET | `/enhance/v1/plugins/{id}/assets/{file}` | 加载插件自己的 ES module（`entry.renderer`、`entry.settings`）及 `assets/` 目录下的静态文件。只服务已启用插件，拒绝路径穿越与符号链接。 |
+| GET | `/enhance/v1/plugins/{id}/assets/{file}` | 加载插件自己的 ES module（`entry.renderer`、`entry.settings`）及 `assets/` 目录下的静态文件。只服务已启用插件，拒绝路径穿越与符号链接；支持可选查询参数 `version`、`updatedAt`、`capabilities` 绑定预期修订并在读盘前后核验一致性（失配返回 `409 PLUGIN_REVISION_MISMATCH`），`200` 响应附带权威 `version`、`updatedAt`、`capabilities`。 |
 | POST | `/enhance/v1/plugins/{id}/token` | 取得该插件的身份令牌（同一令牌），供窗口打开前已启用的插件使用。 |
 
 管理界面使用：

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -558,5 +559,137 @@ func TestOfficialUpdateExposesReenableFailure(t *testing.T) {
 	}
 	if updated.State != StateBlocked {
 		t.Fatalf("expected the blocked state to survive, got %s", updated.State)
+	}
+}
+
+func TestHandleAssetsRevisionBindingAndMetadata(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	db, err := storage.Open(filepath.Join(root, "core.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	v1Files := map[string][]byte{
+		"plugin.json": []byte(`{
+			"id": "kimicode-plus.kct",
+			"name": "KCT",
+			"version": "1.0.0",
+			"apiVersion": 2,
+			"hostVersions": ["1.*"],
+			"capabilities": ["ui:settings", "ui:thinking", "credentials:api..token"],
+			"entry": {"renderer": "renderer.js", "settings": "settings.js"}
+		}`),
+		"renderer.js":      []byte("export function activate(){/*v1*/}\n"),
+		"settings.js":      []byte("export function renderSettings(){/*v1*/}\n"),
+		"LICENSE":          []byte("MIT\n"),
+		"assets/icon.bin":  {0xff, 0xfe, 0x00, 0x01},
+	}
+	bundledSet := map[string]map[string][]byte{"kimicode-plus.kct": v1Files}
+	mgr, err := New(
+		db,
+		func() bool { return false },
+		WithDataDir(root),
+		WithHostVersion("1.3.7"),
+		WithBundled(func() (map[string]map[string][]byte, error) { return bundledSet, nil }),
+		WithOfficial(func() (map[string]string, error) {
+			return map[string]string{"kimicode-plus.kct": ContentDigest(v1Files)}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	if err := mgr.ReleaseBundled(ctx, bundledSet); err != nil {
+		t.Fatalf("release bundled: %v", err)
+	}
+	enabled, err := mgr.Enable(ctx, "kimicode-plus.kct")
+	if err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	mux := http.NewServeMux()
+	mgr.Register(mux)
+
+	capsCSV := strings.Join(enabled.Capabilities, ",")
+	matchingQuery := url.Values{
+		"version":      {enabled.Version},
+		"updatedAt":    {enabled.UpdatedAt},
+		"capabilities": {capsCSV},
+	}.Encode()
+
+	// 1. Bare request (without revision query) returns 200 with authoritative metadata.
+	bareRec := httptest.NewRecorder()
+	mux.ServeHTTP(bareRec, httptest.NewRequest(http.MethodGet, APIPrefix+"/plugins/kimicode-plus.kct/assets/settings.js", nil))
+	if bareRec.Code != http.StatusOK {
+		t.Fatalf("bare asset fetch = %d %s", bareRec.Code, bareRec.Body.String())
+	}
+	var bareBody struct {
+		Path         string   `json:"path"`
+		Source       string   `json:"source"`
+		Version      string   `json:"version"`
+		UpdatedAt    string   `json:"updatedAt"`
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(bareRec.Body.Bytes(), &bareBody); err != nil {
+		t.Fatalf("decode bare asset body: %v", err)
+	}
+	if bareBody.Version != enabled.Version || bareBody.UpdatedAt != enabled.UpdatedAt || strings.Join(bareBody.Capabilities, ",") != capsCSV {
+		t.Fatalf("unexpected bare asset metadata: got=%+v want version=%q updatedAt=%q caps=%q", bareBody, enabled.Version, enabled.UpdatedAt, capsCSV)
+	}
+
+	// 2. Exact matching revision query returns 200 for both UTF-8 module and base64 binary asset.
+	matchRec := httptest.NewRecorder()
+	mux.ServeHTTP(matchRec, httptest.NewRequest(http.MethodGet, APIPrefix+"/plugins/kimicode-plus.kct/assets/settings.js?"+matchingQuery, nil))
+	if matchRec.Code != http.StatusOK || !strings.Contains(matchRec.Body.String(), "/*v1*/") {
+		t.Fatalf("matching asset fetch = %d %s", matchRec.Code, matchRec.Body.String())
+	}
+	binRec := httptest.NewRecorder()
+	mux.ServeHTTP(binRec, httptest.NewRequest(http.MethodGet, APIPrefix+"/plugins/kimicode-plus.kct/assets/assets/icon.bin?"+matchingQuery, nil))
+	if binRec.Code != http.StatusOK {
+		t.Fatalf("matching binary asset fetch = %d %s", binRec.Code, binRec.Body.String())
+	}
+	var binBody struct {
+		Encoding     string   `json:"encoding"`
+		Version      string   `json:"version"`
+		UpdatedAt    string   `json:"updatedAt"`
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(binRec.Body.Bytes(), &binBody); err != nil {
+		t.Fatalf("decode binary asset body: %v", err)
+	}
+	if binBody.Encoding != "base64" || binBody.Version != enabled.Version || binBody.UpdatedAt != enabled.UpdatedAt || strings.Join(binBody.Capabilities, ",") != capsCSV {
+		t.Fatalf("unexpected binary asset metadata: %+v", binBody)
+	}
+
+	// 3. Any mismatched version, updatedAt, or capabilities (including empty capabilities=) returns 409 PLUGIN_REVISION_MISMATCH.
+	mismatches := []struct {
+		name  string
+		query url.Values
+	}{
+		{
+			name:  "version mismatch",
+			query: url.Values{"version": {"1.0.1"}, "updatedAt": {enabled.UpdatedAt}, "capabilities": {capsCSV}},
+		},
+		{
+			name:  "updatedAt mismatch",
+			query: url.Values{"version": {enabled.Version}, "updatedAt": {"stale-timestamp"}, "capabilities": {capsCSV}},
+		},
+		{
+			name:  "capabilities mismatch",
+			query: url.Values{"version": {enabled.Version}, "updatedAt": {enabled.UpdatedAt}, "capabilities": {"ui:settings"}},
+		},
+		{
+			name:  "empty capabilities query mismatch",
+			query: url.Values{"version": {enabled.Version}, "updatedAt": {enabled.UpdatedAt}, "capabilities": {""}},
+		},
+	}
+	for _, tc := range mismatches {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, APIPrefix+"/plugins/kimicode-plus.kct/assets/settings.js?"+tc.query.Encode(), nil))
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "PLUGIN_REVISION_MISMATCH") {
+			t.Fatalf("%s: got %d %s, want 409 PLUGIN_REVISION_MISMATCH", tc.name, rec.Code, rec.Body.String())
+		}
 	}
 }

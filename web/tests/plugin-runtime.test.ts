@@ -5,7 +5,8 @@ import { Scope } from "../src/plugin-runtime/scope.js";
 import { createPluginRuntime, defaultTheme } from "../src/plugin-runtime/runtime.js";
 import { pluginHostBridge, syncPluginHost } from "../src/plugin-runtime/host.js";
 import { entryPath } from "../src/plugin-runtime/loader.js";
-import type { RuntimeRequest } from "../src/plugin-runtime/context.js";
+import { PluginError, type RuntimeRequest } from "../src/plugin-runtime/context.js";
+import { FakeDocument } from "./helpers/fake-dom.js";
 
 /** A transport that records what the runtime actually sent to the core. */
 function recordingTransport(respond: (path: string, body: unknown) => unknown = () => ({ value: {} })) {
@@ -1099,5 +1100,573 @@ test("a plugin can replace its own command callback by registering again", async
     "second",
     "re-registering a command kept the stale callback",
   );
+  runtime.dispose();
+});
+
+test("concurrent activate calls for the same plugin share one in-flight activation", async () => {
+  const host = fakeElement();
+  const runtime = createPluginRuntime({
+    slots: { sidebar: () => host },
+    request: async () => ({ value: {} }),
+  });
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  let activateCalls = 0;
+  const module = {
+    activate: async (context: Parameters<Parameters<typeof runtime.activate>[0]["activate"]>[0]) => {
+      activateCalls += 1;
+      await gate;
+      context.ui.mount("sidebar", () => {});
+    },
+  };
+  const install = { id: "plugin.singleflight", version: "1.0.0", granted: ["ui:sidebar"], token: "t" };
+  const first = runtime.activate(module, install);
+  const second = runtime.activate(module, install);
+  assert.strictEqual(first, second, "concurrent activate did not reuse the in-flight promise");
+
+  release();
+  const [one, two] = await Promise.all([first, second]);
+  assert.strictEqual(one, two);
+  assert.equal(activateCalls, 1, "module.activate executed more than once");
+  assert.equal(host.children.length, 1, "sidebar slot mounted more than once");
+  assert.deepEqual(runtime.stats(), { plugins: 1, decorators: 0 });
+  runtime.dispose();
+});
+
+test("deactivating a plugin while activation is pending cancels and cleans up without reporting failure", async () => {
+  const host = fakeElement();
+  const failures: Array<{ id: string; error: unknown }> = [];
+  const runtime = createPluginRuntime({
+    slots: { sidebar: () => host },
+    onError: (id, error) => failures.push({ id, error }),
+    request: async path => {
+      if (path === "/plugin-runtime/events.poll") return { value: { events: [], next: 1 } };
+      return { value: {} };
+    },
+  });
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  let onDisposeRan = false;
+  let returnedDisposeRan = false;
+  const module = {
+    activate: async (context: Parameters<Parameters<typeof runtime.activate>[0]["activate"]>[0]) => {
+      context.onDispose(() => {
+        onDisposeRan = true;
+      });
+      await gate;
+      context.ui.mount("sidebar", () => {});
+      context.events.on("cache", () => {});
+      return {
+        dispose() {
+          returnedDisposeRan = true;
+        },
+      };
+    },
+  };
+  const install = {
+    id: "plugin.cancelled",
+    version: "1.0.0",
+    granted: ["ui:sidebar", "metrics:read"],
+    token: "t",
+  };
+  const pending = runtime.activate(module, install);
+  runtime.deactivate(install.id);
+
+  await assert.rejects(
+    () => pending,
+    (error: unknown) =>
+      error instanceof PluginError &&
+      error.status === 409 &&
+      error.code === "PLUGIN_DISABLED" &&
+      /插件已停用/.test(error.message),
+  );
+  assert.equal(onDisposeRan, true, "onDispose callback did not run");
+  release();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(returnedDisposeRan, true, "returned dispose callback did not run");
+  assert.equal(host.children.length, 0, "mounted slot leaked after cancelled activation");
+  assert.equal(runtime.get(install.id), null, "cancelled plugin was registered as active");
+  assert.equal(runtime.stats().plugins, 0);
+  assert.equal(failures.length, 0, "deliberate deactivation was reported as an activation failure");
+  const deadline = Date.now() + 250;
+  while (runtime.eventLoops() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(runtime.eventLoops(), 0, "event loop leaked after cancelled activation");
+  runtime.dispose();
+});
+
+test("disposing the runtime while activation is pending cancels and cleans up", async () => {
+  const host = fakeElement();
+  const failures: Array<{ id: string; error: unknown }> = [];
+  const runtime = createPluginRuntime({
+    slots: { sidebar: () => host },
+    onError: (id, error) => failures.push({ id, error }),
+    request: async () => ({ value: {} }),
+  });
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  let cleaned = false;
+  const pending = runtime.activate(
+    {
+      activate: async context => {
+        await gate;
+        context.ui.mount("sidebar", () => {});
+        return () => {
+          cleaned = true;
+        };
+      },
+    },
+    { id: "plugin.disposed", version: "1.0.0", granted: ["ui:sidebar"], token: "t" },
+  );
+  runtime.dispose();
+
+  await assert.rejects(
+    () => pending,
+    (error: unknown) => error instanceof PluginError && error.code === "PLUGIN_DISABLED",
+  );
+  release();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(cleaned, true);
+  assert.equal(host.children.length, 0);
+  assert.equal(runtime.get("plugin.disposed"), null);
+  assert.equal(failures.length, 0);
+});
+
+test("synchronous re-entrant activate reuses the in-flight promise and activates once", async () => {
+  const host = fakeElement();
+  const runtime = createPluginRuntime({
+    slots: { sidebar: () => host },
+    request: async () => ({ value: {} }),
+  });
+  let activateCalls = 0;
+  let reentrant: Promise<unknown> | null = null;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  const install = { id: "plugin.reentrant", version: "1.0.0", granted: ["ui:sidebar"], token: "t" };
+  const module = {
+    activate: async (context: Parameters<Parameters<typeof runtime.activate>[0]["activate"]>[0]) => {
+      activateCalls += 1;
+      reentrant = runtime.activate(module, install);
+      context.ui.mount("sidebar", () => {});
+      await gate;
+    },
+  };
+  const outer = runtime.activate(module, install);
+  assert.strictEqual(reentrant, outer, "synchronous re-entrant activate did not receive the same promise");
+  assert.equal(activateCalls, 1, "module.activate ran more than once on synchronous re-entry");
+
+  release();
+  const [one, two] = await Promise.all([outer, reentrant!]);
+  assert.strictEqual(one, two);
+  assert.equal(host.children.length, 1);
+  runtime.dispose();
+});
+
+test("deactivating or disposing while activation never settles synchronously disposes mounted resources", async () => {
+  const host = fakeElement();
+  const failures: Array<{ id: string; error: unknown }> = [];
+  const runtime = createPluginRuntime({
+    slots: { sidebar: () => host },
+    onError: (id, error) => failures.push({ id, error }),
+    request: async path => {
+      if (path === "/plugin-runtime/events.poll") return { value: { events: [], next: 1 } };
+      return { value: {} };
+    },
+  });
+  let onDisposeRan = false;
+  let mountCleaned = false;
+  const never = new Promise<void>(() => {});
+  const stalledPromise = runtime.activate(
+    {
+      activate: async context => {
+        context.onDispose(() => {
+          onDisposeRan = true;
+        });
+        context.ui.mount("sidebar", () => () => {
+          mountCleaned = true;
+        });
+        context.events.on("cache", () => {});
+        await never;
+      },
+    },
+    { id: "plugin.stalled", version: "1.0.0", granted: ["ui:sidebar", "metrics:read"], token: "t" },
+  );
+  assert.equal(host.children.length, 1);
+  assert.equal(onDisposeRan, false);
+  assert.equal(mountCleaned, false);
+
+  runtime.deactivate("plugin.stalled");
+  assert.equal(onDisposeRan, true, "onDispose did not run synchronously on deactivate");
+  assert.equal(mountCleaned, true, "mounted cleanup did not run synchronously on deactivate");
+  assert.equal(host.children.length, 0, "mounted slot leaked when activation never resolved");
+  assert.equal(runtime.get("plugin.stalled"), null);
+  await assert.rejects(
+    () => stalledPromise,
+    (error: unknown) =>
+      error instanceof PluginError &&
+      error.status === 409 &&
+      error.code === "PLUGIN_DISABLED" &&
+      /插件已停用/.test(error.message),
+  );
+  assert.equal(failures.length, 0);
+  const deadline = Date.now() + 250;
+  while (runtime.eventLoops() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(runtime.eventLoops(), 0, "event loop leaked after deactivating stalled activation");
+
+  let disposeCleanupRan = false;
+  const stalledDisposePromise = runtime.activate(
+    {
+      activate: async context => {
+        context.onDispose(() => {
+          disposeCleanupRan = true;
+        });
+        context.ui.mount("sidebar", () => {});
+        await never;
+      },
+    },
+    { id: "plugin.stalled-dispose", version: "1.0.0", granted: ["ui:sidebar"], token: "t2" },
+  );
+  assert.equal(host.children.length, 1);
+  runtime.dispose();
+  assert.equal(disposeCleanupRan, true, "runtime.dispose did not synchronously clean up stalled activation");
+  assert.equal(host.children.length, 0);
+  await assert.rejects(
+    () => stalledDisposePromise,
+    (error: unknown) =>
+      error instanceof PluginError &&
+      error.status === 409 &&
+      error.code === "PLUGIN_DISABLED" &&
+      /插件已停用/.test(error.message),
+  );
+  assert.equal(failures.length, 0);
+});
+
+test("mountSettings scopes ctx.onDispose to the settings panel and cleans up during pending mount", async () => {
+  const runtime = createPluginRuntime({ slots: {}, request: async () => ({ value: {} }) });
+  let pluginDisposed = false;
+  const active = await runtime.activate(
+    {
+      activate: context => {
+        context.onDispose(() => {
+          pluginDisposed = true;
+        });
+      },
+    },
+    { id: "plugin.settings-scope", version: "1.0.0", granted: ["ui:settings"], token: "t" },
+  );
+
+  // Closing the settings panel disposes settings ctx.onDispose without disabling the plugin.
+  const page = fakeElement();
+  let settingsDisposed = 0;
+  const handle = await active.mountSettings(
+    {
+      renderSettings: (context, element) => {
+        element.append((element.ownerDocument as unknown as { createElement(tag: string): HTMLElement }).createElement("section"));
+        context.onDispose(() => {
+          settingsDisposed += 1;
+        });
+      },
+    },
+    page as unknown as HTMLElement,
+  );
+  assert.equal(page.children.length, 1);
+  handle.dispose();
+  assert.equal(settingsDisposed, 1, "settings ctx.onDispose did not run when settings handle was disposed");
+  assert.equal(page.children.length, 0);
+  assert.equal(pluginDisposed, false, "disposing settings panel unexpectedly disposed the plugin");
+  assert.strictEqual(runtime.get("plugin.settings-scope"), active);
+
+  // Deactivating the plugin while renderSettings is awaiting immediately runs registered cleanup and clears late DOM.
+  let releasePending!: () => void;
+  const pendingGate = new Promise<void>(resolve => {
+    releasePending = resolve;
+  });
+  let earlyDisposed = false;
+  let returnedDisposed = false;
+  const pendingPage = fakeElement();
+  const mountPromise = active.mountSettings(
+    {
+      renderSettings: async (context, element) => {
+        element.append((element.ownerDocument as unknown as { createElement(tag: string): HTMLElement }).createElement("section"));
+        context.onDispose(() => {
+          earlyDisposed = true;
+        });
+        await pendingGate;
+        element.append((element.ownerDocument as unknown as { createElement(tag: string): HTMLElement }).createElement("div"));
+        return () => {
+          returnedDisposed = true;
+        };
+      },
+    },
+    pendingPage as unknown as HTMLElement,
+  );
+  assert.equal(pendingPage.children.length, 1);
+
+  runtime.deactivate("plugin.settings-scope");
+  assert.equal(earlyDisposed, true, "settings onDispose did not run synchronously on plugin deactivation");
+  assert.equal(pendingPage.children.length, 0, "settings container was not cleared synchronously on deactivation");
+
+  releasePending();
+  await mountPromise;
+  assert.equal(returnedDisposed, true, "returned settings cleanup did not run after deactivation");
+  assert.equal(pendingPage.children.length, 0, "late DOM mounted after deactivation leaked in settings container");
+  runtime.dispose();
+});
+
+test("late completion of a released mountSettings does not clear or pollute a newly mounted settings container", async () => {
+  const runtime = createPluginRuntime({ slots: {}, request: async () => ({ value: {} }) });
+  const doc = new FakeDocument();
+  const sharedElement = doc.createElement("div");
+  doc.body.append(sharedElement);
+
+  const oldPlugin = await runtime.activate(
+    { activate: () => {} },
+    { id: "plugin.settings-race", version: "1.0.0", granted: ["ui:settings"], token: "t1" },
+  );
+
+  let releaseOldRender!: () => void;
+  const oldGate = new Promise<void>(resolve => {
+    releaseOldRender = resolve;
+  });
+  let oldEarlyDisposed = false;
+  let oldReturnedDisposed = false;
+
+  const oldMount = oldPlugin.mountSettings(
+    {
+      renderSettings: async (context, element) => {
+        const early = doc.createElement("section");
+        early.className = "old-early";
+        early.textContent = "Old Early";
+        element.append(early as unknown as HTMLElement);
+        context.onDispose(() => {
+          oldEarlyDisposed = true;
+        });
+        await oldGate;
+        const late = doc.createElement("div");
+        late.className = "old-late";
+        late.textContent = "Old Late";
+        element.append(late as unknown as HTMLElement);
+        return () => {
+          oldReturnedDisposed = true;
+        };
+      },
+    },
+    sharedElement as unknown as HTMLElement,
+  );
+  assert.equal(sharedElement.querySelector(".old-early")?.textContent, "Old Early");
+
+  runtime.deactivate("plugin.settings-race");
+  assert.equal(oldEarlyDisposed, true);
+  assert.equal(sharedElement.children.length, 0);
+
+  const newPlugin = await runtime.activate(
+    { activate: () => {} },
+    { id: "plugin.settings-race", version: "2.0.0", granted: ["ui:settings"], token: "t2" },
+  );
+  const newHandle = await newPlugin.mountSettings(
+    {
+      renderSettings: (_context, element) => {
+        const panel = doc.createElement("section");
+        panel.className = "new-settings";
+        panel.textContent = "New Settings v2";
+        element.append(panel as unknown as HTMLElement);
+      },
+    },
+    sharedElement as unknown as HTMLElement,
+  );
+  assert.equal(sharedElement.children.length, 1);
+  assert.equal(sharedElement.querySelector(".new-settings")?.textContent, "New Settings v2");
+
+  releaseOldRender();
+  const oldHandle = await oldMount;
+  oldHandle.dispose();
+
+  assert.equal(oldReturnedDisposed, true, "stale returned cleanup did not run");
+  assert.equal(sharedElement.children.length, 1, "stale settings cleanup cleared the new settings container");
+  assert.equal(
+    sharedElement.querySelector(".new-settings")?.textContent,
+    "New Settings v2",
+    "new settings content was lost after stale renderSettings settled",
+  );
+  assert.equal(sharedElement.querySelector(".old-early"), null, "stale early node leaked into shared container");
+  assert.equal(sharedElement.querySelector(".old-late"), null, "stale late node leaked into shared container");
+
+  // Also verify overlapping mounts on the same active plugin where the older mount resolves and disposes late.
+  let releaseOverlap!: () => void;
+  const overlapGate = new Promise<void>(resolve => {
+    releaseOverlap = resolve;
+  });
+  const staleMount = newPlugin.mountSettings(
+    {
+      renderSettings: async (_context, element) => {
+        await overlapGate;
+        const stale = doc.createElement("div");
+        stale.className = "overlap-stale";
+        stale.textContent = "Overlap Stale";
+        element.append(stale as unknown as HTMLElement);
+      },
+    },
+    sharedElement as unknown as HTMLElement,
+  );
+  const v3Handle = await newPlugin.mountSettings(
+    {
+      renderSettings: (_context, element) => {
+        const panel = doc.createElement("section");
+        panel.className = "v3-settings";
+        panel.textContent = "New Settings v3";
+        element.append(panel as unknown as HTMLElement);
+      },
+    },
+    sharedElement as unknown as HTMLElement,
+  );
+  releaseOverlap();
+  const staleHandle = await staleMount;
+  staleHandle.dispose();
+
+  assert.equal(sharedElement.children.length, 1);
+  assert.equal(sharedElement.querySelector(".v3-settings")?.textContent, "New Settings v3");
+  assert.equal(sharedElement.querySelector(".overlap-stale"), null);
+
+  newHandle.dispose();
+  v3Handle.dispose();
+  assert.equal(sharedElement.children.length, 0);
+  runtime.dispose();
+});
+
+test("mountSettings propagates AbortSignal to childScope for synchronous listener disposal and suppresses post-abort fault reporting", async () => {
+  const faults: Array<{ id: string; error: unknown }> = [];
+  const runtime = createPluginRuntime({
+    slots: {},
+    request: async () => ({ value: {} }),
+    onError: (id, error) => faults.push({ id, error }),
+  });
+  const doc = new FakeDocument();
+  const hostElement = doc.createElement("div");
+  doc.body.append(hostElement);
+
+  const active = await runtime.activate(
+    { activate: () => {} },
+    { id: "kimicode-plus.kct", version: "1.0.4", granted: ["ui:settings"], token: "tok-kct" },
+  );
+
+  // 1. Pre-aborted signal fails immediately with SETTINGS_MOUNT_CANCELLED without touching DOM or reporting faults.
+  const preAborted = new AbortController();
+  preAborted.abort();
+  let preAbortedCalled = false;
+  await assert.rejects(
+    active.mountSettings(
+      {
+        renderSettings: () => {
+          preAbortedCalled = true;
+        },
+      },
+      hostElement as unknown as HTMLElement,
+      { signal: preAborted.signal },
+    ),
+    (err: { code?: string }) => err?.code === "SETTINGS_MOUNT_CANCELLED",
+  );
+  assert.equal(preAbortedCalled, false);
+  assert.equal(hostElement.children.length, 0);
+  assert.equal(faults.length, 0);
+
+  // 2. KCT-style settings module registers window listener + ctx.onDispose before awaiting async credentials.list.
+  const fakeWindow = new EventTarget();
+  let settingsEventsReceived = 0;
+  let rejectPending!: (err: Error) => void;
+  const pendingCredentials = new Promise<void>((_resolve, reject) => {
+    rejectPending = reject;
+  });
+
+  const controllerA = new AbortController();
+  const mountA = active.mountSettings(
+    {
+      renderSettings: async (ctx, element) => {
+        const card = doc.createElement("section");
+        card.className = "kct-panel-a";
+        element.append(card as unknown as HTMLElement);
+        const onSettings = () => {
+          settingsEventsReceived += 1;
+        };
+        fakeWindow.addEventListener("ekdp-kct:settings", onSettings);
+        ctx.onDispose(() => {
+          fakeWindow.removeEventListener("ekdp-kct:settings", onSettings);
+          card.remove();
+        });
+        await pendingCredentials;
+      },
+    },
+    hostElement as unknown as HTMLElement,
+    { signal: controllerA.signal },
+  );
+
+  // Listener is active while panel A is open.
+  fakeWindow.dispatchEvent(new Event("ekdp-kct:settings"));
+  assert.equal(settingsEventsReceived, 1);
+
+  // Closing panel A triggers AbortSignal -> ctx.onDispose MUST remove listener synchronously before async request settles.
+  controllerA.abort();
+  assert.equal(hostElement.children.length, 0, "aborted panel mountRoot must be removed immediately");
+  fakeWindow.dispatchEvent(new Event("ekdp-kct:settings"));
+  assert.equal(settingsEventsReceived, 1, "window listener must be removed synchronously on abort before async request returns");
+
+  // Reopen panel B for the same plugin before panel A's pending request rejects.
+  let panelBEvents = 0;
+  const controllerB = new AbortController();
+  const handleB = await active.mountSettings(
+    {
+      renderSettings: (ctx, element) => {
+        const card = doc.createElement("section");
+        card.className = "kct-panel-b";
+        element.append(card as unknown as HTMLElement);
+        const onSettings = () => {
+          panelBEvents += 1;
+        };
+        fakeWindow.addEventListener("ekdp-kct:settings", onSettings);
+        ctx.onDispose(() => {
+          fakeWindow.removeEventListener("ekdp-kct:settings", onSettings);
+          card.remove();
+        });
+      },
+    },
+    hostElement as unknown as HTMLElement,
+    { signal: controllerB.signal },
+  );
+
+  // Reject panel A's stale async request: must NOT call onError / PLUGIN_SETTINGS_FAILED and must leave panel B intact.
+  rejectPending(new Error("credentials.list failed after close"));
+  await assert.rejects(mountA, /credentials\.list failed after close/);
+  assert.equal(faults.length, 0, "rejection after AbortSignal must never be reported as PLUGIN_SETTINGS_FAILED");
+  assert.ok(hostElement.querySelector(".kct-panel-b"), "reopened panel B must stay mounted");
+  fakeWindow.dispatchEvent(new Event("ekdp-kct:settings"));
+  assert.equal(settingsEventsReceived, 1);
+  assert.equal(panelBEvents, 1);
+
+  // 3. A genuine non-aborted renderSettings failure while plugin is active STILL reports PLUGIN_SETTINGS_FAILED.
+  const controllerFail = new AbortController();
+  const failEl = doc.createElement("div");
+  await assert.rejects(
+    active.mountSettings(
+      {
+        renderSettings: async () => {
+          throw new Error("real render crash");
+        },
+      },
+      failEl as unknown as HTMLElement,
+      { signal: controllerFail.signal },
+    ),
+    /real render crash/,
+  );
+  assert.equal(faults.length, 1);
+  assert.equal(faults[0]!.id, "kimicode-plus.kct");
+  assert.equal((faults[0]!.error as { code?: string }).code, "PLUGIN_SETTINGS_FAILED");
+
+  handleB.dispose();
   runtime.dispose();
 });

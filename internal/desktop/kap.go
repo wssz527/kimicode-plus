@@ -159,10 +159,34 @@ type KAPClient struct {
 // cache layer roots its session scan at the same directory.
 func (k *KAPClient) Home() string { return k.home }
 
+var defaultKAPNoRedirectClient = &http.Client{
+	Transport:     &http.Transport{Proxy: nil},
+	CheckRedirect: rejectKAPRedirect,
+}
+
+func rejectKAPRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
+func noRedirectHTTPClient(base *http.Client) *http.Client {
+	if base == nil {
+		return defaultKAPNoRedirectClient
+	}
+	cloned := *base
+	cloned.CheckRedirect = rejectKAPRedirect
+	return &cloned
+}
+
 func NewKAPClient(home string) *KAPClient {
 	return &KAPClient{
-		home: filepath.Clean(home), watched: map[string]bool{}, client: &http.Client{Transport: &http.Transport{Proxy: nil}},
-		backoffMin: 500 * time.Millisecond, backoffMax: 30 * time.Second,
+		home:    filepath.Clean(home),
+		watched: map[string]bool{},
+		client: &http.Client{
+			Transport:     &http.Transport{Proxy: nil},
+			CheckRedirect: rejectKAPRedirect,
+		},
+		backoffMin: 500 * time.Millisecond,
+		backoffMax: 30 * time.Second,
 	}
 }
 
@@ -245,6 +269,140 @@ func readKAPEndpoint(home string, expectedPID int) (string, string, error) {
 	return "http://" + net.JoinHostPort(host, strconv.Itoa(instances[0].Port)), token, nil
 }
 
+func kapOriginMismatchError() error {
+	return &NativeError{
+		Code:    "KAP_ORIGIN_MISMATCH",
+		Message: "当前窗口连接的官方服务实例与增强核心不一致，已中止保存",
+		Status:  http.StatusConflict,
+	}
+}
+
+func canonicalLoopbackOrigin(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errors.New("缺少官方服务来源地址")
+	}
+	if strings.ContainsAny(trimmed, "?#") {
+		return "", errors.New("官方服务来源地址无效")
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return "", errors.New("官方服务来源地址无效")
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", errors.New("官方服务来源地址协议无效")
+	}
+	if parsed.Opaque != "" || parsed.User != nil {
+		return "", errors.New("官方服务来源地址无效")
+	}
+	if (parsed.Path != "" && parsed.Path != "/") || (parsed.RawPath != "" && parsed.RawPath != "/") {
+		return "", errors.New("官方服务来源地址不能包含路径")
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return "", errors.New("官方服务来源地址无效")
+	}
+	host, portStr, err := net.SplitHostPort(parsed.Host)
+	if err != nil || host == "" || portStr == "" {
+		return "", errors.New("官方服务来源地址缺少有效端口")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 || strconv.Itoa(port) != portStr {
+		return "", errors.New("官方服务来源地址端口无效")
+	}
+	var canonicalHost string
+	if strings.EqualFold(host, "localhost") {
+		canonicalHost = "localhost"
+	} else {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return "", errors.New("官方服务来源地址必须是本机回环地址")
+		}
+		canonicalHost = ip.String()
+	}
+	return scheme + "://" + net.JoinHostPort(canonicalHost, strconv.Itoa(port)), nil
+}
+
+func readKAPEndpointForOrigin(home, expectedOrigin string) (string, string, error) {
+	if home == "" || !filepath.IsAbs(home) {
+		return "", "", errors.New("必须指定独立的 KIMI_CODE_HOME 绝对路径")
+	}
+	canonicalExpected, err := canonicalLoopbackOrigin(expectedOrigin)
+	if err != nil {
+		return "", "", err
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "server", "instances"))
+	if err != nil {
+		return "", "", errors.New("未找到官方服务实例，请确认隔离客户端已启动")
+	}
+	type instance struct {
+		Port        int    `json:"port"`
+		Host        string `json:"host"`
+		PID         int    `json:"pid"`
+		HeartbeatAt int64  `json:"heartbeat_at"`
+		origin      string
+	}
+	matched := []instance{}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(home, "server", "instances", entry.Name()))
+		if err != nil || len(data) > 65536 {
+			continue
+		}
+		var item instance
+		if json.Unmarshal(data, &item) != nil || item.Port <= 0 || item.Port > 65535 {
+			continue
+		}
+		host := strings.TrimSpace(item.Host)
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		origin, originErr := canonicalLoopbackOrigin("http://" + net.JoinHostPort(host, strconv.Itoa(item.Port)))
+		if originErr != nil || origin != canonicalExpected {
+			continue
+		}
+		item.origin = origin
+		matched = append(matched, item)
+	}
+	if len(matched) == 0 {
+		return "", "", kapOriginMismatchError()
+	}
+	sort.Slice(matched, func(i, j int) bool { return matched[i].HeartbeatAt > matched[j].HeartbeatAt })
+	secret, err := os.ReadFile(filepath.Join(home, "server.token"))
+	if err != nil {
+		return "", "", errors.New("官方服务访问凭据不可用，请重新打开隔离客户端")
+	}
+	token := strings.TrimSpace(string(secret))
+	if token == "" || len(token) > 4096 {
+		return "", "", errors.New("官方服务访问凭据格式无效")
+	}
+	return matched[0].origin, token, nil
+}
+
+func (k *KAPClient) resolvePinnedEndpoint(canonicalExpected string) (base, token string, injected bool, err error) {
+	k.mu.Lock()
+	injected = !k.resolved && k.base != "" && k.token != ""
+	injectedBase := k.base
+	injectedToken := k.token
+	home := k.home
+	k.mu.Unlock()
+
+	if injected {
+		canonicalBase, baseErr := canonicalLoopbackOrigin(injectedBase)
+		if baseErr != nil || canonicalBase != canonicalExpected {
+			return "", "", true, kapOriginMismatchError()
+		}
+		return canonicalBase, injectedToken, true, nil
+	}
+	base, token, err = readKAPEndpointForOrigin(home, canonicalExpected)
+	if err != nil {
+		return "", "", false, err
+	}
+	return base, token, false, nil
+}
+
 func (k *KAPClient) endpoint() (string, string, error) {
 	if err := k.resolve(); err != nil {
 		return "", "", err
@@ -256,6 +414,42 @@ func (k *KAPClient) endpoint() (string, string, error) {
 
 func (k *KAPClient) Request(ctx context.Context, method, path string, body any) (json.RawMessage, error) {
 	return k.requestWithPrefix(ctx, NativeAPI, method, path, body)
+}
+
+func (k *KAPClient) RequestPinnedOrigin(ctx context.Context, expectedOrigin, method, path string, body any) (json.RawMessage, error) {
+	if !strings.HasPrefix(path, "/") || strings.Contains(path, "..") {
+		return nil, errors.New("官方接口路径无效")
+	}
+	canonicalExpected, err := canonicalLoopbackOrigin(expectedOrigin)
+	if err != nil {
+		return nil, err
+	}
+	var payload []byte
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		payload = encoded
+	}
+	base, token, injected, err := k.resolvePinnedEndpoint(canonicalExpected)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := k.sendToEndpoint(ctx, base, token, NativeAPI, method, path, payload)
+	if err == nil {
+		return raw, nil
+	}
+	if !retryableRequest(ctx, method, err) {
+		return nil, err
+	}
+	if !injected {
+		base, token, _, err = k.resolvePinnedEndpoint(canonicalExpected)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return k.sendToEndpoint(ctx, base, token, NativeAPI, method, path, payload)
 }
 
 func (k *KAPClient) requestWithPrefix(ctx context.Context, prefix, method, path string, body any) (json.RawMessage, error) {
@@ -312,6 +506,10 @@ func (k *KAPClient) sendWithPrefix(ctx context.Context, prefix, method, path str
 	if err != nil {
 		return nil, err
 	}
+	return k.sendToEndpoint(ctx, base, token, prefix, method, path, payload)
+}
+
+func (k *KAPClient) sendToEndpoint(ctx context.Context, base, token, prefix, method, path string, payload []byte) (json.RawMessage, error) {
 	var reader io.Reader
 	if payload != nil {
 		reader = bytes.NewReader(payload)
@@ -327,7 +525,7 @@ func (k *KAPClient) sendWithPrefix(ctx context.Context, prefix, method, path str
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	response, err := k.client.Do(req)
+	response, err := noRedirectHTTPClient(k.client).Do(req)
 	if err != nil {
 		return nil, &kapTransportError{message: "无法连接官方会话服务", cause: err, sent: !unsentFailure(err)}
 	}
@@ -338,6 +536,13 @@ func (k *KAPClient) sendWithPrefix(ctx context.Context, prefix, method, path str
 	}
 	if response.StatusCode == http.StatusUnauthorized {
 		return nil, &NativeError{Code: "NATIVE_UNAUTHORIZED", Message: "官方会话服务拒绝了当前访问凭据，请重新打开客户端", Status: response.StatusCode}
+	}
+	if response.StatusCode >= 300 && response.StatusCode < 400 {
+		return nil, &NativeError{
+			Code:    "NATIVE_REDIRECT",
+			Message: "官方接口返回异常重定向 HTTP " + strconv.Itoa(response.StatusCode),
+			Status:  http.StatusBadGateway,
+		}
 	}
 	var envelope nativeEnvelope
 	if len(data) > 0 && json.Unmarshal(data, &envelope) == nil && (envelope.Code != 0 || envelope.Message != "" || envelope.Data != nil) {

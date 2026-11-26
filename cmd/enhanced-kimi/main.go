@@ -271,8 +271,10 @@ func runCore(updateAPIBaseURL string, updateHTTPClient *http.Client) error {
 			log.Printf("native enhancement not attached: %s", hostError)
 			// A stale installed record would otherwise keep claiming the interface
 			// is attached after a restart that failed to reattach.
-			_ = desktop.RecordAttach(instance.Dir, err)
-		} else if hostResult != nil {
+			if !desktop.IsAttachStateRecorded(err) && !desktop.IsAttachPersistFailed(err) {
+				_ = desktop.RecordAttach(instance.Dir, err)
+			}
+		} else if hostResult != nil && !desktop.IsAttachStateRecordedResult(hostResult) {
 			_ = desktop.RecordAttach(instance.Dir, hostResult)
 		}
 	}

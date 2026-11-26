@@ -113,8 +113,7 @@ function NumberField({ label, value, min, max, unit, hideLabel = false, hint, va
   hideLabel?: boolean;
   hint?: string;
   disabled?: boolean;
-  /** Extra rule beyond the numeric range; returns a message when the value is
-   * rejected. 0-versus-2..240 for the "other provider" TTL is one of these. */
+  /** Extra rule beyond the numeric range; returns a message when the value is rejected. */
   validate?: (value: number) => string | null;
   onCommit: (value: number | null) => void;
   onEditingChange?: (editing: boolean) => void;

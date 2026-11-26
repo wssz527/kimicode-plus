@@ -82,7 +82,7 @@ func (b *windowsBridge) renewalWindow() time.Duration {
 }
 
 var windowsBridgeFetchPermissions = []string{"core:read", "settings:write", "models:read", "usage:read", "usage:write", "tasks:read", "tasks:write", "adapter:write", "plugins:read", "plugins:write", "chat:read", "chat:write"}
-var windowsBridgeNativePermissions = []string{"core:read", "settings:write", "models:write", "tasks:read", "tasks:write", "usage:read", "credentials:read", "credentials:write", "adapter:write", "plugins:write", "update:read", "update:write"}
+var windowsBridgeNativePermissions = []string{"core:read", "settings:write", "models:read", "models:write", "tasks:read", "tasks:write", "usage:read", "credentials:read", "credentials:write", "adapter:write", "plugins:write", "update:read", "update:write"}
 
 func (b *windowsBridge) allowRequest() bool {
 	b.mu.Lock()
@@ -429,7 +429,7 @@ func (a *App) dispatchWindowsBridge(
 func allowedWindowsBridgeAction(action string) bool {
 	switch action {
 	case "bootstrap", "features.get", "features.set", "events.poll", "sessions.list", "session.view", "session.watch", "session.unwatch", "session.create", "session.send", "session.abort", "session.reply", "handoff",
-		"keepalive.session.get", "keepalive.session.set", "config.get", "config.save", "providers.updateModel", "attach.status", "attach.enable", "attach.disable", "attach.reopen",
+		"keepalive.session.get", "keepalive.session.set", "config.get", "config.save", "providers.updateModel", "providers.updateModels", "providers.modelSuggestion", "providers.saveOfficialForm", "attach.status", "attach.enable", "attach.disable", "attach.reopen",
 		"diagnostics.get", "contracts.status", "contracts.report", "update.status", "update.check", "update.apply", "update.autoCheck",
 		"cache.summary", "cache.sessions", "cache.history", "cache.retention", "cache.receipts", "cache.turns", "automation.get", "automation.set", "recovery.get", "recovery.set", "recovery.watch", "recovery.unwatch", "recovery.check", "managed.usage", "quota.balances",
 		"accounts.list", "accounts.saveCurrent", "accounts.beginAdd", "accounts.completeAdd", "accounts.rename", "accounts.delete", "accounts.refreshQuotas", "accounts.switchPreflight", "accounts.switch", "accounts.cancelPending", "accounts.resetVault",

@@ -7,6 +7,12 @@ async function installNativeRenderer(options) {
   let activeRemove = null;
   let publishedUI = null;
   let publishedPlugins = null;
+  const pluginBridgeListeners = new Set();
+  function notifyPluginBridgeListeners() {
+    for (const fn of [...pluginBridgeListeners]) {
+      try { fn(); } catch {}
+    }
+  }
   let publishedBrowserNav = null;
   const prevRemove = prevUI && typeof prevUI.remove === 'function'
     ? Promise.resolve().then(() => prevUI.remove()).catch(() => {})
@@ -44,7 +50,36 @@ async function installNativeRenderer(options) {
   function bridgeCredentialFailure(status, code) {
     return bridgeCredentialCodes.has(code) || ((status === 401 || status === 403) && code === `HTTP_${status}`);
   }
-  async function bridgeRequest(action, payload) {
+  function bridgeAbortReason(signal) {
+    if (signal?.reason !== undefined) return signal.reason;
+    if (typeof DOMException === 'function') return new DOMException('The operation was aborted.', 'AbortError');
+    return Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+  }
+  function sleepWithSignal(ms, signal) {
+    if (signal?.aborted) return Promise.reject(bridgeAbortReason(signal));
+    return new Promise((resolve, reject) => {
+      let done = false;
+      let onAbort;
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        if (onAbort) signal?.removeEventListener?.('abort', onAbort);
+        resolve();
+      }, ms);
+      if (signal) {
+        onAbort = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          reject(bridgeAbortReason(signal));
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+  }
+  async function bridgeRequest(action, payload, reqOptions) {
+    const signal = reqOptions?.signal || null;
+    if (signal?.aborted) throw bridgeAbortReason(signal);
     const replayable = action === 'update.status' || action === 'events.poll'
       || (action === 'core.fetch' && payload?.method === 'GET');
     const id = typeof globalThis.crypto?.randomUUID === 'function'
@@ -53,14 +88,19 @@ async function installNativeRenderer(options) {
     let response;
     let body;
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (signal?.aborted) throw bridgeAbortReason(signal);
       try {
         response = await nativeFetch(options.endpoint + '/ekd/native/v1', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-EKD-Bridge': options.bridgeKey },
           body: nativeStringify({ protocol: 1, id, action, payload }),
+          ...(signal ? { signal } : {}),
         });
         body = await response.json().catch(() => null);
       } catch (error) {
+        if (signal?.aborted || error?.name === 'AbortError') {
+          throw signal?.aborted ? bridgeAbortReason(signal) : error;
+        }
         if (!replayable || attempt === 1) {
           const wrapped = new Error(replayable ? bridgeCredentialMessage : '增强核心连接中断，操作结果未知。请先查看当前状态。');
           wrapped.code = replayable ? 'BRIDGE_SESSION_EXPIRED' : 'BRIDGE_OUTCOME_UNKNOWN';
@@ -69,22 +109,24 @@ async function installNativeRenderer(options) {
           wrapped.cause = error;
           throw wrapped;
         }
-        await new Promise(resolve => setTimeout(resolve, 250));
+        await sleepWithSignal(250, signal);
         continue;
       }
+      if (signal?.aborted) throw bridgeAbortReason(signal);
       const code = body?.error?.code || (!response.ok ? `HTTP_${response.status}` : '');
       const refused = (!response.ok || body?.error) && bridgeRejectedBeforeDispatch(code);
       if (!refused || attempt === 1) break;
       // A rotated bridge key or a rebinding window is visible for a few hundred
       // milliseconds. One retry rides that out instead of surfacing an error
       // that reads like the official account credentials were lost.
-      await new Promise(resolve => setTimeout(resolve, 250));
+      await sleepWithSignal(250, signal);
     }
     if (!response.ok || body?.error) {
       const code = body?.error?.code || `HTTP_${response.status}`;
       const error = new Error(body?.error?.message || `增强桥返回 HTTP ${response.status}`);
       error.code = code;
-      error.status = response.status;
+      error.status = Number.isInteger(body?.error?.status) ? body.error.status : response.status;
+      if (Number.isInteger(body?.error?.kapCode)) error.kapCode = body.error.kapCode;
       if (bridgeCredentialFailure(response.status, code)) {
         error.message = bridgeCredentialMessage;
         error.code = 'BRIDGE_SESSION_EXPIRED';
@@ -96,7 +138,9 @@ async function installNativeRenderer(options) {
     return body?.result;
   }
   const transport = {
-    async request(action, payload = {}) {
+    async request(action, payload = {}, reqOptions) {
+      const signal = reqOptions?.signal || null;
+      if (signal?.aborted) throw bridgeAbortReason(signal);
       if (windowsLoopback) {
         if (action === 'window.openSettings') {
           window.__ekdNativeUI?.openSettings?.(typeof payload?.tab === 'string' ? payload.tab : '');
@@ -141,7 +185,7 @@ async function installNativeRenderer(options) {
           return { browserId: opened ? 'external' : '' };
         }
       }
-      return bridgeRequest(action, payload);
+      return bridgeRequest(action, payload, reqOptions);
     },
   };
   const moduleURL = URL.createObjectURL(new Blob([options.moduleSource], { type: 'text/javascript' }));
@@ -218,8 +262,6 @@ async function installNativeRenderer(options) {
     keepAliveMenuHandle: null,
     keepAliveMenuSessionId: '',
     keepAliveMenuOutside: null,
-    keepAliveSuppress: new Map(),
-    restoreNotifyCompletion: null,
     unsubscribeConfig: null,
     unsubscribeAccounts: null,
     unsubscribeKeepAlive: null,
@@ -235,9 +277,13 @@ async function installNativeRenderer(options) {
     popoutRoot: null,
     pluginReleases: new Map(),
     pluginRevisions: new Map(),
+    pluginActivating: new Map(),
+    pluginSyncStep: null,
+    deferPluginActivations: true,
     pluginTokens: new Map(),
     pluginAssets: new Map(),
     pluginSettings: new Map(),
+    pluginSettingsRequests: new Map(),
     watchedSession: '',
     browserNavListeners: new Map(),
     contractState: module.createDOMContractState(),
@@ -918,35 +964,6 @@ async function installNativeRenderer(options) {
     toast.append(body, dismiss);
     stack.append(toast);
     setTimeout(() => toast.remove(), 9000);
-  }
-  function installKeepAliveNotifySuppress() {
-    if (state.restoreNotifyCompletion) return;
-    try {
-      const store = document.querySelector('#app')?.__vue_app__?.config.globalProperties.$pinia?._s?.get('kimi.notifications');
-      if (!store || typeof store.maybeNotifyCompletion !== 'function') return;
-      const original = store.maybeNotifyCompletion;
-      store.maybeNotifyCompletion = function patchedNotifyCompletion(sessionId, payload) {
-        const entry = state.keepAliveSuppress.get(sessionId);
-        if (entry) {
-          const now = Date.now();
-          if (now <= entry.expiresAt) {
-            if (!entry.promptId || !payload?.promptId || entry.promptId === payload.promptId) {
-              return;
-            }
-          } else {
-            state.keepAliveSuppress.delete(sessionId);
-          }
-        }
-        return original.apply(this, arguments);
-      };
-      state.restoreNotifyCompletion = () => {
-        if (store.maybeNotifyCompletion !== original) {
-          store.maybeNotifyCompletion = original;
-        }
-      };
-    } catch {
-      // ignore if notifications store is unavailable
-    }
   }
   function syncSessionInfoKeepAlive() {
     if (options.surface !== 'host' || options.popout || state.removed) return;
@@ -2104,6 +2121,13 @@ async function installNativeRenderer(options) {
       }
     }
   }
+  let watchChain = Promise.resolve();
+  let nativeTabClick = null;
+  let sidebarResetClick = null;
+  let settingsTabClick = null;
+  let settingsScroll = null;
+  let onConfigSaved = null;
+  let onAccountSwitched = null;
   let removePromise = null;
   state.remove = () => (removePromise ??= (async () => {
     if (state.removed) return;
@@ -2126,15 +2150,15 @@ async function installNativeRenderer(options) {
     state.unsubscribePlugins?.();
     disposeUpdateSurface();
     state.channel?.close();
-    state.restoreNotifyCompletion?.();
-    state.restoreNotifyCompletion = null;
-    window.removeEventListener('ekd:config-saved', onConfigSaved);
-    window.removeEventListener('ekd:account-switched', onAccountSwitched);
+    if (onConfigSaved) window.removeEventListener('ekd:config-saved', onConfigSaved);
+    if (onAccountSwitched) window.removeEventListener('ekd:account-switched', onAccountSwitched);
     closeAccountSwitchModal();
     closeKeepAliveMenu();
     for (const node of document.querySelectorAll('[data-ekd-account-menu],[data-ekd-keepalive-row],[data-ekd-keepalive-wrap],[data-ekd-toast-stack],[data-ekd-update-pill],[data-ekd-update-popover],[data-ekd-plugins-tab],[data-ekd-settings-tab],[data-ekd-official-section],[data-ekd-account-modal],[data-ekd-keepalive-popover]')) node.remove();
     document.removeEventListener('visibilitychange', pluginRefresh);
     window.removeEventListener('focus', pluginRefresh);
+    for (const activating of [...state.pluginActivating.values()]) activating.cancel();
+    state.pluginActivating.clear();
     for (const release of [...state.pluginReleases.values()]) release();
     for (const entry of [...state.pluginPanels.values()]) entry.dispose?.();
     state.pluginPanels.clear();
@@ -2143,17 +2167,24 @@ async function installNativeRenderer(options) {
     state.pluginEntries.clear();
     state.pluginReleases.clear();
     state.pluginRevisions.clear();
+    state.pluginActivationErrors?.clear();
+    for (const req of [...state.pluginSettingsRequests.values()]) {
+      req.cancelled = true;
+      req.disposeOwned?.();
+    }
+    state.pluginSettingsRequests.clear();
     for (const release of [...state.pluginSettings.values()]) release.dispose();
     state.pluginSettings.clear();
     state.browserNavListeners.clear();
-    if (window.__ekdPluginBrowserNavigated === publishedBrowserNav) delete window.__ekdPluginBrowserNavigated;
+    if (publishedBrowserNav && window.__ekdPluginBrowserNavigated === publishedBrowserNav) delete window.__ekdPluginBrowserNavigated;
     state.plugins?.dispose();
     state.plugins = null;
-    if (window.__ekdPlugins === publishedPlugins) delete window.__ekdPlugins;
-    document.removeEventListener('click', nativeTabClick, true);
-    document.removeEventListener('click', sidebarResetClick, true);
-    document.removeEventListener('click', settingsTabClick, true);
-    document.removeEventListener('scroll', settingsScroll, true);
+    pluginBridgeListeners.clear();
+    if (publishedPlugins && window.__ekdPlugins === publishedPlugins) delete window.__ekdPlugins;
+    if (nativeTabClick) document.removeEventListener('click', nativeTabClick, true);
+    if (sidebarResetClick) document.removeEventListener('click', sidebarResetClick, true);
+    if (settingsTabClick) document.removeEventListener('click', settingsTabClick, true);
+    if (settingsScroll) document.removeEventListener('scroll', settingsScroll, true);
     clearTimeout(state.settingsScrollTimer);
     clearTimeout(state.contractReportTimer);
     state.contractReportTimer = null;
@@ -2171,7 +2202,7 @@ async function installNativeRenderer(options) {
     state.providerEnhance = null;
     nativeStyle.remove();
     URL.revokeObjectURL(moduleURL);
-    if (window.__ekdNativeUI === publishedUI || window.__ekdNativeUI === pendingUI) delete window.__ekdNativeUI;
+    if ((publishedUI && window.__ekdNativeUI === publishedUI) || window.__ekdNativeUI === pendingUI) delete window.__ekdNativeUI;
     await Promise.race([unwatchActiveSession(), new Promise(resolve => setTimeout(resolve, 250))]);
   })());
   activeRemove = state.remove;
@@ -2179,14 +2210,14 @@ async function installNativeRenderer(options) {
     await state.remove();
     return { status: 'removed', surface: options.surface || 'host', domRevision: 1 };
   }
-  const nativeTabClick = event => {
+  nativeTabClick = event => {
     const clickedNative = event.target.closest('.ptb-tab:not([data-ekdp-plugin-panel])')
       || event.target.closest('.sit-link:not([data-ekd-entry]), .pt-body .pl button.ui-menu-item:not([data-ekd-entry])');
     if (!clickedNative) return;
     if (clickedNative.classList?.contains('ptb-tab') && event.target.closest('.ptb-x')) return;
     if (state.activePluginPanel) deactivatePluginPanel(state.activePluginPanel, false);
   };
-  const sidebarResetClick = event => {
+  sidebarResetClick = event => {
     const newChat = event.target.closest('button.btn-new-chat:not([data-ekd-sidebar-nav])');
     const sessionRow = event.target.closest('[data-session-id]');
     const clickedSession = sessionRow && !event.target.closest('[data-session-id] button:not(.row)');
@@ -2195,7 +2226,7 @@ async function installNativeRenderer(options) {
       if (handle.mode === 'page') handle.dispose();
     }
   };
-  const settingsTabClick = event => {
+  settingsTabClick = event => {
     const clicked = event.target.closest('.settings-tab-list button.tab[role="tab"]');
     const tab = clicked && !clicked.hasAttribute('data-ekd-settings-tab') ? clicked : null;
     if (tab) {
@@ -2207,7 +2238,7 @@ async function installNativeRenderer(options) {
       setTimeout(() => ensure(), 40);
     }
   };
-  const settingsScroll = event => {
+  settingsScroll = event => {
     if (!state.settingsActiveTab || event.target !== state.settingsBody) return;
     const body = state.settingsBody;
     body.classList.add('scrolling');
@@ -2261,7 +2292,6 @@ async function installNativeRenderer(options) {
     state.unsubscribeUpdate = makeHost(() => {}).subscribe('update', applyUpdateStatus);
     void transport.request('update.status').then(applyUpdateStatus).catch(() => {});
   }
-  let watchChain = Promise.resolve();
   function syncActiveSessionWatch(targetId) {
     watchChain = watchChain.then(async () => {
       try {
@@ -2330,7 +2360,7 @@ async function installNativeRenderer(options) {
       contractDegraded('官方配置订阅', error);
     }
   }, { detached: true }), null);
-  const onConfigSaved = () => {
+  onConfigSaved = () => {
     const store = piniaStore('kimi.config');
     if (typeof store?.loadConfig === 'function') {
       void store.loadConfig().then(() => {
@@ -2339,7 +2369,7 @@ async function installNativeRenderer(options) {
     }
   };
   window.addEventListener('ekd:config-saved', onConfigSaved);
-  const onAccountSwitched = () => {
+  onAccountSwitched = () => {
     void refreshOfficialAuth();
   };
   window.addEventListener('ekd:account-switched', onAccountSwitched);
@@ -2354,15 +2384,8 @@ async function installNativeRenderer(options) {
       void refreshAccountsCache(true);
     }
   });
-  installKeepAliveNotifySuppress();
   state.unsubscribeKeepAlive = accountEventHost.subscribe('keepalive', event => {
     if (!event || typeof event !== 'object') return;
-    if (event.type === 'keepalive.suppress' && event.sessionId) {
-      const expiresAt = Date.parse(event.expiresAt || '') || (Date.now() + 5 * 60 * 1000);
-      state.keepAliveSuppress.set(event.sessionId, { promptId: event.promptId || '', expiresAt });
-      installKeepAliveNotifySuppress();
-      return;
-    }
     if (event.type === 'keepalive.alert') {
       pushKeepAliveToast(event);
       if (event.sessionId) void fetchSessionKeepAlive(event.sessionId, true);
@@ -2897,7 +2920,7 @@ async function installNativeRenderer(options) {
   // plugin bug: the renderer is simply still holding a token the core revoked.
   // Counting those would turn every normal disable into a reported failure and,
   // worse, would let a permanent 401 accumulate into a code-fault verdict.
-  const passiveRefusals = new Set(['PLUGIN_IDENTITY_REJECTED', 'PLUGIN_DISABLED', 'MANAGER_CLOSED', 'SAFE_MODE', 'PLUGIN_NOT_FOUND']);
+  const passiveRefusals = new Set(['PLUGIN_IDENTITY_REJECTED', 'PLUGIN_DISABLED', 'MANAGER_CLOSED', 'SAFE_MODE', 'PLUGIN_NOT_FOUND', 'PLUGIN_REVISION_MISMATCH']);
   function isPassiveRefusal(error) {
     return passiveRefusals.has(error?.code) || error?.status === 401;
   }
@@ -2939,38 +2962,140 @@ async function installNativeRenderer(options) {
     reportFault(id, error, true);
   }
 
-  let syncPromise = null;
-  let syncPending = false;
+  let reconcileChain = Promise.resolve();
+  // Shared helper outside the activation block (which keeps its own inline
+  // `pluginRevision` because the desktop contract probe slices that block and
+  // runs it standalone). Both spell the same identity: version, updatedAt, capabilities.
+  const pluginRevisionOf = plugin => `${plugin?.version || ''}|${plugin?.updatedAt || ''}|${Array.isArray(plugin?.capabilities) ? plugin.capabilities.join(',') : ''}`;
+
+  function parsePluginRevision(revision) {
+    if (typeof revision !== 'string' || !revision) return null;
+    const first = revision.indexOf('|');
+    if (first < 0) return null;
+    const second = revision.indexOf('|', first + 1);
+    if (second < 0) return null;
+    return {
+      version: revision.slice(0, first),
+      updatedAt: revision.slice(first + 1, second),
+      capabilities: revision.slice(second + 1),
+    };
+  }
+
+  function makeRevisionMismatchError(message = '插件版本已变更，请重新同步') {
+    const error = new Error(message);
+    error.code = 'PLUGIN_REVISION_MISMATCH';
+    return error;
+  }
+
+  function makePluginDisabledError(message = '插件未运行，无法打开设置页') {
+    const error = new Error(message);
+    error.code = 'PLUGIN_DISABLED';
+    return error;
+  }
+
+  function makeHostUnmountedError(message = '插件未运行或宿主已卸载') {
+    const error = new Error(message);
+    error.code = 'HOST_UNMOUNTED';
+    return error;
+  }
+
+  function makeActivationFailedError(cause) {
+    const detail = cause?.message ? String(cause.message) : '';
+    const message = detail ? `插件未运行，无法打开设置页：${detail}` : '插件未运行，无法打开设置页';
+    const error = new Error(message);
+    const causeCode = typeof cause?.code === 'string' ? cause.code : '';
+    error.code = (
+      causeCode
+      && causeCode !== 'PLUGIN_DISABLED'
+      && causeCode !== 'PLUGIN_REVISION_MISMATCH'
+      && causeCode !== 'SETTINGS_MOUNT_CANCELLED'
+    ) ? causeCode : 'PLUGIN_ACTIVATION_FAILED';
+    if (cause !== undefined && cause !== null) error.cause = cause;
+    return error;
+  }
+
+  function isLocalRevisionCurrent(id, revision) {
+    return state.pluginRevisions.get(id) === revision || state.pluginActivating?.get(id)?.revision === revision;
+  }
 
   async function loadPluginAsset(id, entryPath, requiredExport = 'activate', revision = '') {
     // The revision is part of the key: a hot update changes version/updatedAt,
     // so the old bundle can never be served for the new one.
     const key = id + '/' + entryPath + '/' + requiredExport + (revision ? '/' + revision : '');
+    if (revision && !isLocalRevisionCurrent(id, revision)) {
+      throw makeRevisionMismatchError();
+    }
     if (state.pluginAssets.has(key)) return state.pluginAssets.get(key);
-    const asset = await coreGet('/plugins/' + encodeURIComponent(id) + '/assets/' + entryPath.split('/').map(encodeURIComponent).join('/'));
+    let assetPath = '/plugins/' + encodeURIComponent(id) + '/assets/' + entryPath.split('/').map(encodeURIComponent).join('/');
+    if (revision) {
+      const parsed = parsePluginRevision(revision);
+      if (parsed) {
+        assetPath += '?version=' + encodeURIComponent(parsed.version)
+          + '&updatedAt=' + encodeURIComponent(parsed.updatedAt)
+          + '&capabilities=' + encodeURIComponent(parsed.capabilities);
+      }
+    }
+    const asset = await coreGet(assetPath);
+    if (state.removed || isStale()) {
+      const disabledError = new Error('插件已停用');
+      disabledError.code = 'PLUGIN_DISABLED';
+      throw disabledError;
+    }
+    if (revision) {
+      const validMeta = typeof asset?.version === 'string'
+        && typeof asset?.updatedAt === 'string'
+        && Array.isArray(asset?.capabilities)
+        && pluginRevisionOf(asset) === revision;
+      if (!validMeta || !isLocalRevisionCurrent(id, revision)) {
+        throw makeRevisionMismatchError();
+      }
+    }
     const loaded = await module.loadPluginModule(asset?.source || '', requiredExport);
+    if (state.removed || isStale()) {
+      const disabledError = new Error('插件已停用');
+      disabledError.code = 'PLUGIN_DISABLED';
+      throw disabledError;
+    }
+    if (revision && !isLocalRevisionCurrent(id, revision)) {
+      throw makeRevisionMismatchError();
+    }
     state.pluginAssets.set(key, loaded);
     return loaded;
   }
 
-  async function syncPlugins() {
+  async function syncPlugins(syncOpts) {
     if (state.removed || isStale()) return;
-    // Concurrent triggers (a settings action plus a feature change) must not run
-    // two reconciliations against the same maps.
-    if (syncPromise) {
-      syncPending = true;
-      return syncPromise;
+    let pendingActivations = null;
+    const step = reconcileChain.then(async () => {
+      if (state.removed || isStale()) return;
+      const result = await reconcilePlugins();
+      pendingActivations = result?.pendingActivations || null;
+    });
+    reconcileChain = step.catch(() => {});
+    state.pluginSyncStep = step;
+    step.finally(() => {
+      if (state.pluginSyncStep === step) state.pluginSyncStep = null;
+    }).catch(() => {});
+    await step;
+    if (!pendingActivations) return;
+    const waitMs = syncOpts?.waitForActivationMs;
+    if (typeof waitMs !== 'number' || !Number.isFinite(waitMs) || waitMs < 0) {
+      await pendingActivations;
+      return;
     }
-    syncPromise = (async () => {
-      do {
-        syncPending = false;
-        await reconcilePlugins();
-      } while (syncPending && !state.removed && !isStale());
-    })();
+    pendingActivations.catch(() => {});
+    if (waitMs <= 0) return;
+    let timer;
     try {
-      await syncPromise;
+      await Promise.race([
+        pendingActivations,
+        new Promise(resolve => {
+          timer = setTimeout(resolve, waitMs);
+          timer?.unref?.();
+        }),
+      ]);
     } finally {
-      syncPromise = null;
+      clearTimeout(timer);
     }
   }
 
@@ -2988,7 +3113,50 @@ async function installNativeRenderer(options) {
     if (state.removed || isStale()) return;
     const items = list?.items || [];
     state.pluginList = items;
+    const nextListSignature = items
+      .map(item => `${item.id}|${item.enabled ? 1 : 0}|${item.state || ''}|${pluginRevisionOf(item)}`)
+      .join('\n');
+    const listChanged = state.pluginListSignature !== nextListSignature;
+    state.pluginListSignature = nextListSignature;
     const enabled = items.filter(plugin => plugin.enabled && (options.surface !== 'plugin' || plugin.id === options.pluginId));
+    if (!enabled.length) {
+      const hadLiveState = Boolean(
+        state.plugins
+        || state.pluginReleases.size
+        || state.pluginActivating?.size
+        || state.pluginSettings.size
+        || state.pluginSettingsRequests?.size,
+      );
+      for (const entry of [...(state.pluginActivating?.values() || [])]) entry.cancel();
+      state.pluginActivating?.clear();
+      for (const [reqId, req] of [...(state.pluginSettingsRequests?.entries() || [])]) {
+        if (req.waitingForActivation || req.loadingAsset) {
+          if (state.pluginReleases.has(reqId)) {
+            if (!req.unmountedError) req.unmountedError = makePluginDisabledError('插件未运行，无法打开设置页');
+            req.cancelled = true;
+            req.disposeOwned?.();
+            state.pluginSettingsRequests.delete(reqId);
+          }
+          continue;
+        }
+        if (!req.unmountedError) req.unmountedError = makePluginDisabledError('插件未运行或宿主已卸载');
+        req.cancelled = true;
+        req.disposeOwned?.();
+        state.pluginSettingsRequests.delete(reqId);
+      }
+      for (const release of [...state.pluginSettings.values()]) release.dispose();
+      state.pluginSettings.clear();
+      for (const release of [...state.pluginReleases.values()]) release();
+      state.pluginReleases.clear();
+      state.pluginRevisions.clear();
+      state.pluginActivationErrors?.clear();
+      state.pluginTokens.clear();
+      state.pluginAssets.clear();
+      state.plugins?.dispose();
+      state.plugins = null;
+      if (listChanged || hadLiveState) notifyPluginBridgeListeners();
+      return [];
+    }
     if (!state.plugins) {
       state.plugins = module.createPluginRuntime({
         slots: pluginSlots,
@@ -3017,87 +3185,479 @@ async function installNativeRenderer(options) {
     // the DOM together ensures hot updates activate the new bundle cleanly.
     const pluginRevision = plugin => `${plugin?.version || ''}|${plugin?.updatedAt || ''}|${Array.isArray(plugin?.capabilities) ? plugin.capabilities.join(',') : ''}`;
     const wanted = new Map(enabled.map(plugin => [plugin.id, plugin]));
+    let removedOrChanged = false;
     for (const id of [...state.pluginReleases.keys()]) {
       const next = wanted.get(id);
       if (next && state.pluginRevisions.get(id) === pluginRevision(next)) continue;
+      removedOrChanged = true;
+      const pendingSettings = state.pluginSettingsRequests?.get(id);
+      if (pendingSettings) {
+        const keepWaiting = Boolean(
+          next
+          && (pendingSettings.waitingForActivation || pendingSettings.loadingAsset)
+          && (!pendingSettings.matchesPlugin || pendingSettings.matchesPlugin(next)),
+        );
+        if (!keepWaiting) {
+          if (!pendingSettings.unmountedError) {
+            if (!next) {
+              const disabledError = new Error(
+                (pendingSettings.waitingForActivation || pendingSettings.loadingAsset)
+                  ? '插件未运行，无法打开设置页'
+                  : '插件未运行或宿主已卸载',
+              );
+              disabledError.code = 'PLUGIN_DISABLED';
+              pendingSettings.unmountedError = disabledError;
+            } else {
+              const mismatchError = new Error('插件未运行或宿主已卸载：插件版本已更新，正在同步最新版本');
+              mismatchError.code = 'PLUGIN_REVISION_MISMATCH';
+              pendingSettings.unmountedError = mismatchError;
+            }
+          }
+          pendingSettings.cancelled = true;
+          pendingSettings.disposeOwned?.();
+          state.pluginSettingsRequests.delete(id);
+        }
+      }
       state.pluginSettings.get(id)?.dispose();
       state.pluginSettings.delete(id);
       state.pluginReleases.get(id)?.();
       state.pluginReleases.delete(id);
       state.pluginRevisions.delete(id);
+      state.pluginActivationErrors?.delete(id);
       state.pluginTokens.delete(id);
       for (const key of [...state.pluginAssets.keys()]) {
         if (key.startsWith(id + '/')) state.pluginAssets.delete(key);
       }
     }
+    const pluginActivating = (state.pluginActivating ||= new Map());
+    for (const [id, activatingEntry] of [...pluginActivating.entries()]) {
+      const next = wanted.get(id);
+      if (next && activatingEntry.revision === pluginRevision(next)) continue;
+      activatingEntry.cancel();
+      pluginActivating.delete(id);
+      state.pluginActivationErrors?.delete(id);
+      state.pluginTokens.delete(id);
+      for (const key of [...state.pluginAssets.keys()]) {
+        if (key.startsWith(id + '/')) state.pluginAssets.delete(key);
+      }
+    }
+    const activationTasks = [];
     for (const plugin of enabled) {
       if (state.removed || isStale() || !state.plugins) return;
       if (state.pluginReleases.has(plugin.id)) continue;
-      try {
-        const token = plugin.token || (await corePost('/plugins/' + encodeURIComponent(plugin.id) + '/token'))?.token;
-        if (state.removed || isStale() || !state.plugins) return;
-        if (!token) continue;
-        state.pluginTokens.set(plugin.id, token);
-        const entry = await loadPluginAsset(plugin.id, module.pluginEntryPath(plugin.entry?.renderer || 'renderer.js'), 'activate', pluginRevision(plugin));
-        if (state.removed || isStale() || !state.plugins) return;
-        const runtime = state.plugins;
-        await runtime.activate(entry, {
-          id: plugin.id,
-          version: plugin.version,
-          apiVersion: plugin.apiVersion,
-          granted: plugin.capabilities || [],
-          token,
-        });
-        if (state.removed || isStale() || state.plugins !== runtime) {
-          runtime.deactivate(plugin.id);
-          return;
+      const revision = pluginRevision(plugin);
+      if (pluginActivating.get(plugin.id)?.revision === revision) continue;
+      const runtime = state.plugins;
+      let cancelReject = null;
+      const cancelPromise = new Promise((_, reject) => { cancelReject = reject; });
+      cancelPromise.catch(() => {});
+      const activatingEntry = {
+        revision,
+        runtime,
+        cancelled: false,
+        promise: null,
+        cancel() {
+          if (activatingEntry.cancelled) return;
+          activatingEntry.cancelled = true;
+          activatingEntry.runtime?.deactivate(plugin.id);
+          const disabledError = new Error('插件已停用');
+          disabledError.code = 'PLUGIN_DISABLED';
+          cancelReject?.(disabledError);
+        },
+      };
+      pluginActivating.set(plugin.id, activatingEntry);
+      const task = (async () => {
+        try {
+          const tokenPromise = plugin.token
+            ? Promise.resolve({ token: plugin.token })
+            : Promise.resolve(corePost('/plugins/' + encodeURIComponent(plugin.id) + '/token'));
+          tokenPromise.catch(() => {});
+          const token = (await Promise.race([tokenPromise, cancelPromise]))?.token;
+          if (activatingEntry.cancelled || pluginActivating.get(plugin.id) !== activatingEntry) {
+            const disabledError = new Error('插件已停用');
+            disabledError.code = 'PLUGIN_DISABLED';
+            throw disabledError;
+          }
+          if (state.removed || isStale() || !state.plugins) return;
+          if (!token) return;
+          state.pluginTokens.set(plugin.id, token);
+          const entryPath = module.pluginEntryPath(plugin.entry?.renderer || 'renderer.js');
+          const assetKey = plugin.id + '/' + entryPath + '/activate' + (revision ? '/' + revision : '');
+          const assetPromise = Promise.resolve(loadPluginAsset(plugin.id, entryPath, 'activate', revision));
+          assetPromise.then(() => {
+            if (activatingEntry.cancelled && pluginActivating.get(plugin.id)?.revision !== revision && state.pluginRevisions.get(plugin.id) !== revision) {
+              state.pluginAssets.delete(assetKey);
+            }
+          }, () => {});
+          const entry = await Promise.race([assetPromise, cancelPromise]);
+          if (activatingEntry.cancelled || pluginActivating.get(plugin.id) !== activatingEntry) {
+            const disabledError = new Error('插件已停用');
+            disabledError.code = 'PLUGIN_DISABLED';
+            throw disabledError;
+          }
+          if (state.removed || isStale() || !state.plugins) return;
+          const activatePromise = Promise.resolve(runtime.activate(entry, {
+            id: plugin.id,
+            version: plugin.version,
+            apiVersion: plugin.apiVersion,
+            granted: plugin.capabilities || [],
+            token,
+          }));
+          activatePromise.catch(() => {});
+          await Promise.race([activatePromise, cancelPromise]);
+          if (activatingEntry.cancelled || pluginActivating.get(plugin.id) !== activatingEntry) {
+            const disabledError = new Error('插件已停用');
+            disabledError.code = 'PLUGIN_DISABLED';
+            throw disabledError;
+          }
+          if (state.removed || isStale() || state.plugins !== runtime) {
+            runtime.deactivate(plugin.id);
+            return;
+          }
+          state.pluginReleases.set(plugin.id, () => runtime.deactivate(plugin.id));
+          state.pluginRevisions.set(plugin.id, pluginRevision(plugin));
+          state.pluginActivationErrors?.delete(plugin.id);
+        } catch (error) {
+          if (state.removed || isStale()) return;
+          const revisionMismatch = error?.code === 'PLUGIN_REVISION_MISMATCH';
+          const cancelled = activatingEntry.cancelled || error?.code === 'PLUGIN_DISABLED' || revisionMismatch;
+          if (!cancelled) {
+            (state.pluginActivationErrors ||= new Map()).set(plugin.id, { revision, error });
+            // One plugin failing to activate must not stop the others. The plugin
+            // that failed is stopped by the core with the reason recorded.
+            noteActivationFault(plugin.id, error);
+          }
+          if (pluginActivating.get(plugin.id) === activatingEntry) {
+            state.pluginTokens.delete(plugin.id);
+            state.pluginRevisions.delete(plugin.id);
+            // A faulted or cancelled plugin's cached bundle must not be reused on
+            // the retry: the core may hand out a repaired or upgraded entry.
+            for (const key of [...state.pluginAssets.keys()]) {
+              if (key.startsWith(plugin.id + '/')) state.pluginAssets.delete(key);
+            }
+          }
+          if (revisionMismatch && !activatingEntry.cancelled && !state.removed && !isStale()) {
+            const resync = typeof syncPlugins === 'function' ? syncPlugins : state.syncPlugins;
+            if (typeof resync === 'function') {
+              void Promise.resolve().then(() => {
+                if (state.removed || isStale()) return;
+                return resync({ waitForActivationMs: 0 });
+              }).catch(() => {});
+            }
+          }
+        } finally {
+          if (pluginActivating.get(plugin.id) === activatingEntry) {
+            pluginActivating.delete(plugin.id);
+          }
+          if (!state.removed && !isStale() && typeof notifyPluginBridgeListeners === 'function') {
+            notifyPluginBridgeListeners();
+          }
         }
-        state.pluginReleases.set(plugin.id, () => runtime.deactivate(plugin.id));
-        state.pluginRevisions.set(plugin.id, pluginRevision(plugin));
-      } catch (error) {
-        if (state.removed || isStale()) return;
-        // One plugin failing to activate must not stop the others. The plugin
-        // that failed is stopped by the core with the reason recorded.
-        noteActivationFault(plugin.id, error);
-        state.pluginTokens.delete(plugin.id);
-        state.pluginRevisions.delete(plugin.id);
-        // A faulted plugin's cached bundle must not be reused on the retry: the
-        // core may hand out a repaired entry under the same path.
-        for (const key of [...state.pluginAssets.keys()]) {
-          if (key.startsWith(plugin.id + '/')) state.pluginAssets.delete(key);
-        }
-      }
+      })();
+      activatingEntry.promise = task;
+      activationTasks.push(task);
     }
+    if ((removedOrChanged || (typeof listChanged === 'boolean' && listChanged)) && typeof notifyPluginBridgeListeners === 'function') {
+      notifyPluginBridgeListeners();
+    }
+    const pendingActivations = Promise.all(activationTasks);
+    if (state.deferPluginActivations) return { pendingActivations };
+    await pendingActivations;
   }
 
   // The settings surface owns the settings module lifecycle: it asks for the
   // module and the container, and closing the page releases both. The runtime
   // never mounts a plugin's settings page on its own, because the host's own
   // settings body belongs to the official client.
-  //
-  // This copy exists because the activation block below keeps its own inline
-  // `pluginRevision` (the desktop contract probe slices that block and runs it
-  // standalone). Both spell the same identity: version, updatedAt, capabilities.
-  const pluginRevisionOf = plugin => `${plugin?.version || ''}|${plugin?.updatedAt || ''}|${Array.isArray(plugin?.capabilities) ? plugin.capabilities.join(',') : ''}`;
-  async function mountPluginSettings(id, element) {
-    if (state.removed) throw new Error('插件宿主已卸载');
-    const plugin = (state.pluginList || []).find(item => item.id === id);
-    const active = state.plugins?.get(id);
-    if (!active) throw new Error('插件未运行，无法打开设置页');
-    if (!plugin?.entry?.settings) throw new Error('这个插件没有设置页');
-    const settingsModule = await loadPluginAsset(id, module.pluginEntryPath(plugin.entry.settings), 'renderSettings', pluginRevisionOf(plugin));
-    const release = await active.mountSettings(settingsModule, element);
-    state.pluginSettings.set(id, release);
-    return () => {
-      release.dispose();
-      if (state.pluginSettings.get(id) === release) state.pluginSettings.delete(id);
+  let settingsMountSeq = 0;
+  async function mountPluginSettings(id, element, mountOptions) {
+    const signal = mountOptions?.signal;
+    const expectedVersion = typeof mountOptions?.version === 'string' && mountOptions.version ? mountOptions.version : null;
+    const expectedUpdatedAt = typeof mountOptions?.updatedAt === 'string' && mountOptions.updatedAt ? mountOptions.updatedAt : null;
+    const expectedCaps = Array.isArray(mountOptions?.capabilities) ? mountOptions.capabilities.join(',') : null;
+    const matchesExpectedPlugin = item => {
+      if (!item || !item.enabled) return false;
+      if (expectedVersion !== null && (item.version || '') !== expectedVersion) return false;
+      if (expectedUpdatedAt !== null && (item.updatedAt || '') !== expectedUpdatedAt) return false;
+      if (expectedCaps !== null && (Array.isArray(item.capabilities) ? item.capabilities.join(',') : '') !== expectedCaps) return false;
+      return true;
     };
+    const isDesiredActive = () => {
+      const inst = state.plugins?.get(id);
+      if (!inst) return false;
+      const listed = (state.pluginList || []).find(item => item.id === id);
+      if (!listed || !matchesExpectedPlugin(listed)) return false;
+      const activeRev = state.pluginRevisions?.get(id);
+      if (activeRev !== undefined && activeRev !== pluginRevisionOf(listed)) return false;
+      if (state.pluginActivating?.has(id)) return false;
+      return true;
+    };
+    const makeCancelledError = () => {
+      const error = new Error('插件设置页挂载已取消');
+      error.code = 'SETTINGS_MOUNT_CANCELLED';
+      return error;
+    };
+    if (signal?.aborted) throw makeCancelledError();
+    if (state.removed || isStale()) throw makeHostUnmountedError('插件宿主已卸载');
+
+    const mountController = typeof AbortController === 'function' ? new AbortController() : null;
+    const reqEntry = {
+      seq: ++settingsMountSeq,
+      cancelled: false,
+      waitingForActivation: true,
+      loadingAsset: false,
+      matchesPlugin: matchesExpectedPlugin,
+      unmountedError: null,
+      release: null,
+      disposed: false,
+      disposeOwned: null,
+      controller: mountController,
+    };
+    const prevReq = state.pluginSettingsRequests.get(id);
+    if (prevReq) {
+      prevReq.cancelled = true;
+      prevReq.disposeOwned?.();
+    }
+    const prevRelease = state.pluginSettings.get(id);
+    if (prevRelease) {
+      state.pluginSettings.delete(id);
+      prevRelease.dispose?.();
+    }
+    state.pluginSettingsRequests.set(id, reqEntry);
+
+    const disposeOwned = () => {
+      if (reqEntry.disposed) return;
+      reqEntry.disposed = true;
+      signal?.removeEventListener?.('abort', onAbort);
+      if (mountController && !mountController.signal.aborted) {
+        mountController.abort();
+      }
+      const owned = reqEntry.release;
+      reqEntry.release = null;
+      if (owned) {
+        if (state.pluginSettings.get(id) === owned) state.pluginSettings.delete(id);
+        owned.dispose?.();
+      }
+      if (state.pluginSettingsRequests.get(id) === reqEntry) {
+        state.pluginSettingsRequests.delete(id);
+      }
+    };
+    const onAbort = () => {
+      reqEntry.cancelled = true;
+      disposeOwned();
+    };
+    reqEntry.disposeOwned = disposeOwned;
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+
+    const isCancelled = () => Boolean(
+      reqEntry.cancelled
+      || reqEntry.disposed
+      || signal?.aborted
+      || mountController?.signal.aborted
+      || state.pluginSettingsRequests.get(id) !== reqEntry,
+    );
+
+    const raceMountSignal = promise => {
+      const resolveAbortError = () => {
+        if (state.removed || isStale()) {
+          return makeHostUnmountedError('插件未运行或宿主已卸载');
+        }
+        if (signal?.aborted) {
+          return makeCancelledError();
+        }
+        if (reqEntry.unmountedError) {
+          return reqEntry.unmountedError;
+        }
+        if (active && state.plugins?.get(id) !== active) {
+          return reqEntry.loadingAsset
+            ? makeRevisionMismatchError()
+            : makeHostUnmountedError('插件未运行或宿主已卸载');
+        }
+        if (isCancelled()) {
+          return makeCancelledError();
+        }
+        return null;
+      };
+      const immediateError = resolveAbortError();
+      if (immediateError) return Promise.reject(immediateError);
+      const ctrlSignal = mountController?.signal || signal || null;
+      if (!ctrlSignal) return promise;
+      let onCtrlAbort;
+      const abortPromise = new Promise((_, reject) => {
+        onCtrlAbort = () => reject(resolveAbortError() || makeCancelledError());
+        ctrlSignal.addEventListener('abort', onCtrlAbort, { once: true });
+      });
+      const guarded = Promise.resolve(promise);
+      guarded.catch(() => {});
+      return Promise.race([guarded, abortPromise]).finally(() => {
+        ctrlSignal.removeEventListener('abort', onCtrlAbort);
+      });
+    };
+
+    let active = null;
+    const abortOrUnmounted = () => {
+      if (state.removed || isStale()) {
+        return makeHostUnmountedError('插件未运行或宿主已卸载');
+      }
+      if (signal?.aborted) {
+        return makeCancelledError();
+      }
+      if (reqEntry.unmountedError) {
+        return reqEntry.unmountedError;
+      }
+      if (active && state.plugins?.get(id) !== active) {
+        return makeHostUnmountedError('插件未运行或宿主已卸载');
+      }
+      if (isCancelled()) return makeCancelledError();
+      return null;
+    };
+
+    const maxRevisionRetries = 2;
+    let settingsModule = null;
+    try {
+      for (let attempt = 0; ; attempt += 1) {
+        active = null;
+        reqEntry.waitingForActivation = true;
+        reqEntry.loadingAsset = false;
+        if (!isDesiredActive()) {
+          if (state.pluginSyncStep) {
+            await raceMountSignal(state.pluginSyncStep.catch(() => {}));
+          }
+          if (state.removed || isStale()) throw makeHostUnmountedError('插件宿主已卸载');
+          if (reqEntry.unmountedError) throw reqEntry.unmountedError;
+          if (isCancelled()) throw makeCancelledError();
+
+          if (!isDesiredActive()) {
+            const listedNow = (state.pluginList || []).find(item => item.id === id);
+            const wantRev = listedNow && matchesExpectedPlugin(listedNow) ? pluginRevisionOf(listedNow) : null;
+            const activatingEntry = state.pluginActivating?.get(id);
+            const activatingMatch = Boolean(wantRev && activatingEntry?.promise && activatingEntry.revision === wantRev);
+            if (!activatingMatch) {
+              void syncPlugins({ waitForActivationMs: 0 }).catch(() => {});
+              if (state.pluginSyncStep) {
+                await raceMountSignal(state.pluginSyncStep.catch(() => {}));
+              }
+            }
+          }
+          if (state.removed || isStale()) throw makeHostUnmountedError('插件宿主已卸载');
+          if (reqEntry.unmountedError) throw reqEntry.unmountedError;
+          if (isCancelled()) throw makeCancelledError();
+
+          while (!isDesiredActive()) {
+            const activating = state.pluginActivating?.get(id);
+            if (!activating?.promise) break;
+            const listed = (state.pluginList || []).find(item => item.id === id);
+            if (listed && !matchesExpectedPlugin(listed)) break;
+            await raceMountSignal(activating.promise.catch(() => {}));
+            if (state.removed || isStale()) throw makeHostUnmountedError('插件宿主已卸载');
+            if (reqEntry.unmountedError) throw reqEntry.unmountedError;
+            if (isCancelled()) throw makeCancelledError();
+          }
+        }
+
+        reqEntry.waitingForActivation = false;
+        if (state.removed || isStale()) throw makeHostUnmountedError('插件宿主已卸载');
+        if (reqEntry.unmountedError) throw reqEntry.unmountedError;
+        if (isCancelled()) throw makeCancelledError();
+
+        const plugin = (state.pluginList || []).find(item => item.id === id);
+        if (!plugin || !plugin.enabled) {
+          throw makePluginDisabledError('插件未运行，无法打开设置页');
+        }
+        if (!matchesExpectedPlugin(plugin)) {
+          throw makeRevisionMismatchError('插件版本已更新，正在同步最新版本');
+        }
+        const expectedRev = pluginRevisionOf(plugin);
+        active = state.plugins?.get(id);
+        if (!isDesiredActive() || !active) {
+          const recorded = state.pluginActivationErrors?.get(id);
+          const cause = recorded && (!recorded.revision || recorded.revision === expectedRev)
+            ? recorded.error
+            : null;
+          throw makeActivationFailedError(cause);
+        }
+        if (!plugin?.entry?.settings) throw new Error('这个插件没有设置页');
+
+        try {
+          reqEntry.loadingAsset = true;
+          settingsModule = await raceMountSignal(
+            loadPluginAsset(id, module.pluginEntryPath(plugin.entry.settings), 'renderSettings', pluginRevisionOf(plugin)),
+          );
+          reqEntry.loadingAsset = false;
+          break;
+        } catch (err) {
+          reqEntry.loadingAsset = false;
+          if (err?.code === 'PLUGIN_REVISION_MISMATCH' && attempt < maxRevisionRetries && !state.removed && !isStale() && !isCancelled()) {
+            active = null;
+            reqEntry.waitingForActivation = true;
+            reqEntry.unmountedError = null;
+            void syncPlugins({ waitForActivationMs: 0 }).catch(() => {});
+            if (state.pluginSyncStep) {
+              await raceMountSignal(state.pluginSyncStep.catch(() => {}));
+            }
+            if (state.removed || isStale()) throw makeHostUnmountedError('插件宿主已卸载');
+            if (reqEntry.unmountedError) throw reqEntry.unmountedError;
+            if (isCancelled()) throw makeCancelledError();
+            continue;
+          }
+          throw err;
+        }
+      }
+      const beforeMountError = abortOrUnmounted();
+      if (beforeMountError) throw beforeMountError;
+
+      const mountPromise = Promise.resolve().then(() => active.mountSettings(
+        settingsModule,
+        element,
+        mountController ? { signal: mountController.signal } : undefined,
+      ));
+      mountPromise.then(lateRelease => {
+        if (reqEntry.disposed || reqEntry.cancelled || state.removed || isStale() || state.plugins?.get(id) !== active) {
+          lateRelease?.dispose?.();
+        }
+      }, () => {});
+      let release;
+      try {
+        release = await raceMountSignal(mountPromise);
+      } catch (mountErr) {
+        if (state.removed || isStale()) {
+          throw makeHostUnmountedError('插件未运行或宿主已卸载');
+        }
+        if (signal?.aborted) {
+          throw makeCancelledError();
+        }
+        if (reqEntry.unmountedError) {
+          throw reqEntry.unmountedError;
+        }
+        throw mountErr;
+      }
+      const afterMountError = abortOrUnmounted();
+      if (afterMountError) {
+        release?.dispose?.();
+        throw afterMountError;
+      }
+      reqEntry.release = release;
+      state.pluginSettings.set(id, release);
+      return () => {
+        disposeOwned();
+      };
+    } catch (error) {
+      disposeOwned();
+      throw error;
+    }
   }
   publishedPlugins = {
     sync: syncPlugins,
     mountSettings: mountPluginSettings,
     invokeCommand: target => state.plugins?.invokeLocal(target),
     list: () => state.pluginList || [],
+    subscribe: listener => {
+      if (typeof listener !== 'function') return () => {};
+      pluginBridgeListeners.add(listener);
+      return () => {
+        pluginBridgeListeners.delete(listener);
+      };
+    },
   };
   window.__ekdPlugins = publishedPlugins;
 
@@ -3108,7 +3668,10 @@ async function installNativeRenderer(options) {
   // has to touch it. It belongs to the official window only: the settings
   // surface has no provider page.
   state.providerEnhance = options.surface === 'host' ? createProviderEnhance({ request: transport.request }) : null;
-  state.providerEnhance?.install();
+  state.providerEnhance?.install({
+    excludeOrigins: [options.endpoint],
+    readOfficialConfig: () => probe('官方配置', () => piniaStore('kimi.config')?.config ?? null, null),
+  });
   // Features and plugin lifecycle events drive syncPlugins() immediately, so
   // enable/disable takes effect on the next frame without waiting for window focus.
   const pluginEventHost = makeHost(() => {});

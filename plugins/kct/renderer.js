@@ -19,6 +19,7 @@ const BATCH_CHARS = 4000;
 const CONCURRENCY = 3;
 const STREAM_DEBOUNCE_MS = 700;
 const STREAM_MAX_WAIT_MS = 3000;
+const KCT_DISPOSE_KEY = "__ekdpKctDispose";
 
 const TARGET_LANGUAGES = ["zh", "en", "ja", "ko", "es", "fr", "de", "ru"];
 const AUTO = "__auto__";
@@ -76,7 +77,10 @@ export async function activate(ctx) {
         state.skipped = false;
         state.translatedSource = "";
         state.translatedPrefix = "";
+        state.completedSource = "";
+        state.completedPrefix = "";
         state.failedSource = "";
+        state.failedSignature = "";
         state.preferOriginal = false;
         state.body.querySelector(".ekdp-kct-translated")?.remove();
         setView(state, "original");
@@ -99,12 +103,18 @@ export async function activate(ctx) {
   window.addEventListener("ekdp-kct:cache", onCacheCleared);
 
   const decoration = ctx.ui.decorate("thinking", (block, info) => {
+    const prevDispose = block[KCT_DISPOSE_KEY];
+    if (typeof prevDispose === "function") {
+      try {
+        prevDispose();
+      } catch {}
+    }
     const enhanced = block.matches("[data-ekdp-thinking]");
-    const style = enhanced ? injectStyles(block.getRootNode()) : null;
-    const root = block.getRootNode();
     const head = enhanced ? block.querySelector("summary") : block.querySelector("button.think-head");
     const body = enhanced ? block.querySelector("[data-ekdp-thinking-body]") : block.querySelector(".think-body-inner") ?? block.querySelector(".think-body");
     if (!head || !body) return;
+    const root = block.getRootNode();
+    const style = enhanced ? injectStyles(root) : null;
 
     const bar = document.createElement("div");
     bar.className = "ekdp-kct-bar";
@@ -150,8 +160,11 @@ export async function activate(ctx) {
       source: "",
       translatedSource: "",
       translatedPrefix: "",
-      // 上次失败的原文；相同内容不再自动重试，避免 429 时的重试风暴。
+      completedSource: "",
+      completedPrefix: "",
+      // 上次失败的原文与配置签名；相同前缀在同配置下不再自动重试，避免 429 时的重试风暴。
       failedSource: "",
+      failedSignature: "",
       view: "original",
       rendered: false,
       running: false,
@@ -161,12 +174,14 @@ export async function activate(ctx) {
       skipped: false,
       generation: 0,
       timer: 0,
+      timerDue: 0,
+      timerForce: false,
       streamSince: 0,
       // 译文是用哪一组设置产生的；设置变化后与之比较以决定是否重译。
       signature: translationSignature(engine.settings),
     };
     blocks.add(state);
-    bar.hidden = !info.open || enhanced;
+    bar.hidden = !info.open;
 
     toggle.addEventListener("click", () => {
       if (state.rendered) {
@@ -176,13 +191,15 @@ export async function activate(ctx) {
       }
       if (state.running) return;
       state.failedSource = "";
+      state.failedSignature = "";
       state.requested = true;
       schedule(state, true);
     });
     status.addEventListener("click", () => {
       if (status.dataset.state !== "error") return;
-      // 用户手动重试就是这个标记唯一的清除入口（另一个是原文变化）。
+      // 用户手动重试就是这个标记唯一的清除入口（另一个是稳定前缀或配置变化）。
       state.failedSource = "";
+      state.failedSignature = "";
       state.requested = true;
       schedule(state, true);
     });
@@ -190,27 +207,41 @@ export async function activate(ctx) {
     state.manual = manual;
     settings.addEventListener("click", () => manual.toggle(settings));
 
+    let disposed = false;
+    const dispose = () => {
+      if (disposed) return;
+      disposed = true;
+      if (block[KCT_DISPOSE_KEY] === dispose) {
+        delete block[KCT_DISPOSE_KEY];
+      }
+      cancel(state);
+      blocks.delete(state);
+      for (const node of state.body.querySelectorAll("[data-ekdp-kct-hidden]")) node.removeAttribute("data-ekdp-kct-hidden");
+      state.manual.dispose();
+      popover.closeFor(settings);
+      if (state.style) removeStyles(state.root);
+      bar.remove();
+      const node = state.body.querySelector(".ekdp-kct-translated");
+      node?.remove();
+      state.block.removeAttribute("data-ekdp-kct-view");
+    };
+    Object.defineProperty(block, KCT_DISPOSE_KEY, {
+      value: dispose,
+      configurable: true,
+      writable: true,
+    });
+
     schedule(state, false);
 
     return {
       update(next) {
+        if (disposed) return;
         state.info = next;
-        bar.hidden = !next.open || state.enhanced;
+        bar.hidden = !next.open;
         if (!next.open) state.manual.closeFor(settings);
         schedule(state, false);
       },
-      dispose() {
-        cancel(state);
-        blocks.delete(state);
-        for (const node of state.body.querySelectorAll("[data-ekdp-kct-hidden]")) node.removeAttribute("data-ekdp-kct-hidden");
-        state.manual.dispose();
-        popover.closeFor(settings);
-        if (state.style) removeStyles(state.root);
-        bar.remove();
-        const node = state.body.querySelector(".ekdp-kct-translated");
-        node?.remove();
-        state.block.removeAttribute("data-ekdp-kct-view");
-      },
+      dispose,
     };
   }, { includeEnhanced: true });
   ctx.onDispose(() => {
@@ -218,6 +249,7 @@ export async function activate(ctx) {
     window.removeEventListener("ekdp-kct:cache", onCacheCleared);
     popover.dispose();
     decoration.dispose();
+    for (const state of blocks) cancel(state);
     blocks.clear();
     engine.dispose();
   });
@@ -227,6 +259,55 @@ export async function activate(ctx) {
 
   // ---------------------------------------------------------------- 调度
 
+  function monotonicNow() {
+    return typeof performance !== "undefined" && typeof performance.now === "function"
+      ? performance.now()
+      : Date.now();
+  }
+
+  function clearTimer(state) {
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = 0;
+    }
+    state.timerDue = 0;
+    state.timerForce = false;
+  }
+
+  function armTimer(state, delayMs, force) {
+    const due = monotonicNow() + delayMs;
+    if (state.timer) {
+      if (state.timerDue <= due) {
+        if (force) state.timerForce = true;
+        return;
+      }
+      clearTimer(state);
+    }
+    state.timerDue = due;
+    state.timerForce = Boolean(force);
+    state.timer = window.setTimeout(() => {
+      const runForce = state.timerForce;
+      state.timer = 0;
+      state.timerDue = 0;
+      state.timerForce = false;
+      void maybeRun(state, runForce);
+    }, delayMs);
+  }
+
+  function scheduleStreamWait(state, fullSource, currentSource, signature, force) {
+    if (!state.info.streaming || !state.info.open || !state.block.isConnected) return;
+    if (state.enhanced) return;
+    const waitedSource = stableStreamSource(fullSource, true);
+    if (waitedSource.length <= currentSource.length || !waitedSource.trim()) return;
+    if (waitedSource === state.source && state.rendered) return;
+    if (!force && state.failedSource && waitedSource === state.failedSource && signature === state.failedSignature) {
+      return;
+    }
+    const elapsed = state.streamSince > 0 ? Date.now() - state.streamSince : 0;
+    const remaining = Math.max(20, STREAM_MAX_WAIT_MS - elapsed);
+    armTimer(state, remaining, false);
+  }
+
   function schedule(state, force) {
     if (!state.info.open) {
       cancel(state);
@@ -234,31 +315,24 @@ export async function activate(ctx) {
     }
     // 流式输出期间按固定间隔重试，避免每个 token 都发一次请求。
     if (state.info.streaming) {
-      // 每次触发翻译都从此刻重新计时。只在第一次设值会让 streamSince 一直停在
-      // 3 秒前的时刻，之后每次调度都判定「已等够」并退化为 0ms 防抖，等于对
-      // 每个 token 发一次请求。
-      if (!state.timer) {
-        state.streamSince = Date.now();
-        state.timer = window.setTimeout(() => {
-          state.timer = 0;
-          state.streamSince = 0;
-          void maybeRun(state, force);
-        }, STREAM_DEBOUNCE_MS);
+      if (force) {
+        clearTimer(state);
+        void maybeRun(state, true);
+        return;
       }
+      if (!state.streamSince) state.streamSince = Date.now();
+      armTimer(state, STREAM_DEBOUNCE_MS, false);
       return;
     }
-    if (state.timer) {
-      clearTimeout(state.timer);
-      state.timer = 0;
-    }
+    state.streamSince = 0;
+    clearTimer(state);
     void maybeRun(state, force);
   }
 
   function cancel(state) {
     state.generation += 1;
     state.running = false;
-    clearTimeout(state.timer);
-    state.timer = 0;
+    clearTimer(state);
     state.streamSince = 0;
   }
 
@@ -272,6 +346,7 @@ export async function activate(ctx) {
     if (body !== state.body) {
       state.generation += 1;
       state.running = false;
+      clearTimer(state);
       state.body = body;
       state.sourceNode = state.enhanced ? null : pickSource(body);
       state.source = "";
@@ -279,6 +354,12 @@ export async function activate(ctx) {
       state.rendered = false;
       state.skipped = false;
       state.translatedSource = "";
+      state.translatedPrefix = "";
+      state.completedSource = "";
+      state.completedPrefix = "";
+      state.failedSource = "";
+      state.failedSignature = "";
+      state.streamSince = 0;
       setView(state, "original");
     }
     if (!state.bar.isConnected) {
@@ -288,10 +369,6 @@ export async function activate(ctx) {
     }
 
     const source = readSource(state);
-    if (state.failedSource && source !== state.failedSource) {
-      // 原文继续增长或变化：上一次失败针对的是旧内容，值得再试一次。
-      state.failedSource = "";
-    }
     if (state.skipped && source !== state.source) {
       state.skipped = false;
       state.done = false;
@@ -303,6 +380,9 @@ export async function activate(ctx) {
     } else if (state.rendered) {
       state.rendered = false;
       state.translatedSource = "";
+      state.translatedPrefix = "";
+      state.completedSource = "";
+      state.completedPrefix = "";
       setView(state, "original");
     }
     if (source !== state.source && state.done) {
@@ -319,10 +399,6 @@ export async function activate(ctx) {
     if (!state.running && state.info.open && ((!state.enhanced && settings.autoTranslate) || state.requested || force)) {
       if (!source.trim()) return;
       if (source === state.source && state.done) return;
-      // 自动扫描遇到与上次失败完全相同的原文时不再重试：429/断网会让每次
-      // 调度都重新发一遍请求，形成无限重试风暴。只有用户手动点「重试」、
-      // 原文继续增长或翻译配置变更（failedSource 在两者中被清空）才恢复。
-      if (!force && !state.requested && state.failedSource && source === state.failedSource) return;
       if (settings.provider === "custom" && !customEndpoint(settings)) {
         const raw = String(settings.customEndpoint || "").trim();
         setStatus(
@@ -335,24 +411,53 @@ export async function activate(ctx) {
         );
         return;
       }
-      await run(state, source);
+      await run(state, force);
     }
   }
 
-  async function run(state, sourceArg) {
+  async function run(state, force = false) {
     if (state.running) return;
-    const fullSource = readSource(state);
-    let source = fullSource;
-    if (state.info.streaming) {
-      source = stableStreamSource(fullSource, Date.now() - state.streamSince >= STREAM_MAX_WAIT_MS);
-      if (!source.trim()) return;
+    if (state.enhanced && state.info.streaming) {
+      setStatus(state, "loading", "等待思考完成");
+      state.running = false;
+      state.generation += 1;
+      return;
     }
+    const fullSource = readSource(state);
     const settings = current();
     const lang = resolveTarget(settings);
+    const signature = translationSignature(settings);
+    let source = fullSource;
+    let waited = false;
+    if (state.info.streaming) {
+      if (!state.streamSince) state.streamSince = Date.now();
+      waited = Date.now() - state.streamSince >= STREAM_MAX_WAIT_MS;
+      source = stableStreamSource(fullSource, waited);
+      if (!source.trim()) {
+        if (!waited) scheduleStreamWait(state, fullSource, source, signature, force);
+        return;
+      }
+    }
+    if (force) {
+      state.failedSource = "";
+      state.failedSignature = "";
+    } else if (state.failedSource) {
+      if (source === state.failedSource && signature === state.failedSignature) {
+        if (state.info.streaming && !waited) scheduleStreamWait(state, fullSource, source, signature, false);
+        return;
+      }
+      state.failedSource = "";
+      state.failedSignature = "";
+    }
     if (translationPieces(fullSource, lang).every(piece => piece.skip)) {
       render(state, fullSource);
+      if (state.info.streaming && fullSource !== state.source) {
+        state.streamSince = Date.now();
+      }
       state.source = fullSource;
       state.done = !state.info.streaming;
+      state.failedSource = "";
+      state.failedSignature = "";
       setStatus(state, "ok", "");
       return;
     }
@@ -362,16 +467,37 @@ export async function activate(ctx) {
         // 流式期间的收尾分支：全部内容已译出但状态还停在「后续内容待翻译」，
         // 这里必须一并清掉。
         setStatus(state, "ok", "");
+      } else if (!waited) {
+        scheduleStreamWait(state, fullSource, source, signature, force);
       }
       return;
     }
 
-    if (state.enhanced && state.info.streaming) {
-      if (!state.running) setStatus(state, "loading", "等待思考完成");
-      state.running = false;
-      state.generation += 1;
+    const baseSource = state.completedSource;
+    const baseTranslated = state.completedPrefix;
+    const incremental =
+      Boolean(baseSource) &&
+      state.signature === signature &&
+      hasSafePrefixBoundary(baseSource, source);
+    const delta = incremental ? source.slice(baseSource.length) : source;
+    if (incremental && translationPieces(delta, lang).every(piece => piece.skip)) {
+      const combined = preserveFencedCode(source, baseTranslated + delta);
+      state.translatedPrefix = combined;
+      state.translatedSource = source;
+      state.completedPrefix = combined;
+      state.completedSource = source;
+      render(state, combined + fullSource.slice(source.length));
+      state.done = fullSource === source && !state.info.streaming;
+      if (state.info.streaming && source !== state.source) state.streamSince = Date.now();
+      state.source = source;
+      state.failedSource = "";
+      state.failedSignature = "";
+      state.signature = signature;
+      setStatus(state, state.done ? "ok" : "loading", state.done ? "" : "后续内容待翻译");
+      if (state.info.streaming) scheduleStreamWait(state, fullSource, source, signature, false);
       return;
     }
+
     const generation = ++state.generation;
     const body = state.body;
     const valid = () =>
@@ -385,37 +511,55 @@ export async function activate(ctx) {
     setStatus(state, "loading", "翻译中…");
 
     try {
-      const translated = await engine.translate(source, lang, (text, done, total) => {
+      const translated = await engine.translate(delta, lang, (text, done, total) => {
         if (!valid()) return;
         const text2 = readSource(state);
         if (!text2.startsWith(source)) return;
-        state.translatedPrefix = text;
+        const combined = incremental ? preserveFencedCode(source, baseTranslated + text) : text;
+        state.translatedPrefix = combined;
         state.translatedSource = source;
-        render(state, text + text2.slice(source.length));
+        render(state, combined + text2.slice(source.length));
         setStatus(state, "loading", `翻译中 ${done}/${total}`);
       }, valid);
       if (!valid()) return;
       const nowSource = readSource(state);
       if (!nowSource.startsWith(source)) return;
-      state.translatedPrefix = translated;
+      const finalTranslated = incremental ? preserveFencedCode(source, baseTranslated + translated) : translated;
+      state.translatedPrefix = finalTranslated;
       state.translatedSource = source;
-      render(state, translated + nowSource.slice(source.length));
+      state.completedPrefix = finalTranslated;
+      state.completedSource = source;
+      render(state, finalTranslated + nowSource.slice(source.length));
       state.done = nowSource === source && !state.info.streaming;
+      if (state.info.streaming && source !== state.source) state.streamSince = Date.now();
       state.source = source;
       state.failedSource = "";
-      state.signature = translationSignature(settings);
+      state.failedSignature = "";
+      state.signature = signature;
       setStatus(state, state.done ? "ok" : "loading", state.done ? "" : "后续内容待翻译");
     } catch (error) {
       if (!valid()) return;
       state.failedSource = source;
+      state.failedSignature = signature;
       setStatus(state, "error", `重试 · ${errorBrief(error)}`, `翻译失败：${messageOf(error)}`);
     } finally {
       if (state.generation === generation) {
         state.running = false;
+        const currentFull = readSource(state);
         // valid() 为假除了折叠与断开，还可能是原文被整体替换：这时必须重新调
         // 度，否则新原文永远得不到翻译，状态也停在「翻译中…」。schedule 会经
         // maybeRun 按当前状态重新判断，块已折叠或已断开时它自己会退出。
-        if (!valid() || readSource(state) !== fullSource) schedule(state, false);
+        if (!valid() || currentFull !== fullSource) {
+          schedule(state, false);
+        } else if (state.info.streaming && state.block.isConnected && state.info.open) {
+          const unlocked = stableStreamSource(currentFull, true);
+          if (
+            unlocked.length > source.length &&
+            !(state.failedSource && state.failedSignature === signature && unlocked === state.failedSource)
+          ) {
+            scheduleStreamWait(state, currentFull, source, signature, false);
+          }
+        }
       }
     }
   }
@@ -1307,36 +1451,750 @@ async function request(ctx, url, init) {
 
 // ------------------------------------------------------------- 文本分段
 
-// 与独立版一致：围栏代码、行内代码与链接整体跳过，翻译不会改动它们。
-function protectedPieces(text) {
-  const pieces = [];
-  const tokens = /^ {0,3}(`{3,})[^`\n]*(?:\n|$)|^ {0,3}(~{3,})[^\n]*(?:\n|$)|(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\3(?!`)|https?:\/\/[^\s`<>。！？；，]+/gm;
+const FENCE_OPEN_RE = /^ {0,3}(`{3,})[^`\n]*(?:\n|$)|^ {0,3}(~{3,})[^\n]*(?:\n|$)/gm;
+const BARE_URL_RE = /https?:\/\/[^\s`<>。！？；，]+/g;
+const UNCLOSED_URL_RE = /https?:\/\/[^\s`<>。！？；，)]*$/;
+const EMAIL_LOCAL_CHAR_RE = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]$/;
+
+function splitFencedSegments(text) {
+  const segments = [];
+  const re = new RegExp(FENCE_OPEN_RE.source, "gm");
   let last = 0;
   let match;
-  while ((match = tokens.exec(text)) !== null) {
-    if (match.index > last) pieces.push({ text: text.slice(last, match.index), skip: false });
-    const fence = match[1] || match[2];
-    if (fence) {
-      const closing = new RegExp(`^ {0,3}${fence[0]}{${fence.length},}[ \\t]*\\r?$`, "gm");
-      closing.lastIndex = tokens.lastIndex;
-      const end = closing.exec(text);
-      tokens.lastIndex = end ? closing.lastIndex : text.length;
+  while ((match = re.exec(text)) !== null) {
+    if (match.index > last) {
+      segments.push({ start: last, end: match.index, fenced: false, unclosed: false });
     }
-    pieces.push({ text: text.slice(match.index, tokens.lastIndex), skip: true, fenced: !!fence });
-    last = tokens.lastIndex;
+    const fence = match[1] || match[2];
+    const closing = new RegExp(`^ {0,3}${fence[0]}{${fence.length},}[ \\t]*\\r?$`, "gm");
+    closing.lastIndex = re.lastIndex;
+    const end = closing.exec(text);
+    const fenceEnd = end ? closing.lastIndex : text.length;
+    segments.push({ start: match.index, end: fenceEnd, fenced: true, unclosed: !end });
+    re.lastIndex = fenceEnd;
+    last = fenceEnd;
   }
-  if (last < text.length) pieces.push({ text: text.slice(last), skip: false });
-  return pieces;
+  if (last < text.length) {
+    segments.push({ start: last, end: text.length, fenced: false, unclosed: false });
+  }
+  return segments;
+}
+
+function fencedTexts(text) {
+  return splitFencedSegments(text)
+    .filter(seg => seg.fenced)
+    .map(seg => text.slice(seg.start, seg.end));
 }
 
 // 译文里的围栏必须与原文一一对应，否则说明服务改写了代码，整块退回原文。
 function preserveFencedCode(source, translated) {
-  const fences = text => protectedPieces(text).filter(piece => piece.fenced).map(piece => piece.text);
-  const original = fences(source);
-  const result = fences(translated);
+  const original = fencedTexts(source);
+  const result = fencedTexts(translated);
   return original.length === result.length && original.every((text, i) => text === result[i])
     ? translated
     : source;
+}
+
+function lineBreakLength(text, index) {
+  if (text[index] === "\n") return 1;
+  if (text[index] === "\r" && text[index + 1] === "\n") return 2;
+  return 0;
+}
+
+function isBlankLineAt(text, index, lb = lineBreakLength(text, index)) {
+  if (!lb) return false;
+  let p = index + lb;
+  while (p < text.length && (text[p] === " " || text[p] === "\t")) p += 1;
+  return lineBreakLength(text, p) > 0;
+}
+
+function isEscaped(text, index) {
+  let backslashes = 0;
+  for (let i = index - 1; i >= 0 && text[i] === "\\"; i -= 1) backslashes += 1;
+  return backslashes % 2 === 1;
+}
+
+function findClosingBackticks(text, searchStart, tickLen) {
+  const len = text.length;
+  let p = searchStart;
+  while (p < len) {
+    const lb = lineBreakLength(text, p);
+    if (lb > 0) {
+      if (isBlankLineAt(text, p, lb)) return { status: "blank" };
+      p += lb;
+      continue;
+    }
+    if (text[p] === "`") {
+      let q = p + 1;
+      while (q < len && text[q] === "`") q += 1;
+      if (q - p === tickLen) return { status: "closed", end: q };
+      p = q;
+      continue;
+    }
+    p += 1;
+  }
+  return { status: "unclosed" };
+}
+
+function skipLinkWhitespace(text, k) {
+  const len = text.length;
+  let lineBreaks = 0;
+  let sawSpace = false;
+  while (k < len) {
+    const ch = text[k];
+    if (ch === " " || ch === "\t") {
+      sawSpace = true;
+      k += 1;
+      continue;
+    }
+    const lb = lineBreakLength(text, k);
+    if (lb > 0) {
+      lineBreaks += 1;
+      if (lineBreaks > 1) return { invalid: true, next: k, sawSpace };
+      sawSpace = true;
+      k += lb;
+      continue;
+    }
+    break;
+  }
+  return { invalid: false, next: k, sawSpace };
+}
+
+function parseLinkParen(text, openParen) {
+  const len = text.length;
+  const lead = skipLinkWhitespace(text, openParen + 1);
+  if (lead.invalid) return { status: "invalid" };
+  let k = lead.next;
+  if (k >= len) return { status: "unclosed" };
+  if (text[k] === ")") return { status: "complete", end: k + 1 };
+
+  if (text[k] === "<") {
+    k += 1;
+    let closedAngle = false;
+    while (k < len) {
+      const ch = text[k];
+      if (ch === "\r" || ch === "\n" || ch === "<") return { status: "invalid" };
+      if (ch === "\\") {
+        if (k + 1 >= len) return { status: "unclosed" };
+        if (text[k + 1] === "\r" || text[k + 1] === "\n") return { status: "invalid" };
+        k += 2;
+        continue;
+      }
+      if (ch === ">") {
+        k += 1;
+        closedAngle = true;
+        break;
+      }
+      k += 1;
+    }
+    if (!closedAngle) return { status: "unclosed" };
+  } else {
+    let parenDepth = 0;
+    const destStart = k;
+    while (k < len) {
+      const ch = text[k];
+      if (ch === "\\") {
+        if (k + 1 >= len) return { status: "unclosed" };
+        const nextCode = text.charCodeAt(k + 1);
+        if (nextCode <= 0x20 || nextCode === 0x7f) {
+          k += 1;
+          continue;
+        }
+        k += 2;
+        continue;
+      }
+      if (ch === "(") {
+        parenDepth += 1;
+        k += 1;
+        continue;
+      }
+      if (ch === ")") {
+        if (parenDepth === 0) return { status: "complete", end: k + 1 };
+        parenDepth -= 1;
+        k += 1;
+        continue;
+      }
+      if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+        if (parenDepth > 0) return { status: "invalid" };
+        break;
+      }
+      const code = ch.charCodeAt(0);
+      if (code < 0x20 || code === 0x7f) return { status: "invalid" };
+      k += 1;
+    }
+    if (k >= len) return { status: "unclosed" };
+    if (k === destStart) return { status: "invalid" };
+  }
+
+  if (k >= len) return { status: "unclosed" };
+  if (text[k] === ")") return { status: "complete", end: k + 1 };
+
+  const afterDest = skipLinkWhitespace(text, k);
+  if (afterDest.invalid || !afterDest.sawSpace) return { status: "invalid" };
+  k = afterDest.next;
+  if (k >= len) return { status: "unclosed" };
+  if (text[k] === ")") return { status: "complete", end: k + 1 };
+
+  const openQuote = text[k];
+  if (openQuote !== '"' && openQuote !== "'" && openQuote !== "(") return { status: "invalid" };
+  const closeQuote = openQuote === "(" ? ")" : openQuote;
+  k += 1;
+  let closedTitle = false;
+  while (k < len) {
+    const lb = lineBreakLength(text, k);
+    if (lb > 0) {
+      if (isBlankLineAt(text, k, lb)) return { status: "invalid" };
+      k += lb;
+      continue;
+    }
+    const ch = text[k];
+    if (ch === "\\") {
+      if (k + 1 >= len) return { status: "unclosed" };
+      if (text[k + 1] === "\r" || text[k + 1] === "\n") {
+        k += 1;
+        continue;
+      }
+      k += 2;
+      continue;
+    }
+    if (closeQuote === ")" && ch === "(") return { status: "invalid" };
+    if (ch === closeQuote) {
+      k += 1;
+      closedTitle = true;
+      break;
+    }
+    k += 1;
+  }
+  if (!closedTitle) return { status: "unclosed" };
+
+  const afterTitle = skipLinkWhitespace(text, k);
+  if (afterTitle.invalid) return { status: "invalid" };
+  k = afterTitle.next;
+  if (k >= len) return { status: "unclosed" };
+  if (text[k] === ")") return { status: "complete", end: k + 1 };
+  return { status: "invalid" };
+}
+
+function isAsciiLetter(code) {
+  return (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a);
+}
+
+function isAsciiDigit(code) {
+  return code >= 0x30 && code <= 0x39;
+}
+
+function isAsciiAlnum(code) {
+  return isAsciiLetter(code) || isAsciiDigit(code);
+}
+
+function isSchemeChar(code) {
+  return isAsciiAlnum(code) || code === 0x2b || code === 0x2d || code === 0x2e;
+}
+
+function isTagNameChar(code) {
+  return isAsciiAlnum(code) || code === 0x2d;
+}
+
+function isAttrNameStart(code) {
+  return isAsciiLetter(code) || code === 0x5f || code === 0x3a;
+}
+
+function isAttrNameChar(code) {
+  return isAsciiAlnum(code) || code === 0x5f || code === 0x2e || code === 0x3a || code === 0x2d;
+}
+
+function isUnquotedAttrChar(ch) {
+  return ch !== " " && ch !== "\t" && ch !== "\n" && ch !== "\r" &&
+    ch !== '"' && ch !== "'" && ch !== "=" && ch !== "<" && ch !== ">" && ch !== "`";
+}
+
+function scanUriAutolink(text, openAngle, canUnclose) {
+  const len = text.length;
+  let k = openAngle + 1;
+  if (k >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+  if (!isAsciiLetter(text.charCodeAt(k))) return { status: "invalid" };
+  const schemeStart = k;
+  k += 1;
+  while (k < len && k - schemeStart < 32 && isSchemeChar(text.charCodeAt(k))) k += 1;
+  if (k >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+  if (text[k] !== ":" || k - schemeStart < 2) return { status: "invalid" };
+  k += 1;
+  while (k < len) {
+    const ch = text[k];
+    if (ch === ">") return { status: "closed", end: k + 1 };
+    const code = ch.charCodeAt(0);
+    if (code <= 0x20 || code === 0x7f || ch === "<") return { status: "invalid" };
+    k += 1;
+  }
+  return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+}
+
+function scanEmailAutolink(text, openAngle, canUnclose) {
+  const len = text.length;
+  let k = openAngle + 1;
+  const localStart = k;
+  while (k < len && EMAIL_LOCAL_CHAR_RE.test(text[k])) k += 1;
+  if (k === localStart || k >= len || text[k] !== "@") return { status: "invalid" };
+  k += 1;
+  if (k >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+
+  while (k < len) {
+    const labelStart = k;
+    if (!isAsciiAlnum(text.charCodeAt(k))) return { status: "invalid" };
+    k += 1;
+    while (k < len && (isAsciiAlnum(text.charCodeAt(k)) || text[k] === "-")) {
+      if (k - labelStart >= 63) return { status: "invalid" };
+      k += 1;
+    }
+    const endsWithHyphen = text[k - 1] === "-";
+    if (k >= len) {
+      if (endsWithHyphen && k - labelStart >= 63) return { status: "invalid" };
+      return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+    }
+    if (endsWithHyphen) return { status: "invalid" };
+    if (text[k] === ">") return { status: "closed", end: k + 1 };
+    if (text[k] === ".") {
+      k += 1;
+      if (k >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+      continue;
+    }
+    return { status: "invalid" };
+  }
+  return { status: "invalid" };
+}
+
+function scanOpenHtmlTag(text, openAngle, canUnclose) {
+  const len = text.length;
+  let k = openAngle + 1;
+  if (k >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+  if (!isAsciiLetter(text.charCodeAt(k))) return { status: "invalid" };
+  k += 1;
+  while (k < len && isTagNameChar(text.charCodeAt(k))) k += 1;
+
+  while (true) {
+    const ws = skipLinkWhitespace(text, k);
+    if (ws.invalid) return { status: "invalid" };
+    k = ws.next;
+    if (k >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+
+    if (text[k] === ">") return { status: "closed", end: k + 1 };
+    if (text[k] === "/") {
+      k += 1;
+      if (k >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+      if (text[k] === ">") return { status: "closed", end: k + 1 };
+      return { status: "invalid" };
+    }
+
+    if (!ws.sawSpace || !isAttrNameStart(text.charCodeAt(k))) return { status: "invalid" };
+    k += 1;
+    while (k < len && isAttrNameChar(text.charCodeAt(k))) k += 1;
+
+    const afterName = skipLinkWhitespace(text, k);
+    if (afterName.invalid) return { status: "invalid" };
+    if (afterName.next >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+    if (text[afterName.next] !== "=") continue;
+
+    const afterEq = skipLinkWhitespace(text, afterName.next + 1);
+    if (afterEq.invalid) return { status: "invalid" };
+    k = afterEq.next;
+    if (k >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+
+    const quote = text[k];
+    if (quote === '"' || quote === "'") {
+      k += 1;
+      let closedQuote = false;
+      while (k < len) {
+        const lb = lineBreakLength(text, k);
+        if (lb > 0) {
+          if (isBlankLineAt(text, k, lb)) return { status: "invalid" };
+          k += lb;
+          continue;
+        }
+        if (text[k] === quote) {
+          k += 1;
+          closedQuote = true;
+          break;
+        }
+        k += 1;
+      }
+      if (!closedQuote) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+    } else {
+      const valStart = k;
+      while (k < len && isUnquotedAttrChar(text[k])) k += 1;
+      if (k === valStart) return { status: "invalid" };
+    }
+  }
+}
+
+function scanHtmlInline(text, openAngle, canUnclose) {
+  const len = text.length;
+  if (openAngle + 1 >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+  const next = text[openAngle + 1];
+
+  if (next === "!") {
+    const k = openAngle + 2;
+    if (k >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+
+    if (text[k] === "-") {
+      if (k + 1 >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+      if (text[k + 1] !== "-") return { status: "invalid" };
+      let p = openAngle + 4;
+      if (p >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+      if (text[p] === ">") return { status: "closed", end: p + 1 };
+      if (text[p] === "-" && p + 1 < len && text[p + 1] === ">") return { status: "closed", end: p + 2 };
+      while (p < len) {
+        const lb = lineBreakLength(text, p);
+        if (lb > 0) {
+          if (isBlankLineAt(text, p, lb)) return { status: "invalid" };
+          p += lb;
+          continue;
+        }
+        if (text[p] === "-" && text[p + 1] === "-" && text[p + 2] === ">") {
+          return { status: "closed", end: p + 3 };
+        }
+        p += 1;
+      }
+      return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+    }
+
+    if (text[k] === "[") {
+      const prefix = "[CDATA[";
+      let m = 0;
+      while (m < prefix.length && k + m < len) {
+        if (text[k + m] !== prefix[m]) return { status: "invalid" };
+        m += 1;
+      }
+      if (m < prefix.length) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+      let p = k + prefix.length;
+      while (p < len) {
+        const lb = lineBreakLength(text, p);
+        if (lb > 0) {
+          if (isBlankLineAt(text, p, lb)) return { status: "invalid" };
+          p += lb;
+          continue;
+        }
+        if (text[p] === "]" && text[p + 1] === "]" && text[p + 2] === ">") {
+          return { status: "closed", end: p + 3 };
+        }
+        p += 1;
+      }
+      return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+    }
+
+    if (isAsciiLetter(text.charCodeAt(k))) {
+      let p = k + 1;
+      while (p < len) {
+        const lb = lineBreakLength(text, p);
+        if (lb > 0) {
+          if (isBlankLineAt(text, p, lb)) return { status: "invalid" };
+          p += lb;
+          continue;
+        }
+        if (text[p] === ">") return { status: "closed", end: p + 1 };
+        p += 1;
+      }
+      return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+    }
+
+    return { status: "invalid" };
+  }
+
+  if (next === "?") {
+    let p = openAngle + 2;
+    while (p < len) {
+      const lb = lineBreakLength(text, p);
+      if (lb > 0) {
+        if (isBlankLineAt(text, p, lb)) return { status: "invalid" };
+        p += lb;
+        continue;
+      }
+      if (text[p] === "?" && text[p + 1] === ">") {
+        return { status: "closed", end: p + 2 };
+      }
+      p += 1;
+    }
+    return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+  }
+
+  if (next === "/") {
+    let p = openAngle + 2;
+    if (p >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+    if (!isAsciiLetter(text.charCodeAt(p))) return { status: "invalid" };
+    p += 1;
+    while (p < len && isTagNameChar(text.charCodeAt(p))) p += 1;
+    const ws = skipLinkWhitespace(text, p);
+    if (ws.invalid) return { status: "invalid" };
+    p = ws.next;
+    if (p >= len) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+    if (text[p] === ">") return { status: "closed", end: p + 1 };
+    return { status: "invalid" };
+  }
+
+  return scanOpenHtmlTag(text, openAngle, canUnclose);
+}
+
+function scanAngleInline(text, openAngle, canUnclose) {
+  if (openAngle + 1 >= text.length) return canUnclose ? { status: "unclosed" } : { status: "invalid" };
+  const uri = scanUriAutolink(text, openAngle, canUnclose);
+  if (uri.status === "closed") return uri;
+  const email = scanEmailAutolink(text, openAngle, canUnclose);
+  if (email.status === "closed") return email;
+  const html = scanHtmlInline(text, openAngle, canUnclose);
+  if (html.status === "closed") return html;
+  if (canUnclose && (uri.status === "unclosed" || email.status === "unclosed" || html.status === "unclosed")) {
+    return { status: "unclosed" };
+  }
+  return { status: "invalid" };
+}
+
+function pushPlainWithBareUrls(pieces, text, start, end) {
+  if (start >= end) return;
+  const slice = text.slice(start, end);
+  let cursor = 0;
+  for (const match of slice.matchAll(BARE_URL_RE)) {
+    if (match.index > cursor) {
+      const pStart = start + cursor;
+      const pEnd = start + match.index;
+      pieces.push({ text: text.slice(pStart, pEnd), start: pStart, end: pEnd, skip: false });
+    }
+    const uStart = start + match.index;
+    const uEnd = uStart + match[0].length;
+    pieces.push({ text: match[0], start: uStart, end: uEnd, skip: true, url: true });
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < slice.length) {
+    const pStart = start + cursor;
+    pieces.push({ text: text.slice(pStart, end), start: pStart, end, skip: false });
+  }
+}
+
+// 块级围栏优先，非围栏段内按 CommonMark 优先级联动扫描行内代码、行内 HTML/自动链接、行内链接/图片与裸 URL。
+function analyzeMarkdownSegments(text) {
+  const segments = splitFencedSegments(text);
+  const pieces = [];
+  let unclosedStart = null;
+  const noteUnclosed = pos => {
+    if (unclosedStart === null || pos < unclosedStart) unclosedStart = pos;
+  };
+
+  for (let segIdx = 0; segIdx < segments.length; segIdx += 1) {
+    const seg = segments[segIdx];
+    if (seg.fenced) {
+      if (seg.unclosed) noteUnclosed(seg.start);
+      pieces.push({
+        text: text.slice(seg.start, seg.end),
+        start: seg.start,
+        end: seg.end,
+        skip: true,
+        fenced: true,
+        unclosed: seg.unclosed,
+      });
+      continue;
+    }
+
+    const nextSeg = segments[segIdx + 1];
+    const pendingBacktickFence = Boolean(
+      nextSeg &&
+      nextSeg.fenced &&
+      nextSeg.unclosed &&
+      !text.slice(nextSeg.start, nextSeg.end).includes("\n") &&
+      text.slice(nextSeg.start, nextSeg.end).trimStart().startsWith("`")
+    );
+    const canUnclose = seg.end === text.length || pendingBacktickFence;
+
+    const raw = text.slice(seg.start, seg.end);
+    const len = raw.length;
+    const lastCloseParen = raw.lastIndexOf(")");
+    const lastCloseAngle = raw.lastIndexOf(">");
+    const ranges = [];
+    const stack = [];
+    let i = 0;
+
+    while (i < len) {
+      const lb = lineBreakLength(raw, i);
+      if (lb > 0) {
+        if (isBlankLineAt(raw, i, lb)) stack.length = 0;
+        i += lb;
+        continue;
+      }
+      const ch = raw[i];
+      if (ch === "\\") {
+        if (i + 1 >= len) {
+          if (canUnclose) noteUnclosed(seg.start + i);
+          break;
+        }
+        if (raw[i + 1] === "\r" || raw[i + 1] === "\n") i += 1;
+        else i += 2;
+        continue;
+      }
+      if (ch === "`") {
+        let q = i + 1;
+        while (q < len && raw[q] === "`") q += 1;
+        const tickLen = q - i;
+        const closed = findClosingBackticks(raw, q, tickLen);
+        if (closed.status === "closed") {
+          ranges.push({ start: seg.start + i, end: seg.start + closed.end, inlineCode: true });
+          i = closed.end;
+          continue;
+        }
+        if (closed.status === "unclosed" && canUnclose) {
+          const firstActive = stack.find(entry => entry.active);
+          noteUnclosed(seg.start + (firstActive ? firstActive.start : i));
+        }
+        i = q;
+        continue;
+      }
+      if (ch === "<") {
+        const firstActive = canUnclose ? stack.find(entry => entry.active) : null;
+        const candidateUnclosed = seg.start + (firstActive ? firstActive.start : i);
+        const canClose = i < lastCloseAngle;
+        const needsUnclosedCheck = canUnclose && (unclosedStart === null || candidateUnclosed < unclosedStart);
+        if (canClose || needsUnclosedCheck) {
+          const angle = scanAngleInline(raw, i, canUnclose);
+          if (angle.status === "closed") {
+            ranges.push({ start: seg.start + i, end: seg.start + angle.end, angleInline: true });
+            i = angle.end;
+            continue;
+          }
+          if (angle.status === "unclosed" && canUnclose) {
+            noteUnclosed(candidateUnclosed);
+          }
+        }
+        i += 1;
+        continue;
+      }
+      if (ch === "[") {
+        const isImage = i > 0 && raw[i - 1] === "!" && !isEscaped(raw, i - 1);
+        stack.push({ start: isImage ? i - 1 : i, isImage, active: true });
+        i += 1;
+        continue;
+      }
+      if (ch === "]") {
+        const opener = stack.pop();
+        if (!opener || !opener.active) {
+          i += 1;
+          continue;
+        }
+        if (i + 1 >= len) {
+          if (canUnclose) noteUnclosed(seg.start + opener.start);
+          i += 1;
+          continue;
+        }
+        if (raw[i + 1] === "(") {
+          const canComplete = i + 1 < lastCloseParen;
+          const needsUnclosedCheck = canUnclose && (unclosedStart === null || seg.start + opener.start < unclosedStart);
+          if (canComplete || needsUnclosedCheck) {
+            const parsed = parseLinkParen(raw, i + 1);
+            if (parsed.status === "complete") {
+              const absStart = seg.start + opener.start;
+              const absEnd = seg.start + parsed.end;
+              while (ranges.length && ranges[ranges.length - 1].start >= absStart) {
+                ranges.pop();
+              }
+              ranges.push({ start: absStart, end: absEnd, link: true });
+              if (!opener.isImage) {
+                for (const entry of stack) {
+                  if (!entry.isImage) entry.active = false;
+                }
+              }
+              i = parsed.end;
+              continue;
+            }
+            if (parsed.status === "unclosed" && canUnclose) {
+              noteUnclosed(seg.start + opener.start);
+            }
+          }
+        }
+        i += 1;
+        continue;
+      }
+      i += 1;
+    }
+
+    if (canUnclose) {
+      for (const entry of stack) {
+        if (entry.active) {
+          noteUnclosed(seg.start + entry.start);
+          break;
+        }
+      }
+    }
+
+    let cursor = seg.start;
+    for (const range of ranges) {
+      pushPlainWithBareUrls(pieces, text, cursor, range.start);
+      pieces.push({
+        text: text.slice(range.start, range.end),
+        start: range.start,
+        end: range.end,
+        skip: true,
+        inlineCode: !!range.inlineCode,
+        link: !!range.link,
+        angleInline: !!range.angleInline,
+      });
+      cursor = range.end;
+    }
+    pushPlainWithBareUrls(pieces, text, cursor, seg.end);
+  }
+
+  let limit = unclosedStart === null ? text.length : unclosedStart;
+  if (limit > 0) {
+    for (const piece of pieces) {
+      if (piece.start >= limit) break;
+      if (piece.end >= limit) {
+        if (!piece.skip || piece.url) {
+          const head = piece.text.slice(0, limit - piece.start);
+          const unclosedUrl = UNCLOSED_URL_RE.exec(head);
+          if (unclosedUrl) limit = Math.min(limit, piece.start + unclosedUrl.index);
+        }
+        break;
+      }
+    }
+  }
+
+  return { pieces, limit };
+}
+
+function createPieceSlicer(pieces) {
+  let index = 0;
+  let offset = 0;
+  return (start, end) => {
+    const result = [];
+    while (index < pieces.length && offset + pieces[index].text.length <= start) {
+      offset += pieces[index].text.length;
+      index += 1;
+    }
+    let i = index;
+    let pos = offset;
+    while (i < pieces.length && pos < end) {
+      const piece = pieces[i];
+      const pieceEnd = pos + piece.text.length;
+      const from = Math.max(start, pos) - pos;
+      const to = Math.min(end, pieceEnd) - pos;
+      if (to > from) result.push({ text: piece.text.slice(from, to), skip: piece.skip });
+      if (pieceEnd <= end) {
+        pos = pieceEnd;
+        i += 1;
+      } else {
+        break;
+      }
+    }
+    index = i;
+    offset = pos;
+    return result;
+  };
+}
+
+function hasSafePrefixBoundary(baseSource, source) {
+  const boundary = baseSource.length;
+  if (!boundary || boundary >= source.length || !source.startsWith(baseSource)) return false;
+  const { pieces } = analyzeMarkdownSegments(source);
+  for (const piece of pieces) {
+    if (piece.skip && piece.start < boundary && piece.end > boundary) return false;
+  }
+  const combinedFences = [...fencedTexts(baseSource), ...fencedTexts(source.slice(boundary))];
+  const fullFences = pieces.filter(piece => piece.fenced).map(piece => piece.text);
+  return combinedFences.length === fullFences.length && fullFences.every((text, i) => text === combinedFences[i]);
 }
 
 function endsWithAbbreviation(text) {
@@ -1374,7 +2232,7 @@ function splitLong(text) {
 
 function splitParagraphs(text) {
   const parts = [];
-  const re = /(\n[ \t]*\n)/g;
+  const re = /(\r?\n[ \t]*\r?\n)/g;
   let last = 0;
   let match;
   while ((match = re.exec(text)) !== null) {
@@ -1385,26 +2243,38 @@ function splitParagraphs(text) {
   return parts;
 }
 
+function closedStreamPrefix(text, analyzed = analyzeMarkdownSegments(text)) {
+  return analyzed.limit;
+}
+
 // 流式输出时只翻译已经稳定的段落，最后一句永远等它写完。
 function stableStreamSource(text, waited = false) {
-  const masked = protectedPieces(text).map(piece => (piece.skip ? " ".repeat(piece.text.length) : piece.text)).join("");
-  const paragraphs = splitParagraphs(masked);
+  const analyzed = analyzeMarkdownSegments(text);
+  const limit = closedStreamPrefix(text, analyzed);
+  if (!limit) return "";
+  const safe = text.slice(0, limit);
+  const pieces = limit === text.length ? analyzed.pieces : analyzeMarkdownSegments(safe).pieces;
+  const masked = pieces.map(piece => (piece.skip ? " ".repeat(piece.text.length) : piece.text)).join("");
+  const scan = limit < text.length ? `${masked}x` : masked;
+  const paragraphs = splitParagraphs(scan);
   let end = paragraphs.slice(0, -1).reduce((length, part) => length + part.body.length + part.sep.length, 0);
-  const tail = masked.slice(end);
-  if (tail.length >= MAX_CHARS || waited) {
+  const tail = scan.slice(end);
+  if (masked.length - end >= MAX_CHARS || waited) {
     end += sentenceUnits(tail).slice(0, -1).reduce((length, unit) => length + unit.length, 0);
   }
-  return text.slice(0, end);
+  return safe.slice(0, Math.min(end, limit));
 }
 
 function translationPieces(source, lang) {
-  const masked = protectedPieces(source).map(piece => (piece.skip ? " ".repeat(piece.text.length) : piece.text)).join("");
+  const { pieces: allPieces } = analyzeMarkdownSegments(source);
+  const masked = allPieces.map(piece => (piece.skip ? " ".repeat(piece.text.length) : piece.text)).join("");
+  const sliceRange = createPieceSlicer(allPieces);
   let offset = 0;
   return splitParagraphs(masked).flatMap(({ body, sep }) => {
     const groups = [];
     for (const unit of sentenceUnits(body)) {
       const skip = unit.trim() ? isTargetLanguage(unit, lang) : groups.at(-1)?.skip ?? true;
-      for (const piece of protectedPieces(source.slice(offset, offset + unit.length))) {
+      for (const piece of sliceRange(offset, offset + unit.length)) {
         const last = groups.at(-1);
         const preserve = skip || piece.skip;
         if (last && last.skip === preserve) last.text += piece.text;
@@ -1433,7 +2303,10 @@ function translationPieces(source, lang) {
 
 // 已经是目标语言的部分不送去翻译，省请求也避免译文被二次改写。
 function isTargetLanguage(text, lang) {
-  const prose = protectedPieces(text).filter(piece => !piece.skip).map(piece => piece.text).join("");
+  const prose = analyzeMarkdownSegments(text).pieces
+    .filter(piece => !piece.skip)
+    .map(piece => piece.text)
+    .join("");
   const letters = prose.match(/\p{L}/gu) || [];
   if (!letters.length) return true;
   const count = pattern => (prose.match(pattern) || []).length;

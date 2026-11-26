@@ -171,9 +171,9 @@ func nativeActionPermission(action string) string {
 		return "credentials:write"
 	case "contracts.report":
 		return "adapter:write"
-	case "models.list":
+	case "models.list", "providers.modelSuggestion":
 		return "models:read"
-	case "providers.updateModel":
+	case "providers.updateModel", "providers.updateModels", "providers.saveOfficialForm":
 		return "models:write"
 	case "session.view", "session.watch", "session.unwatch", "sessions.list", "sessions.view", "sessions.history", "sessions.diff", "sessions.watch", "sessions.unwatch", "keepalive.session.get", "schedule.list", "schedule.runs", "schedule.checkGit":
 		return "tasks:read"

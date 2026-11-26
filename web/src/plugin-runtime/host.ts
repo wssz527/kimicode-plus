@@ -11,10 +11,25 @@
  * Outside the native host — the web preview, a plain browser tab — the bridge is
  * absent, so callers get null instead of a broken panel.
  */
+const DEFAULT_SYNC_WAIT_MS = 150;
+
 export interface PluginHostBridge {
-  sync(): Promise<void>;
-  list(): Array<{ id: string; enabled: boolean; entry?: { renderer?: string; settings?: string }; hasSettings?: boolean }>;
-  mountSettings(id: string, element: HTMLElement): Promise<() => void>;
+  sync(options?: { waitForActivationMs?: number }): Promise<void>;
+  list(): Array<{
+    id: string;
+    enabled: boolean;
+    version?: string;
+    updatedAt?: string;
+    capabilities?: string[];
+    entry?: { renderer?: string; settings?: string };
+    hasSettings?: boolean;
+  }>;
+  subscribe?(listener: () => void): () => void;
+  mountSettings(
+    id: string,
+    element: HTMLElement,
+    options?: { signal?: AbortSignal; version?: string; updatedAt?: string; capabilities?: string[] },
+  ): Promise<() => void>;
 }
 
 declare global {
@@ -28,11 +43,33 @@ export function pluginHostBridge(): PluginHostBridge | null {
   return window.__ekdPlugins ?? null;
 }
 
-export async function syncPluginHost(): Promise<string | null> {
+export async function syncPluginHost(options?: { waitForActivationMs?: number }): Promise<string | null> {
+  const bridge = pluginHostBridge();
+  if (!bridge) return null;
+  const waitMs =
+    typeof options?.waitForActivationMs === "number" && Number.isFinite(options.waitForActivationMs) && options.waitForActivationMs >= 0
+      ? options.waitForActivationMs
+      : DEFAULT_SYNC_WAIT_MS;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
   try {
-    await pluginHostBridge()?.sync();
+    const syncPromise = Promise.resolve().then(() => bridge.sync({ waitForActivationMs: waitMs }));
+    const guardedSync = syncPromise.catch(cause => {
+      if (timedOut) return;
+      throw cause;
+    });
+    const timeoutPromise = new Promise<void>(resolve => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        resolve();
+      }, waitMs);
+      (timer as { unref?: () => void } | undefined)?.unref?.();
+    });
+    await Promise.race([guardedSync, timeoutPromise]);
     return null;
   } catch (cause) {
     return cause instanceof Error ? cause.message : String(cause);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }

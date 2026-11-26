@@ -16,18 +16,25 @@ from scenarios import verify_bridge, verify_plugin_safe_mode, verify_plugins, ve
 
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+def core_environment():
+    env = os.environ.copy()
+    env['EKD_DISABLE_OS_KEYCHAIN'] = '1'
+    env['EKD_DISABLE_AUTO_UPDATE_CHECK'] = '1'
+    return env
+
 class Core:
     def __init__(self, binary, folder):
         self.folder = Path(folder)
         self.connection = None
         self.stderr_path = self.folder / 'core.stderr.log'
-        with self.stderr_path.open('wb') as stderr:
-            self.process = subprocess.Popen([str(binary), '--data-dir', str(folder)],
-                                            stdout=subprocess.DEVNULL, stderr=stderr)
-        runtime = self.folder / 'runtime.json'
-        deadline = time.monotonic() + 15
-        last_read_error = None
+        self.process = None
         try:
+            with self.stderr_path.open('wb') as stderr:
+                self.process = subprocess.Popen([str(binary), '--data-dir', str(folder)],
+                                                stdout=subprocess.DEVNULL, stderr=stderr, env=core_environment())
+            runtime = self.folder / 'runtime.json'
+            deadline = time.monotonic() + 15
+            last_read_error = None
             while True:
                 if self.process.poll() is not None:
                     raise AssertionError('core exited before readiness')
@@ -40,13 +47,19 @@ class Core:
                 if time.monotonic() > deadline:
                     raise AssertionError('core readiness timeout') from last_read_error
                 time.sleep(.01)
-        except Exception as error:
-            diagnostics = self.diagnostics()
-            self.stop(hard=True)
+            self.base, self.token = data['url'], data['pairingToken']
+            address = urllib.parse.urlsplit(self.base)
+            self.connection = http.client.HTTPConnection(address.hostname, address.port, timeout=15)
+        except BaseException as error:
+            if self.process is None:
+                raise
+            try:
+                diagnostics = self.diagnostics() if isinstance(error, Exception) else None
+            finally:
+                self.stop(hard=True)
+            if diagnostics is None:
+                raise
             raise AssertionError(f'{error}\n{diagnostics}') from error
-        self.base, self.token = data['url'], data['pairingToken']
-        address = urllib.parse.urlsplit(self.base)
-        self.connection = http.client.HTTPConnection(address.hostname, address.port, timeout=15)
 
     def diagnostics(self):
         status = self.process.poll()
@@ -72,16 +85,25 @@ class Core:
         return data
 
     def stop(self, hard=False):
-        if self.connection is not None:
-            self.connection.close()
-        if self.process.poll() is None:
-            if hard:
+        report_timeout = not hard and sys.exc_info()[0] is None
+        try:
+            if self.process.poll() is None:
+                if hard:
+                    self.process.kill()
+                elif os.name == 'nt':
+                    self.process.terminate()
+                else:
+                    self.process.send_signal(signal.SIGTERM)
+            try:
+                self.process.wait(timeout=15)
+            except subprocess.TimeoutExpired as error:
                 self.process.kill()
-            elif os.name == 'nt':
-                self.process.terminate()
-            else:
-                self.process.send_signal(signal.SIGTERM)
-        self.process.wait(timeout=15)
+                self.process.wait()
+                if report_timeout:
+                    raise AssertionError("core did not exit cleanly before timeout") from error
+        finally:
+            if self.connection is not None:
+                self.connection.close()
 
 def run(binary):
     Path('work').mkdir(exist_ok=True)
@@ -104,8 +126,11 @@ def run(binary):
             pair = core.request('/pair', {'pairingToken': core.token, 'permissions': ['models:read']}, token=False)
             core.request('/usage', headers={'Authorization': 'Bearer ' + pair['sessionToken']}, expected=403)
             results.append('pairing / Host / Origin / resource permission enforcement')
-            second = subprocess.run([str(binary), '--data-dir', folder], capture_output=True, text=True, timeout=10)
-            assert second.returncode != 0
+            second = subprocess.run([str(binary), '--data-dir', folder], capture_output=True, text=True,
+                                    timeout=10, env=core_environment())
+            second_output = second.stderr + second.stdout
+            assert second.returncode != 0, second_output
+            assert 'already owns this data directory' in second_output, second_output
             results.append('second process cannot acquire owned data directory')
             sources = core.request('/chat/sources')['items']
             assert sources[0]['id'] == 'kimi'

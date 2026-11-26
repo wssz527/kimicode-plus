@@ -64,13 +64,14 @@ type NativeService struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu                 sync.Mutex
-	automationMu       sync.Mutex
-	featureMu          sync.Mutex
-	cacheMu            sync.Mutex
-	providerModelsMu   sync.Mutex
-	publicModelCatalog publicModelCatalog
-	watchMu            sync.Mutex
+	mu                    sync.Mutex
+	automationMu          sync.Mutex
+	featureMu             sync.Mutex
+	cacheMu               sync.Mutex
+	providerModelsSemOnce sync.Once
+	providerModelsSem     chan struct{}
+	publicModelCatalog    publicModelCatalog
+	watchMu               sync.Mutex
 	// watchOpMu serializes subscribe and unsubscribe transitions. It is separate
 	// from watchMu because one transition includes a network call: holding the
 	// reference map only while it is read would let a second caller see a
@@ -524,6 +525,8 @@ func (s *NativeService) Action(ctx context.Context, action string, payload json.
 		return s.updateProviderModel(ctx, input)
 	case "providers.updateModels":
 		return s.updateProviderModels(ctx, input)
+	case "providers.saveOfficialForm":
+		return s.saveOfficialProviderForm(ctx, input)
 	case "providers.modelSuggestion":
 		return s.providerModelSuggestion(ctx, input)
 	case "managed.usage":

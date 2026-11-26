@@ -240,10 +240,17 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 				AllowDailyInstance: opts.AllowDailyInstance, AppVersionOverride: opts.AppVersionOverride,
 			}, candidate)
 			if err != nil {
-				_ = RecordAttach(opts.DataDir, err)
+				if !IsAttachStateRecorded(err) && !IsAttachPersistFailed(err) {
+					_ = RecordAttach(opts.DataDir, err)
+				}
 				return nil, err
 			}
-			_ = RecordAttach(opts.DataDir, result)
+			if result != nil && !IsAttachStateRecordedResult(result) {
+				if result.hostStarted == "" {
+					result.hostStarted = candidate.Started
+				}
+				_ = RecordAttach(opts.DataDir, result)
+			}
 			return &WindowsLaunchResult{CoreReused: coreReused, CoreURL: coreRec.URL, KimiReused: true, KimiPID: candidate.PID, Attach: result}, nil
 		}
 		targetProc = candidate
@@ -319,23 +326,38 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 	}
 
 	// Step 4: Re-verify process identity and loopback port ownership immediately before attaching.
-	recheckProcs, err := deps.ListProcesses(ctx)
+	gate, err := acquireHostAttachLock(ctx, opts.DataDir)
 	if err != nil {
 		return nil, err
+	}
+	if gate != nil {
+		defer gate.Close()
+	}
+	prevInstalled := readInstalledAttachState(opts.DataDir)
+	recordLaunchFailure := func(err error) error {
+		_, committedErr := commitAttachOutcomeWithPreviousUnlocked(opts.DataDir, prevInstalled, nil, err)
+		return committedErr
+	}
+	recheckProcs, err := deps.ListProcesses(ctx)
+	if err != nil {
+		return nil, recordLaunchFailure(err)
 	}
 	recheckMatches, err := SelectWindowsMainProcesses(sid, recheckProcs, opts.KimiExecutable, opts.Profile)
 	if err != nil || len(recheckMatches) != 1 {
-		return nil, errors.New("Windows 宿主进程在接入前发生变化或退出")
+		return nil, recordLaunchFailure(errors.New("Windows 宿主进程在接入前发生变化或退出"))
 	}
 	if err := VerifyWindowsProcessIdentity(targetProc, recheckMatches[0]); err != nil {
-		return nil, err
+		return nil, recordLaunchFailure(err)
 	}
 	listeners, err := deps.ListListeners(ctx, debugPort)
 	if err != nil {
-		return nil, fmt.Errorf("无法检查调试端口监听属主：%w", err)
+		return nil, recordLaunchFailure(fmt.Errorf("无法检查调试端口监听属主：%w", err))
 	}
 	if err := VerifyWindowsDebugPortOwner(listeners, debugPort, targetProc.PID); err != nil {
-		return nil, err
+		return nil, recordLaunchFailure(err)
+	}
+	if invalidateErr := invalidateInstalledAttachBeforeInjectUnlocked(opts.DataDir); invalidateErr != nil {
+		return nil, markAttachPersistFailed(fmt.Errorf("无法更新接入状态文件，已中止接入以免破坏现有增强桥：%w", invalidateErr))
 	}
 
 	// Step 5: Attach the native bridge, with Chromium CDP as the compatibility path.
@@ -353,6 +375,7 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 	attachOptions := WindowsCDPAttachOptions{
 		DebugPort:          debugPort,
 		HostPID:            targetProc.PID,
+		HostStarted:        targetProc.Started,
 		CoreURL:            coreRec.URL,
 		PairingToken:       coreRec.PairingToken,
 		CoreVersion:        coreRec.Version,
@@ -374,9 +397,8 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 		})
 		inspectorClosed = windowsInspectorClosed(inspectorPort)
 		if !inspectorClosed {
-			err := errors.Join(attachErr, errors.New("Windows 临时主进程调试端口未关闭，已停止本次启动"))
-			_ = RecordAttach(opts.DataDir, err)
-			return nil, err
+			err := markBridgeTornDown(errors.Join(attachErr, errors.New("Windows 临时主进程调试端口未关闭，已停止本次启动")))
+			return nil, recordLaunchFailure(err)
 		}
 		if attachErr != nil {
 			mainWarning = attachErr.Error()
@@ -386,12 +408,31 @@ func RunWindowsLauncher(ctx context.Context, opts WindowsLaunchOptions, deps Win
 		attachResult, attachErr = deps.AttachCDP(ctx, attachOptions)
 	}
 	if attachErr != nil {
-		_ = RecordAttach(opts.DataDir, attachErr)
-		return nil, attachErr
+		if isWindowsCDPRendererTornDownErr(attachErr) || isWindowsMainBridgeTornDownErr(attachErr) {
+			attachErr = markBridgeTornDown(attachErr)
+		}
+		return nil, recordLaunchFailure(attachErr)
 	}
 	attachResult.MainBridgeWarning = mainWarning
 	attachResult.hostStarted = targetProc.Started
-	_ = RecordAttach(opts.DataDir, attachResult)
+	if attachResult.attachKey == "" {
+		keyOpts := AttachOptions{
+			CoreURL:            coreRec.URL,
+			PairingToken:       coreRec.PairingToken,
+			CoreVersion:        coreRec.Version,
+			Profile:            opts.Profile,
+			AppVersionOverride: opts.AppVersionOverride,
+		}
+		if attachResult.Transport == "main-loopback-rpc" {
+			attachResult.attachKey = windowsLiveAttachKey(targetProc, keyOpts)
+		} else {
+			attachResult.attachKey = windowsCDPAttachKey(targetProc, debugPort, keyOpts)
+		}
+	}
+	attachResult, err = commitAttachOutcomeUnlocked(opts.DataDir, attachResult, nil)
+	if err != nil {
+		return nil, err
+	}
 
 	return &WindowsLaunchResult{
 		CoreReused: coreReused,

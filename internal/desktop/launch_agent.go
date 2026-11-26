@@ -8,10 +8,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"time"
 
 	"enhancedkimi/internal/platform"
+
+	"github.com/gofrs/flock"
 )
 
 const (
@@ -506,13 +510,152 @@ func AttachOnce(ctx context.Context, options AttachOptions) (*AttachResult, erro
 	return AttachNative(ctx, options)
 }
 
-// RecordAttach writes the last attach result next to the agent so the settings
-// surface can explain why it is not attached without reading the log.
-func RecordAttach(dataDir string, value any) error {
+var attachHealthyInstanceAlive = defaultAttachHealthyInstanceAlive
+
+func readInstalledAttachState(dataDir string) map[string]any {
+	state := ReadAttachState(dataDir)
+	if state == nil || state["status"] != "installed" {
+		return nil
+	}
+	return state
+}
+
+func shouldPreserveInstalledAttachState(prev map[string]any, currentCore int) bool {
+	if currentCore <= 0 || prev == nil || prev["status"] != "installed" {
+		return false
+	}
+	prevCore, ok := attachStatePID(prev["corePid"])
+	if !ok || prevCore != currentCore {
+		return false
+	}
+	hostPid, ok := attachStatePID(prev["hostPid"])
+	if !ok || hostPid <= 0 {
+		return false
+	}
+	hostStarted, _ := prev["hostStarted"].(string)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return attachHealthyInstanceAlive(ctx, currentCore, hostPid, strings.TrimSpace(hostStarted))
+}
+
+func shouldPreserveInstalledAttach(dataDir string, currentCore int) bool {
+	if currentCore <= 0 {
+		return false
+	}
+	return shouldPreserveInstalledAttachState(ReadAttachState(dataDir), currentCore)
+}
+
+func invalidateInstalledAttachBeforeInjectUnlocked(dataDir string) error {
 	if dataDir == "" {
 		return nil
 	}
-	payload := map[string]any{"at": time.Now().UTC().Format(time.RFC3339Nano), "corePid": corePID(dataDir)}
+	target := filepath.Join(dataDir, "attach-state.json")
+	raw, readErr := os.ReadFile(target)
+	if readErr != nil {
+		if errors.Is(readErr, os.ErrNotExist) {
+			return nil
+		}
+	} else {
+		var state map[string]any
+		if json.Unmarshal(raw, &state) == nil && state != nil {
+			if status, ok := state["status"].(string); ok && status != "" && status != "installed" {
+				return nil
+			}
+		}
+	}
+	writeErr := writeAttachState(dataDir, map[string]any{
+		"at":      time.Now().UTC().Format(time.RFC3339Nano),
+		"status":  "attaching",
+		"corePid": corePID(dataDir),
+	})
+	if writeErr == nil {
+		return nil
+	}
+	removeErr := os.Remove(target)
+	if removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
+		return nil
+	}
+	if readErr != nil {
+		return errors.Join(fmt.Errorf("读取旧接入状态文件失败：%w", readErr), writeErr, fmt.Errorf("移除旧接入状态文件失败：%w", removeErr))
+	}
+	return errors.Join(writeErr, fmt.Errorf("移除旧接入状态文件失败：%w", removeErr))
+}
+
+func defaultAttachHealthyInstanceAlive(ctx context.Context, corePid, hostPid int, hostStarted string) bool {
+	if corePid <= 0 || hostPid <= 0 {
+		return false
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		if corePid != os.Getpid() {
+			if _, err := ProcessIdentity(ctx, corePid); err != nil {
+				return false
+			}
+		}
+		info, err := ProcessIdentity(ctx, hostPid)
+		if err != nil || info.PID != hostPid {
+			return false
+		}
+		if hostStarted != "" {
+			return info.Started == hostStarted
+		}
+		return slices.Contains(kimiExecutables(), info.Executable)
+	case "windows":
+		if hostStarted == "" {
+			script := fmt.Sprintf(
+				"$ErrorActionPreference='Stop';$c=Get-CimInstance Win32_Process -Filter 'ProcessId=%d';if(-not $c){exit 1};$h=Get-CimInstance Win32_Process -Filter 'ProcessId=%d';if(-not $h -or $h.Name -ine '%s'){exit 1}",
+				corePid, hostPid, WindowsKimiExecutableName,
+			)
+			return exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", EncodeWindowsPowerShellCommand(script)).Run() == nil
+		}
+		script := fmt.Sprintf(
+			"$ErrorActionPreference='Stop';$c=Get-CimInstance Win32_Process -Filter 'ProcessId=%d';if(-not $c){exit 1};$h=Get-CimInstance Win32_Process -Filter 'ProcessId=%d';if(-not $h){exit 1};if($h.CreationDate){Write-Output $h.CreationDate.ToUniversalTime().ToString('o')}",
+			corePid, hostPid,
+		)
+		out, err := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", EncodeWindowsPowerShellCommand(script)).Output()
+		if err != nil {
+			return false
+		}
+		actualStarted := strings.TrimSpace(string(out))
+		return hostStartedEqual(hostStarted, actualStarted)
+	default:
+		return false
+	}
+}
+
+func hostStartedEqual(expected, actual string) bool {
+	expected = strings.TrimSpace(expected)
+	actual = strings.TrimSpace(actual)
+	if expected == actual {
+		return true
+	}
+	expectedTime, errA := time.Parse(time.RFC3339Nano, expected)
+	actualTime, errB := time.Parse(time.RFC3339Nano, actual)
+	return errA == nil && errB == nil && expectedTime.Truncate(time.Microsecond).Equal(actualTime.Truncate(time.Microsecond))
+}
+
+func tryAcquireHostAttachLockForFallback(dataDir string) (func(), bool, error) {
+	if dataDir == "" {
+		return func() {}, true, nil
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return nil, false, err
+	}
+	gate := flock.New(filepath.Join(dataDir, hostAttachLockFile))
+	ok, err := gate.TryLock()
+	if err != nil {
+		_ = gate.Close()
+		return nil, false, err
+	}
+	if !ok {
+		_ = gate.Close()
+		return nil, false, nil
+	}
+	return func() { _ = gate.Close() }, true, nil
+}
+
+func buildAttachPayload(currentCore int, value any) map[string]any {
+	payload := map[string]any{"at": time.Now().UTC().Format(time.RFC3339Nano), "corePid": currentCore}
 	if result, ok := value.(*AttachResult); ok && result != nil {
 		payload["status"] = result.Status
 		payload["hostPid"] = result.HostPID
@@ -549,7 +692,43 @@ func RecordAttach(dataDir string, value any) error {
 		payload["error"] = err.Error()
 		payload["consentRequired"] = errors.Is(err, ErrConsentRequired)
 	}
-	return writeAttachState(dataDir, payload)
+	return payload
+}
+
+func recordAttachUnlocked(dataDir string, value any) error {
+	if dataDir == "" {
+		return nil
+	}
+	currentCore := corePID(dataDir)
+	if err, ok := value.(error); ok && err != nil {
+		if !isBridgeTornDown(err) && shouldPreserveInstalledAttach(dataDir, currentCore) {
+			return nil
+		}
+	}
+	return writeAttachState(dataDir, buildAttachPayload(currentCore, value))
+}
+
+// RecordAttach writes the last attach result next to the agent so the settings
+// surface can explain why it is not attached without reading the log.
+func RecordAttach(dataDir string, value any) error {
+	if dataDir == "" {
+		return nil
+	}
+	if result, ok := value.(*AttachResult); ok && result != nil && result.stateRecorded {
+		return nil
+	}
+	if err, ok := value.(error); ok && err != nil && (isAttachStateRecorded(err) || isAttachPersistFailed(err)) {
+		return nil
+	}
+	release, acquired, err := tryAcquireHostAttachLockForFallback(dataDir)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return nil
+	}
+	defer release()
+	return recordAttachUnlocked(dataDir, value)
 }
 
 // corePID lets a later reader tell whether the recorded state belongs to the

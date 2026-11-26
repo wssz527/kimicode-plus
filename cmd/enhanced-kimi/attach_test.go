@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -140,6 +144,90 @@ func TestResolveAttachCredentialsPrefersLiveRuntime(t *testing.T) {
 	}
 }
 
+func TestResolveAttachRuntimeAlwaysProbesHealthEvenWhenFallbackMatches(t *testing.T) {
+	ctx := context.Background()
+	token := strings.Repeat("z", 48)
+	var healthHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/enhance/v1/health" && r.Header.Get("Authorization") == "Bearer "+token {
+			healthHits++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"OK"}`))
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	dir := t.TempDir()
+	payload, err := json.Marshal(map[string]any{
+		"url":          srv.URL,
+		"pairingToken": token,
+		"version":      "0.2.10",
+		"pid":          os.Getpid(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Even when CLI fallback matches runtime.json exactly, /enhance/v1/health must be probed.
+	gotURL, gotToken, gotVersion := resolveAttachRuntime(ctx, dir, srv.URL, token)
+	if gotURL != srv.URL || gotToken != token || gotVersion != "0.2.10" {
+		t.Fatalf("live matching runtime.json failed: got (%s, %s, %s)", gotURL, gotToken, gotVersion)
+	}
+	if healthHits != 1 {
+		t.Fatalf("resolveAttachRuntime skipped /enhance/v1/health probe when fallback matched: hits=%d", healthHits)
+	}
+
+	// Once the core exits (server closed) leaving stale runtime.json on disk, matching CLI flags must NOT adopt it.
+	srv.Close()
+	gotURL, gotToken, gotVersion = resolveAttachRuntime(ctx, dir, srv.URL, token)
+	if gotURL != srv.URL || gotToken != token || gotVersion != "" {
+		t.Fatalf("dead core stale runtime.json was wrongly adopted: got (%s, %s, %q)", gotURL, gotToken, gotVersion)
+	}
+}
+
+func TestRunAttachPersistFailedDoesNotReRecordOutOfLock(t *testing.T) {
+	dir := t.TempDir()
+	token := strings.Repeat("p", 48)
+	initialRaw, err := json.Marshal(map[string]any{
+		"status":    "installed",
+		"hostPid":   9001,
+		"attachKey": "untouched-state",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "attach-state.json"), initialRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	prevAttach := attachOnce
+	prevStdout := attachStdout
+	attachStdout = io.Discard
+	attachOnce = func(_ context.Context, _ desktop.AttachOptions) (*desktop.AttachResult, error) {
+		return nil, desktop.MarkAttachPersistFailed(errors.New("写入接入状态文件失败：rename blocked"))
+	}
+	t.Cleanup(func() {
+		attachOnce = prevAttach
+		attachStdout = prevStdout
+	})
+
+	err = runAttach([]string{"--data-dir", dir, "--core-url", "http://127.0.0.1:8321", "--pairing-token", token})
+	if err == nil || !desktop.IsAttachPersistFailed(err) {
+		t.Fatalf("expected persist-failed error from runAttach, got: %v", err)
+	}
+	if desktop.IsAttachStateRecorded(err) {
+		t.Fatalf("persist-failed error must not be marked stateRecorded: %v", err)
+	}
+	state := desktop.ReadAttachState(dir)
+	if state["status"] != "installed" || state["attachKey"] != "untouched-state" {
+		t.Fatalf("runAttach performed out-of-lock RecordAttach despite persist-failed marker: %+v", state)
+	}
+}
+
 // A recorded, successful attach is replayed with the exact consent it was
 // recorded with. A Windows launcher lease must not widen that consent.
 func TestRestartStateReplaysRecordedAttach(t *testing.T) {
@@ -189,4 +277,320 @@ func TestRestartStateIgnoresExpiredWindowsLease(t *testing.T) {
 	if state := restartStateForCore(dir, 41000, "", true); state.Reattach || state.ReattachDaily {
 		t.Fatalf("a missing lease asked for a reattach: %+v", state)
 	}
+}
+
+func TestRunAttachDefaultsSkipCurrentAndEchoesStateWhenSkipped(t *testing.T) {
+	dir := t.TempDir()
+	token := strings.Repeat("c", 48)
+	existingPayload := map[string]any{
+		"status":      "installed",
+		"hostPid":     float64(9001),
+		"appVersion":  "1.4.3",
+		"attachKey":   "stable-key",
+		"hostStarted": "Thu Nov 26 10:00:00 2026",
+	}
+	rawState, err := json.Marshal(existingPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(dir, "attach-state.json")
+	if err := os.WriteFile(statePath, rawState, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotOpts []desktop.AttachOptions
+	prevAttach := attachOnce
+	prevStdout := attachStdout
+	attachOnce = func(_ context.Context, opts desktop.AttachOptions) (*desktop.AttachResult, error) {
+		gotOpts = append(gotOpts, opts)
+		if opts.SkipCurrent {
+			return nil, nil
+		}
+		return &desktop.AttachResult{Status: "installed", HostPID: 9001, AppVersion: "1.4.3"}, nil
+	}
+	t.Cleanup(func() {
+		attachOnce = prevAttach
+		attachStdout = prevStdout
+	})
+
+	// Foreground without --force: SkipCurrent=true, outputs existing state JSON, does not overwrite file.
+	var fgOut bytes.Buffer
+	attachStdout = &fgOut
+	if err := runAttach([]string{"--data-dir", dir, "--core-url", "http://127.0.0.1:8321", "--pairing-token", token}); err != nil {
+		t.Fatalf("foreground skipped attach: %v", err)
+	}
+	if len(gotOpts) != 1 || !gotOpts[0].SkipCurrent {
+		t.Fatalf("foreground attach did not default SkipCurrent=true: %+v", gotOpts)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(fgOut.Bytes(), &decoded); err != nil {
+		t.Fatalf("foreground skipped stdout not valid JSON (%q): %v", fgOut.String(), err)
+	}
+	if decoded["status"] != "installed" || decoded["attachKey"] != "stable-key" {
+		t.Fatalf("foreground skipped stdout = %+v", decoded)
+	}
+	afterSkip, err := os.ReadFile(statePath)
+	if err != nil || string(afterSkip) != string(rawState) {
+		t.Fatalf("attach-state.json changed on skip: got %q, want %q", afterSkip, rawState)
+	}
+
+	// Background without --force: SkipCurrent=true, silent stdout.
+	var bgOut bytes.Buffer
+	attachStdout = &bgOut
+	if err := runAttach([]string{"--background", "--data-dir", dir, "--core-url", "http://127.0.0.1:8321", "--pairing-token", token}); err != nil {
+		t.Fatalf("background skipped attach: %v", err)
+	}
+	if len(gotOpts) != 2 || !gotOpts[1].SkipCurrent {
+		t.Fatalf("background attach did not set SkipCurrent=true: %+v", gotOpts)
+	}
+	if bgOut.Len() != 0 {
+		t.Fatalf("background skipped attach wrote to stdout: %q", bgOut.String())
+	}
+
+	// Explicit --force: SkipCurrent=false, performs fresh attach.
+	var forceOut bytes.Buffer
+	attachStdout = &forceOut
+	if err := runAttach([]string{"--force", "--data-dir", dir, "--core-url", "http://127.0.0.1:8321", "--pairing-token", token}); err != nil {
+		t.Fatalf("forced attach: %v", err)
+	}
+	if len(gotOpts) != 3 || gotOpts[2].SkipCurrent {
+		t.Fatalf("--force did not set SkipCurrent=false: %+v", gotOpts)
+	}
+	decoded = nil
+	if err := json.Unmarshal(forceOut.Bytes(), &decoded); err != nil || decoded["status"] != "installed" {
+		t.Fatalf("forced attach stdout = %q, err=%v", forceOut.String(), err)
+	}
+}
+
+func TestRunAttachForceBridgeTornDownUpdatesErrorAndNextAttachReinjects(t *testing.T) {
+	dir := t.TempDir()
+	token := strings.Repeat("d", 48)
+	selfPID := os.Getpid()
+	hostStarted := "Thu Nov 26 10:00:00 2026"
+	canVerifyLiveProcess := false
+	if runtime.GOOS == "darwin" {
+		if info, err := desktop.ProcessIdentity(context.Background(), selfPID); err == nil && info.Started != "" {
+			hostStarted = info.Started
+			canVerifyLiveProcess = true
+		}
+	}
+	runtimeRaw, err := json.Marshal(map[string]any{"pid": selfPID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), runtimeRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initialState := map[string]any{
+		"status":      "installed",
+		"corePid":     selfPID,
+		"hostPid":     selfPID,
+		"hostStarted": hostStarted,
+		"appVersion":  "1.4.2",
+		"attachKey":   "stable-key",
+	}
+	rawInitial, err := json.Marshal(initialState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "attach-state.json"), rawInitial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	prevAttach := attachOnce
+	prevStdout := attachStdout
+	t.Cleanup(func() {
+		attachOnce = prevAttach
+		attachStdout = prevStdout
+	})
+
+	// 1. Pre-touch lock/precheck error (not marked torn-down) preserves healthy installed state.
+	attachOnce = func(_ context.Context, _ desktop.AttachOptions) (*desktop.AttachResult, error) {
+		return nil, errors.New("等待其他 KimiCode+ 接入流程完成超时")
+	}
+	var out bytes.Buffer
+	attachStdout = &out
+	if err := runAttach([]string{"--force", "--data-dir", dir, "--core-url", "http://127.0.0.1:8321", "--pairing-token", token}); err == nil {
+		t.Fatal("expected precheck error from --force attach")
+	}
+	if canVerifyLiveProcess {
+		state := desktop.ReadAttachState(dir)
+		if state["status"] != "installed" || state["attachKey"] != "stable-key" {
+			t.Fatalf("pre-touch failure overwrote healthy installed state: %+v", state)
+		}
+	}
+
+	// 2. --force fails after tearing down the old bridge: attach-state.json must become error and drop attachKey.
+	attachOnce = func(_ context.Context, opts desktop.AttachOptions) (*desktop.AttachResult, error) {
+		if opts.SkipCurrent {
+			t.Fatal("--force unexpectedly set SkipCurrent=true")
+		}
+		return nil, desktop.MarkBridgeTornDown(errors.New("宿主没有确认正式 RPC 已挂载"))
+	}
+	if err := runAttach([]string{"--force", "--data-dir", dir, "--core-url", "http://127.0.0.1:8321", "--pairing-token", token}); err == nil {
+		t.Fatal("expected torn-down error from --force attach")
+	}
+	state := desktop.ReadAttachState(dir)
+	if state["status"] != "error" || state["attachKey"] != nil {
+		t.Fatalf("--force teardown failure did not update attach-state.json to error: %+v", state)
+	}
+
+	// 3. Subsequent ordinary attach (SkipCurrent=true) must not skip because attach-state.json is now error.
+	reinjected := 0
+	attachOnce = func(_ context.Context, opts desktop.AttachOptions) (*desktop.AttachResult, error) {
+		if !opts.SkipCurrent {
+			t.Fatal("ordinary attach did not set SkipCurrent=true")
+		}
+		if existing := desktop.ReadAttachState(opts.DataDir); existing["status"] == "installed" && existing["attachKey"] == "stable-key" {
+			return nil, nil
+		}
+		reinjected++
+		return &desktop.AttachResult{Status: "installed", HostPID: selfPID, AppVersion: "1.4.2"}, nil
+	}
+	out.Reset()
+	if err := runAttach([]string{"--data-dir", dir, "--core-url", "http://127.0.0.1:8321", "--pairing-token", token}); err != nil {
+		t.Fatalf("ordinary recovery attach failed: %v", err)
+	}
+	if reinjected != 1 {
+		t.Fatalf("ordinary attach after torn-down failure skipped reinjection: reinjected=%d", reinjected)
+	}
+	state = desktop.ReadAttachState(dir)
+	if state["status"] != "installed" {
+		t.Fatalf("ordinary recovery attach did not restore installed state: %+v", state)
+	}
+}
+
+func TestRunAttachInterleavingNeverOverwritesOutOfLock(t *testing.T) {
+	token := strings.Repeat("e", 48)
+	selfPID := os.Getpid()
+
+	t.Run("A torn-down error in lock then B installed in lock: A return must not overwrite B", func(t *testing.T) {
+		dir := t.TempDir()
+		runtimeRaw, err := json.Marshal(map[string]any{"pid": selfPID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "runtime.json"), runtimeRaw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		aCommitted := make(chan struct{})
+		bCommitted := make(chan struct{})
+		prevAttach := attachOnce
+		prevStdout := attachStdout
+		attachStdout = io.Discard
+		attachOnce = func(_ context.Context, opts desktop.AttachOptions) (*desktop.AttachResult, error) {
+			if !opts.SkipCurrent {
+				// Process A (--force): records torn-down error inside lock, releases lock, then pauses before returning to CLI.
+				errA := desktop.MarkBridgeTornDown(errors.New("A tore down old bridge"))
+				if recErr := desktop.RecordAttach(opts.DataDir, errA); recErr != nil {
+					return nil, recErr
+				}
+				recordedErrA := desktop.MarkAttachStateRecorded(errA)
+				close(aCommitted)
+				<-bCommitted
+				return nil, recordedErrA
+			}
+			// Process B: waits for A to commit & release lock, then records installed inside lock.
+			<-aCommitted
+			resB := &desktop.AttachResult{Status: "installed", HostPID: selfPID, AppVersion: "1.4.2", Transport: "main-loopback-rpc"}
+			if recErr := desktop.RecordAttach(opts.DataDir, resB); recErr != nil {
+				return nil, recErr
+			}
+			desktop.MarkAttachStateRecordedResult(resB)
+			close(bCommitted)
+			return resB, nil
+		}
+		t.Cleanup(func() {
+			attachOnce = prevAttach
+			attachStdout = prevStdout
+		})
+
+		errChA := make(chan error, 1)
+		errChB := make(chan error, 1)
+		go func() {
+			errChA <- runAttach([]string{"--force", "--data-dir", dir, "--core-url", "http://127.0.0.1:8321", "--pairing-token", token})
+		}()
+		go func() {
+			errChB <- runAttach([]string{"--data-dir", dir, "--core-url", "http://127.0.0.1:8321", "--pairing-token", token})
+		}()
+
+		errA := <-errChA
+		errB := <-errChB
+		if errA == nil || !desktop.IsBridgeTornDown(errA) {
+			t.Fatalf("expected torn-down error from A, got: %v", errA)
+		}
+		if errB != nil {
+			t.Fatalf("expected B to succeed, got: %v", errB)
+		}
+		state := desktop.ReadAttachState(dir)
+		if state["status"] != "installed" || state["hostPid"] != float64(selfPID) {
+			t.Fatalf("A returning to CLI overwrote B's installed state: %+v", state)
+		}
+	})
+
+	t.Run("B installed in lock then A torn-down error in lock: B return must not restore installed", func(t *testing.T) {
+		dir := t.TempDir()
+		runtimeRaw, err := json.Marshal(map[string]any{"pid": selfPID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "runtime.json"), runtimeRaw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		bCommitted := make(chan struct{})
+		aCommitted := make(chan struct{})
+		prevAttach := attachOnce
+		prevStdout := attachStdout
+		attachStdout = io.Discard
+		attachOnce = func(_ context.Context, opts desktop.AttachOptions) (*desktop.AttachResult, error) {
+			if opts.SkipCurrent {
+				// Process B: records installed inside lock, releases lock, then pauses before returning to CLI.
+				resB := &desktop.AttachResult{Status: "installed", HostPID: selfPID, AppVersion: "1.4.2", Transport: "main-loopback-rpc"}
+				if recErr := desktop.RecordAttach(opts.DataDir, resB); recErr != nil {
+					return nil, recErr
+				}
+				desktop.MarkAttachStateRecordedResult(resB)
+				close(bCommitted)
+				<-aCommitted
+				return resB, nil
+			}
+			// Process A (--force): waits for B to commit & release lock, then tears down and records error inside lock.
+			<-bCommitted
+			errA := desktop.MarkBridgeTornDown(errors.New("A force teardown failed"))
+			if recErr := desktop.RecordAttach(opts.DataDir, errA); recErr != nil {
+				return nil, recErr
+			}
+			recordedErrA := desktop.MarkAttachStateRecorded(errA)
+			close(aCommitted)
+			return nil, recordedErrA
+		}
+		t.Cleanup(func() {
+			attachOnce = prevAttach
+			attachStdout = prevStdout
+		})
+
+		errChB := make(chan error, 1)
+		errChA := make(chan error, 1)
+		go func() {
+			errChB <- runAttach([]string{"--data-dir", dir, "--core-url", "http://127.0.0.1:8321", "--pairing-token", token})
+		}()
+		go func() {
+			errChA <- runAttach([]string{"--force", "--data-dir", dir, "--core-url", "http://127.0.0.1:8321", "--pairing-token", token})
+		}()
+
+		errB := <-errChB
+		errA := <-errChA
+		if errB != nil {
+			t.Fatalf("expected B to succeed, got: %v", errB)
+		}
+		if errA == nil || !desktop.IsBridgeTornDown(errA) {
+			t.Fatalf("expected torn-down error from A, got: %v", errA)
+		}
+		state := desktop.ReadAttachState(dir)
+		if state["status"] != "error" || state["attachKey"] != nil {
+			t.Fatalf("B returning to CLI overwrote A's error state back to installed: %+v", state)
+		}
+	})
 }

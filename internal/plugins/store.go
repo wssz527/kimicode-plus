@@ -250,6 +250,7 @@ const (
 	ActivityEnable     = "ENABLE"
 	ActivityDisable    = "DISABLE"
 	ActivityUninstall  = "UNINSTALL"
+	ActivityLog        = "LOG"
 	ActivityError      = "ERROR"
 	ActivitySession    = "SESSIONS_SEND"
 	ActivityConfig     = "CONFIG_WRITE"

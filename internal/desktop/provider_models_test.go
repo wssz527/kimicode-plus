@@ -1,14 +1,22 @@
 package desktop
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // officialModelStore stands in for the official KAP /config endpoint. It stores
@@ -947,4 +955,905 @@ func TestConfigActionsRedactCredentialsAndRetainModelOrder(t *testing.T) {
 			t.Fatalf("%s config response = %s", input.action, body)
 		}
 	}
+}
+
+func TestSaveOfficialProviderFormSerializesWithUpdateModelClearMaxOutput(t *testing.T) {
+	runCase := func(t *testing.T, updateFirst bool) {
+		t.Helper()
+		size := int64(1024)
+		models := inspectModels()
+		alpha := models["r2-inspect/alpha"]
+		alpha.MaxOutputSize = &size
+		models["r2-inspect/alpha"] = alpha
+		store := newOfficialModelStore(models)
+		baseHandler := store.handler()
+
+		firstPutEntered := make(chan struct{})
+		releaseFirstPut := make(chan struct{})
+		var putCount atomic.Int32
+		var getWhilePutHeld atomic.Int32
+		var putInFlight atomic.Bool
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config") && putInFlight.Load() {
+				getWhilePutHeld.Add(1)
+			}
+			if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/providers/") {
+				if putCount.Add(1) == 1 {
+					putInFlight.Store(true)
+					close(firstPutEntered)
+					<-releaseFirstPut
+					putInFlight.Store(false)
+				}
+			}
+			baseHandler.ServeHTTP(w, r)
+		})
+		service, _ := newAutomationTestService(t, handler)
+
+		saveFormPayload := json.RawMessage(fmt.Sprintf(`{
+			"providerId": "r2-inspect",
+			"expectedOrigin": %q,
+			"payload": {
+				"type": "openai",
+				"base_url": "https://example.invalid/v2",
+				"models": [
+					{"model": "alpha", "max_context_size": 131072, "display_name": "R2 Alpha"},
+					{"model": "beta", "max_context_size": 65536, "display_name": "R2 Beta"}
+				]
+			},
+			"opening": {}
+		}`, service.kap.base))
+		clearOutputPayload := json.RawMessage(`{"providerId":"r2-inspect","model":"alpha","edit":{"max_output_size":null}}`)
+
+		errCh1 := make(chan error, 1)
+		errCh2 := make(chan error, 1)
+		if updateFirst {
+			go func() {
+				_, err := service.Action(context.Background(), "providers.updateModel", clearOutputPayload)
+				errCh1 <- err
+			}()
+			<-firstPutEntered
+			go func() {
+				_, err := service.Action(context.Background(), "providers.saveOfficialForm", saveFormPayload)
+				errCh2 <- err
+			}()
+		} else {
+			go func() {
+				_, err := service.Action(context.Background(), "providers.saveOfficialForm", saveFormPayload)
+				errCh1 <- err
+			}()
+			<-firstPutEntered
+			go func() {
+				_, err := service.Action(context.Background(), "providers.updateModel", clearOutputPayload)
+				errCh2 <- err
+			}()
+		}
+
+		// Give the second goroutine a window to attempt /config if locking were broken.
+		time.Sleep(40 * time.Millisecond)
+		close(releaseFirstPut)
+
+		if err := <-errCh1; err != nil {
+			t.Fatalf("first action failed: %v", err)
+		}
+		if err := <-errCh2; err != nil {
+			t.Fatalf("second action failed: %v", err)
+		}
+		if getWhilePutHeld.Load() != 0 {
+			t.Fatalf("concurrent GET /config ran while providerModelsMu PUT was in flight: %d", getWhilePutHeld.Load())
+		}
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		if got := store.models["r2-inspect/alpha"].MaxOutputSize; got != nil {
+			t.Fatalf("cleared max_output_size was resurrected: %d (bodies=%v)", *got, store.bodies)
+		}
+		if len(store.bodies) != 2 {
+			t.Fatalf("expected 2 serialized PUT bodies, got %d", len(store.bodies))
+		}
+	}
+
+	t.Run("updateModel clears before saveOfficialForm", func(t *testing.T) {
+		runCase(t, true)
+	})
+	t.Run("saveOfficialForm runs before updateModel clears", func(t *testing.T) {
+		runCase(t, false)
+	})
+}
+
+func TestSaveOfficialProviderFormHandlesOmittedKeysExplicitEditsAndRedaction(t *testing.T) {
+	size := int64(1024)
+	stored := map[string]modelConfig{
+		"team/alpha": {
+			Provider:         "team",
+			Model:            "alpha",
+			DisplayName:      "Alpha",
+			MaxContextSize:   131072,
+			MaxOutputSize:    &size,
+			Capabilities:     []string{"video_in", "thinking"},
+			SupportEfforts:   []string{"low", "high"},
+			AdaptiveThinking: boolPtr(true),
+			DefaultEffort:    "high",
+			OffEffort:        "off",
+		},
+		"team/beta": {
+			Provider:       "team",
+			Model:          "beta",
+			DisplayName:    "Beta",
+			MaxContextSize: 65536,
+			Capabilities:   []string{"video_in"},
+			SupportEfforts: []string{"medium"},
+		},
+	}
+
+	var mu sync.Mutex
+	var putBodies []map[string]any
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config"):
+			mu.Lock()
+			snapshot := map[string]any{
+				"providers": map[string]providerConfig{
+					"team": {Type: "openai", BaseURL: "https://example.invalid/v1"},
+				},
+				"models": stored,
+			}
+			mu.Unlock()
+			writeNativeTestEnvelope(w, snapshot)
+		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/providers/team"):
+			var body map[string]any
+			decoder := json.NewDecoder(r.Body)
+			decoder.UseNumber()
+			if err := decoder.Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			putBodies = append(putBodies, body)
+			mu.Unlock()
+			writeNativeTestEnvelope(w, map[string]any{
+				"provider": map[string]any{
+					"id":          "team-renamed",
+					"type":        "openai",
+					"api_key":     "sk-must-not-leak",
+					"apiKey":      "sk-camel-must-not-leak",
+					"has_api_key": true,
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	service, _ := newAutomationTestService(t, handler)
+
+	t.Run("omitted keys preserve stored capabilities and thinking even with mismatched or empty opening", func(t *testing.T) {
+		res, err := service.Action(context.Background(), "providers.saveOfficialForm", json.RawMessage(fmt.Sprintf(`{
+			"providerId": "team",
+			"expectedOrigin": %q,
+			"payload": {
+				"type": "openai",
+				"new_id": "team-renamed",
+				"api_key": "sk-user-entered",
+				"base_url": "https://example.invalid/v2",
+				"default_model": "alpha",
+				"models": [
+					{"model": "alpha", "max_context_size": 131072, "display_name": "Alpha"},
+					{"model": "beta", "max_context_size": 65536, "display_name": "Beta"}
+				]
+			},
+			"opening": {
+				"alpha": {
+					"raw": {
+						"capabilities": ["image_in"],
+						"support_efforts": ["low"],
+						"adaptive_thinking": false,
+						"default_effort": "low",
+						"off_effort": "none"
+					},
+					"merged": null
+				}
+			}
+		}`, service.kap.base)))
+		if err != nil {
+			t.Fatalf("saveOfficialForm failed: %v", err)
+		}
+
+		mu.Lock()
+		if len(putBodies) != 1 {
+			mu.Unlock()
+			t.Fatalf("expected 1 PUT body, got %d", len(putBodies))
+		}
+		putBody := putBodies[0]
+		mu.Unlock()
+
+		if putBody["new_id"] != "team-renamed" || putBody["api_key"] != "sk-user-entered" || putBody["base_url"] != "https://example.invalid/v2" || putBody["default_model"] != "alpha" {
+			t.Fatalf("top-level official fields dropped: %#v", putBody)
+		}
+		models := rawSlice(putBody["models"])
+		if len(models) != 2 {
+			t.Fatalf("expected 2 models in PUT, got %#v", models)
+		}
+		alphaBody := models[0]
+		if !reflect.DeepEqual(cleanWireStringList(alphaBody["capabilities"]), []string{"video_in", "thinking"}) {
+			t.Fatalf("omitted capabilities were not preserved: %#v", alphaBody["capabilities"])
+		}
+		if !reflect.DeepEqual(cleanWireStringList(alphaBody["support_efforts"]), []string{"low", "high"}) {
+			t.Fatalf("omitted support_efforts were not preserved: %#v", alphaBody["support_efforts"])
+		}
+		if alphaBody["adaptive_thinking"] != true {
+			t.Fatalf("omitted adaptive_thinking was not preserved: %#v", alphaBody["adaptive_thinking"])
+		}
+		if alphaBody["default_effort"] != "high" || alphaBody["off_effort"] != "off" {
+			t.Fatalf("omitted effort defaults were not preserved: %#v", alphaBody)
+		}
+		if got, err := numberValue(alphaBody["max_output_size"]); err != nil || got != 1024 {
+			t.Fatalf("omitted max_output_size was not preserved: %#v (%v)", alphaBody["max_output_size"], err)
+		}
+		betaBody := models[1]
+		if !reflect.DeepEqual(cleanWireStringList(betaBody["capabilities"]), []string{"video_in"}) {
+			t.Fatalf("beta omitted capabilities were not preserved: %#v", betaBody["capabilities"])
+		}
+		if !reflect.DeepEqual(cleanWireStringList(betaBody["support_efforts"]), []string{"medium"}) {
+			t.Fatalf("beta omitted support_efforts were not preserved: %#v", betaBody["support_efforts"])
+		}
+		if _, hasOutput := betaBody["max_output_size"]; hasOutput {
+			t.Fatalf("beta nil max_output_size should not be injected: %#v", betaBody)
+		}
+
+		encoded, err := json.Marshal(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(encoded), "sk-must-not-leak") || strings.Contains(string(encoded), "sk-camel-must-not-leak") {
+			t.Fatalf("response leaked plaintext api key: %s", encoded)
+		}
+		var decoded struct {
+			Data struct {
+				Provider map[string]any `json:"provider"`
+			} `json:"data"`
+			MergedModels map[string]wireCapabilitySnapshot `json:"mergedModels"`
+		}
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Data.Provider["id"] != "team-renamed" || decoded.Data.Provider["has_api_key"] != true {
+			t.Fatalf("unexpected sanitized data: %#v", decoded.Data)
+		}
+		alphaSnap := decoded.MergedModels["alpha"]
+		if !reflect.DeepEqual(alphaSnap.Capabilities, []string{"video_in", "thinking"}) ||
+			!reflect.DeepEqual(alphaSnap.SupportEfforts, []string{"low", "high"}) ||
+			alphaSnap.AdaptiveThinking == nil || !*alphaSnap.AdaptiveThinking ||
+			alphaSnap.DefaultEffort != "high" || alphaSnap.OffEffort != "off" {
+			t.Fatalf("unexpected mergedModels[alpha]: %#v", alphaSnap)
+		}
+		betaSnap := decoded.MergedModels["beta"]
+		if betaSnap.AdaptiveThinking != nil {
+			t.Fatalf("expected beta adaptive_thinking omitted/nil, got %#v", *betaSnap.AdaptiveThinking)
+		}
+	})
+
+	t.Run("explicit edit differing from opening is respected", func(t *testing.T) {
+		res, err := service.Action(context.Background(), "providers.saveOfficialForm", json.RawMessage(fmt.Sprintf(`{
+			"providerId": "team",
+			"expectedOrigin": %q,
+			"payload": {
+				"type": "openai",
+				"models": [
+					{
+						"model": "alpha",
+						"max_context_size": 512,
+						"capabilities": ["image_in"],
+						"support_efforts": ["medium"],
+						"adaptive_thinking": false,
+						"default_effort": "medium",
+						"off_effort": "none"
+					}
+				]
+			},
+			"opening": {
+				"alpha": {
+					"raw": {
+						"capabilities": ["video_in", "thinking"],
+						"support_efforts": ["low", "high"],
+						"adaptive_thinking": true,
+						"default_effort": "high",
+						"off_effort": "off"
+					},
+					"merged": null
+				}
+			}
+		}`, service.kap.base)))
+		if err != nil {
+			t.Fatalf("saveOfficialForm explicit edit failed: %v", err)
+		}
+		mu.Lock()
+		putBody := putBodies[len(putBodies)-1]
+		mu.Unlock()
+		alphaBody := rawSlice(putBody["models"])[0]
+		if !reflect.DeepEqual(cleanWireStringList(alphaBody["capabilities"]), []string{"image_in"}) {
+			t.Fatalf("explicit capabilities edit was overwritten: %#v", alphaBody["capabilities"])
+		}
+		if !reflect.DeepEqual(cleanWireStringList(alphaBody["support_efforts"]), []string{"medium"}) {
+			t.Fatalf("explicit support_efforts edit was overwritten: %#v", alphaBody["support_efforts"])
+		}
+		if alphaBody["adaptive_thinking"] != false {
+			t.Fatalf("explicit adaptive_thinking edit was overwritten: %#v", alphaBody["adaptive_thinking"])
+		}
+		if alphaBody["default_effort"] != "medium" || alphaBody["off_effort"] != "none" {
+			t.Fatalf("explicit effort edit was overwritten: %#v", alphaBody)
+		}
+		if _, hasOutput := alphaBody["max_output_size"]; hasOutput {
+			t.Fatalf("oversized stored max_output_size (1024 > 512) must not be injected: %#v", alphaBody)
+		}
+		merged := res.(map[string]any)["mergedModels"].(map[string]wireCapabilitySnapshot)["alpha"]
+		if !reflect.DeepEqual(merged.Capabilities, []string{"image_in"}) {
+			t.Fatalf("mergedModels did not reflect explicit edit: %#v", merged)
+		}
+	})
+}
+
+func TestSaveOfficialProviderFormAbortsOnReadConfigFailureAndInvalidInput(t *testing.T) {
+	var getCalls, putCalls atomic.Int32
+	service, _ := newAutomationTestService(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			getCalls.Add(1)
+		}
+		if r.Method == http.MethodPut {
+			putCalls.Add(1)
+			writeNativeTestEnvelope(w, map[string]any{"provider": "team"})
+			return
+		}
+		http.Error(w, "kap config down", http.StatusInternalServerError)
+	}))
+
+	_, err := service.Action(context.Background(), "providers.saveOfficialForm", json.RawMessage(fmt.Sprintf(`{
+		"providerId": "team",
+		"expectedOrigin": %q,
+		"payload": {"type": "openai", "models": [{"model": "alpha", "max_context_size": 8192}]}
+	}`, service.kap.base)))
+	if err == nil {
+		t.Fatal("expected error when readConfig fails")
+	}
+	if putCalls.Load() != 0 {
+		t.Fatalf("PUT was sent despite readConfig failure: %d", putCalls.Load())
+	}
+
+	getCallsBeforeInvalid := getCalls.Load()
+	for _, bad := range []string{
+		fmt.Sprintf(`{"providerId":"","expectedOrigin":%q,"payload":{"models":[]}}`, service.kap.base),
+		fmt.Sprintf(`{"providerId":"managed:kimi-code","expectedOrigin":%q,"payload":{"models":[]}}`, service.kap.base),
+		fmt.Sprintf(`{"providerId":"team","expectedOrigin":%q}`, service.kap.base),
+		fmt.Sprintf(`{"providerId":"team","expectedOrigin":%q,"payload":{"type":"openai"}}`, service.kap.base),
+		`{"providerId":"team","payload":{"type":"openai","models":[]}}`,
+		`{"providerId":"team","expectedOrigin":"","payload":{"type":"openai","models":[]}}`,
+		`{"providerId":"team","expectedOrigin":"http://example.com:8080","payload":{"type":"openai","models":[]}}`,
+		`{"providerId":"team","expectedOrigin":"http://127.0.0.1","payload":{"type":"openai","models":[]}}`,
+		`{"providerId":"team","expectedOrigin":"http://user:pass@127.0.0.1:8080","payload":{"type":"openai","models":[]}}`,
+		`{"providerId":"team","expectedOrigin":"http://127.0.0.1:8080/api/v1","payload":{"type":"openai","models":[]}}`,
+		`{"providerId":"team","expectedOrigin":"http://127.0.0.1:8080?a=1","payload":{"type":"openai","models":[]}}`,
+		`{"providerId":"team","expectedOrigin":"http://127.0.0.1:8080#x","payload":{"type":"openai","models":[]}}`,
+	} {
+		if _, err := service.Action(context.Background(), "providers.saveOfficialForm", json.RawMessage(bad)); err == nil {
+			t.Fatalf("expected validation error for %s", bad)
+		}
+	}
+	if getCalls.Load() != getCallsBeforeInvalid || putCalls.Load() != 0 {
+		t.Fatalf("invalid inputs triggered KAP requests: getDelta=%d put=%d", getCalls.Load()-getCallsBeforeInvalid, putCalls.Load())
+	}
+}
+
+func TestSaveOfficialProviderFormOriginPinningAndMultiInstance(t *testing.T) {
+	t.Run("mismatched expectedOrigin on injected endpoint returns 409 KAP_ORIGIN_MISMATCH with zero requests", func(t *testing.T) {
+		var requests atomic.Int32
+		service, _ := newAutomationTestService(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			writeNativeTestEnvelope(w, map[string]any{"providers": map[string]any{}, "models": map[string]any{}})
+		}))
+		wrongOrigin := "http://127.0.0.1:1"
+		if service.kap.base == wrongOrigin {
+			wrongOrigin = "http://127.0.0.1:2"
+		}
+		payload := fmt.Sprintf(`{"providerId":"team","expectedOrigin":%q,"payload":{"type":"openai","models":[{"model":"alpha","max_context_size":8192}]}}`, wrongOrigin)
+		_, err := service.Action(context.Background(), "providers.saveOfficialForm", json.RawMessage(payload))
+		var native *NativeError
+		if !errors.As(err, &native) || native.Code != "KAP_ORIGIN_MISMATCH" || native.Status != http.StatusConflict {
+			t.Fatalf("expected KAP_ORIGIN_MISMATCH 409, got %#v (%v)", native, err)
+		}
+		// Verify HTTP action handler preserves 409 + KAP_ORIGIN_MISMATCH.
+		mux := http.NewServeMux()
+		service.Register(mux)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/enhance/v1/desktop/actions/providers.saveOfficialForm", bytes.NewReader([]byte(payload)))
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "KAP_ORIGIN_MISMATCH") {
+			t.Fatalf("HTTP handler did not preserve 409 KAP_ORIGIN_MISMATCH: code=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if requests.Load() != 0 {
+			t.Fatalf("mismatched origin issued KAP requests: %d", requests.Load())
+		}
+	})
+
+	t.Run("multi-instance pins GET /config and PUT to daemon A even when daemon B has newer heartbeat", func(t *testing.T) {
+		home := t.TempDir()
+		sizeA := int64(2048)
+		var getA, putA, callsB atomic.Int32
+		var putBodyA map[string]any
+
+		daemonA := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config"):
+				getA.Add(1)
+				writeNativeTestEnvelope(w, map[string]any{
+					"providers": map[string]providerConfig{"team": {Type: "openai"}},
+					"models": map[string]modelConfig{
+						"team/alpha": {
+							Provider:       "team",
+							Model:          "alpha",
+							MaxContextSize: 32768,
+							MaxOutputSize:  &sizeA,
+							Capabilities:   []string{"video_in"},
+						},
+					},
+				})
+			case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/providers/team"):
+				putA.Add(1)
+				dec := json.NewDecoder(r.Body)
+				dec.UseNumber()
+				_ = dec.Decode(&putBodyA)
+				writeNativeTestEnvelope(w, map[string]any{"provider": map[string]any{"id": "team"}})
+			default:
+				http.NotFound(w, r)
+			}
+		})
+		daemonB := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			callsB.Add(1)
+			writeNativeTestEnvelope(w, map[string]any{"providers": map[string]any{}, "models": map[string]any{}})
+		})
+
+		writeInstanceWithHeartbeat(t, home, "a.json", "127.0.0.1", portOf(t, daemonA), 100, "tok-1")
+		writeInstanceWithHeartbeat(t, home, "b.json", "127.0.0.1", portOf(t, daemonB), 999999, "tok-1")
+
+		kap := NewKAPClient(home)
+		// Prime default cache to daemon B first so we prove pinned requests ignore it.
+		if cached, _, err := kap.endpoint(); err != nil || cached != daemonB.URL {
+			t.Fatalf("expected cached endpoint to be daemon B, got %q err=%v", cached, err)
+		}
+		service := &NativeService{kap: kap, bus: NewEventBus(), cache: map[string]cachedSession{}}
+
+		_, err := service.Action(context.Background(), "providers.saveOfficialForm", json.RawMessage(fmt.Sprintf(`{
+			"providerId": "team",
+			"expectedOrigin": %q,
+			"payload": {"type": "openai", "models": [{"model": "alpha", "max_context_size": 32768}]},
+			"opening": {}
+		}`, daemonA.URL)))
+		if err != nil {
+			t.Fatalf("pinned saveOfficialForm to daemon A failed: %v", err)
+		}
+		if getA.Load() != 1 || putA.Load() != 1 || callsB.Load() != 0 {
+			t.Fatalf("expected getA=1 putA=1 callsB=0, got getA=%d putA=%d callsB=%d", getA.Load(), putA.Load(), callsB.Load())
+		}
+		alphaBody := rawSlice(putBodyA["models"])[0]
+		if got, err := numberValue(alphaBody["max_output_size"]); err != nil || got != 2048 {
+			t.Fatalf("daemon A max_output_size not preserved: %#v (%v)", alphaBody["max_output_size"], err)
+		}
+
+		// Unknown port must be rejected with 409 KAP_ORIGIN_MISMATCH and 0 calls.
+		unknownPort := 1
+		for unknownPort == portOf(t, daemonA) || unknownPort == portOf(t, daemonB) {
+			unknownPort++
+		}
+		_, err = service.Action(context.Background(), "providers.saveOfficialForm", json.RawMessage(fmt.Sprintf(`{
+			"providerId": "team",
+			"expectedOrigin": "http://127.0.0.1:%d",
+			"payload": {"type": "openai", "models": [{"model": "alpha", "max_context_size": 32768}]},
+			"opening": {}
+		}`, unknownPort)))
+		var native *NativeError
+		if !errors.As(err, &native) || native.Code != "KAP_ORIGIN_MISMATCH" || native.Status != http.StatusConflict {
+			t.Fatalf("expected KAP_ORIGIN_MISMATCH 409 for unknown port, got %#v (%v)", native, err)
+		}
+		if getA.Load() != 1 || putA.Load() != 1 || callsB.Load() != 0 {
+			t.Fatalf("unknown port sent unexpected requests: getA=%d putA=%d callsB=%d", getA.Load(), putA.Load(), callsB.Load())
+		}
+	})
+
+	t.Run("401 token refresh retry during saveOfficialForm stays pinned to daemon A", func(t *testing.T) {
+		home := t.TempDir()
+		var getA, putA, callsB atomic.Int32
+		daemonA := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config"):
+				if getA.Add(1) == 1 {
+					if err := os.WriteFile(filepath.Join(home, "server.token"), []byte("tok-fresh"), 0o600); err != nil {
+						t.Errorf("rotate token: %v", err)
+					}
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				if got := r.Header.Get("Authorization"); got != "Bearer tok-fresh" {
+					t.Errorf("GET retry used wrong token: %q", got)
+				}
+				writeNativeTestEnvelope(w, map[string]any{
+					"providers": map[string]providerConfig{"team": {Type: "openai"}},
+					"models":    map[string]modelConfig{},
+				})
+			case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/providers/team"):
+				if putA.Add(1) == 1 {
+					if err := os.WriteFile(filepath.Join(home, "server.token"), []byte("tok-fresh-2"), 0o600); err != nil {
+						t.Errorf("rotate token for PUT: %v", err)
+					}
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				if got := r.Header.Get("Authorization"); got != "Bearer tok-fresh-2" {
+					t.Errorf("PUT retry used wrong token: %q", got)
+				}
+				writeNativeTestEnvelope(w, map[string]any{"provider": map[string]any{"id": "team"}})
+			default:
+				http.NotFound(w, r)
+			}
+		})
+		daemonB := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			callsB.Add(1)
+			writeNativeTestEnvelope(w, map[string]any{"providers": map[string]any{}, "models": map[string]any{}})
+		})
+		writeInstanceWithHeartbeat(t, home, "a.json", "127.0.0.1", portOf(t, daemonA), 100, "tok-stale")
+		writeInstanceWithHeartbeat(t, home, "b.json", "127.0.0.1", portOf(t, daemonB), 999999, "tok-stale")
+
+		service := &NativeService{kap: NewKAPClient(home), bus: NewEventBus(), cache: map[string]cachedSession{}}
+		_, err := service.Action(context.Background(), "providers.saveOfficialForm", json.RawMessage(fmt.Sprintf(`{
+			"providerId": "team",
+			"expectedOrigin": %q,
+			"payload": {"type": "openai", "models": [{"model": "alpha", "max_context_size": 8192}]},
+			"opening": {}
+		}`, daemonA.URL)))
+		if err != nil {
+			t.Fatalf("saveOfficialForm with 401 token refresh failed: %v", err)
+		}
+		if getA.Load() != 2 || putA.Load() != 2 || callsB.Load() != 0 {
+			t.Fatalf("401 retries drifted from daemon A: getA=%d putA=%d callsB=%d", getA.Load(), putA.Load(), callsB.Load())
+		}
+	})
+}
+
+func TestProviderWritesRejectIncompleteConfigResponses(t *testing.T) {
+	cases := []struct {
+		name string
+		data string
+	}{
+		{name: "null root", data: `null`},
+		{name: "empty root object", data: `{}`},
+		{name: "missing models", data: `{"providers":{}}`},
+		{name: "null models", data: `{"providers":{},"models":null}`},
+		{name: "null providers", data: `{"providers":null,"models":{}}`},
+		{name: "array models", data: `{"providers":{},"models":[]}`},
+		{name: "null model entry", data: `{"providers":{},"models":{"team/alpha":null}}`},
+		{name: "null provider entry", data: `{"providers":{"team":null},"models":{}}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var putCalls atomic.Int32
+			service, _ := newAutomationTestService(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut {
+					putCalls.Add(1)
+					writeNativeTestEnvelope(w, map[string]any{"provider": "team"})
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"code":0,"msg":"","data":` + tc.data + `}`))
+			}))
+
+			_, formErr := service.Action(context.Background(), "providers.saveOfficialForm", json.RawMessage(fmt.Sprintf(`{
+				"providerId": "team",
+				"expectedOrigin": %q,
+				"payload": {"type": "openai", "models": [{"model": "alpha", "max_context_size": 8192}]},
+				"opening": {}
+			}`, service.kap.base)))
+			if formErr == nil {
+				t.Fatalf("saveOfficialForm unexpectedly succeeded on incomplete /config %s", tc.data)
+			}
+
+			_, updateErr := service.Action(context.Background(), "providers.updateModel", json.RawMessage(`{
+				"providerId": "team",
+				"model": "alpha",
+				"edit": {"capabilities": ["image_in"]}
+			}`))
+			if updateErr == nil {
+				t.Fatalf("updateModel unexpectedly succeeded on incomplete /config %s", tc.data)
+			}
+
+			_, batchErr := service.Action(context.Background(), "providers.updateModels", json.RawMessage(`{
+				"providerId": "team",
+				"models": [{"model": "alpha", "edit": {"capabilities": ["image_in"]}}]
+			}`))
+			if batchErr == nil {
+				t.Fatalf("updateModels unexpectedly succeeded on incomplete /config %s", tc.data)
+			}
+
+			if putCalls.Load() != 0 {
+				t.Fatalf("incomplete /config %s triggered %d PUT call(s)", tc.data, putCalls.Load())
+			}
+		})
+	}
+}
+
+func TestProviderModelSaveLockQueueRespectsContextCancellation(t *testing.T) {
+	t.Run("queued save returns immediately on ctx cancel with zero GET or PUT", func(t *testing.T) {
+		store := newOfficialModelStore(inspectModels())
+		baseHandler := store.handler()
+
+		firstPutEntered := make(chan struct{})
+		releaseFirstPut := make(chan struct{})
+		var getCount, putCount atomic.Int32
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config") {
+				getCount.Add(1)
+			}
+			if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/providers/") {
+				if putCount.Add(1) == 1 {
+					close(firstPutEntered)
+					<-releaseFirstPut
+				}
+			}
+			baseHandler.ServeHTTP(w, r)
+		})
+		service, _ := newAutomationTestService(t, handler)
+
+		saveFormPayload := json.RawMessage(fmt.Sprintf(`{
+			"providerId": "r2-inspect",
+			"expectedOrigin": %q,
+			"payload": {
+				"type": "openai",
+				"models": [
+					{"model": "alpha", "max_context_size": 131072, "display_name": "R2 Alpha"},
+					{"model": "beta", "max_context_size": 65536, "display_name": "R2 Beta"}
+				]
+			},
+			"opening": {}
+		}`, service.kap.base))
+
+		firstDone := make(chan error, 1)
+		go func() {
+			_, err := service.Action(context.Background(), "providers.saveOfficialForm", saveFormPayload)
+			firstDone <- err
+		}()
+		<-firstPutEntered
+
+		queuedCtx, cancelQueued := context.WithCancel(context.Background())
+		queuedDone := make(chan error, 1)
+		go func() {
+			_, err := service.Action(queuedCtx, "providers.saveOfficialForm", saveFormPayload)
+			queuedDone <- err
+		}()
+
+		queuedUpdateCtx, cancelQueuedUpdate := context.WithCancel(context.Background())
+		queuedUpdateDone := make(chan error, 1)
+		go func() {
+			_, err := service.Action(queuedUpdateCtx, "providers.updateModel", json.RawMessage(`{"providerId":"r2-inspect","model":"alpha","edit":{"capabilities":["image_in"]}}`))
+			queuedUpdateDone <- err
+		}()
+
+		time.Sleep(25 * time.Millisecond)
+		cancelQueued()
+		cancelQueuedUpdate()
+
+		select {
+		case err := <-queuedDone:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("expected context.Canceled for queued saveOfficialForm, got %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("queued saveOfficialForm did not abort promptly on context cancellation")
+		}
+		select {
+		case err := <-queuedUpdateDone:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("expected context.Canceled for queued updateModel, got %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("queued updateModel did not abort promptly on context cancellation")
+		}
+
+		close(releaseFirstPut)
+		if err := <-firstDone; err != nil {
+			t.Fatalf("first saveOfficialForm failed: %v", err)
+		}
+		// Only save #1 should have issued GET /config (1) and PUT /providers (1).
+		if getCount.Load() != 1 || putCount.Load() != 1 {
+			t.Fatalf("cancelled queued saves issued unexpected requests: get=%d put=%d", getCount.Load(), putCount.Load())
+		}
+	})
+
+	t.Run("ctx cancelled after GET /config aborts before PUT", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		var putCount atomic.Int32
+		service, _ := newAutomationTestService(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config") {
+				writeNativeTestEnvelope(w, map[string]any{
+					"providers": map[string]providerConfig{"team": {Type: "openai"}},
+					"models": map[string]modelConfig{
+						"team/alpha": {Provider: "team", Model: "alpha", MaxContextSize: 8192},
+					},
+				})
+				cancel()
+				return
+			}
+			if r.Method == http.MethodPut {
+				putCount.Add(1)
+				writeNativeTestEnvelope(w, map[string]any{"provider": "team"})
+				return
+			}
+			http.NotFound(w, r)
+		}))
+
+		_, err := service.Action(ctx, "providers.saveOfficialForm", json.RawMessage(fmt.Sprintf(`{
+			"providerId": "team",
+			"expectedOrigin": %q,
+			"payload": {"type": "openai", "models": [{"model": "alpha", "max_context_size": 8192}]},
+			"opening": {}
+		}`, service.kap.base)))
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled before PUT, got %v", err)
+		}
+		if putCount.Load() != 0 {
+			t.Fatalf("PUT ran despite ctx cancellation after GET /config: %d", putCount.Load())
+		}
+	})
+}
+
+func TestSaveOfficialProviderFormRejectsRedirectsWithoutLeakingAPIKey(t *testing.T) {
+	t.Run("307 Temporary Redirect on PUT fails with 502 NATIVE_REDIRECT and leaks zero requests", func(t *testing.T) {
+		home := t.TempDir()
+		var getCalls, putCalls, targetCalls atomic.Int32
+		target := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			targetCalls.Add(1)
+			writeNativeTestEnvelope(w, map[string]any{"provider": map[string]any{"id": "team"}})
+		})
+		pinned := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config"):
+				getCalls.Add(1)
+				writeNativeTestEnvelope(w, map[string]any{
+					"providers": map[string]providerConfig{"team": {Type: "openai"}},
+					"models": map[string]modelConfig{
+						"team/alpha": {Provider: "team", Model: "alpha", MaxContextSize: 32768},
+					},
+				})
+			case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/providers/team"):
+				putCalls.Add(1)
+				w.Header().Set("Location", target.URL+r.URL.Path)
+				w.WriteHeader(http.StatusTemporaryRedirect)
+			default:
+				http.NotFound(w, r)
+			}
+		})
+		writeInstanceWithHeartbeat(t, home, "pinned.json", "127.0.0.1", portOf(t, pinned), 100, "secret-kap-token")
+
+		service := &NativeService{kap: NewKAPClient(home), bus: NewEventBus(), cache: map[string]cachedSession{}}
+		payload := fmt.Sprintf(`{
+			"providerId": "team",
+			"expectedOrigin": %q,
+			"payload": {
+				"type": "openai",
+				"api_key": "sk-synthetic-secret-do-not-leak",
+				"models": [{"model": "alpha", "max_context_size": 32768}]
+			},
+			"opening": {}
+		}`, pinned.URL)
+
+		_, err := service.Action(context.Background(), "providers.saveOfficialForm", json.RawMessage(payload))
+		var native *NativeError
+		if !errors.As(err, &native) || native.Code != "NATIVE_REDIRECT" || native.Status != http.StatusBadGateway {
+			t.Fatalf("expected NATIVE_REDIRECT 502 on PUT 307, got %#v (%v)", native, err)
+		}
+		if getCalls.Load() != 1 || putCalls.Load() != 1 {
+			t.Fatalf("expected getCalls=1 putCalls=1 (no retry), got get=%d put=%d", getCalls.Load(), putCalls.Load())
+		}
+		if targetCalls.Load() != 0 {
+			t.Fatalf("redirect target received %d request(s) on PUT 307", targetCalls.Load())
+		}
+
+		// Verify HTTP action handler preserves 502 + NATIVE_REDIRECT and still leaks zero requests.
+		mux := http.NewServeMux()
+		service.Register(mux)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/enhance/v1/desktop/actions/providers.saveOfficialForm", bytes.NewReader([]byte(payload)))
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "NATIVE_REDIRECT") {
+			t.Fatalf("HTTP handler did not preserve 502 NATIVE_REDIRECT: code=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if targetCalls.Load() != 0 {
+			t.Fatalf("redirect target received %d request(s) via HTTP handler", targetCalls.Load())
+		}
+	})
+
+	t.Run("307 Temporary Redirect on GET /config aborts before PUT and leaks zero requests", func(t *testing.T) {
+		home := t.TempDir()
+		var getCalls, putCalls, targetCalls atomic.Int32
+		target := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			targetCalls.Add(1)
+			writeNativeTestEnvelope(w, map[string]any{
+				"providers": map[string]providerConfig{"team": {Type: "openai"}},
+				"models":    map[string]modelConfig{},
+			})
+		})
+		pinned := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config"):
+				getCalls.Add(1)
+				w.Header().Set("Location", target.URL+r.URL.Path)
+				w.WriteHeader(http.StatusTemporaryRedirect)
+			case r.Method == http.MethodPut:
+				putCalls.Add(1)
+				writeNativeTestEnvelope(w, map[string]any{"provider": map[string]any{"id": "team"}})
+			default:
+				http.NotFound(w, r)
+			}
+		})
+		writeInstanceWithHeartbeat(t, home, "pinned.json", "127.0.0.1", portOf(t, pinned), 100, "secret-kap-token")
+
+		service := &NativeService{kap: NewKAPClient(home), bus: NewEventBus(), cache: map[string]cachedSession{}}
+		_, err := service.Action(context.Background(), "providers.saveOfficialForm", json.RawMessage(fmt.Sprintf(`{
+			"providerId": "team",
+			"expectedOrigin": %q,
+			"payload": {
+				"type": "openai",
+				"api_key": "sk-synthetic-secret-do-not-leak",
+				"models": [{"model": "alpha", "max_context_size": 32768}]
+			},
+			"opening": {}
+		}`, pinned.URL)))
+		var native *NativeError
+		if !errors.As(err, &native) || native.Code != "NATIVE_REDIRECT" || native.Status != http.StatusBadGateway {
+			t.Fatalf("expected NATIVE_REDIRECT 502 on GET /config 307, got %#v (%v)", native, err)
+		}
+		if getCalls.Load() != 1 || putCalls.Load() != 0 {
+			t.Fatalf("expected getCalls=1 putCalls=0, got get=%d put=%d", getCalls.Load(), putCalls.Load())
+		}
+		if targetCalls.Load() != 0 {
+			t.Fatalf("redirect target received %d request(s) on GET 307", targetCalls.Load())
+		}
+	})
+
+	t.Run("injected http.Client without CheckRedirect still blocks 307 on PUT", func(t *testing.T) {
+		var targetCalls atomic.Int32
+		target := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			targetCalls.Add(1)
+			writeNativeTestEnvelope(w, map[string]any{"provider": map[string]any{"id": "team"}})
+		})
+		pinned := kapServer(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config") {
+				writeNativeTestEnvelope(w, map[string]any{
+					"providers": map[string]providerConfig{"team": {Type: "openai"}},
+					"models":    map[string]modelConfig{},
+				})
+				return
+			}
+			w.Header().Set("Location", target.URL+r.URL.Path)
+			w.WriteHeader(http.StatusTemporaryRedirect)
+		})
+		service := &NativeService{
+			kap:   &KAPClient{client: &http.Client{}, base: pinned.URL, token: "secret-kap-token"},
+			bus:   NewEventBus(),
+			cache: map[string]cachedSession{},
+		}
+		_, err := service.Action(context.Background(), "providers.saveOfficialForm", json.RawMessage(fmt.Sprintf(`{
+			"providerId": "team",
+			"expectedOrigin": %q,
+			"payload": {
+				"type": "openai",
+				"api_key": "sk-synthetic-secret-do-not-leak",
+				"models": [{"model": "alpha", "max_context_size": 32768}]
+			},
+			"opening": {}
+		}`, pinned.URL)))
+		var native *NativeError
+		if !errors.As(err, &native) || native.Code != "NATIVE_REDIRECT" || native.Status != http.StatusBadGateway {
+			t.Fatalf("expected NATIVE_REDIRECT 502 with default http.Client, got %#v (%v)", native, err)
+		}
+		if targetCalls.Load() != 0 {
+			t.Fatalf("redirect target received %d request(s) with injected http.Client", targetCalls.Load())
+		}
+	})
 }

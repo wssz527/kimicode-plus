@@ -119,8 +119,12 @@ func (m *Manager) runAction(ctx context.Context, id, token, action string, param
 		if level != "info" && level != "warn" && level != "error" {
 			level = "info"
 		}
+		kind := ActivityLog
+		if level == "error" {
+			kind = ActivityError
+		}
 		message := truncate(redact.Text(input.Message), 300)
-		_ = recordActivity(ctx, m.db, id, ActivityError, level+": "+message, m.now())
+		_ = recordActivity(ctx, m.db, id, kind, level+": "+message, m.now())
 		return map[string]any{"logged": true}, nil
 	case action == "report.error":
 		return m.reportError(ctx, id, r, params)

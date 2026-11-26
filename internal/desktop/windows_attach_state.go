@@ -2,11 +2,14 @@ package desktop
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -48,11 +51,69 @@ func currentCorePID(dir string) int {
 	return pid
 }
 
-func recordWindowsAttachFailure(dir string, proc WindowsProcessInfo, err error) error {
+func shouldPreserveWindowsInstalledAttachState(prev map[string]any, proc WindowsProcessInfo, currentCore int) bool {
+	if currentCore <= 0 || prev == nil || prev["status"] != "installed" {
+		return false
+	}
+	prevCore, ok := attachStatePID(prev["corePid"])
+	if !ok || prevCore != currentCore {
+		return false
+	}
+	hostPid, ok := attachStatePID(prev["hostPid"])
+	if !ok || hostPid <= 0 {
+		return false
+	}
+	if proc.PID > 0 && hostPid != proc.PID {
+		return false
+	}
+	prevStarted, _ := prev["hostStarted"].(string)
+	prevStarted = strings.TrimSpace(prevStarted)
+	procStarted := strings.TrimSpace(proc.Started)
+	if procStarted != "" && (prevStarted == "" || !hostStartedEqual(prevStarted, procStarted)) {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return attachHealthyInstanceAlive(ctx, currentCore, hostPid, prevStarted)
+}
+
+func shouldPreserveWindowsInstalledAttach(dir string, proc WindowsProcessInfo, currentCore int) bool {
+	if dir == "" || currentCore <= 0 {
+		return false
+	}
+	return shouldPreserveWindowsInstalledAttachState(ReadAttachState(dir), proc, currentCore)
+}
+
+func recordWindowsAttachFailureUnlocked(dir string, proc WindowsProcessInfo, err error) error {
+	if dir == "" {
+		return nil
+	}
+	currentCore := currentCorePID(dir)
+	if !isBridgeTornDown(err) && shouldPreserveWindowsInstalledAttach(dir, proc, currentCore) {
+		return nil
+	}
 	return recordWindowsAttachState(dir, proc, "error", err)
 }
 
+func recordWindowsAttachFailure(dir string, proc WindowsProcessInfo, err error) error {
+	if dir == "" || isAttachStateRecorded(err) || isAttachPersistFailed(err) {
+		return nil
+	}
+	release, acquired, lockErr := tryAcquireHostAttachLockForFallback(dir)
+	if lockErr != nil {
+		return lockErr
+	}
+	if !acquired {
+		return nil
+	}
+	defer release()
+	return recordWindowsAttachFailureUnlocked(dir, proc, err)
+}
+
 func recordWindowsAttachState(dir string, proc WindowsProcessInfo, state string, err error) error {
+	if dir == "" {
+		return nil
+	}
 	payload := map[string]any{
 		"at": time.Now().UTC().Format(time.RFC3339Nano), "status": state,
 		"hostPid": proc.PID, "hostStarted": proc.Started, "platform": "windows",
@@ -64,27 +125,281 @@ func recordWindowsAttachState(dir string, proc WindowsProcessInfo, state string,
 	return writeAttachState(dir, payload)
 }
 
-// recordWindowsAttachInstalled keeps the standard attach payload and adds the
-// core identity so a later core restart cannot be mistaken for this attach.
-func recordWindowsAttachInstalled(dir string, proc WindowsProcessInfo, result *AttachResult) error {
+func recordWindowsAttachInstalledUnlocked(dir string, proc WindowsProcessInfo, result *AttachResult) error {
+	if dir == "" {
+		return nil
+	}
 	if result == nil {
 		return recordWindowsAttachState(dir, proc, "installed", nil)
 	}
-	if err := RecordAttach(dir, result); err != nil {
-		return err
-	}
-	last := ReadAttachState(dir)
-	if last == nil {
-		last = map[string]any{}
-	}
+	currentCore := currentCorePID(dir)
+	payload := buildAttachPayload(currentCore, result)
 	// Stamp the identity the caller already verified, but never overwrite an
 	// attach result that reported a different host process.
-	if recorded, ok := attachStatePID(last["hostPid"]); !ok || recorded == proc.PID {
-		last["hostPid"] = proc.PID
-		last["hostStarted"] = proc.Started
+	if recorded, ok := attachStatePID(payload["hostPid"]); !ok || recorded == proc.PID {
+		payload["hostPid"] = proc.PID
+		payload["hostStarted"] = proc.Started
 	}
-	last["corePid"] = currentCorePID(dir)
-	return writeAttachState(dir, last)
+	payload["corePid"] = currentCore
+	return writeAttachState(dir, payload)
+}
+
+// recordWindowsAttachInstalled keeps the standard attach payload and adds the
+// core identity so a later core restart cannot be mistaken for this attach.
+func recordWindowsAttachInstalled(dir string, proc WindowsProcessInfo, result *AttachResult) error {
+	if dir == "" || IsAttachStateRecordedResult(result) {
+		return nil
+	}
+	release, acquired, lockErr := tryAcquireHostAttachLockForFallback(dir)
+	if lockErr != nil {
+		return lockErr
+	}
+	if !acquired {
+		return nil
+	}
+	defer release()
+	return recordWindowsAttachInstalledUnlocked(dir, proc, result)
+}
+
+func windowsCDPAttachKey(proc WindowsProcessInfo, debugPort int, options AttachOptions) string {
+	appOverride := ""
+	if options.Profile != "" {
+		appOverride = strings.TrimSpace(options.AppVersionOverride)
+	}
+	identity := fmt.Sprintf(
+		"windows-cdp\x00%d\x00%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s",
+		proc.PID,
+		strings.TrimSpace(proc.Started),
+		debugPort,
+		strings.TrimRight(strings.TrimSpace(options.CoreURL), "/"),
+		strings.TrimSpace(options.PairingToken),
+		strings.TrimSpace(options.CoreVersion),
+		appOverride,
+		injectBundleHash(),
+	)
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(identity)))
+}
+
+func windowsLiveAttachKey(proc WindowsProcessInfo, options AttachOptions) string {
+	appOverride := ""
+	if options.Profile != "" {
+		appOverride = strings.TrimSpace(options.AppVersionOverride)
+	}
+	identity := fmt.Sprintf(
+		"windows-main\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s",
+		proc.PID,
+		strings.TrimSpace(proc.Started),
+		strings.TrimRight(strings.TrimSpace(options.CoreURL), "/"),
+		strings.TrimSpace(options.PairingToken),
+		strings.TrimSpace(options.CoreVersion),
+		appOverride,
+		injectBundleHash(),
+	)
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(identity)))
+}
+
+func isWindowsCDPRendererTornDownErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isBridgeTornDown(err) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Windows 渲染页面注入失败") ||
+		strings.Contains(msg, "Windows 渲染页面未确认挂载成功") ||
+		strings.Contains(msg, "没有成功注入任何 Kimi Code 渲染页面")
+}
+
+func isWindowsMainBridgeTornDownErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isBridgeTornDown(err) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Windows 主进程增强桥接入失败") ||
+		strings.Contains(msg, "Windows 宿主未确认主进程桥已安装") ||
+		strings.Contains(msg, "Windows 临时主进程调试端口未关闭")
+}
+
+type windowsCompatCDPDeps struct {
+	verifyReady func(ctx context.Context) error
+	attachCDP   func(ctx context.Context, opts WindowsCDPAttachOptions) (*AttachResult, error)
+	auditClient func(ctx context.Context, port, hostPID int) ([]WindowsDebugClientAlert, error)
+}
+
+func commitWindowsAttachOutcomeUnlocked(dataDir string, proc WindowsProcessInfo, result *AttachResult, retErr error) (*AttachResult, error) {
+	return commitWindowsAttachOutcomeWithPreviousUnlocked(dataDir, proc, nil, result, retErr)
+}
+
+func commitWindowsAttachOutcomeWithPreviousUnlocked(dataDir string, proc WindowsProcessInfo, prevInstalled map[string]any, result *AttachResult, retErr error) (*AttachResult, error) {
+	if dataDir == "" {
+		return result, retErr
+	}
+	if retErr != nil {
+		if !isAttachStateRecorded(retErr) && !isAttachPersistFailed(retErr) {
+			var recordErr error
+			if !isBridgeTornDown(retErr) {
+				currentCore := currentCorePID(dataDir)
+				if shouldPreserveWindowsInstalledAttach(dataDir, proc, currentCore) {
+					recordErr = nil
+				} else if prevInstalled != nil && shouldPreserveWindowsInstalledAttachState(prevInstalled, proc, currentCore) {
+					recordErr = writeAttachState(dataDir, prevInstalled)
+				} else {
+					recordErr = recordWindowsAttachFailureUnlocked(dataDir, proc, retErr)
+				}
+			} else {
+				recordErr = recordWindowsAttachFailureUnlocked(dataDir, proc, retErr)
+			}
+			if recordErr != nil {
+				persistErr := fmt.Errorf("写入接入状态文件失败：%w", recordErr)
+				if removeErr := os.Remove(filepath.Join(dataDir, "attach-state.json")); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+					persistErr = errors.Join(persistErr, fmt.Errorf("移除旧接入状态文件失败：%w", removeErr))
+				}
+				retErr = markAttachPersistFailed(errors.Join(retErr, persistErr))
+			} else {
+				retErr = markAttachStateRecorded(retErr)
+			}
+		}
+		return nil, retErr
+	}
+	if result != nil && !result.stateRecorded {
+		if recordErr := recordWindowsAttachInstalledUnlocked(dataDir, proc, result); recordErr != nil {
+			return nil, markAttachPersistFailed(fmt.Errorf("写入接入状态文件失败：%w", recordErr))
+		}
+		result.stateRecorded = true
+	}
+	return result, nil
+}
+
+func attachWindowsCompatCDPUnlocked(ctx context.Context, options AttachOptions, proc WindowsProcessInfo, debugPort int, forceReinject bool, prevInstalled map[string]any, deps windowsCompatCDPDeps) (*AttachResult, error) {
+	if deps.verifyReady != nil {
+		if err := deps.verifyReady(ctx); err != nil {
+			if forceReinject {
+				err = markBridgeTornDown(err)
+			}
+			return nil, err
+		}
+	}
+	key := windowsCDPAttachKey(proc, debugPort, options)
+	if options.SkipCurrent && !forceReinject {
+		diskState := ReadAttachState(options.DataDir)
+		skipCandidate := diskState
+		if (skipCandidate == nil || skipCandidate["status"] != "installed") && prevInstalled != nil && prevInstalled["status"] == "installed" {
+			skipCandidate = prevInstalled
+		}
+		if attachStateMatchesLiveCore(ctx, options.DataDir, skipCandidate, key, options) {
+			if options.DataDir != "" && (diskState == nil || diskState["status"] != "installed") {
+				if restoreErr := writeAttachState(options.DataDir, skipCandidate); restoreErr != nil {
+					persistErr := fmt.Errorf("恢复接入状态文件失败：%w", restoreErr)
+					if removeErr := os.Remove(filepath.Join(options.DataDir, "attach-state.json")); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+						persistErr = errors.Join(persistErr, fmt.Errorf("移除旧接入状态文件失败：%w", removeErr))
+					}
+					return nil, markAttachPersistFailed(persistErr)
+				}
+			}
+			return nil, nil
+		}
+	}
+	if invalidateErr := invalidateInstalledAttachBeforeInjectUnlocked(options.DataDir); invalidateErr != nil {
+		return nil, markAttachPersistFailed(fmt.Errorf("无法更新接入状态文件，已中止接入以免破坏现有增强桥：%w", invalidateErr))
+	}
+	attachFn := deps.attachCDP
+	if attachFn == nil {
+		attachFn = AttachWindowsCDP
+	}
+	attached, err := attachFn(ctx, WindowsCDPAttachOptions{
+		DebugPort:          debugPort,
+		HostPID:            proc.PID,
+		HostStarted:        proc.Started,
+		CoreURL:            options.CoreURL,
+		PairingToken:       options.PairingToken,
+		CoreVersion:        options.CoreVersion,
+		Profile:            options.Profile,
+		Daily:              options.Profile == "",
+		AppVersionOverride: options.AppVersionOverride,
+		AuditClients:       deps.auditClient,
+	})
+	if err != nil {
+		if isWindowsCDPRendererTornDownErr(err) || forceReinject {
+			err = markBridgeTornDown(err)
+		}
+		return nil, err
+	}
+	if attached != nil {
+		attached.attachKey = key
+		attached.hostStarted = proc.Started
+	}
+	return attached, nil
+}
+
+func attachWindowsCompatCDP(ctx context.Context, options AttachOptions, proc WindowsProcessInfo, debugPort int, forceReinject bool, deps windowsCompatCDPDeps) (result *AttachResult, retErr error) {
+	gate, err := acquireHostAttachLock(ctx, options.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	if gate != nil {
+		defer gate.Close()
+	}
+	prevInstalled := readInstalledAttachState(options.DataDir)
+	if options.DataDir != "" {
+		defer func() {
+			result, retErr = commitWindowsAttachOutcomeWithPreviousUnlocked(options.DataDir, proc, prevInstalled, result, retErr)
+		}()
+	}
+	return attachWindowsCompatCDPUnlocked(ctx, options, proc, debugPort, forceReinject, prevInstalled, deps)
+}
+
+type windowsAttachFallbackDeps struct {
+	tryLive    bool
+	liveAttach func(ctx context.Context, options AttachOptions, proc WindowsProcessInfo) (*AttachResult, error)
+	compat     windowsCompatCDPDeps
+}
+
+func runWindowsAttachWithFallbackUnlocked(ctx context.Context, options AttachOptions, proc WindowsProcessInfo, debugPort int, prevInstalled map[string]any, deps windowsAttachFallbackDeps) (*AttachResult, error) {
+	liveTornDown := false
+	if deps.tryLive && deps.liveAttach != nil {
+		result, attachErr := deps.liveAttach(ctx, options, proc)
+		if attachErr == nil {
+			return result, nil
+		}
+		if isAttachPersistFailed(attachErr) {
+			return nil, attachErr
+		}
+		if isWindowsMainBridgeTornDownErr(attachErr) {
+			attachErr = markBridgeTornDown(attachErr)
+		}
+		if debugPort <= 0 {
+			return nil, attachErr
+		}
+		liveTornDown = isBridgeTornDown(attachErr)
+	}
+	if debugPort <= 0 {
+		return nil, errors.New("当前客户端无法运行中接入，请通过 KimiCode+ 入口重新打开 Kimi Code")
+	}
+	return attachWindowsCompatCDPUnlocked(ctx, options, proc, debugPort, liveTornDown, prevInstalled, deps.compat)
+}
+
+func attachWindowsWithFallback(ctx context.Context, options AttachOptions, proc WindowsProcessInfo, debugPort int, deps windowsAttachFallbackDeps) (result *AttachResult, retErr error) {
+	if !deps.tryLive && debugPort <= 0 {
+		return nil, errors.New("当前客户端无法运行中接入，请通过 KimiCode+ 入口重新打开 Kimi Code")
+	}
+	gate, err := acquireHostAttachLock(ctx, options.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	if gate != nil {
+		defer gate.Close()
+	}
+	prevInstalled := readInstalledAttachState(options.DataDir)
+	if options.DataDir != "" {
+		defer func() {
+			result, retErr = commitWindowsAttachOutcomeWithPreviousUnlocked(options.DataDir, proc, prevInstalled, result, retErr)
+		}()
+	}
+	return runWindowsAttachWithFallbackUnlocked(ctx, options, proc, debugPort, prevInstalled, deps)
 }
 
 func attachStatePID(value any) (int, bool) {
@@ -358,17 +673,26 @@ func runWindowsBackgroundAttachStep(ctx context.Context, cfg AttachConfig, retri
 	result, err := deps.attach(ctx, AttachOptions{
 		DataDir: cfg.DataDir, CoreURL: cfg.CoreURL, PairingToken: cfg.PairingToken, CoreVersion: cfg.CoreVersion, Profile: cfg.Profile,
 		AllowDailyInstance: cfg.Profile == "",
+		SkipCurrent:        true,
 	})
 	if err == nil && result != nil {
-		_ = deps.recordInstalled(proc, result)
+		if !IsAttachStateRecordedResult(result) && deps.recordInstalled != nil {
+			_ = deps.recordInstalled(proc, result)
+		}
 		retries.success(target)
 		return
 	}
 	if err == nil {
+		if latest := windowsCurrentAttachStateForDir(cfg.DataDir, proc, deps.readAttachState(), hasDebugPort, corePID); latest == "attached" || latest == "compatibility" {
+			retries.success(target)
+			return
+		}
 		err = errors.New("接入未返回结果")
 	}
 	if deps.serviceAlive == nil || deps.serviceAlive() {
-		_ = deps.recordFailure(proc, err)
+		if !IsAttachStateRecorded(err) && !IsAttachPersistFailed(err) && deps.recordFailure != nil {
+			_ = deps.recordFailure(proc, err)
+		}
 		retries.failure(target, now())
 	}
 }

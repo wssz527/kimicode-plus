@@ -799,3 +799,46 @@ func TestInstallPreviewBindsZipContents(t *testing.T) {
 		t.Fatalf("install new preview: %+v (%v)", installed, err)
 	}
 }
+
+func TestLogActionUsesLogKindForInfoAndWarnAndErrorKindForError(t *testing.T) {
+	manager, _ := testManager(t, func() bool { return false })
+	ctx := context.Background()
+	source := writePluginDir(t, filepath.Join(t.TempDir(), "source"), testManifest, nil)
+	if _, err := manager.Install(ctx, InstallRequest{Root: source, PackageDigest: previewDigest(t, manager, source), Capabilities: confirmAll(t, source)}); err != nil {
+		t.Fatal(err)
+	}
+	enabled, err := manager.Enable(ctx, "test.sample")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendLog := func(level, message string) {
+		t.Helper()
+		body := `{"params":{"level":"` + level + `","message":"` + message + `"}}`
+		request := httptest.NewRequest(http.MethodPost, "/enhance/v1/plugins/test.sample/action/log", strings.NewReader(body))
+		request.Header.Set(IdentityHeader, enabled.Token)
+		if _, err := manager.Call(ctx, "test.sample", "log", enabled.Token, request); err != nil {
+			t.Fatalf("log(%s): %v", level, err)
+		}
+	}
+	sendLog("info", "思考内容翻译已启用")
+	sendLog("warn", "检测到缓存回退")
+	sendLog("error", "请求上游失败")
+
+	items, _, err := loadActivity(ctx, manager.db, "test.sample", 0, 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, item := range items {
+		got[item.Detail] = item.Kind
+	}
+	if got["info: 思考内容翻译已启用"] != ActivityLog {
+		t.Fatalf("info log kind = %q, want %q (all=%#v)", got["info: 思考内容翻译已启用"], ActivityLog, got)
+	}
+	if got["warn: 检测到缓存回退"] != ActivityLog {
+		t.Fatalf("warn log kind = %q, want %q (all=%#v)", got["warn: 检测到缓存回退"], ActivityLog, got)
+	}
+	if got["error: 请求上游失败"] != ActivityError {
+		t.Fatalf("error log kind = %q, want %q (all=%#v)", got["error: 请求上游失败"], ActivityError, got)
+	}
+}

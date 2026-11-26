@@ -154,19 +154,99 @@ async function installNativeBootstrap(options) {
     })().finally(() => { pairing = null; });
     return pairing;
   }
-  async function coreFetch(path, init = {}) {
+  function combineAbortSignal(timeoutMs, externalSignal) {
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    if (!externalSignal) return { signal: timeoutSignal, cleanup: () => {} };
+    if (typeof AbortSignal.any === 'function') {
+      return { signal: AbortSignal.any([timeoutSignal, externalSignal]), cleanup: () => {} };
+    }
+    const controller = new AbortController();
+    const forward = source => {
+      if (!controller.signal.aborted) controller.abort(source.reason);
+    };
+    if (externalSignal.aborted) {
+      forward(externalSignal);
+      return { signal: controller.signal, cleanup: () => {} };
+    }
+    const onTimeout = () => forward(timeoutSignal);
+    const onExternal = () => forward(externalSignal);
+    timeoutSignal.addEventListener('abort', onTimeout, { once: true });
+    externalSignal.addEventListener('abort', onExternal, { once: true });
+    return {
+      signal: controller.signal,
+      cleanup: () => {
+        timeoutSignal.removeEventListener('abort', onTimeout);
+        externalSignal.removeEventListener('abort', onExternal);
+      },
+    };
+  }
+  function parseAllowedCoreFetchTarget(rawTarget) {
+    const deny = () => new Error('核心请求路径不被允许');
+    if (typeof rawTarget !== 'string' || !rawTarget.startsWith('/enhance/v1/') || rawTarget.includes('#') || rawTarget.includes('\x00')) {
+      throw deny();
+    }
+    const qIndex = rawTarget.indexOf('?');
+    const rawPathname = qIndex >= 0 ? rawTarget.slice(0, qIndex) : rawTarget;
+    const rawSearch = qIndex >= 0 ? rawTarget.slice(qIndex) : '';
+    if (!rawPathname.startsWith('/enhance/v1/') || rawPathname.includes('\\') || /[\x00-\x1f\x7f]/.test(rawPathname) || /%(?:2f|5c)/i.test(rawPathname)) {
+      throw deny();
+    }
+    let parsed;
+    try {
+      parsed = new URL(rawPathname, 'http://ekd.local');
+    } catch {
+      throw deny();
+    }
+    if (parsed.origin !== 'http://ekd.local' || parsed.pathname !== rawPathname) {
+      throw deny();
+    }
+    const suffix = rawPathname.slice('/enhance/v1/'.length);
+    const segments = suffix.split('/');
+    for (const seg of segments) {
+      if (!seg || seg === '.' || seg === '..') throw deny();
+      let decoded;
+      try {
+        decoded = decodeURIComponent(seg);
+      } catch {
+        throw deny();
+      }
+      if (!decoded || decoded === '.' || decoded === '..' || decoded.includes('/') || decoded.includes('\\') || decoded.includes('\x00')) {
+        throw deny();
+      }
+    }
+    return { pathname: parsed.pathname, search: rawSearch };
+  }
+  async function coreFetch(path, init = {}, search = '') {
+    const externalSignal = init.signal || null;
+    if (externalSignal?.aborted) {
+      throw externalSignal.reason || Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+    }
     const headers = new Headers(init.headers || {});
     headers.set('Accept', 'application/json');
     if (init.body !== undefined && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-    const request = token => {
+    const request = async token => {
+      if (externalSignal?.aborted) {
+        throw externalSignal.reason || Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+      }
       headers.set('Authorization', 'Bearer ' + token);
-      return fetch(new URL(path, options.coreURL), { ...init, headers, signal: AbortSignal.timeout(120000), redirect: 'error' });
+      const { signal, cleanup } = combineAbortSignal(120000, externalSignal);
+      try {
+        const targetUrl = new URL(options.coreURL);
+        targetUrl.pathname = path;
+        targetUrl.search = typeof search === 'string' ? search : '';
+        return await fetch(targetUrl, { ...init, headers, signal, redirect: 'error' });
+      } finally {
+        cleanup();
+      }
     };
     // Renew ahead of the expiry instead of waiting for a failure. This also
     // covers a laptop that slept through the twelve-hour mark: the first request
     // after waking renews before it is sent.
     if (options.runtimePath && !state.cleaned && coreTokenExpiresAtMs > 0 && Date.now() >= coreTokenExpiresAtMs - 15 * 60 * 1000) {
       await refreshCoreSession().catch(error => { console.warn('[EKD] proactive core session renewal failed:', error?.message || String(error)); });
+    }
+    if (externalSignal?.aborted) {
+      throw externalSignal.reason || Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
     }
     const originalToken = coreToken;
     let response = await request(originalToken);
@@ -176,17 +256,38 @@ async function installNativeBootstrap(options) {
     if (response.status !== 401 || !options.runtimePath || state.cleaned) return response;
     const failure = await response.clone().json().catch(() => null);
     if (failure?.error?.code !== 'TOKEN_EXPIRED') return response;
+    if (externalSignal?.aborted) {
+      await response.body?.cancel().catch(() => {});
+      throw externalSignal.reason || Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+    }
     if (coreToken === originalToken) await refreshCoreSession().catch(error => { console.warn('[EKD] reactive core session renewal failed:', error?.message || String(error)); });
+    if (externalSignal?.aborted) {
+      await response.body?.cancel().catch(() => {});
+      throw externalSignal.reason || Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+    }
     if (state.cleaned || coreToken === originalToken) return response;
     await response.body?.cancel();
     // Exactly one retry: a renewed token that is still refused is a real
     // authorization failure and must surface to the caller unchanged.
     return request(coreToken);
   }
-  async function nativeAction(action, payload) {
-    const response = await coreFetch('/enhance/v1/desktop/actions/' + action, { method: 'POST', body: JSON.stringify(payload || {}) });
+  async function nativeAction(action, payload, signal) {
+    const response = await coreFetch('/enhance/v1/desktop/actions/' + action, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+      ...(signal ? { signal } : {}),
+    });
     const body = await response.json().catch(() => null);
-    if (!response.ok) { const error = new Error(body?.error?.message || `核心返回 HTTP ${response.status}`); error.code = body?.error?.code || 'CORE_ERROR'; throw error; }
+    if (signal?.aborted) {
+      throw signal.reason || Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+    }
+    if (!response.ok) {
+      const error = new Error(body?.error?.message || `核心返回 HTTP ${response.status}`);
+      error.code = body?.error?.code || 'CORE_ERROR';
+      error.status = Number.isInteger(body?.error?.status) ? body.error.status : response.status;
+      if (Number.isInteger(body?.error?.kapCode)) error.kapCode = body.error.kapCode;
+      throw error;
+    }
     return body?.value;
   }
   // A plugin view is owned by one plugin and one view id; both must be present
@@ -402,12 +503,12 @@ async function installNativeBootstrap(options) {
     for (const win of state.windows.values()) if (!win.isDestroyed()) win.close();
     void bindRenderer(target, 'host').catch(error => console.warn('KimiCode+ host reconnection failed', error.message));
   }
-  async function dispatch(target, message) {
+  async function dispatch(target, message, signal) {
     const payload = message.payload || {};
     if (message.action.startsWith('browser.view.')) payload.instanceId = state.channels.get(target.id)?.instanceId || '';
     switch (message.action) {
       case 'core.fetch': {
-        if (typeof payload.path !== 'string' || !payload.path.startsWith('/enhance/v1/') || payload.path.includes('..') || payload.path.includes('\\')) throw new Error('核心请求路径不被允许');
+        const targetUrl = parseAllowedCoreFetchTarget(payload.path);
         const method = String(payload.method || 'GET').toUpperCase();
         if (!['GET','POST','PUT','PATCH','DELETE'].includes(method)) throw new Error('核心请求方法不被允许');
         const headers = {};
@@ -416,7 +517,7 @@ async function installNativeBootstrap(options) {
         }
         const body = payload.bodyBase64 ? Buffer.from(payload.bodyBase64, 'base64') : undefined;
         if (body && body.length > 16 * 1024 * 1024) throw new Error('核心请求体过大');
-        const response = await coreFetch(payload.path, { method, headers, body });
+        const response = await coreFetch(targetUrl.pathname, { method, headers, body, ...(signal ? { signal } : {}) }, targetUrl.search);
         const result = Buffer.from(await response.arrayBuffer()).toString('base64');
         return { status: response.status, headers: [['Content-Type', response.headers.get('content-type') || 'application/json']], bodyBase64: result };
       }
@@ -674,7 +775,7 @@ async function installNativeBootstrap(options) {
         const text = await browser.executeJavaScript('window.getSelection()?.toString() || document.querySelector("main")?.innerText || document.body.innerText');
         return String(text || '').slice(0, 200000);
       }
-      default: return nativeAction(message.action, payload);
+      default: return nativeAction(message.action, payload, signal);
     }
   }
   const server = http.createServer(async (request, response) => {
@@ -691,6 +792,11 @@ async function installNativeBootstrap(options) {
       return;
     }
     let id = '';
+    const rpcController = new AbortController();
+    const onClose = () => {
+      if (!response.writableEnded) rpcController.abort();
+    };
+    response.on('close', onClose);
     try {
       const body = JSON.parse(await readBody(request));
       id = typeof body.id === 'string' ? body.id : '';
@@ -698,10 +804,25 @@ async function installNativeBootstrap(options) {
       // (`browser.view.open`), so the action grammar allows dotted prefixes
       // rather than a single one.
       if (body.protocol !== 1 || !id || id.length > 100 || typeof body.action !== 'string' || body.action.length > 80 || !/^(?:[a-z]+\.){0,4}[a-zA-Z][a-zA-Z0-9]*$/.test(body.action)) throw new Error('增强桥请求格式无效');
-      const result = await dispatch(request.owner, { id, action: body.action, payload: body.payload });
-      json(response, 200, { protocol: 1, id, result }, origin);
+      const result = await dispatch(request.owner, { id, action: body.action, payload: body.payload }, rpcController.signal);
+      if (!response.writableEnded && !response.destroyed) {
+        json(response, 200, { protocol: 1, id, result }, origin);
+      }
     } catch (error) {
-      json(response, 200, { protocol: 1, id, error: { code: error.code || 'NATIVE_RPC', message: error.message || String(error) } }, origin);
+      if (!response.writableEnded && !response.destroyed) {
+        json(response, 200, {
+          protocol: 1,
+          id,
+          error: {
+            code: error.code || 'NATIVE_RPC',
+            message: error.message || String(error),
+            ...(Number.isInteger(error.status) ? { status: error.status } : {}),
+            ...(Number.isInteger(error.kapCode) ? { kapCode: error.kapCode } : {}),
+          },
+        }, origin);
+      }
+    } finally {
+      response.off('close', onClose);
     }
   });
   const originalHandler = server.listeners('request')[0];

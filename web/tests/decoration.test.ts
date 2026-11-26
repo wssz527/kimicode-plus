@@ -487,3 +487,183 @@ test("enhanced thinking opt-in follows open shadow roots and releases removed bl
   assert.equal(h.observer.targets.has(root), false);
   h.hub.dispose();
 });
+
+test("owned nodes and think-time ticks are excluded from blockText change detection", () => {
+  const h = harness();
+  const block = h.think("Reasoning step one.", { id: "t-timer", streaming: true });
+  const head = block.querySelector(".think-head") as FakeElement;
+  const timer = new FakeElement("span", "think-time");
+  const timerText = Object.assign(new FakeElement("#TEXT"), { nodeValue: "0.4s" }) as unknown as FakeElement;
+  timer.textContent = "0.4s";
+  timer.childNodes.push(timerText);
+  head.append(timer);
+
+  const bar = new FakeElement("div", "ekdp-kct-bar");
+  bar.setAttribute("data-ekdp-owned", "1");
+  bar.textContent = "翻译中 1/2";
+  block.append(bar);
+
+  const inner = block.querySelector(".think-body-inner") as FakeElement;
+  const translated = new FakeElement("pre", "ekdp-kct-translated");
+  translated.textContent = "推理步骤一。";
+  inner.append(translated);
+
+  const scope = new Scope();
+  let updates = 0;
+  h.hub.register("thinking", () => ({
+    dispose: () => {},
+    update: () => {
+      updates += 1;
+    },
+  }), scope);
+
+  timer.textContent = "1.8s";
+  (timerText as unknown as { nodeValue: string }).nodeValue = "1.8s";
+  h.observer.emit([{ type: "characterData", target: timerText }]);
+  h.flush();
+  assert.equal(updates, 0, "think-time stopwatch update triggered onUpdate");
+
+  bar.textContent = "翻译中 2/2";
+  translated.textContent = "推理步骤一。更新";
+  h.hub.sweep();
+  assert.equal(updates, 0, "plugin owned/translated nodes changed blockText");
+
+  const pre = block.querySelector("pre.think-text") as FakeElement;
+  pre.textContent = "Reasoning step one. Step two.";
+  pre.childNodes[0] = Object.assign(new FakeElement("#TEXT"), { nodeValue: "Reasoning step one. Step two." }) as unknown as FakeElement;
+  h.observer.emit([{ type: "childList", target: pre }]);
+  h.flush();
+  assert.equal(updates, 1, "real source text change did not dispatch update");
+  h.hub.dispose();
+});
+
+test("collapsed ancestor containers report open false and notify when expanded", () => {
+  const h = harness();
+  const arBody = new FakeElement("div", "ar-body");
+  const tfBody = new FakeElement("div", "tf-body open");
+  const outerDetails = new FakeElement("details");
+  outerDetails.setAttribute("open", "");
+  const block = h.think("Hidden inside collapsed turn.", { id: "t-nested", open: true });
+  outerDetails.append(block);
+  tfBody.append(outerDetails);
+  arBody.append(tfBody);
+  h.doc.body.append(arBody);
+
+  const scope = new Scope();
+  const states: Array<{ open: boolean; revision: number }> = [];
+  h.hub.register("thinking", (_block, info) => {
+    states.push({ open: info.open, revision: info.revision });
+    return {
+      dispose: () => {},
+      update: next => {
+        states.push({ open: next.open, revision: next.revision });
+      },
+    };
+  }, scope);
+
+  assert.deepEqual(states, [{ open: false, revision: 0 }], "block inside collapsed .ar-body should report open: false");
+
+  arBody.classList.add("open");
+  h.observer.emit([{ type: "attributes", target: arBody, attributeName: "class" }]);
+  h.flush();
+  assert.equal(states.length, 2, "expanding ancestor .ar-body did not trigger update");
+  assert.equal(states[1]!.open, true);
+  assert.equal(states[1]!.revision, 1);
+
+  tfBody.classList.remove("open");
+  h.observer.emit([{ type: "attributes", target: tfBody, attributeName: "class" }]);
+  h.flush();
+  assert.equal(states.at(-1)?.open, false);
+
+  tfBody.classList.add("open");
+  h.observer.emit([{ type: "attributes", target: tfBody, attributeName: "class" }]);
+  h.flush();
+  assert.equal(states.at(-1)?.open, true);
+
+  outerDetails.removeAttribute("open");
+  h.observer.emit([{ type: "attributes", target: outerDetails, attributeName: "open" }]);
+  h.flush();
+  assert.equal(states.at(-1)?.open, false);
+
+  outerDetails.setAttribute("open", "");
+  h.observer.emit([{ type: "attributes", target: outerDetails, attributeName: "open" }]);
+  h.flush();
+  assert.equal(states.at(-1)?.open, true);
+
+  arBody.setAttribute("hidden", "");
+  h.observer.emit([{ type: "attributes", target: arBody, attributeName: "hidden" }]);
+  h.flush();
+  assert.equal(states.at(-1)?.open, false);
+
+  arBody.removeAttribute("hidden");
+  arBody.setAttribute("inert", "");
+  h.observer.emit([{ type: "attributes", target: arBody, attributeName: "inert" }]);
+  h.flush();
+  assert.equal(states.at(-1)?.open, false);
+
+  arBody.removeAttribute("inert");
+  h.observer.emit([{ type: "attributes", target: arBody, attributeName: "inert" }]);
+  h.flush();
+  assert.equal(states.at(-1)?.open, true);
+  h.hub.dispose();
+});
+
+test("mutations inside .think-time skip scheduling a sweep unless a .think block is added or removed", () => {
+  const doc = new FakeDocument();
+  const pending: Array<() => void> = [];
+  let scheduleCalls = 0;
+  let observer: FakeObserverBox | null = null;
+  const hub = new DecorationHub({
+    document: doc as unknown as { body: unknown; querySelectorAll(selector: string): ArrayLike<HTMLElement> },
+    createObserver: callback => {
+      observer = new FakeObserverBox(callback);
+      return observer;
+    },
+    schedule: flush => {
+      scheduleCalls += 1;
+      pending.push(flush);
+    },
+  });
+
+  const block = new FakeElement("div", "think streaming");
+  block.id = "t-stopwatch";
+  const head = new FakeElement("button", "think-head");
+  const timer = new FakeElement("span", "think-time");
+  const timerSpan = new FakeElement("span");
+  timerSpan.textContent = "0.4s";
+  timer.append(timerSpan);
+  head.append(timer);
+  const body = new FakeElement("div", "think-body open");
+  const inner = new FakeElement("div", "think-body-inner");
+  const pre = new FakeElement("pre", "think-text");
+  pre.textContent = "Thinking...";
+  inner.append(pre);
+  body.append(inner);
+  block.append(head, body);
+  doc.body.append(block);
+
+  let updates = 0;
+  hub.register("thinking", () => ({
+    dispose: () => {},
+    update: () => {
+      updates += 1;
+    },
+  }), new Scope());
+
+  const fakeTextNode = { nodeType: 3, parentElement: timer, nodeValue: "1.2s" } as unknown as FakeElement;
+  observer!.emit([
+    { type: "characterData", target: fakeTextNode },
+    { type: "childList", target: timer, addedNodes: [new FakeElement("span")], removedNodes: [timerSpan] },
+    { type: "attributes", target: timer, attributeName: "class" },
+  ]);
+  assert.equal(scheduleCalls, 0, "mutations inside .think-time scheduled an unnecessary sweep");
+  assert.equal(pending.length, 0);
+  assert.equal(updates, 0);
+
+  pre.textContent = "Thinking... next step.";
+  observer!.emit([{ type: "childList", target: pre }]);
+  assert.equal(scheduleCalls, 1, "real source text change failed to schedule a sweep");
+  while (pending.length) pending.shift()?.();
+  assert.equal(updates, 1);
+  hub.dispose();
+});

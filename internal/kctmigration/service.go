@@ -191,10 +191,15 @@ func (s *Service) Status(_ context.Context) Report {
 	report.Detected = report.PlistPresent || report.DataDirPresent
 	report.NeedsConfirmation = report.Detected && !report.Migrated
 	if report.Migrated {
-		// Once migrated the leftover data directory is expected; it no longer
-		// means a second injector exists.
-		report.Detected = false
-		report.NeedsConfirmation = false
+		if report.PlistPresent {
+			report.Detected = true
+			report.NeedsConfirmation = true
+		} else {
+			// Once migrated the leftover data directory is expected; it no longer
+			// means a second injector exists.
+			report.Detected = false
+			report.NeedsConfirmation = false
+		}
 	}
 	s.mu.Lock()
 	report.Detail = s.lastError
@@ -233,7 +238,7 @@ func (s *Service) Confirm(ctx context.Context) (Result, error) {
 	}()
 
 	report := s.Status(ctx)
-	if report.Migrated {
+	if report.Migrated && !report.PlistPresent {
 		return Result{Report: report, AlreadyMigrated: true, Message: "独立版 KCT 已经停用，不需要重复迁移。"}, nil
 	}
 	if !report.Detected {

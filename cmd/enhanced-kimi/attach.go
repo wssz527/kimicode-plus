@@ -35,6 +35,7 @@ type attachOptions struct {
 	uninstall          bool
 	status             bool
 	background         bool
+	force              bool
 }
 
 // runAttach implements `enhanced-kimi attach`. Without --install/--uninstall it
@@ -49,6 +50,7 @@ func runAttach(args []string) error {
 	set.StringVar(&options.profile, "host-profile", "", "isolated Kimi Code profile (empty: the running client)")
 	set.IntVar(&options.debugPort, "debug-port", 0, "optional loopback debugging port on Windows")
 	set.BoolVar(&options.background, "background", false, "skip an existing attachment to the same running core")
+	set.BoolVar(&options.force, "force", false, "force re-attaching even when the current host instance is already attached")
 	set.BoolVar(&options.allowDailyInstance, "allow-daily-instance", false, "attach to the client you actually use")
 	set.StringVar(&options.appVersionOverride, "app-version-override", "", "override reported host version on isolated profile for contract acceptance")
 	set.StringVar(&options.coreURL, "core-url", "", "core base URL to report to")
@@ -138,24 +140,36 @@ func runAttach(args []string) error {
 	if coreVersion == "" {
 		coreVersion = server.Version
 	}
-	result, attachErr := desktop.AttachOnce(ctx, desktop.AttachOptions{
+	result, attachErr := attachOnce(ctx, desktop.AttachOptions{
 		DataDir: options.dataDir, KimiExecutable: options.kimiExe, DebugPort: options.debugPort,
 		Profile: options.profile, CoreURL: coreURL, PairingToken: pairingToken, CoreVersion: coreVersion,
 		AllowDailyInstance: options.allowDailyInstance,
 		AppVersionOverride: options.appVersionOverride,
-		SkipCurrent:        options.background,
+		SkipCurrent:        !options.force,
 	})
 	if result == nil && attachErr == nil {
+		if options.background {
+			return nil
+		}
+		if existing := desktop.ReadAttachState(options.dataDir); existing != nil {
+			return json.NewEncoder(attachStdout).Encode(existing)
+		}
 		return nil
 	}
-	recordErr := desktop.RecordAttach(options.dataDir, anyOrError(result, attachErr))
 	if attachErr != nil {
+		if !desktop.IsAttachStateRecorded(attachErr) && !desktop.IsAttachPersistFailed(attachErr) {
+			if recordErr := desktop.RecordAttach(options.dataDir, attachErr); recordErr != nil {
+				fmt.Fprintln(os.Stderr, "接入结果未能写入状态文件：", recordErr)
+			}
+		}
 		return attachErr
 	}
-	if recordErr != nil {
-		fmt.Fprintln(os.Stderr, "接入结果未能写入状态文件：", recordErr)
+	if result != nil && !desktop.IsAttachStateRecordedResult(result) {
+		if recordErr := desktop.RecordAttach(options.dataDir, result); recordErr != nil {
+			fmt.Fprintln(os.Stderr, "接入结果未能写入状态文件：", recordErr)
+		}
 	}
-	return json.NewEncoder(os.Stdout).Encode(result)
+	return json.NewEncoder(attachStdout).Encode(result)
 }
 
 func resolveAttachCredentials(ctx context.Context, dataDir, fallbackURL, fallbackToken string) (string, string) {
@@ -184,9 +198,6 @@ func resolveAttachRuntime(ctx context.Context, dataDir, fallbackURL, fallbackTok
 	liveVersion := strings.TrimSpace(runtimeInfo.Version)
 	if !isLoopbackHTTPURL(liveURL) || len(liveToken) < desktop.AttachTokenMinLength {
 		return fallbackURL, fallbackToken, ""
-	}
-	if liveURL == strings.TrimRight(strings.TrimSpace(fallbackURL), "/") && liveToken == strings.TrimSpace(fallbackToken) {
-		return fallbackURL, fallbackToken, liveVersion
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -225,7 +236,11 @@ func isLoopbackHTTPURL(raw string) bool {
 // installLaunchAgent is the install step, indirected so a test can prove
 // --install validates before it writes anything without touching the real
 // LaunchAgents directory.
-var installLaunchAgent = desktop.EnableAutoAttach
+var (
+	installLaunchAgent           = desktop.EnableAutoAttach
+	attachOnce                   = desktop.AttachOnce
+	attachStdout       io.Writer = os.Stdout
+)
 
 // validateAgentArguments parses the agent's argument list with the same flag set
 // the subcommand uses. This is the guard against the plist and the CLI drifting
@@ -265,12 +280,4 @@ func validateAttachCredentials(coreURL, token string) error {
 		return errors.New("提供核心地址时需要有效的 --pairing-token")
 	}
 	return nil
-}
-
-// anyOrError lets RecordAttach receive either branch without a nil-interface trap.
-func anyOrError(result *desktop.AttachResult, err error) any {
-	if err != nil {
-		return err
-	}
-	return result
 }

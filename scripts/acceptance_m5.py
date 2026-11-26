@@ -36,28 +36,33 @@ class Core:
     def __init__(self, binary, folder, home):
         env = dict(os.environ)
         env["HOME"] = str(home)
+        env["EKD_DISABLE_OS_KEYCHAIN"] = "1"
+        env["EKD_DISABLE_AUTO_UPDATE_CHECK"] = "1"
         self.home = Path(home)
         self.process = subprocess.Popen(
             [str(binary), "--data-dir", str(folder)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
         )
-        runtime = Path(folder) / "runtime.json"
-        deadline = time.monotonic() + 20
-        while True:
-            if self.process.poll() is not None:
-                raise AssertionError(self.process.stderr.read())
-            if runtime.exists():
+        try:
+            runtime = Path(folder) / "runtime.json"
+            deadline = time.monotonic() + 20
+            while True:
+                if self.process.poll() is not None:
+                    _, stderr = self.process.communicate(timeout=20)
+                    raise AssertionError(stderr)
                 try:
                     data = json.loads(runtime.read_text())
                     if data.get("pid") == self.process.pid:
                         break
                 except (FileNotFoundError, json.JSONDecodeError):
                     pass
-            if time.monotonic() > deadline:
-                self.process.kill()
-                raise AssertionError("core readiness timeout")
-            time.sleep(0.01)
-        self.base, self.token = data["url"], data["pairingToken"]
+                if time.monotonic() > deadline:
+                    raise AssertionError("core readiness timeout")
+                time.sleep(0.01)
+            self.base, self.token = data["url"], data["pairingToken"]
+        except BaseException:
+            self.stop(hard=True)
+            raise
 
     def request(self, path, body=None, method=None, token=True, headers=None, expected=200):
         values = {"Content-Type": "application/json"}
@@ -78,10 +83,20 @@ class Core:
         assert response.status == expected, (path, response.status, payload)
         return payload
 
-    def stop(self):
+    def stop(self, hard=False):
+        report_timeout = not hard and sys.exc_info()[0] is None
         if self.process.poll() is None:
-            self.process.terminate()
+            if hard:
+                self.process.kill()
+            else:
+                self.process.terminate()
+        try:
             self.process.communicate(timeout=20)
+        except subprocess.TimeoutExpired as error:
+            self.process.kill()
+            self.process.communicate()
+            if report_timeout:
+                raise AssertionError("core did not exit cleanly before timeout") from error
 
 
 def install_legacy(home, settings):
@@ -98,14 +113,15 @@ def run(binary, root):
     # platform.Acquire refuses a data directory that another user could read, and
     # mkdtemp already gives 0700; the nested directories must match.
     folder = root / "core"
-    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    folder.mkdir(mode=0o700)
     home = root / "home"
-    home.mkdir(exist_ok=True, mode=0o700)
+    home.mkdir(mode=0o700)
     real_plist = Path.home() / "Library" / "LaunchAgents" / (LABEL + ".plist")
     real_before = real_plist.read_bytes() if real_plist.exists() else None
 
-    core = Core(binary, folder, home)
+    core = None
     try:
+        core = Core(binary, folder, home)
         items = {item["id"]: item for item in core.request("/plugins")["items"]}
         assert PLUGIN in items, sorted(items)
         adapter = items[PLUGIN]
@@ -129,11 +145,11 @@ def run(binary, root):
         token = enabled["token"]
         denied = core.request(
             "/plugins/" + PLUGIN + "/action/net.fetch",
-            {"params": {"url": "https://example.com/", "method": "GET"}},
+            {"params": {"url": "https://example.com/", "method": "POST"}},
             headers={"X-Plugin-Token": token}, expected=403,
         )
-        assert denied["error"]["code"] == "PLUGIN_CAPABILITY_DENIED", denied
-        results.append("an enabled adapter reaches only the hosts its manifest declares")
+        assert denied["error"]["code"] == "PLUGIN_NET_ENDPOINT_DENIED", denied
+        results.append("an enabled adapter reaches only declared allowlisted or configured translation endpoints")
         core.request("/plugins/" + PLUGIN + "/disable", {})
 
         install_legacy(home, {"provider": "bing", "targetLanguage": "ja", "customKey": "not-a-real-key"})
@@ -179,16 +195,47 @@ def run(binary, root):
         assert after["migrated"] is True and after["needsConfirmation"] is False, after
         results.append("the handover is idempotent")
 
-        (home / "Library" / "LaunchAgents" / (LABEL + ".plist")).write_text("<plist/>\n")
-        later = core.request("/kct/migration")
-        assert later["migrated"] is True and later["needsConfirmation"] is False, later
-        core.request("/plugins/" + PLUGIN + "/enable", {})
-        results.append("a recorded handover survives a reinstalled standalone plist")
-    finally:
-        core.stop()
+        core.request("/plugins/" + PLUGIN + "/disable", {})
+        leftover = core.request("/kct/migration")
+        assert (
+            leftover["migrated"] is True
+            and leftover["dataDirPresent"] is True
+            and leftover["plistPresent"] is False
+            and leftover["needsConfirmation"] is False
+        ), leftover
+        reallowed = core.request("/plugins/" + PLUGIN + "/enable", {})
+        assert reallowed["state"] == "ENABLED", reallowed
+        results.append("a leftover standalone data directory alone does not block re-enabling after handover")
 
-    real_after = real_plist.read_bytes() if real_plist.exists() else None
-    assert real_before == real_after, "the user's own standalone plist was modified"
+        core.request("/plugins/" + PLUGIN + "/disable", {})
+        plist.write_text("<plist/>\n")
+        reinstalled = core.request("/kct/migration")
+        assert (
+            reinstalled["migrated"] is True
+            and reinstalled["plistPresent"] is True
+            and reinstalled["needsConfirmation"] is True
+        ), reinstalled
+        reblocked = core.request("/plugins/" + PLUGIN + "/enable", {}, expected=409)
+        assert reblocked["error"]["code"] == "PLUGIN_MIGRATION_REQUIRED", reblocked
+        reconfirmed = core.request("/kct/migration/confirm", {})
+        assert reconfirmed["alreadyMigrated"] is False and reconfirmed["disabledPlist"] is True, reconfirmed
+        assert not plist.exists(), "reinstalled plist was left in place"
+        recovered = core.request("/kct/migration")
+        assert (
+            recovered["migrated"] is True
+            and recovered["plistPresent"] is False
+            and recovered["needsConfirmation"] is False
+        ), recovered
+        restored = core.request("/plugins/" + PLUGIN + "/enable", {})
+        assert restored["state"] == "ENABLED", restored
+        results.append("a reinstalled standalone plist re-triggers confirmation and can be cleared again")
+    finally:
+        try:
+            if core is not None:
+                core.stop()
+        finally:
+            real_after = real_plist.read_bytes() if real_plist.exists() else None
+            assert real_before == real_after, "the user's own standalone plist was modified"
     if real_before is not None:
         results.append("the user's own standalone installation was left untouched")
     return results
@@ -197,8 +244,16 @@ def run(binary, root):
 if __name__ == "__main__":
     binary = Path(sys.argv[1]).resolve()
     kept = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
-    root = kept or Path(tempfile.mkdtemp(prefix="m5-acceptance-"))
+    if kept is not None:
+        real_home = Path.home().resolve()
+        real_library = (real_home / "Library").resolve()
+        if kept == real_home or kept == real_library or real_library in kept.parents:
+            raise SystemExit("kept directory must be outside the user's Library and cannot be the user's home")
+        kept.mkdir(parents=True, exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix="m5-acceptance-", dir=kept))
     try:
+        if kept is not None:
+            print(f"Kept acceptance directory: {root}", flush=True)
         passed = run(binary, root)
         for text in passed:
             print("PASS " + text)

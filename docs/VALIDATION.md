@@ -2,6 +2,35 @@
 
 验收使用本项目 `work/` 下的隔离数据目录和独立宿主 profile（Windows 端使用独立临时隔离目录）。当前范围为核心 M0–M6、插件接口 v2（A1）、规划插件（A3）、修正轮（R0–R4）、下一轮（N0–N6）以及 v0.2.4 以来的发布修复。多屏会话插件 A2 延期。
 
+## v0.2.11 审查修复与发布交接（2026-11-27）
+
+核心发布版本为 `0.2.11`，标签为 `v0.2.11`。官方插件使用独立的 `plugins-latest` 通道，同步更新 KCT 至 `1.0.9`（标签 `plugin-kct-v1.0.9`），Planner `1.0.8`（`minCoreVersion: 0.2.10`）、Monitor `1.1.3` 和 Scheduler `1.1.1` 保持不变。
+
+### 交付范围
+
+- KCT 思维链翻译彻底消除多重翻译与残留：修复卸载清理 TDZ 异常、外层折叠容器误匹配与三排工具栏叠加、流式输出 `streamSince = 0` 整段重译以及未闭合行内代码/链接提前切片外发；设置保存采用最新配置合并避免旧快照冲掉字段。
+- 宿主兼容与接入稳健性：Kimi Code `1.4.3` 纳入已验证宿主版本；修复后台 `attach` 与 `attach --force` 状态回写及桥存活校验；独立版 KCT 重装 LaunchAgent 时重新触发迁移确认入口；Windows/macOS 接入锁与状态读写加严。
+- 供应商模型能力与官方表单协同：仅在同一官方供应商表单成功提交后按前后快照对账恢复被官方表单丢弃的 `max_output_size` 等扩展字段，修复 KAP 跨端口/重定向凭据保护与超时语义。
+- 插件运行时、日志与热更新设置面板一致性：修正 `ctx.log("info")` 误记 `ERROR`；挂起激活支持立即取消与 Scope 回收；插件资产接口端到端绑定 `version`/`updatedAt`/`capabilities` 并做读盘前后二次一致性校验，设置面板挂载与取消信号竞速、区分停用/宿主卸载/激活失败错误码，并在忙碌期排队刷新及官方更新短暂 `Disable -> Enable` 后自动恢复重挂。
+- 同步修正 `README.md`、`PRODUCT.md`、`CacheSettings.tsx`、`FRONTEND.md`、`PLUGINS.md`、`API_CONTRACT.md`、`NATIVE_INTEGRATION.md` 中滞后的保活与插件契约说明并清理死代码。
+- 隔离验收启动核心时默认设置 `EKD_DISABLE_OS_KEYCHAIN=1` 和 `EKD_DISABLE_AUTO_UPDATE_CHECK=1`，禁用系统钥匙串与自动更新检查。M5 验收同时使用临时 `HOME`。
+
+### 验证与复审
+
+| 项目 | 结果 |
+|---|---|
+| 前端 | TypeScript 类型检查、424/424 单测、普通与宿主生产构建通过 |
+| Go | `go vet ./cmd/... ./internal/... ./plugins/...` 与 `./cmd/... ./internal/... ./plugins/...` 全量测试通过 |
+| 打包与同步 | `scripts/test_package.py` 11/11、`scripts/test_sync_cnb_release.py` 7/7 通过 |
+| 真实二进制 | `scripts/acceptance.py --binary ./dist/enhanced-kimi` 27/27、`scripts/acceptance_m5.py ./dist/enhanced-kimi` 10/10 通过 |
+| 独立复审 | 业务改动与验收隔离脚本均经独立复审，发现项已修复闭合 |
+
+### 发布与后续边界
+
+核心将由 `v0.2.11` 注释标签触发 `.github/workflows/release.yml`。工作流先将完整资产上传至 GitHub 草稿，再同步 CNB，随后将 GitHub 草稿公开为正式 Release。官方插件将由 `plugin-kct-v1.0.9` 标签触发 `.github/workflows/release-plugins.yml`，更新 GitHub 与 CNB 的 `plugins-latest`。两端均在归档上传完成后发布清单。
+
+本轮未调用真实付费翻译服务、真实账号 KAP 流程和系统文件选择窗口，完整桌面客户端宿主也未进行实机操作。保活核对之后才落盘的步骤不回补记账。自定义中继仅在符合官方主机名单时发送私有 `thinking`。真实线上插件热替换、同账号有无保活的长周期缓存 TTL 对照以及八站登录态提取与回填仍待进一步实测。
+
 ## v0.2.10 审查修复与发布交接（2026-11-26）
 
 核心发布版本为 `0.2.10`，标签为 `v0.2.10`。官方插件使用独立的 `plugins-latest` 通道，包含 KCT `1.0.8`、Planner `1.0.8`、Monitor `1.1.3` 和 Scheduler `1.1.1`；Planner 的最低核心版本为 `0.2.10`。

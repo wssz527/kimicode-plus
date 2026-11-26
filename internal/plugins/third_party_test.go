@@ -267,14 +267,22 @@ func TestPluginAssetsContainmentAndSize(t *testing.T) {
 	}
 	mux := http.NewServeMux()
 	manager.Register(mux)
-	get := func(name string, want int) map[string]string {
+	type assetResponse struct {
+		Path         string   `json:"path"`
+		Source       string   `json:"source"`
+		Encoding     string   `json:"encoding"`
+		Version      string   `json:"version"`
+		UpdatedAt    string   `json:"updatedAt"`
+		Capabilities []string `json:"capabilities"`
+	}
+	get := func(name string, want int) assetResponse {
 		t.Helper()
 		response := httptest.NewRecorder()
 		mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, APIPrefix+"/plugins/"+installed.ID+"/assets/"+name, nil))
 		if response.Code != want {
 			t.Fatalf("asset %s: got status %d, want %d", name, response.Code, want)
 		}
-		asset := map[string]string{}
+		var asset assetResponse
 		if want == http.StatusOK {
 			if err := json.Unmarshal(response.Body.Bytes(), &asset); err != nil {
 				t.Fatal(err)
@@ -288,11 +296,11 @@ func TestPluginAssetsContainmentAndSize(t *testing.T) {
 	}
 	get("renderer.js", http.StatusOK)
 	get("settings.js", http.StatusOK)
-	if asset := get("assets/nested/text.txt", http.StatusOK); asset["source"] != "asset text" || asset["path"] != "assets/nested/text.txt" {
+	if asset := get("assets/nested/text.txt", http.StatusOK); asset.Source != "asset text" || asset.Path != "assets/nested/text.txt" {
 		t.Fatalf("text asset: %#v", asset)
 	}
 	binary := get("assets/logo.bin", http.StatusOK)
-	if bytes, err := base64.StdEncoding.DecodeString(binary["source"]); err != nil || string(bytes) != "\xff\x00\xfe" || binary["encoding"] != "base64" {
+	if bytes, err := base64.StdEncoding.DecodeString(binary.Source); err != nil || string(bytes) != "\xff\x00\xfe" || binary.Encoding != "base64" {
 		t.Fatalf("binary asset was changed: %#v, %v", binary, err)
 	}
 	dir := filepath.Join(root, "plugins", installed.ID)

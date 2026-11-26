@@ -456,19 +456,17 @@ func TestMarkerSurvivesReinstallAndStopsBlocking(t *testing.T) {
 		t.Fatalf("confirm: %v", err)
 	}
 
-	// Reinstalling the standalone extension restores its plist; the marker is what
-	// keeps the adapter from being blocked a second time.
-	if err := os.WriteFile(f.plistPath(), []byte("<plist/>"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	report := service.Status(context.Background())
-	if !report.Migrated {
-		t.Fatalf("marker was not read: %+v", report)
+	// Reinstalling the adapter creates a new service pointing at the same dataDir;
+	// the marker keeps the leftover data directory from blocking it a second time.
+	reinstalled := New(service.dataDir, newStore(), f.sys)
+	report := reinstalled.Status(context.Background())
+	if !report.Migrated || !report.DataDirPresent || report.PlistPresent {
+		t.Fatalf("marker or leftover data dir state unexpected: %+v", report)
 	}
 	if report.Detected || report.NeedsConfirmation {
 		t.Fatalf("migrated install still reported as needing confirmation: %+v", report)
 	}
-	if code, _ := service.CheckEnable(context.Background(), PluginID); code != "" {
+	if code, _ := reinstalled.CheckEnable(context.Background(), PluginID); code != "" {
 		t.Fatalf("marker did not unblock the adapter, code=%q", code)
 	}
 }
@@ -593,5 +591,64 @@ func TestLoadedJobPathComparisonFollowsSymlinks(t *testing.T) {
 	}
 	if !result.StoppedLoader || len(f.called("bootout")) != 1 {
 		t.Fatalf("a symlinked path was not recognised as this home's job: %+v %v", result, f.calls)
+	}
+}
+
+func TestReinstalledPlistAfterMigrationReTriggersDetectionAndConfirm(t *testing.T) {
+	f := newFake(t)
+	f.installLegacy(t, map[string]string{"provider": "bing", "targetLanguage": "zh"})
+	f.runErr = nil
+	f.printOutput = f.plistPath()
+	store := newStore()
+	service := newService(t, f, store)
+
+	first, err := service.Confirm(context.Background())
+	if err != nil {
+		t.Fatalf("first confirm: %v", err)
+	}
+	if !first.DisabledPlist || !first.StoppedLoader {
+		t.Fatalf("first confirm did not disable loader: %+v", first)
+	}
+
+	afterFirst := service.Status(context.Background())
+	if !afterFirst.Migrated || !afterFirst.DataDirPresent || afterFirst.PlistPresent || afterFirst.Detected || afterFirst.NeedsConfirmation {
+		t.Fatalf("status after migration with leftover data dir = %+v", afterFirst)
+	}
+	if code, _ := service.CheckEnable(context.Background(), PluginID); code != "" {
+		t.Fatalf("adapter remained blocked with only leftover data dir: %q", code)
+	}
+	repeat, err := service.Confirm(context.Background())
+	if err != nil || !repeat.AlreadyMigrated {
+		t.Fatalf("repeat confirm without plist = %+v, %v", repeat, err)
+	}
+
+	f.now = f.now.Add(2 * time.Hour)
+	f.installLegacy(t, map[string]string{"provider": "google", "targetLanguage": "en"})
+	reinstalled := service.Status(context.Background())
+	if !reinstalled.Migrated || !reinstalled.PlistPresent || !reinstalled.Detected || !reinstalled.NeedsConfirmation {
+		t.Fatalf("reinstalled plist was ignored after migration: %+v", reinstalled)
+	}
+	if code, _ := service.CheckEnable(context.Background(), PluginID); code != "PLUGIN_MIGRATION_REQUIRED" {
+		t.Fatalf("CheckEnable did not re-block reinstalled plist: %q", code)
+	}
+
+	second, err := service.Confirm(context.Background())
+	if err != nil {
+		t.Fatalf("second confirm: %v", err)
+	}
+	if second.AlreadyMigrated || !second.DisabledPlist || !second.StoppedLoader {
+		t.Fatalf("second confirm did not remove reinstalled plist: %+v", second)
+	}
+	if second.Report.Detected || second.Report.NeedsConfirmation || second.Report.PlistPresent {
+		t.Fatalf("status after second confirm = %+v", second.Report)
+	}
+	if second.Report.MigratedAt != f.now.UTC().Format(time.RFC3339) {
+		t.Fatalf("MigratedAt = %q, want %q", second.Report.MigratedAt, f.now.UTC().Format(time.RFC3339))
+	}
+	if _, err := os.Stat(f.plistPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reinstalled plist still exists: %v", err)
+	}
+	if code, _ := service.CheckEnable(context.Background(), PluginID); code != "" {
+		t.Fatalf("adapter remained blocked after second confirm: %q", code)
 	}
 }

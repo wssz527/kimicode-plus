@@ -83,7 +83,7 @@ export interface ActivePlugin {
    * returned handle disposes the module and empties the container, so a detail
    * page that closes cannot leave either a live scope or stale nodes behind.
    */
-  mountSettings(module: SettingsModule, element: HTMLElement): Promise<Disposable>;
+  mountSettings(module: SettingsModule, element: HTMLElement, options?: { signal?: AbortSignal }): Promise<Disposable>;
   dispose(): void;
 }
 
@@ -106,6 +106,10 @@ const OPEN_SETTINGS_CAPABILITIES = [
 export function createPluginRuntime(options: RuntimeOptions) {
   const hub = new DecorationHub();
   const active = new Map<string, ActivePlugin>();
+  const activating = new Map<
+    string,
+    { promise: Promise<ActivePlugin>; scope: Scope; cancelled: boolean; cancel: () => void }
+  >();
   // Command bodies live here, keyed by owner and name. Go owns the registry and
   // the authorization; this map is the actual code, and it only ever holds
   // functions the owning plugin registered in its own scope.
@@ -688,80 +692,183 @@ export function createPluginRuntime(options: RuntimeOptions) {
     return await handler(target.args ?? null);
   }
 
-  async function activate(
+  function activate(
     module: PluginModule,
     install: { id: string; version: string; apiVersion?: number; granted: string[]; token: string },
   ): Promise<ActivePlugin> {
     const existing = active.get(install.id);
-    if (existing) return existing;
+    if (existing) return Promise.resolve(existing);
+    const inflight = activating.get(install.id);
+    if (inflight && !inflight.cancelled) return inflight.promise;
     const scope = new Scope();
     const context = createContext(install.id, install.version, install.apiVersion ?? 2, install.granted, install.token, scope);
-    let result: Awaited<ReturnType<PluginModule["activate"]>>;
-    try {
-      result = await module.activate(context);
-    } catch (error) {
-      // A plugin that mounts a surface and then throws must not leave that
-      // surface behind: nothing recorded this scope as active, so without this
-      // the nodes, listeners and timers it created would outlive every retry.
-      scope.dispose();
-      // A failure raised inside a mount or decorator was already reported there
-      // with its own phase code; reporting it again here would turn one broken
-      // render into two faults. Only a throw with no phase tag is the plugin's
-      // own activation failure, and that one is what the host treats as fatal on
-      // the first occurrence.
-      const existing = (error as { code?: string } | null)?.code;
-      const failure = Object.assign(
-        error instanceof Error ? error : new Error(String(error)),
-        { code: existing || "PLUGIN_ACTIVATION_FAILED" },
-      );
-      if (!existing) reportFailure(install.id, failure, failure.code, "插件激活失败");
-      throw failure;
-    }
-    if (result && typeof result === "object" && "dispose" in result && typeof result.dispose === "function") {
-      scope.add(() => result.dispose());
-    } else if (typeof result === "function") {
-      // The module contract allows returning a plain cleanup function, so the
-      // teardown a v2 plugin hands back must run on disable like any other.
-      scope.add(result);
-    }
-    const granted = [...install.granted];
-    const plugin: ActivePlugin = {
-      id: install.id,
-      theme,
-      async mountSettings(settingsModule, element) {
-        if (!granted.includes("ui:settings")) {
-          throw new PluginError(403, "PLUGIN_CAPABILITY_DENIED", "插件没有提供设置页的能力");
-        }
-        if (typeof settingsModule.renderSettings !== "function") {
-          throw new Error("插件设置模块没有导出 renderSettings(ctx, element)");
-        }
-        const childScope = new Scope();
-        scope.add(() => childScope.dispose());
-        const release = () => {
-          childScope.dispose();
-          element.replaceChildren();
-        };
-        try {
-          childScope.add(await settingsModule.renderSettings(context, element));
-        } catch (error) {
-          release();
-          reportFailure(install.id, error, "PLUGIN_SETTINGS_FAILED", "设置页挂载失败");
-          throw error;
-        }
-        return { dispose: release };
-      },
-      dispose: () => scope.dispose(),
+    let resolveEntry!: (plugin: ActivePlugin) => void;
+    let rejectEntry!: (reason?: unknown) => void;
+    let settled = false;
+    const settleResolve = (plugin: ActivePlugin) => {
+      if (settled) return;
+      settled = true;
+      resolveEntry(plugin);
     };
-    active.set(install.id, plugin);
-    return plugin;
+    const settleReject = (reason: unknown) => {
+      if (settled) return;
+      settled = true;
+      rejectEntry(reason);
+    };
+    const promise = new Promise<ActivePlugin>((resolve, reject) => {
+      resolveEntry = resolve;
+      rejectEntry = reject;
+    });
+    const entry = {
+      promise,
+      scope,
+      cancelled: false,
+      cancel() {
+        settleReject(new PluginError(409, "PLUGIN_DISABLED", "插件已停用"));
+      },
+    };
+    activating.set(install.id, entry);
+    void (async () => {
+      let result: Awaited<ReturnType<PluginModule["activate"]>>;
+      try {
+        result = await module.activate(context);
+      } catch (error) {
+        if (activating.get(install.id) === entry) activating.delete(install.id);
+        // A plugin that mounts a surface and then throws must not leave that
+        // surface behind: nothing recorded this scope as active, so without this
+        // the nodes, listeners and timers it created would outlive every retry.
+        scope.dispose();
+        if (entry.cancelled) {
+          if (!active.has(install.id) && !activating.has(install.id)) pump.release(install.id);
+          settleReject(new PluginError(409, "PLUGIN_DISABLED", "插件已停用"));
+          return;
+        }
+        // A failure raised inside a mount or decorator was already reported there
+        // with its own phase code; reporting it again here would turn one broken
+        // render into two faults. Only a throw with no phase tag is the plugin's
+        // own activation failure, and that one is what the host treats as fatal on
+        // the first occurrence.
+        const existingCode = (error as { code?: string } | null)?.code;
+        const failure = Object.assign(
+          error instanceof Error ? error : new Error(String(error)),
+          { code: existingCode || "PLUGIN_ACTIVATION_FAILED" },
+        );
+        if (!existingCode) reportFailure(install.id, failure, failure.code, "插件激活失败");
+        settleReject(failure);
+        return;
+      }
+      if (result && typeof result === "object" && "dispose" in result && typeof result.dispose === "function") {
+        scope.add(() => result.dispose());
+      } else if (typeof result === "function") {
+        // The module contract allows returning a plain cleanup function, so the
+        // teardown a v2 plugin hands back must run on disable like any other.
+        scope.add(result);
+      }
+      if (activating.get(install.id) === entry) activating.delete(install.id);
+      if (entry.cancelled) {
+        scope.dispose();
+        if (!active.has(install.id) && !activating.has(install.id)) pump.release(install.id);
+        settleReject(new PluginError(409, "PLUGIN_DISABLED", "插件已停用"));
+        return;
+      }
+      const granted = [...install.granted];
+      const plugin: ActivePlugin = {
+        id: install.id,
+        theme,
+        async mountSettings(settingsModule, element, mountOptions) {
+          if (!granted.includes("ui:settings")) {
+            throw new PluginError(403, "PLUGIN_CAPABILITY_DENIED", "插件没有提供设置页的能力");
+          }
+          if (typeof settingsModule.renderSettings !== "function") {
+            throw new Error("插件设置模块没有导出 renderSettings(ctx, element)");
+          }
+          const signal = mountOptions?.signal;
+          if (signal?.aborted) {
+            throw Object.assign(new Error("插件设置页挂载已取消"), { code: "SETTINGS_MOUNT_CANCELLED" });
+          }
+          const mountRoot = createSettingsMountRoot(element);
+          const isolated = mountRoot !== element;
+          const clearRoot = () => {
+            if (isolated) {
+              mountRoot.remove?.();
+              mountRoot.replaceChildren?.();
+            } else {
+              element.replaceChildren?.();
+            }
+          };
+          const childScope = new Scope();
+          let released = false;
+          let cancelled = false;
+          const release = () => {
+            if (released) return;
+            released = true;
+            childScope.dispose();
+            clearRoot();
+          };
+          const onAbort = () => {
+            cancelled = true;
+            release();
+          };
+          if (signal) {
+            signal.addEventListener("abort", onAbort, { once: true });
+            childScope.add(() => signal.removeEventListener("abort", onAbort));
+          }
+          scope.add(release);
+          if (released) {
+            if (cancelled || signal?.aborted) {
+              throw Object.assign(new Error("插件设置页挂载已取消"), { code: "SETTINGS_MOUNT_CANCELLED" });
+            }
+            return { dispose: release };
+          }
+          if (isolated) {
+            mountRoot.className = "ekdp-settings-mount";
+            if (mountRoot.dataset) mountRoot.dataset.ekdpPlugin = install.id;
+            element.replaceChildren?.();
+            element.append(mountRoot);
+          }
+          const settingsContext: PluginContext = {
+            ...context,
+            onDispose(cleanup) {
+              childScope.add(cleanup);
+            },
+          };
+          try {
+            childScope.add(await settingsModule.renderSettings(settingsContext, mountRoot));
+          } catch (error) {
+            const suppressed = cancelled || released || Boolean(signal?.aborted) || !active.has(install.id);
+            release();
+            if (!suppressed) {
+              reportFailure(install.id, error, "PLUGIN_SETTINGS_FAILED", "设置页挂载失败");
+            }
+            throw error;
+          }
+          if (released) {
+            childScope.dispose();
+            clearRoot();
+          }
+          return { dispose: release };
+        },
+        dispose: () => scope.dispose(),
+      };
+      active.set(install.id, plugin);
+      settleResolve(plugin);
+    })().catch(settleReject);
+    return promise;
   }
 
   function deactivate(id: string): void {
+    const inflight = activating.get(id);
+    if (inflight) {
+      inflight.cancelled = true;
+      activating.delete(id);
+      inflight.scope.dispose();
+    }
     active.get(id)?.dispose();
     active.delete(id);
     // Dropping this plugin's subscriptions leaves the shared loop running for
     // every other plugin.
-    pump.release(id);
+    if (!active.has(id) && !activating.has(id)) pump.release(id);
+    inflight?.cancel();
   }
 
   return {
@@ -770,6 +877,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
     get: (id: string) => active.get(id) ?? null,
     invokeLocal,
     dispose() {
+      for (const id of [...activating.keys()]) deactivate(id);
       for (const id of [...active.keys()]) deactivate(id);
       pump.stop();
       hub.dispose();
@@ -950,6 +1058,25 @@ function createEventPump(reportFailure: (id: string, error: unknown, code: strin
       return stopped ? 0 : running.size;
     },
   };
+}
+
+function createSettingsMountRoot(element: HTMLElement): HTMLElement {
+  const fromOwner = element.ownerDocument?.createElement?.("div");
+  if (fromOwner) return fromOwner;
+  const fromGlobal = typeof document !== "undefined" ? document?.createElement?.("div") : null;
+  if (fromGlobal) return fromGlobal;
+  const ctor: unknown = (element as { constructor?: unknown })?.constructor;
+  if (typeof ctor === "function" && ctor !== Object) {
+    try {
+      const created = new (ctor as new (tag: string) => HTMLElement)("div");
+      if (created && typeof created === "object" && typeof (created as { remove?: unknown }).remove === "function") {
+        return created;
+      }
+    } catch {
+      // Fall back to the caller container if the test element cannot construct a child node.
+    }
+  }
+  return element;
 }
 
 function bytesToBase64(bytes: Uint8Array): string {

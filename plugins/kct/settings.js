@@ -29,7 +29,22 @@ const SERVICES = [
 const LOCAL_ENDPOINT_HOSTS = new Set(["127.0.0.1", "[::1]", "localhost"]);
 
 export async function renderSettings(ctx, element) {
+  let disposed = false;
+  let card = null;
+  let onExternalChange = null;
+  let onCacheChanged = null;
+  const cleanup = () => {
+    if (disposed) return;
+    disposed = true;
+    if (onExternalChange) window.removeEventListener("ekdp-kct:settings", onExternalChange);
+    if (onCacheChanged) window.removeEventListener("ekdp-kct:cache", onCacheChanged);
+    card?.remove();
+  };
+  ctx.onDispose?.(cleanup);
+  if (disposed) return cleanup;
+
   const stored = await ctx.storage.get(SETTINGS_KEY).catch(() => undefined);
+  if (disposed) return cleanup;
   const settings = {
     targetLanguage: "__auto__",
     provider: "bing",
@@ -40,7 +55,7 @@ export async function renderSettings(ctx, element) {
     ...(stored && typeof stored === "object" ? stored : {}),
   };
 
-  const card = document.createElement("section");
+  card = document.createElement("section");
   card.className = "ekdp-settings";
 
   const intro = document.createElement("p");
@@ -217,16 +232,19 @@ export async function renderSettings(ctx, element) {
     syncVisibility();
   }
 
-  async function onExternalChange() {
+  onExternalChange = async () => {
+    if (disposed) return;
     const next = await ctx.storage.get(SETTINGS_KEY).catch(() => undefined);
-    if (!next || typeof next !== "object") return;
+    if (disposed || !next || typeof next !== "object") return;
     syncControls({ ...settings, ...next });
-  }
+  };
   window.addEventListener("ekdp-kct:settings", onExternalChange);
 
   async function refreshCredential() {
+    if (disposed) return;
     try {
       const result = await ctx.core.request("credentials.list");
+      if (disposed) return;
       const entry = Array.isArray(result?.items)
         ? result.items.find(item => item?.name === CREDENTIAL)
         : null;
@@ -239,6 +257,7 @@ export async function renderSettings(ctx, element) {
       credentialClear.disabled = !entry?.stored;
       credentialUseSwitch.disabled = !entry?.stored;
     } catch (error) {
+      if (disposed) return;
       credentialState.textContent = `无法读取凭据状态：${messageOf(error)}`;
       credentialSummary = "凭据状态不可读";
       credentialClear.disabled = true;
@@ -313,14 +332,17 @@ export async function renderSettings(ctx, element) {
   });
 
   async function refreshCache() {
+    if (disposed) return;
     try {
       const keys = await ctx.storage.list(CACHE_ENTRY_PREFIX);
+      if (disposed) return;
       cacheState.textContent = keys.length
         ? `已缓存 ${keys.length} 个段落，命中时直接复用译文。`
         : "暂无缓存段落。";
       cacheSummary = keys.length ? `缓存 ${keys.length} 段` : "无缓存";
       cacheClear.disabled = keys.length === 0;
     } catch {
+      if (disposed) return;
       cacheState.textContent = "无法读取缓存状态。";
       cacheSummary = "缓存状态不可读";
     }
@@ -334,10 +356,12 @@ export async function renderSettings(ctx, element) {
       for (const key of keys) await ctx.storage.delete(key);
       await ctx.storage.delete(CACHE_INDEX_KEY);
       await ctx.storage.delete("cache.v1");
+      if (disposed) return;
       setStatus("翻译缓存已清除。", "ok");
       window.dispatchEvent(new Event("ekdp-kct:cache"));
       await refreshCache();
     } catch (error) {
+      if (disposed) return;
       setStatus(`清除缓存失败：${messageOf(error)}`, "error");
     } finally {
       cacheClear.disabled = false;
@@ -345,18 +369,17 @@ export async function renderSettings(ctx, element) {
   });
 
   await refreshCredential().catch(() => {});
+  if (disposed) return cleanup;
   await refreshCache().catch(() => {});
+  if (disposed) return cleanup;
 
-  function onCacheChanged() {
+  onCacheChanged = () => {
+    if (disposed) return;
     void refreshCache();
-  }
+  };
   window.addEventListener("ekdp-kct:cache", onCacheChanged);
 
-  return () => {
-    window.removeEventListener("ekdp-kct:settings", onExternalChange);
-    window.removeEventListener("ekdp-kct:cache", onCacheChanged);
-    card.remove();
-  };
+  return cleanup;
 }
 
 function settingRow(label, hint, control) {

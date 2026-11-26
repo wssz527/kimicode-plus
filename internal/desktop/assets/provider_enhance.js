@@ -1,4 +1,4 @@
-function createProviderEnhance({ request }) {
+function createProviderEnhance({ request, officialOrigin, excludeOrigins, readOfficialConfig } = {}) {
   const CAPABILITIES = [
     ['image_in', '图片输入', '图片'],
     ['video_in', '视频输入', '视频'],
@@ -7,7 +7,21 @@ function createProviderEnhance({ request }) {
   const MODES = [['none', '关闭'], ['toggle', '可切换'], ['always', '始终思考']];
   const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
   const PANEL_ID = 'ekd-px-inspector';
+  const HTTP_STATUS_TEXT = {
+    200: 'OK',
+    400: 'Bad Request',
+    401: 'Unauthorized',
+    403: 'Forbidden',
+    404: 'Not Found',
+    409: 'Conflict',
+    422: 'Unprocessable Entity',
+    500: 'Internal Server Error',
+    502: 'Bad Gateway',
+    503: 'Service Unavailable',
+    504: 'Gateway Timeout',
+  };
   const state = { panel: null, style: null, table: null };
+  const openingModels = new Map();
   let enabled = true;
   let removed = false;
   let observer;
@@ -15,6 +29,11 @@ function createProviderEnhance({ request }) {
   let generation = 0;
   let snapshot;
   let pending;
+  let pendingFormOpen = null;
+  let originalFetch = null;
+  let wrappedFetch = null;
+  let installExcludeOrigins = null;
+  let installReadOfficialConfig = null;
 
   function el(tag, props = {}, children = []) {
     const node = document.createElement(tag);
@@ -122,10 +141,14 @@ function createProviderEnhance({ request }) {
     return bare?.provider === providerId && (bare.model || modelId) === modelId ? bare : null;
   }
 
+  function formTextInputs(form) {
+    return [...form.querySelectorAll('.pf-field input.ui-input')]
+      .filter(input => input.type !== 'password' && !input.closest('.pf-key-wrap'));
+  }
+
   function resolveProvider(form, config) {
     const providers = config.providers || {};
-    const inputs = [...form.querySelectorAll('.pf-field input.ui-input')]
-      .filter(input => input.type !== 'password' && !input.closest('.pf-key-wrap'));
+    const inputs = formTextInputs(form);
     const name = inputs[0]?.value.trim();
     const url = inputs.find(input => /^https?:\/\//i.test(input.value.trim()))?.value.trim();
     if (name && Object.hasOwn(providers, name)) {
@@ -140,6 +163,502 @@ function createProviderEnhance({ request }) {
     const ids = new Set(rows.map(row => modelInput(row)?.value.trim()).filter(Boolean));
     const matching = Object.keys(providers).filter(providerId => [...ids].some(id => savedModel(config, providerId, id)));
     return matching.length === 1 ? matching[0] : '';
+  }
+
+  function hasModelsRecord(config) {
+    return Boolean(config && typeof config === 'object' && config.models && typeof config.models === 'object' && !Array.isArray(config.models));
+  }
+
+  function readOfficialConfigSnapshot() {
+    const reader = typeof installReadOfficialConfig === 'function'
+      ? installReadOfficialConfig
+      : typeof readOfficialConfig === 'function'
+        ? readOfficialConfig
+        : null;
+    if (!reader) return null;
+    try {
+      const config = reader();
+      return hasModelsRecord(config) ? config : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function cloneOpeningConfig(config) {
+    if (!hasModelsRecord(config)) return null;
+    const providers = {};
+    if (config.providers && typeof config.providers === 'object' && !Array.isArray(config.providers)) {
+      for (const [id, provider] of Object.entries(config.providers)) {
+        if (!provider || typeof provider !== 'object') continue;
+        providers[id] = {
+          base_url: provider.base_url ?? provider.baseUrl,
+          baseUrl: provider.baseUrl ?? provider.base_url,
+        };
+      }
+    }
+    const models = {};
+    for (const [key, model] of Object.entries(config.models)) {
+      if (!model || typeof model !== 'object') continue;
+      const copy = { ...model };
+      if (Array.isArray(model.capabilities)) copy.capabilities = [...model.capabilities];
+      if (Array.isArray(model.support_efforts)) copy.support_efforts = [...model.support_efforts];
+      if (Array.isArray(model.supportEfforts)) copy.supportEfforts = [...model.supportEfforts];
+      models[key] = copy;
+    }
+    return { providers, models };
+  }
+
+  function cleanStringList(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(value => typeof value === 'string').map(value => value.trim()).filter(Boolean);
+  }
+
+  function wireCapabilitySnapshot(model = {}) {
+    const rawCapabilities = Object.hasOwn(model, 'capabilities') ? model.capabilities : undefined;
+    const rawEfforts = Object.hasOwn(model, 'support_efforts')
+      ? model.support_efforts
+      : Object.hasOwn(model, 'supportEfforts')
+        ? model.supportEfforts
+        : undefined;
+    const rawAdaptive = Object.hasOwn(model, 'adaptive_thinking')
+      ? model.adaptive_thinking
+      : Object.hasOwn(model, 'adaptiveThinking')
+        ? model.adaptiveThinking
+        : undefined;
+    const rawDefault = Object.hasOwn(model, 'default_effort')
+      ? model.default_effort
+      : Object.hasOwn(model, 'defaultEffort')
+        ? model.defaultEffort
+        : undefined;
+    const rawOff = Object.hasOwn(model, 'off_effort')
+      ? model.off_effort
+      : Object.hasOwn(model, 'offEffort')
+        ? model.offEffort
+        : undefined;
+    return {
+      capabilities: cleanStringList(rawCapabilities),
+      support_efforts: cleanStringList(rawEfforts),
+      adaptive_thinking: typeof rawAdaptive === 'boolean' ? rawAdaptive : undefined,
+      default_effort: typeof rawDefault === 'string' ? rawDefault.trim() : '',
+      off_effort: typeof rawOff === 'string' ? rawOff.trim() : '',
+    };
+  }
+
+  function providerModels(config, providerId) {
+    const result = new Map();
+    const models = config?.models || {};
+    for (const [key, item] of Object.entries(models)) {
+      if (!item || typeof item !== 'object') continue;
+      const slash = key.indexOf('/');
+      const owner = slash > 0 && slash < key.length - 1 ? key.slice(0, slash) : (item.provider || '');
+      const modelId = slash > 0 && slash < key.length - 1 ? key.slice(slash + 1) : (item.model || key);
+      if (owner !== providerId || !modelId) continue;
+      const qualified = `${providerId}/${modelId}`;
+      if (!result.has(modelId) || key === qualified) result.set(modelId, item);
+    }
+    return result;
+  }
+
+  function captureModelsFromConfig(config, providerId) {
+    if (!providerId || providerId.startsWith('managed:')) return;
+    if (!hasModelsRecord(config)) {
+      openingModels.delete(providerId);
+      return;
+    }
+    const models = new Map();
+    for (const [modelId, model] of providerModels(config, providerId)) {
+      models.set(modelId, { raw: wireCapabilitySnapshot(model), merged: null });
+    }
+    openingModels.set(providerId, models);
+  }
+
+  function captureOpeningModels(current, providerId) {
+    if (!providerId || providerId.startsWith('managed:')) return;
+    if (current.openingCaptured.has(providerId)) return;
+    current.openingCaptured.add(providerId);
+    if (!current.openingConfig) {
+      openingModels.delete(providerId);
+      return;
+    }
+    captureModelsFromConfig(current.openingConfig, providerId);
+  }
+
+  function capturePendingFormOpen() {
+    const form = findForm();
+    const table = form?.querySelector('.pmt');
+    if (!form || !table || !form.querySelector('.pf-back')) {
+      pendingFormOpen = null;
+      return;
+    }
+    if (state.table?.form === form && state.table?.table === table) return;
+    if (pendingFormOpen?.form === form && pendingFormOpen?.table === table) return;
+    const officialAtOpen = readOfficialConfigSnapshot();
+    const snapshotAtOpen = hasModelsRecord(snapshot) ? snapshot : null;
+    const openingConfig = cloneOpeningConfig(officialAtOpen || snapshotAtOpen);
+    const openingOrigin = resolveOfficialBase()?.origin || '';
+    pendingFormOpen = { form, table, openingConfig, openingOrigin };
+    if (openingConfig) {
+      const openProviderId = resolveProvider(form, openingConfig);
+      if (openProviderId && !openProviderId.startsWith('managed:')) {
+        captureModelsFromConfig(openingConfig, openProviderId);
+      }
+    }
+  }
+
+  function ensureOpeningCapturedForProvider(providerId) {
+    if (!providerId || providerId.startsWith('managed:')) return;
+    if (state.table) {
+      if (!state.table.openingCaptured.has(providerId)) {
+        captureOpeningModels(state.table, providerId);
+      }
+      return;
+    }
+    if (!pendingFormOpen) capturePendingFormOpen();
+    if (pendingFormOpen) {
+      if (pendingFormOpen.openingConfig && !openingModels.has(providerId)) {
+        captureModelsFromConfig(pendingFormOpen.openingConfig, providerId);
+      } else if (!pendingFormOpen.openingConfig) {
+        openingModels.delete(providerId);
+      }
+    }
+  }
+
+  function serializeOpeningModels(providerId) {
+    const providerOpening = openingModels.get(providerId);
+    if (!providerOpening || providerOpening.size === 0) return {};
+    const out = {};
+    for (const [modelId, entry] of providerOpening.entries()) {
+      if (!entry || typeof entry !== 'object') continue;
+      out[modelId] = {
+        raw: entry.raw,
+        merged: entry.merged || null,
+      };
+    }
+    return out;
+  }
+
+  function buildNextOpening(payload, mergedModels) {
+    const nextOpening = new Map();
+    const mergedMap = mergedModels && typeof mergedModels === 'object' && !Array.isArray(mergedModels)
+      ? mergedModels
+      : null;
+    for (const item of payload.models) {
+      if (!item || typeof item !== 'object') continue;
+      const modelId = String(item.model || '').trim();
+      if (!modelId) continue;
+      const rawSnap = wireCapabilitySnapshot(item);
+      const mergedEntry = mergedMap && Object.hasOwn(mergedMap, modelId) ? mergedMap[modelId] : null;
+      const mergedSnap = mergedEntry && typeof mergedEntry === 'object'
+        ? wireCapabilitySnapshot(mergedEntry)
+        : null;
+      nextOpening.set(modelId, { raw: rawSnap, merged: mergedSnap });
+    }
+    return nextOpening;
+  }
+
+  function isLoopbackHost(hostname) {
+    const host = String(hostname || '').toLowerCase();
+    return host === '127.0.0.1' || host === 'localhost' || host === '[::1]' || host === '::1';
+  }
+
+  function readLocation() {
+    try {
+      return globalThis.location || (typeof window !== 'undefined' ? window.location : null);
+    } catch {
+      return null;
+    }
+  }
+
+  function readQueryOrigin() {
+    const loc = readLocation();
+    try {
+      let search = typeof loc?.search === 'string' ? loc.search : '';
+      if (!search && typeof loc?.href === 'string') {
+        search = new URL(loc.href).search;
+      }
+      if (!search) return '';
+      if (typeof URLSearchParams === 'function') {
+        return new URLSearchParams(search).get('kimi_origin') || '';
+      }
+      const qs = search.startsWith('?') ? search : `?${search}`;
+      return new URL(`http://localhost/${qs}`).searchParams.get('kimi_origin') || '';
+    } catch {
+      return '';
+    }
+  }
+
+  function readSessionStorageOrigin() {
+    try {
+      const storage = globalThis.sessionStorage || (typeof window !== 'undefined' ? window.sessionStorage : null);
+      return storage?.getItem?.('kimi-desktop-server-origin') || '';
+    } catch {
+      return '';
+    }
+  }
+
+  function parseOfficialBase(raw, originOnly = false) {
+    const text = typeof raw === 'string'
+      ? raw.trim()
+      : (typeof URL === 'function' && raw instanceof URL ? raw.href : '');
+    if (!text) return null;
+    let parsed;
+    try {
+      parsed = new URL(text);
+    } catch {
+      return null;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    if (!isLoopbackHost(parsed.hostname)) return null;
+    if (originOnly) return { origin: parsed.origin, basePath: '' };
+    const basePath = parsed.pathname.replace(/\/v1\/?$/, '').replace(/\/$/, '');
+    return { origin: parsed.origin, basePath };
+  }
+
+  function resolveOfficialBase() {
+    if (officialOrigin !== undefined && officialOrigin !== null) {
+      const raw = typeof officialOrigin === 'function' ? officialOrigin() : officialOrigin;
+      return parseOfficialBase(raw);
+    }
+    const queryOrigin = readQueryOrigin();
+    if (queryOrigin && queryOrigin.trim()) {
+      return parseOfficialBase(queryOrigin);
+    }
+    const storedOrigin = readSessionStorageOrigin();
+    if (storedOrigin && storedOrigin.trim()) {
+      return parseOfficialBase(storedOrigin);
+    }
+    const loc = readLocation();
+    const fromOrigin = parseOfficialBase(loc?.origin, true);
+    if (fromOrigin) return fromOrigin;
+    return parseOfficialBase(loc?.href, true);
+  }
+
+  function resolveExcludedOrigins() {
+    const excluded = new Set();
+    for (const source of [excludeOrigins, installExcludeOrigins]) {
+      const rawList = typeof source === 'function' ? source() : source;
+      if (!rawList) continue;
+      for (const item of rawList) {
+        const text = typeof item === 'string'
+          ? item.trim()
+          : (typeof URL === 'function' && item instanceof URL ? item.href : '');
+        if (!text) continue;
+        try {
+          const parsed = new URL(text);
+          if (parsed.origin && parsed.origin !== 'null') excluded.add(parsed.origin);
+        } catch {
+          // Ignore invalid exclude entries.
+        }
+      }
+    }
+    return excluded;
+  }
+
+  function matchProviderPut(input, init) {
+    const method = String(init?.method ?? (input && typeof input === 'object' ? input.method : '') ?? 'GET').toUpperCase();
+    if (method !== 'PUT' || typeof init?.body !== 'string') return null;
+    const official = resolveOfficialBase();
+    if (!official || official.basePath) return null;
+    const rawUrl = typeof input === 'string'
+      ? input
+      : (typeof URL === 'function' && input instanceof URL)
+        ? input.href
+        : (typeof input?.url === 'string' ? input.url : '');
+    if (!rawUrl) return null;
+    let parsed;
+    try {
+      const loc = readLocation();
+      const base = typeof loc?.href === 'string' && loc.href ? loc.href : undefined;
+      try {
+        parsed = base ? new URL(rawUrl, base) : new URL(rawUrl);
+      } catch {
+        parsed = new URL(rawUrl);
+      }
+    } catch {
+      return null;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    if (parsed.origin !== official.origin) return null;
+    if (resolveExcludedOrigins().has(parsed.origin)) return null;
+    const match = /^\/api\/v1\/providers\/([^/?#]+)$/.exec(parsed.pathname);
+    if (!match) return null;
+    let providerId;
+    try {
+      providerId = decodeURIComponent(match[1]);
+    } catch {
+      return null;
+    }
+    if (!providerId || providerId.startsWith('managed:')) return null;
+    return { providerId, origin: parsed.origin };
+  }
+
+  function abortReason(signal) {
+    if (signal?.reason !== undefined) return signal.reason;
+    if (typeof DOMException === 'function') return new DOMException('The operation was aborted.', 'AbortError');
+    return Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+  }
+
+  function raceWithSignal(promise, signal) {
+    if (!signal) return promise;
+    if (signal.aborted) {
+      Promise.resolve(promise).catch(() => {});
+      return Promise.reject(abortReason(signal));
+    }
+    let onAbort;
+    const abortPromise = new Promise((_, reject) => {
+      onAbort = () => reject(abortReason(signal));
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    const guarded = Promise.resolve(promise);
+    guarded.catch(() => {});
+    return Promise.race([guarded, abortPromise]).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+  }
+
+  function createDaemonJsonResponse(status, bodyObj) {
+    const statusText = HTTP_STATUS_TEXT[status] || (status >= 200 && status < 300 ? 'OK' : 'Error');
+    const bodyStr = JSON.stringify(bodyObj);
+    if (typeof Response === 'function') {
+      return new Response(bodyStr, {
+        status,
+        statusText,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      });
+    }
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      statusText,
+      headers: {
+        get: key => (String(key).toLowerCase() === 'content-type' ? 'application/json; charset=utf-8' : null),
+        [Symbol.iterator]: function* () {
+          yield ['content-type', 'application/json; charset=utf-8'];
+        },
+      },
+      clone() {
+        return this;
+      },
+      text: async () => bodyStr,
+      json: async () => JSON.parse(bodyStr),
+    };
+  }
+
+  function createSaveErrorResponse(err) {
+    const status = Number.isInteger(err?.status) && err.status >= 400 && err.status < 600 ? err.status : 503;
+    const kapCode = Number.isInteger(err?.kapCode) ? err.kapCode : 50300;
+    const msg = String(err?.message || '无法读取或合并最新增强模型配置，已中止保存，请重试。');
+    return createDaemonJsonResponse(status, { code: kapCode, msg, data: null });
+  }
+
+  async function forwardMergedProviderPut(providerId, expectedOrigin, payload, signal) {
+    if (signal?.aborted) throw abortReason(signal);
+    const activeFormOrigin = state.table?.form?.isConnected
+      ? state.table.openingOrigin
+      : (pendingFormOpen?.form?.isConnected ? pendingFormOpen.openingOrigin : '');
+    if (activeFormOrigin && activeFormOrigin !== expectedOrigin) {
+      return createDaemonJsonResponse(409, {
+        code: 40900,
+        msg: '当前窗口连接的官方服务实例已变化，请关闭表单后重新打开再保存。',
+        data: null,
+      });
+    }
+    ensureOpeningCapturedForProvider(providerId);
+    let result;
+    try {
+      result = await raceWithSignal(
+        request(
+          'providers.saveOfficialForm',
+          {
+            providerId,
+            expectedOrigin,
+            payload,
+            opening: serializeOpeningModels(providerId),
+          },
+          { signal },
+        ),
+        signal,
+      );
+    } catch (err) {
+      if (signal?.aborted || err?.name === 'AbortError') {
+        throw signal?.aborted ? abortReason(signal) : err;
+      }
+      return createSaveErrorResponse(err);
+    }
+    if (signal?.aborted) throw abortReason(signal);
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+      return createSaveErrorResponse(null);
+    }
+    if (!removed && enabled) {
+      const nextProviderId = typeof payload.new_id === 'string' && payload.new_id.trim()
+        ? payload.new_id.trim()
+        : providerId;
+      if (nextProviderId !== providerId) openingModels.delete(providerId);
+      openingModels.set(nextProviderId, buildNextOpening(payload, result.mergedModels));
+      if (state.table?.openingCaptured) {
+        state.table.openingCaptured.delete(providerId);
+        state.table.openingCaptured.add(nextProviderId);
+      }
+      invalidate();
+    }
+    return createDaemonJsonResponse(200, {
+      code: 0,
+      msg: '',
+      data: result?.data ?? null,
+    });
+  }
+
+  function handleFetch(baseFetch, thisArg, input, init) {
+    const matched = matchProviderPut(input, init);
+    if (!matched) return baseFetch.call(thisArg, input, init);
+    let payload;
+    try {
+      payload = JSON.parse(init.body);
+    } catch {
+      return baseFetch.call(thisArg, input, init);
+    }
+    if (!payload || typeof payload !== 'object' || !Array.isArray(payload.models)) {
+      return baseFetch.call(thisArg, input, init);
+    }
+    const signal = init?.signal !== undefined
+      ? init.signal
+      : (input && typeof input === 'object' ? input.signal : null);
+    return forwardMergedProviderPut(matched.providerId, matched.origin, payload, signal);
+  }
+
+  function attachFetch() {
+    if (wrappedFetch || typeof globalThis.fetch !== 'function') return;
+    const baseFetch = globalThis.fetch;
+    originalFetch = baseFetch;
+    wrappedFetch = function ekdProviderEnhanceFetch(input, init) {
+      if (!enabled || removed || wrappedFetch !== ekdProviderEnhanceFetch) {
+        return baseFetch.call(this, input, init);
+      }
+      return handleFetch(baseFetch, this, input, init);
+    };
+    globalThis.fetch = wrappedFetch;
+  }
+
+  function detachFetch() {
+    if (!wrappedFetch) return;
+    if (globalThis.fetch === wrappedFetch) globalThis.fetch = originalFetch;
+    wrappedFetch = null;
+    originalFetch = null;
+  }
+
+  function syncOfficialContextInput(current, modelId, maxContextSize) {
+    if (!current || !Number.isSafeInteger(maxContextSize) || maxContextSize < 1) return;
+    const nextValue = String(maxContextSize);
+    for (const [node, row] of current.rows) {
+      if (row.input.value.trim() !== modelId) continue;
+      const ctxInput = modelInputs(node)[1];
+      if (!ctxInput || ctxInput.value === nextValue) continue;
+      ctxInput.value = nextValue;
+      if (typeof ctxInput.dispatchEvent === 'function') {
+        ctxInput.dispatchEvent(new Event('input', { bubbles: true }));
+        ctxInput.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
   }
 
   function hasOfficialModelEdits(current, config, providerId) {
@@ -300,6 +819,7 @@ function createProviderEnhance({ request }) {
       for (const row of current.rows.values()) row.select.checked = false;
     }
     current.providerId = providerId;
+    captureOpeningModels(current, providerId);
     const managed = providerId.startsWith('managed:');
     current.toolbar.hidden = !providerId || managed;
     const rows = [...current.table.querySelectorAll('.pmt-grid')].filter(row => !row.classList.contains('pmt-head'));
@@ -349,7 +869,7 @@ function createProviderEnhance({ request }) {
 
   function nativeInput(event) {
     const current = state.table;
-    if (!current || !snapshot || event.target.tagName !== 'INPUT') return;
+    if (!current || event.target.tagName !== 'INPUT' || !snapshot) return;
     const row = event.target.closest('.pmt-grid');
     if (current.rows.get(row)?.input === event.target) render(current, snapshot);
   }
@@ -550,12 +1070,15 @@ function createProviderEnhance({ request }) {
         } else {
           await request('providers.updateModel', { providerId, model: `${providerId}/${ids[0]}`, edit });
         }
+        if (!batch && edit.max_context_size !== undefined) {
+          syncOfficialContextInput(current, ids[0], edit.max_context_size);
+        }
         invalidate();
         window.dispatchEvent(new CustomEvent('ekd:config-saved'));
         if (state.panel !== panel) return;
         if (batch) {
           current.selecting = false;
-          current.feedback = `已保存 ${ids.length} 个模型。再次编辑官方表单前，请返回列表并重新打开。`;
+          current.feedback = `已保存 ${ids.length} 个模型。后续点击官方保存时会自动保留这些配置。`;
           for (const row of current.rows.values()) row.select.checked = false;
           updateSelection(current);
           const templateTrigger = panel.trigger;
@@ -566,7 +1089,7 @@ function createProviderEnhance({ request }) {
         }
         baseline = readFields();
         panel.discard.hidden = true;
-        statusOf(panel, '已保存并核对。再次编辑官方表单前，请返回列表并重新打开。');
+        statusOf(panel, '已保存并核对。上下文与增强配置会自动与官方表单保持同步。');
       } catch (error) {
         if (state.panel === panel) statusOf(panel, `保存未确认。${error.message || '请重试。'}`, true);
       } finally {
@@ -578,7 +1101,7 @@ function createProviderEnhance({ request }) {
       }
     }
 
-    if (!managed && officialDirty) panel.body.append(el('p', { class: 'ekd-px-hint', text: '官方表单有未保存的模型改动。可先保存官方改动，或在此保存后返回列表，避免提交旧表单。' }));
+    if (!managed && officialDirty) panel.body.append(el('p', { class: 'ekd-px-hint', text: '官方表单有未保存的模型改动。在此保存后会同步上下文，并在官方保存后自动保留增强配置。' }));
     if (managed) panel.body.append(el('p', { class: 'ekd-px-hint', text: '此模型由内置订阅供应商维护。' }));
     if (batch) panel.body.append(el('p', { class: 'ekd-px-hint', text: '同一模板会替换所选模型的输入、工具与思考配置。' }), el('p', { class: 'ekd-px-identity', text: ids.join('、') }));
     let suggesting = false;
@@ -640,11 +1163,34 @@ function createProviderEnhance({ request }) {
     const form = findForm();
     const table = form?.querySelector('.pmt');
     if (state.table?.table !== table || state.table?.form !== form || (state.table && !form.querySelector('.pf-back'))) {
+      const matchedPending = pendingFormOpen && pendingFormOpen.form === form && pendingFormOpen.table === table
+        ? pendingFormOpen
+        : null;
+      const snapshotAtOpen = hasModelsRecord(snapshot) ? snapshot : null;
       clearDecorations();
       if (!table || !form.querySelector('.pf-back')) return;
-      state.table = { form, table, rows: new Map(), providerId: '', selecting: false };
+      const openingConfig = matchedPending
+        ? matchedPending.openingConfig
+        : cloneOpeningConfig(readOfficialConfigSnapshot() || snapshotAtOpen);
+      const openingOrigin = matchedPending
+        ? matchedPending.openingOrigin
+        : (resolveOfficialBase()?.origin || '');
+      state.table = {
+        form,
+        table,
+        rows: new Map(),
+        providerId: '',
+        selecting: false,
+        openingCaptured: new Set(),
+        openingConfig,
+        openingOrigin,
+      };
       decorateToolbar(state.table);
       state.table.toolbar.hidden = true;
+      if (openingConfig) {
+        const openProviderId = resolveProvider(form, openingConfig);
+        if (openProviderId) captureOpeningModels(state.table, openProviderId);
+      }
     }
     const current = state.table;
     if (!current) return;
@@ -659,7 +1205,9 @@ function createProviderEnhance({ request }) {
   }
 
   function scan() {
-    if (!enabled || removed || timer !== undefined) return;
+    if (!enabled || removed) return;
+    capturePendingFormOpen();
+    if (timer !== undefined) return;
     timer = setTimeout(() => {
       timer = undefined;
       void refresh();
@@ -669,9 +1217,11 @@ function createProviderEnhance({ request }) {
   function clearDecorations() {
     closePanel(true);
     state.table = null;
+    pendingFormOpen = null;
     snapshot = null;
     generation += 1;
     pending = null;
+    openingModels.clear();
     for (const node of document.querySelectorAll('[data-ekd-px-mount]')) node.remove();
   }
 
@@ -683,29 +1233,48 @@ function createProviderEnhance({ request }) {
     if (removed || enabled === Boolean(next)) return;
     enabled = Boolean(next);
     if (enabled) {
-      if (observer) observe();
+      if (observer) {
+        observe();
+        attachFetch();
+      }
       scan();
     } else {
       observer?.disconnect();
       clearTimeout(timer);
       timer = undefined;
+      detachFetch();
+      openingModels.clear();
       clearDecorations();
     }
   }
 
-  function install() {
+  function install(installOpts) {
+    if (installOpts?.excludeOrigins !== undefined) {
+      installExcludeOrigins = installOpts.excludeOrigins;
+    }
+    if (installOpts?.readOfficialConfig !== undefined) {
+      installReadOfficialConfig = installOpts.readOfficialConfig;
+    }
     ensureStyle();
     observer = new MutationObserver(scan);
     window.addEventListener('ekd:config-saved', invalidate);
     window.addEventListener('ekd:official-config-changed', invalidate);
     window.addEventListener('keydown', onKeyDown, true);
     document.addEventListener('input', nativeInput);
-    if (enabled) observe();
+    if (enabled) {
+      observe();
+      attachFetch();
+    }
     scan();
   }
 
   function remove() {
     setEnabled(false);
+    detachFetch();
+    openingModels.clear();
+    pendingFormOpen = null;
+    installExcludeOrigins = null;
+    installReadOfficialConfig = null;
     removed = true;
     observer = null;
     window.removeEventListener('ekd:config-saved', invalidate);

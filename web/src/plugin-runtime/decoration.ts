@@ -26,11 +26,12 @@ export const DECORATION_TARGETS = {
   thinking: {
     selector: ".think",
     state(block: HTMLElement) {
+      const visible = isBlockVisible(block);
       if (block.matches(THINKING_BLOCK)) {
-        return { open: block.hasAttribute("open"), streaming: block.hasAttribute("data-streaming") };
+        return { open: visible && block.hasAttribute("open"), streaming: block.hasAttribute("data-streaming") };
       }
       const body = block.querySelector(".think-body");
-      const open = Boolean(body && body.classList.contains("open"));
+      const open = visible && Boolean(body && body.classList.contains("open"));
       const streaming =
         block.classList.contains("streaming") || block.getAttribute("data-streaming") === "true";
       return { open, streaming };
@@ -102,6 +103,71 @@ interface BlockState {
   text: string;
 }
 
+function hasClass(
+  element: { classList?: { contains?: (name: string) => boolean }; className?: unknown },
+  name: string,
+): boolean {
+  if (typeof element.classList?.contains === "function") return element.classList.contains(name);
+  if (typeof element.className === "string") return element.className.split(/\s+/).includes(name);
+  return false;
+}
+
+function hasAttributeOrFlag(
+  element: { hasAttribute?: (name: string) => boolean; getAttribute?: (name: string) => string | null; hidden?: unknown; inert?: unknown },
+  name: "hidden" | "inert",
+): boolean {
+  if (typeof element.hasAttribute === "function" && element.hasAttribute(name)) return true;
+  if (typeof element.getAttribute === "function" && element.getAttribute(name) != null) return true;
+  return element[name] === true;
+}
+
+function parentElementOf(element: HTMLElement): HTMLElement | null {
+  if (element.parentElement) return element.parentElement;
+  const parentNode = (element as { parentNode?: { nodeType?: number; host?: unknown } | null }).parentNode;
+  if (parentNode && parentNode.nodeType === 11 && parentNode.host && typeof parentNode.host === "object") {
+    return parentNode.host as HTMLElement;
+  }
+  return null;
+}
+
+function isBlockVisible(block: HTMLElement): boolean {
+  if (hasAttributeOrFlag(block, "hidden") || hasAttributeOrFlag(block, "inert")) return false;
+  let current = parentElementOf(block);
+  while (current) {
+    if (hasAttributeOrFlag(current, "hidden") || hasAttributeOrFlag(current, "inert")) return false;
+    if (typeof current.tagName === "string" && current.tagName.toUpperCase() === "DETAILS") {
+      const hasOpen =
+        typeof current.hasAttribute === "function"
+          ? current.hasAttribute("open")
+          : typeof current.getAttribute === "function" && current.getAttribute("open") != null;
+      if (!hasOpen) return false;
+    }
+    if ((hasClass(current, "ar-body") || hasClass(current, "tf-body")) && !hasClass(current, "open")) {
+      return false;
+    }
+    current = parentElementOf(current);
+  }
+  return true;
+}
+
+function shouldSkipTextNode(element: {
+  hasAttribute?: (name: string) => boolean;
+  getAttribute?: (name: string) => string | null;
+  classList?: { contains?: (name: string) => boolean };
+  className?: unknown;
+}): boolean {
+  if (typeof element.hasAttribute === "function") {
+    if (element.hasAttribute("data-ekdp-owned")) return true;
+  } else if (typeof element.getAttribute === "function" && element.getAttribute("data-ekdp-owned") != null) {
+    return true;
+  }
+  return (
+    hasClass(element, "ekdp-kct-translated") ||
+    hasClass(element, "ekdp-kct-bar") ||
+    hasClass(element, "think-time")
+  );
+}
+
 /** Reads the block's current text without normalizing whitespace.
  *
  * A recursive walk is used instead of `textContent` because some hosts (and the
@@ -115,7 +181,16 @@ function blockText(block: HTMLElement): string {
   const parts: string[] = [];
   const walk = (node: unknown): void => {
     if (!node || typeof node !== "object") return;
-    const element = node as { childNodes?: ArrayLike<unknown>; nodeValue?: unknown; textContent?: unknown };
+    const element = node as {
+      hasAttribute?: (name: string) => boolean;
+      getAttribute?: (name: string) => string | null;
+      classList?: { contains?: (name: string) => boolean };
+      className?: unknown;
+      childNodes?: ArrayLike<unknown>;
+      nodeValue?: unknown;
+      textContent?: unknown;
+    };
+    if (node !== block && shouldSkipTextNode(element)) return;
     const children = element.childNodes;
     if (children && children.length) {
       for (let index = 0; index < children.length; index += 1) walk(children[index]);
@@ -314,7 +389,7 @@ export class DecorationHub implements Disposable {
       subtree: true,
       characterData: true,
       attributes: true,
-      attributeFilter: ["class", "open", "data-streaming", THINKING_ROOT, "data-ekdp-thinking", THINKING_SOURCE],
+      attributeFilter: ["class", "open", "hidden", "inert", "data-streaming", THINKING_ROOT, "data-ekdp-thinking", THINKING_SOURCE],
     });
   }
 
@@ -356,6 +431,13 @@ export class DecorationHub implements Disposable {
       const target = record.target;
       const element = elementOf(target);
       if (!element || isOwned(element)) continue;
+      if (
+        !element.matches?.(".think") &&
+        closestMatch(element, ".think-time") &&
+        !touchesThinkBlock(record, enhanced)
+      ) {
+        continue;
+      }
       if (enhanced && (record.attributeName === THINKING_ROOT || record.attributeName === "data-ekdp-thinking")) dirty = true;
       if (record.type === "childList") {
         // A decorator renders into a host container it does not own — appending
@@ -395,13 +477,24 @@ export class DecorationHub implements Disposable {
       }
       for (const registration of this.registrations) {
         const block = closestMatch(element, matchingSelector(registration));
-        if (!block) continue;
-        const state = registration.blocks.get(block);
-        if (state) {
-          state.revision += 1;
-          state.info = { ...state.info, revision: state.revision };
+        if (block) {
+          const state = registration.blocks.get(block);
+          if (state) {
+            state.revision += 1;
+            state.info = { ...state.info, revision: state.revision };
+          }
+          dirty = true;
         }
-        dirty = true;
+        if (record.type === "attributes") {
+          for (const [registeredBlock, state] of registration.blocks) {
+            if (registeredBlock === block || registeredBlock === element) continue;
+            if (containsNode(element, registeredBlock)) {
+              state.revision += 1;
+              state.info = { ...state.info, revision: state.revision };
+              dirty = true;
+            }
+          }
+        }
       }
     }
     if (dirty) this.requestSweep();
@@ -474,6 +567,22 @@ function enclosesThinkingRoot(element: HTMLElement | null): boolean {
   return Boolean(element?.matches(selector) || element?.querySelector(selector));
 }
 
+function touchesThinkBlock(record: DecorationMutation, enhanced: boolean): boolean {
+  if (record.type !== "childList") return false;
+  for (const list of [record.addedNodes, record.removedNodes]) {
+    if (!list) continue;
+    for (let index = 0; index < list.length; index += 1) {
+      const node = elementOf(list[index]);
+      if (!node) continue;
+      if (node.matches?.(".think") || node.querySelector?.(".think")) return true;
+      if (enhanced && (node.matches?.(THINKING_BLOCK) || node.querySelector?.(THINKING_BLOCK) || enclosesThinkingRoot(node))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function elementOf(node: Node | null | undefined): HTMLElement | null {
   if (!node) return null;
   if (node.nodeType === 1) return node as HTMLElement;
@@ -507,6 +616,16 @@ function onlyOwnedNodes(record: DecorationMutation): boolean {
     }
   }
   return seen > 0;
+}
+
+function containsNode(ancestor: HTMLElement, target: HTMLElement): boolean {
+  if (ancestor.contains?.(target)) return true;
+  let current = parentElementOf(target);
+  while (current) {
+    if (current === ancestor) return true;
+    current = parentElementOf(current);
+  }
+  return false;
 }
 
 function closestMatch(element: HTMLElement, selector: string): HTMLElement | null {

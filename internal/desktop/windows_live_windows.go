@@ -28,16 +28,51 @@ func attachRunningWindowsMain(ctx context.Context, options AttachOptions, proc W
 	if gate != nil {
 		defer gate.Close()
 	}
+	prevInstalled := readInstalledAttachState(options.DataDir)
+	defer func() {
+		result, attachErr = commitWindowsAttachOutcomeWithPreviousUnlocked(options.DataDir, proc, prevInstalled, result, attachErr)
+	}()
+	return attachRunningWindowsMainUnlocked(ctx, options, proc)
+}
+
+func attachRunningWindowsMainUnlocked(ctx context.Context, options AttachOptions, proc WindowsProcessInfo) (result *AttachResult, attachErr error) {
+	if options.DataDir == "" {
+		return nil, errors.New("运行中接入需要增强数据目录")
+	}
+	defer func() {
+		if attachErr != nil && isWindowsMainBridgeTornDownErr(attachErr) {
+			attachErr = markBridgeTornDown(attachErr)
+		}
+	}()
+	if err := validateLiveWindowsHost(ctx, options, proc); err != nil {
+		return nil, err
+	}
+	key := windowsLiveAttachKey(proc, options)
 	if options.SkipCurrent {
-		if windowsCurrentAttachStateForDir(options.DataDir, proc, ReadAttachState(options.DataDir), false, currentCorePID(options.DataDir)) == "attached" {
-			return nil, nil
+		state := ReadAttachState(options.DataDir)
+		if recordedKey, _ := state["attachKey"].(string); recordedKey != "" {
+			if state["transport"] == "main-loopback-rpc" && attachStateMatchesLiveCore(ctx, options.DataDir, state, key, options) {
+				return nil, nil
+			}
+		} else {
+			runtimePID, runtimeErr := readCoreRuntimePID(options.DataDir)
+			if runtimeErr == nil || errors.Is(runtimeErr, os.ErrNotExist) {
+				corePID := runtimePID
+				if runtimeErr != nil {
+					corePID = os.Getpid()
+				}
+				if windowsCurrentAttachStateForDir(options.DataDir, proc, state, false, corePID) == "attached" &&
+					verifyLiveCoreForSkip(ctx, corePID, options.CoreURL, options.PairingToken) {
+					return nil, nil
+				}
+			}
 		}
 	}
 	if !windowsInspectorClosed(InspectorPort) {
 		return nil, errors.New("本机临时调试端口已被占用，请关闭其他调试会话后重试")
 	}
-	if err := validateLiveWindowsHost(ctx, options, proc); err != nil {
-		return nil, err
+	if invalidateErr := invalidateInstalledAttachBeforeInjectUnlocked(options.DataDir); invalidateErr != nil {
+		return nil, markAttachPersistFailed(fmt.Errorf("无法更新接入状态文件，已中止接入以免破坏现有增强桥：%w", invalidateErr))
 	}
 	// Electron's enabled RunAsNode mode uses the same Node build and architecture as its host.
 	triggerCtx, stopTrigger := context.WithTimeout(ctx, 4*time.Second)
@@ -88,8 +123,8 @@ func attachRunningWindowsMain(ctx context.Context, options AttachOptions, proc W
 	}
 	portClosed = true
 	if attached != nil {
+		attached.attachKey = key
 		attached.hostStarted = proc.Started
-		_ = recordWindowsAttachInstalled(options.DataDir, proc, attached)
 	}
 	return attached, nil
 }

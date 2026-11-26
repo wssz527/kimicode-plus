@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { createPluginRuntime } from "../src/plugin-runtime/runtime.js";
 
 const source = readFileSync("../plugins/kct/renderer.js", "utf8");
+const settingsSource = readFileSync("../plugins/kct/settings.js", "utf8");
 const manifest = JSON.parse(readFileSync("../plugins/kct/plugin.json", "utf8"));
 
 class FakeClassList {
@@ -36,8 +38,21 @@ class FakeElement {
   disabled = false;
   type = "";
   title = "";
+  value = "";
+  placeholder = "";
+  autocomplete = "";
+  selectedIndex = 0;
   style: Record<string, string> = {};
   isConnected = true;
+
+  get options() {
+    return this.children;
+  }
+
+  replaceChildren(...nodes: FakeElement[]) {
+    for (const child of [...this.children]) child.remove();
+    for (const node of nodes) this.appendChild(node);
+  }
 
   constructor(tag: string, className = "", root?: unknown) {
     this.tagName = tag.toUpperCase();
@@ -817,5 +832,1286 @@ test("enhanced thinking translates only on request and keeps both views renderab
     assert.equal(shadowHead.children.length, 0);
   } finally {
     boot.cleanup();
+  }
+});
+
+test("streaming single paragraph waits 3000ms before splitting and translates only incremental deltas", async () => {
+  const sentTexts: string[][] = [];
+  const dict: Record<string, string> = {
+    "Sentence one. Sentence two. Sentence three.": "句一。句二。句三。",
+    "Sentence four. Sentence five.": "句四。句五。",
+    "Sentence six.": "句六。",
+  };
+  const realDateNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  const boot = await bootKct({
+    translate: async (_url: string, init: any) => {
+      const texts: string[] = JSON.parse(init.body);
+      sentTexts.push(texts);
+      return {
+        ok: true,
+        status: 200,
+        body: JSON.stringify(texts.map(text => ({ translations: [{ text: dict[text] ?? `译(${text})` }] }))),
+      };
+    },
+  });
+  try {
+    const { block, inner, pre } = makeBlock(boot.bodyRoot, "Sentence one. Partial");
+    const handle = boot.decorator!(block, { open: true, streaming: true });
+
+    // 700ms debounce fires at +750ms (< 3000ms): must not split paragraph yet.
+    now = 1_000_750;
+    await wait(760);
+    assert.equal(sentTexts.length, 0, "split streaming paragraph before 3000ms");
+
+    // Append sentence two at +1500ms and wait another debounce (+2250ms < 3000ms).
+    now = 1_001_500;
+    pre.textContent = "Sentence one. Sentence two. Partial";
+    handle.update({ open: true, streaming: true });
+    now = 1_002_250;
+    await wait(760);
+    assert.equal(sentTexts.length, 0, "streamSince should still block splitting before 3000ms");
+
+    // Append sentence three and cross 3000ms threshold: first prefix translates once.
+    now = 1_002_500;
+    pre.textContent = "Sentence one. Sentence two. Sentence three. Partial";
+    handle.update({ open: true, streaming: true });
+    now = 1_003_200;
+    await wait(760);
+    assert.equal(sentTexts.length, 1, "expected first translation after 3000ms");
+    assert.deepEqual(sentTexts[0], ["Sentence one. Sentence two. Sentence three."]);
+    assert.equal(inner.querySelector(".ekdp-kct-translated")?.textContent, "句一。句二。句三。 Partial");
+
+    // Next sentence arrives at +800ms after reset (< 3000ms): must wait again.
+    now = 1_004_000;
+    pre.textContent = "Sentence one. Sentence two. Sentence three. Sentence four. Partial";
+    handle.update({ open: true, streaming: true });
+    now = 1_004_750;
+    await wait(760);
+    assert.equal(sentTexts.length, 1, "streamSince did not reset after prefix translation");
+
+    // Cross another 3000ms: only the new delta is sent, never the already translated prefix.
+    now = 1_005_500;
+    pre.textContent = "Sentence one. Sentence two. Sentence three. Sentence four. Sentence five. Partial";
+    handle.update({ open: true, streaming: true });
+    now = 1_006_300;
+    await wait(760);
+    assert.equal(sentTexts.length, 2, "expected incremental delta translation after second 3000ms window");
+    assert.deepEqual(sentTexts[1], ["Sentence four. Sentence five."]);
+    assert.ok(
+      !sentTexts[1].some(text => text.includes("Sentence one") || text.includes("Sentence two") || text.includes("Sentence three")),
+      "already translated prefix was requested again",
+    );
+    assert.equal(inner.querySelector(".ekdp-kct-translated")?.textContent, "句一。句二。句三。 句四。句五。 Partial");
+
+    // Stream finishes with a final sentence: only the final tail is translated.
+    now = 1_006_500;
+    pre.textContent = "Sentence one. Sentence two. Sentence three. Sentence four. Sentence five. Sentence six.";
+    handle.update({ open: true, streaming: false });
+    await wait(80);
+    assert.equal(sentTexts.length, 3);
+    assert.deepEqual(sentTexts[2], ["Sentence six."]);
+    assert.equal(inner.querySelector(".ekdp-kct-translated")?.textContent, "句一。句二。句三。 句四。句五。 句六。");
+    assert.equal(block.querySelector(".ekdp-kct-status")?.textContent, "");
+
+    // Appending a target-language-only delta reuses the prefix with zero extra requests.
+    pre.textContent = "Sentence one. Sentence two. Sentence three. Sentence four. Sentence five. Sentence six. 仅追加中文尾巴。";
+    handle.update({ open: true, streaming: false });
+    await wait(80);
+    assert.equal(sentTexts.length, 3, "target-language-only delta should not issue a request");
+    assert.equal(inner.querySelector(".ekdp-kct-translated")?.textContent, "句一。句二。句三。 句四。句五。 句六。 仅追加中文尾巴。");
+    assert.equal(block.getAttribute("data-ekdp-kct-view"), "translated");
+    handle.dispose?.();
+  } finally {
+    Date.now = realDateNow;
+    boot.cleanup();
+  }
+});
+
+test("decorating the same block twice keeps only one toolbar", async () => {
+  const boot = await bootKct({
+    settings: { autoTranslate: false },
+    translate: async () => ({ ok: true, status: 200, body: "[]" }),
+  });
+  try {
+    const { block } = makeBlock(boot.bodyRoot, "Check idempotent bar mounting.");
+    const first = boot.decorator!(block, { open: true, streaming: false });
+    const second = boot.decorator!(block, { open: true, streaming: false });
+    assert.equal(block.querySelectorAll(".ekdp-kct-bar").length, 1, "duplicate toolbar was mounted on the same block");
+
+    first?.dispose?.();
+    assert.equal(block.querySelectorAll(".ekdp-kct-bar").length, 1, "disposing stale handle removed active toolbar");
+
+    second?.dispose?.();
+    assert.equal(block.querySelectorAll(".ekdp-kct-bar").length, 0, "disposing active handle left toolbar behind");
+  } finally {
+    boot.cleanup();
+  }
+});
+
+test("enhanced thinking toolbar stays visible while open and streaming", async () => {
+  const requests: string[][] = [];
+  const boot = await bootKct({
+    translate: async (_url: string, init: any) => {
+      requests.push(JSON.parse(init.body));
+      return { ok: true, status: 200, body: JSON.stringify([{ translations: [{ text: "思考完成后的译文。" }] }]) };
+    },
+  });
+  try {
+    const shadowRoot = new FakeElement("shadow-root");
+    const shadowHead = new FakeElement("head");
+    Object.assign(shadowRoot, { ownerDocument: document, head: shadowHead });
+    const block = new FakeElement("details", "", shadowRoot);
+    block.setAttribute("data-ekdp-thinking", "");
+    const summary = new FakeElement("summary", "", shadowRoot);
+    const body = new FakeElement("div", "", shadowRoot);
+    body.setAttribute("data-ekdp-thinking-body", "");
+    body.setAttribute("data-ekdp-thinking-source", "Streaming thought in progress.");
+    block.append(summary, body);
+    boot.bodyRoot.appendChild(block);
+
+    const handle = boot.decorator!(block, { open: true, streaming: true });
+    const bar = block.querySelector(".ekdp-kct-bar");
+    assert.equal(bar?.hidden, false, "enhanced toolbar was hidden during initial open stream");
+
+    handle.update({ open: true, streaming: true });
+    assert.equal(bar?.hidden, false, "enhanced toolbar was hidden on streaming update");
+    assert.equal(requests.length, 0, "enhanced streaming block auto-translated unexpectedly");
+
+    const toggle = block.querySelectorAll(".ekdp-kct-btn").find(item => item.textContent === "翻译");
+    assert.ok(toggle);
+    toggle.click();
+    await wait(40);
+    assert.equal(requests.length, 0, "enhanced streaming block translated before completion");
+    assert.equal(block.querySelector(".ekdp-kct-status")?.textContent, "等待思考完成");
+
+    handle.update({ open: true, streaming: false });
+    await wait(80);
+    assert.equal(requests.length, 1, "manual request did not complete once streaming ended");
+    assert.equal(body.querySelector(".ekdp-kct-translated")?.textContent, "思考完成后的译文。");
+
+    handle.update({ open: false, streaming: false });
+    assert.equal(bar?.hidden, true, "toolbar stayed visible after collapsing enhanced block");
+    handle.dispose?.();
+  } finally {
+    boot.cleanup();
+  }
+});
+
+test("KCT settings unmounting while credentials.list is pending removes ekdp-kct:settings listener immediately", async () => {
+  const runtimeGlobals = globalThis as unknown as Record<string, any>;
+  const prevDocument = runtimeGlobals.document;
+  const prevWindow = runtimeGlobals.window;
+  const windowEvents = new EventTarget();
+  runtimeGlobals.document = {
+    createElement: (tag: string) => new FakeElement(tag),
+  };
+  runtimeGlobals.window = {
+    addEventListener: (...args: any[]) => (windowEvents.addEventListener as any)(...args),
+    removeEventListener: (...args: any[]) => (windowEvents.removeEventListener as any)(...args),
+    dispatchEvent: (event: any) => windowEvents.dispatchEvent(event),
+  };
+
+  try {
+    const moduleUrl = `data:text/javascript;base64,${Buffer.from(settingsSource).toString("base64")}`;
+    const settingsModule = await import(moduleUrl);
+
+    let storageGetCalls = 0;
+    let storageListCalls = 0;
+    let resolveCredentials!: (value: unknown) => void;
+    let credentialsRequested!: () => void;
+    const credentialsSeen = new Promise<void>(resolve => {
+      credentialsRequested = resolve;
+    });
+    const credentialsPending = new Promise<unknown>(resolve => {
+      resolveCredentials = resolve;
+    });
+
+    const pluginRuntime = createPluginRuntime({
+      slots: {},
+      request: async path => {
+        if (path === "/plugin-runtime/storage.get") {
+          storageGetCalls += 1;
+          return { value: { found: true, value: JSON.stringify({ targetLanguage: "zh", provider: "bing", autoTranslate: true }) } };
+        }
+        if (path === "/plugin-runtime/storage.list") {
+          storageListCalls += 1;
+          return { value: { keys: [] } };
+        }
+        if (path === "/plugin-runtime/credentials.list") {
+          credentialsRequested();
+          return { value: await credentialsPending };
+        }
+        return { value: {} };
+      },
+    });
+
+    const active = await pluginRuntime.activate(
+      { activate: () => {} },
+      {
+        id: "kimicode-plus.kct",
+        version: "1.0.0",
+        granted: ["ui:settings", "storage", "credentials:translator"],
+        token: "t-kct",
+      },
+    );
+
+    const container = new FakeElement("div");
+    const mountPromise = active.mountSettings(settingsModule, container as unknown as HTMLElement);
+    await credentialsSeen;
+    assert.equal(storageGetCalls, 1, "initial settings load should have executed once");
+    assert.equal(container.children.length, 1, "settings card should be mounted before credentials.list resolves");
+
+    // Deactivating the plugin while credentials.list is pending must remove the window listener immediately.
+    pluginRuntime.deactivate("kimicode-plus.kct");
+    assert.equal(container.children.length, 0, "settings card was not removed on deactivation");
+
+    windowEvents.dispatchEvent(new Event("ekdp-kct:settings"));
+    await wait(20);
+    assert.equal(storageGetCalls, 1, "ekdp-kct:settings listener leaked and triggered storage.get after deactivation");
+
+    resolveCredentials({ items: [] });
+    await mountPromise;
+    assert.equal(storageListCalls, 0, "refreshCache ran after settings panel was already disposed");
+    assert.equal(container.children.length, 0);
+
+    windowEvents.dispatchEvent(new Event("ekdp-kct:cache"));
+    await wait(20);
+    assert.equal(storageListCalls, 0, "ekdp-kct:cache listener leaked after disposal during pending mount");
+    pluginRuntime.dispose();
+
+    // Direct renderSettings call whose ctx.onDispose is triggered while credentials.list is pending.
+    let directGets = 0;
+    let directLists = 0;
+    let releaseDirectCreds!: (value: unknown) => void;
+    let directCredsRequested!: () => void;
+    const directCredsSeen = new Promise<void>(resolve => {
+      directCredsRequested = resolve;
+    });
+    const directCredsPending = new Promise<unknown>(resolve => {
+      releaseDirectCreds = resolve;
+    });
+    const directDisposers: Array<() => void> = [];
+    const directContainer = new FakeElement("div");
+    const directPromise = settingsModule.renderSettings(
+      {
+        plugin: { version: "1.0.0" },
+        storage: {
+          get: async () => {
+            directGets += 1;
+            return { targetLanguage: "zh", provider: "bing", autoTranslate: true };
+          },
+          set: async () => {},
+          delete: async () => {},
+          list: async () => {
+            directLists += 1;
+            return [];
+          },
+        },
+        core: {
+          request: async () => {
+            directCredsRequested();
+            return directCredsPending;
+          },
+        },
+        onDispose: (fn: () => void) => directDisposers.push(fn),
+      },
+      directContainer,
+    );
+    await directCredsSeen;
+    assert.equal(directGets, 1);
+    for (const fn of directDisposers) fn();
+    windowEvents.dispatchEvent(new Event("ekdp-kct:settings"));
+    await wait(20);
+    assert.equal(directGets, 1, "direct settings handle disposal did not remove ekdp-kct:settings listener");
+    releaseDirectCreds({ items: [] });
+    await directPromise;
+    assert.equal(directLists, 0);
+  } finally {
+    runtimeGlobals.document = prevDocument;
+    runtimeGlobals.window = prevWindow;
+  }
+});
+
+test("streaming protects unclosed inline code, fenced code, and links from being split into translation", async () => {
+  const sentTexts: string[][] = [];
+  const dict: Record<string, string> = {
+    "Completed sentence.": "已完成句子。",
+    "Done.": "完成。",
+    "Link prefix sentence.": "链接前缀句。",
+    "Url prefix sentence.": "网址前缀句。",
+    "Fence prefix sentence.": "围栏前缀句。",
+  };
+  const realDateNow = Date.now;
+  let now = 2_000_000;
+  Date.now = () => now;
+  const boot = await bootKct({
+    translate: async (_url: string, init: any) => {
+      const texts: string[] = JSON.parse(init.body);
+      sentTexts.push(texts);
+      return {
+        ok: true,
+        status: 200,
+        body: JSON.stringify(texts.map(text => ({ translations: [{ text: dict[text] ?? `译(${text})` }] }))),
+      };
+    },
+  });
+  try {
+    // 1) Unclosed inline code span: never send code fragment for translation.
+    const { block, inner, pre } = makeBlock(boot.bodyRoot, "Completed sentence. `private fragment. still typing");
+    const handle = boot.decorator!(block, { open: true, streaming: true });
+    now = 2_003_200;
+    await wait(760);
+    assert.equal(sentTexts.length, 1, "expected completed prefix before unclosed inline code to translate");
+    assert.deepEqual(sentTexts[0], ["Completed sentence."]);
+    assert.ok(
+      !sentTexts.flat().some(text => text.includes("private fragment")),
+      "unclosed inline code fragment leaked to external translator",
+    );
+    assert.equal(inner.querySelector(".ekdp-kct-translated")?.textContent, "已完成句子。 `private fragment. still typing");
+
+    // Closing the inline code and finishing the sentence preserves inline code verbatim and translates only Done.
+    pre.textContent = "Completed sentence. `private fragment. still typing` Done.";
+    handle.update({ open: true, streaming: false });
+    await wait(80);
+    assert.equal(sentTexts.length, 2);
+    assert.deepEqual(sentTexts[1], ["Done."]);
+    assert.ok(
+      !sentTexts.flat().some(text => text.includes("private fragment")),
+      "closed inline code fragment was translated instead of preserved",
+    );
+    assert.equal(inner.querySelector(".ekdp-kct-translated")?.textContent, "已完成句子。 `private fragment. still typing` 完成。");
+    handle.dispose?.();
+
+    // 2) Unclosed Markdown link, bare URL, and unclosed fenced code block must also be excluded.
+    const linkBlock = makeBlock(boot.bodyRoot, "Link prefix sentence. [ref. note](https://example.com/a.b");
+    const linkHandle = boot.decorator!(linkBlock.block, { open: true, streaming: true });
+    now += 3_200;
+    await wait(760);
+    assert.equal(sentTexts.length, 3);
+    assert.deepEqual(sentTexts[2], ["Link prefix sentence."]);
+    assert.ok(!sentTexts.flat().some(text => text.includes("ref. note") || text.includes("example.com")));
+    assert.equal(
+      linkBlock.inner.querySelector(".ekdp-kct-translated")?.textContent,
+      "链接前缀句。 [ref. note](https://example.com/a.b",
+    );
+    linkHandle.dispose?.();
+
+    const urlBlock = makeBlock(boot.bodyRoot, "Url prefix sentence. https://example.com/a.b");
+    const urlHandle = boot.decorator!(urlBlock.block, { open: true, streaming: true });
+    now += 3_200;
+    await wait(760);
+    assert.equal(sentTexts.length, 4);
+    assert.deepEqual(sentTexts[3], ["Url prefix sentence."]);
+    assert.ok(!sentTexts.flat().some(text => text.includes("example.com")));
+    assert.equal(
+      urlBlock.inner.querySelector(".ekdp-kct-translated")?.textContent,
+      "网址前缀句。 https://example.com/a.b",
+    );
+    urlHandle.dispose?.();
+
+    const fenceBlock = makeBlock(boot.bodyRoot, "Fence prefix sentence.\n```js\nconst secret = 1. still typing");
+    const fenceHandle = boot.decorator!(fenceBlock.block, { open: true, streaming: true });
+    now += 3_200;
+    await wait(760);
+    assert.equal(sentTexts.length, 5);
+    assert.deepEqual(sentTexts[4], ["Fence prefix sentence."]);
+    assert.ok(!sentTexts.flat().some(text => text.includes("secret")));
+    assert.equal(
+      fenceBlock.inner.querySelector(".ekdp-kct-translated")?.textContent,
+      "围栏前缀句。\n```js\nconst secret = 1. still typing",
+    );
+    fenceHandle.dispose?.();
+  } finally {
+    Date.now = realDateNow;
+    boot.cleanup();
+  }
+});
+
+test("streaming single paragraph auto-schedules translation after 3000ms pause with no new tokens", async () => {
+  const sentTexts: string[][] = [];
+  const boot = await bootKct({
+    translate: async (_url: string, init: any) => {
+      const texts: string[] = JSON.parse(init.body);
+      sentTexts.push(texts);
+      return {
+        ok: true,
+        status: 200,
+        body: JSON.stringify(texts.map(() => ({ translations: [{ text: "停顿前的句子。" }] }))),
+      };
+    },
+  });
+  try {
+    const { block, inner } = makeBlock(boot.bodyRoot, "Paused sentence. still thinking");
+    const handle = boot.decorator!(block, { open: true, streaming: true });
+
+    // After the initial 700ms debounce, 3000ms has not elapsed yet.
+    await wait(850);
+    assert.equal(sentTexts.length, 0, "translated single streaming paragraph before 3000ms");
+
+    // With zero further handle.update() calls, the scheduled remaining-wait timer fires once 3000ms elapses.
+    await wait(2450);
+    assert.equal(sentTexts.length, 1, "remaining-wait timer did not fire after 3000ms pause");
+    assert.deepEqual(sentTexts[0], ["Paused sentence."]);
+    assert.equal(inner.querySelector(".ekdp-kct-translated")?.textContent, "停顿前的句子。 still thinking");
+    handle.dispose?.();
+  } finally {
+    boot.cleanup();
+  }
+});
+
+test("streaming failed prefix is not resent while incomplete tail grows until next sentence or manual retry", async () => {
+  const sentTexts: string[][] = [];
+  let mode: "429" | "400" | "ok" = "429";
+  const realDateNow = Date.now;
+  let now = 3_000_000;
+  Date.now = () => now;
+  const boot = await bootKct({
+    translate: async (_url: string, init: any) => {
+      const texts: string[] = JSON.parse(init.body);
+      sentTexts.push(texts);
+      if (mode === "429") {
+        return { ok: false, status: 429, headers: { "Retry-After": "1" }, body: JSON.stringify({ error: "rate limit" }) };
+      }
+      if (mode === "400") {
+        return { ok: false, status: 400, body: JSON.stringify({ error: "bad request" }) };
+      }
+      return {
+        ok: true,
+        status: 200,
+        body: JSON.stringify(texts.map(text => ({ translations: [{ text: `译(${text})` }] }))),
+      };
+    },
+  });
+  try {
+    const { block, inner, pre } = makeBlock(boot.bodyRoot, "First sentence. typing");
+    const handle = boot.decorator!(block, { open: true, streaming: true });
+    const status = block.querySelector(".ekdp-kct-status")!;
+
+    // Trigger first streaming prefix after 3000ms; 429 retries twice internally then marks prefix failed.
+    now = 3_003_200;
+    const deadline = realDateNow() + 6_000;
+    while (status.dataset.state !== "error" && realDateNow() < deadline) {
+      await wait(100);
+    }
+    assert.equal(status.dataset.state, "error", "expected streaming 429 to enter error state");
+    const callsAfter429 = sentTexts.length;
+    assert.ok(callsAfter429 >= 1);
+
+    // Move clock past 429 cooldown so only failedSource/failedSignature deduplication guards against resending.
+    now += 10_000;
+
+    // Appending characters inside the same incomplete sentence must NOT resend the failed prefix.
+    pre.textContent = "First sentence. typing more";
+    handle.update({ open: true, streaming: true });
+    await wait(780);
+    pre.textContent = "First sentence. typing more words";
+    handle.update({ open: true, streaming: true });
+    await wait(780);
+    assert.equal(sentTexts.length, callsAfter429, "failed streaming prefix was resent while incomplete tail grew");
+
+    // Manual retry clears the failed guard immediately (using 400 to test immediate failure without backoff).
+    mode = "400";
+    status.click();
+    await wait(60);
+    assert.equal(sentTexts.length, callsAfter429 + 1, "manual retry did not resend failed prefix immediately");
+    assert.equal(status.dataset.state, "error");
+
+    // Growing the same incomplete tail after a failed manual retry must still NOT trigger a retry storm.
+    pre.textContent = "First sentence. typing more words still";
+    handle.update({ open: true, streaming: true });
+    await wait(780);
+    assert.equal(sentTexts.length, callsAfter429 + 1, "failed manual retry caused a resend storm on tail growth");
+
+    // Forming the next complete sentence changes the stable prefix and automatically recovers.
+    mode = "ok";
+    pre.textContent = "First sentence. Second sentence. tail";
+    handle.update({ open: true, streaming: true });
+    await wait(780);
+    assert.equal(sentTexts.length, callsAfter429 + 2, "completing a new sentence did not recover from failed prefix");
+    assert.deepEqual(sentTexts.at(-1), ["First sentence. Second sentence."]);
+    assert.equal(inner.querySelector(".ekdp-kct-translated")?.textContent, "译(First sentence. Second sentence.) tail");
+    handle.dispose?.();
+  } finally {
+    Date.now = realDateNow;
+    boot.cleanup();
+  }
+});
+
+test("streaming protects unclosed Markdown link labels, pending brackets, and quoted link titles", async () => {
+  const sentTexts: string[][] = [];
+  const realDateNow = Date.now;
+  let now = 4_000_000;
+  Date.now = () => now;
+  const boot = await bootKct({
+    translate: async (_url: string, init: any) => {
+      const texts: string[] = JSON.parse(init.body);
+      sentTexts.push(texts);
+      return {
+        ok: true,
+        status: 200,
+        body: JSON.stringify(texts.map(text => ({ translations: [{ text: `译(${text})` }] }))),
+      };
+    },
+  });
+  try {
+    // 1) Unclosed `[` link label: at 3000ms only translate "Completed. " without splitting at "Private label."
+    const labelBlock = makeBlock(boot.bodyRoot, "Completed. [Private label. still typing");
+    const labelHandle = boot.decorator!(labelBlock.block, { open: true, streaming: true });
+    now += 3_200;
+    await wait(780);
+    assert.equal(sentTexts.length, 1);
+    assert.deepEqual(sentTexts[0], ["Completed."]);
+    assert.ok(
+      !sentTexts.flat().some(text => text.includes("Private label")),
+      "unclosed Markdown link label leaked into translation",
+    );
+    assert.equal(
+      labelBlock.inner.querySelector(".ekdp-kct-translated")?.textContent,
+      "译(Completed.) [Private label. still typing",
+    );
+
+    // Trailing `]` waits for the next character in case `(` follows immediately.
+    labelBlock.pre.textContent = "Completed. [Private label. still typing]";
+    labelHandle.update({ open: true, streaming: true });
+    now += 3_200;
+    await wait(780);
+    assert.equal(sentTexts.length, 1, "pending ] bracket was translated before confirming whether ( follows");
+
+    // Closing into a full link + Next. incrementally translates the remainder.
+    labelBlock.pre.textContent = "Completed. [Private label. still typing](https://example.com) Next.";
+    labelHandle.update({ open: true, streaming: false });
+    await wait(80);
+    assert.equal(sentTexts.length, 2, "closing the Markdown link did not continue translation");
+    assert.ok(
+      !sentTexts[1].includes("Completed."),
+      "already translated prefix was re-sent instead of continuing incrementally",
+    );
+    assert.ok(
+      sentTexts[1].some(text => text.includes("Next.")),
+      "post-link sentence was not translated after link closed",
+    );
+    const labelRendered = labelBlock.inner.querySelector(".ekdp-kct-translated")?.textContent ?? "";
+    assert.ok(labelRendered.startsWith("译(Completed.) "), "previous translated prefix was lost");
+    assert.ok(labelRendered.includes("https://example.com)"), "link URL was not preserved");
+    assert.ok(labelRendered.endsWith("译(Next.)"), "post-link translation missing");
+    labelHandle.dispose?.();
+  } finally {
+    Date.now = realDateNow;
+    boot.cleanup();
+  }
+
+  // 2) Unclosed link with spaces and quoted title: at 3000ms only translate "Completed. "
+  const titleSentTexts: string[][] = [];
+  let titleNow = 4_100_000;
+  Date.now = () => titleNow;
+  const titleBoot = await bootKct({
+    translate: async (_url: string, init: any) => {
+      const texts: string[] = JSON.parse(init.body);
+      titleSentTexts.push(texts);
+      return {
+        ok: true,
+        status: 200,
+        body: JSON.stringify(texts.map(text => ({ translations: [{ text: `译(${text})` }] }))),
+      };
+    },
+  });
+  try {
+    const titleBlock = makeBlock(titleBoot.bodyRoot, 'Completed. [Doc](https://example.com "Title. still typing');
+    const titleHandle = titleBoot.decorator!(titleBlock.block, { open: true, streaming: true });
+    titleNow += 3_200;
+    await wait(780);
+    assert.equal(titleSentTexts.length, 1);
+    assert.deepEqual(titleSentTexts[0], ["Completed."]);
+    assert.ok(
+      !titleSentTexts[0].some(text => text.includes("Doc") || text.includes("Title") || text.includes("example.com")),
+      "unclosed Markdown link with quoted title leaked into translation",
+    );
+    assert.equal(
+      titleBlock.inner.querySelector(".ekdp-kct-translated")?.textContent,
+      '译(Completed.) [Doc](https://example.com "Title. still typing',
+    );
+    titleHandle.dispose?.();
+  } finally {
+    Date.now = realDateNow;
+    titleBoot.cleanup();
+  }
+});
+
+test("failed streaming paragraph schedules 3000ms unlock for longer prefix and stops if that prefix also fails", async () => {
+  const sentTexts: string[][] = [];
+  let attempt = 0;
+  let failSecond = false;
+  const boot = await bootKct({
+    translate: async (_url: string, init: any) => {
+      const texts: string[] = JSON.parse(init.body);
+      sentTexts.push(texts);
+      attempt += 1;
+      if (attempt === 1 || (failSecond && attempt >= 2)) {
+        return { ok: false, status: 400, body: JSON.stringify({ error: "transient error" }) };
+      }
+      return {
+        ok: true,
+        status: 200,
+        body: JSON.stringify(texts.map(text => ({ translations: [{ text: `译(${text})` }] }))),
+      };
+    },
+  });
+  try {
+    // 1) Initial 700ms paragraph fails while stream pauses; 3000ms timer wakes up for longer prefix.
+    const { block, inner } = makeBlock(boot.bodyRoot, "First para.\n\nSecond sentence. still typing");
+    const handle = boot.decorator!(block, { open: true, streaming: true });
+    const status = block.querySelector(".ekdp-kct-status")!;
+
+    await wait(850);
+    assert.equal(sentTexts.length, 1, "first paragraph should have been attempted after 700ms");
+    assert.deepEqual(sentTexts[0], ["First para."]);
+    assert.equal(status.dataset.state, "error", "first paragraph failure should show error status");
+
+    await wait(2450);
+    assert.equal(sentTexts.length, 2, "3000ms wait timer did not wake up for longer unlocked prefix");
+    assert.deepEqual(sentTexts[1], ["First para.", "Second sentence."]);
+    assert.equal(
+      inner.querySelector(".ekdp-kct-translated")?.textContent,
+      "译(First para.)\n\n译(Second sentence.) still typing",
+    );
+    handle.dispose?.();
+
+    // 2) If the unlocked 3000ms prefix also fails, no retry timer is scheduled.
+    attempt = 0;
+    failSecond = true;
+    sentTexts.length = 0;
+    const stormBlock = makeBlock(boot.bodyRoot, "Alpha para.\n\nBeta sentence. still typing");
+    const stormHandle = boot.decorator!(stormBlock.block, { open: true, streaming: true });
+
+    await wait(850);
+    assert.equal(sentTexts.length, 1);
+    assert.deepEqual(sentTexts[0], ["Alpha para."]);
+    await wait(2450);
+    assert.equal(sentTexts.length, 2, "3000ms unlock attempt did not fire");
+    assert.deepEqual(sentTexts[1], ["Alpha para.", "Beta sentence."]);
+    await wait(250);
+    assert.equal(sentTexts.length, 2, "failing the unlocked prefix triggered a retry storm");
+    stormHandle.dispose?.();
+  } finally {
+    boot.cleanup();
+  }
+});
+
+test("streaming protects multiline unclosed Markdown link labels, unlocks on blank line, and preserves closed multiline links incrementally", async () => {
+  const realDateNow = Date.now;
+  let now = 5_000_000;
+  Date.now = () => now;
+
+  // 1) Multiline unclosed label stays protected at 3000ms, then unlocks once a blank line proves it is not a link.
+  const blankSentTexts: string[][] = [];
+  const blankBoot = await bootKct({
+    translate: async (_url: string, init: any) => {
+      const texts: string[] = JSON.parse(init.body);
+      blankSentTexts.push(texts);
+      return {
+        ok: true,
+        status: 200,
+        body: JSON.stringify(texts.map(text => ({ translations: [{ text: `译(${text})` }] }))),
+      };
+    },
+  });
+  try {
+    const { block, inner, pre } = makeBlock(blankBoot.bodyRoot, "Completed. [private label.\nstill typing");
+    const handle = blankBoot.decorator!(block, { open: true, streaming: true });
+    now += 3_200;
+    await wait(780);
+    assert.equal(blankSentTexts.length, 1);
+    assert.deepEqual(blankSentTexts[0], ["Completed."]);
+    assert.ok(
+      !blankSentTexts.flat().some(text => text.includes("private label") || text.includes("still typing")),
+      "multiline unclosed Markdown link label leaked into translation",
+    );
+    assert.equal(
+      inner.querySelector(".ekdp-kct-translated")?.textContent,
+      "译(Completed.) [private label.\nstill typing",
+    );
+
+    pre.textContent = "Completed. [private label.\n\nNext para.";
+    handle.update({ open: true, streaming: true });
+    await wait(780);
+    assert.equal(blankSentTexts.length, 2, "blank line did not unlock non-link bracket paragraph");
+    assert.deepEqual(blankSentTexts[1], ["[private label."]);
+    assert.equal(
+      inner.querySelector(".ekdp-kct-translated")?.textContent,
+      "译(Completed.) 译([private label.)\n\nNext para.",
+    );
+
+    handle.update({ open: true, streaming: false });
+    await wait(80);
+    assert.equal(blankSentTexts.length, 3);
+    assert.deepEqual(blankSentTexts[2], ["Next para."]);
+    assert.equal(
+      inner.querySelector(".ekdp-kct-translated")?.textContent,
+      "译(Completed.) 译([private label.)\n\n译(Next para.)",
+    );
+    handle.dispose?.();
+  } finally {
+    blankBoot.cleanup();
+  }
+
+  // 2) Closing a multiline label into a full link preserves the multiline link and translates only Tail. incrementally.
+  const closeSentTexts: string[][] = [];
+  now = 5_100_000;
+  const closeBoot = await bootKct({
+    translate: async (_url: string, init: any) => {
+      const texts: string[] = JSON.parse(init.body);
+      closeSentTexts.push(texts);
+      return {
+        ok: true,
+        status: 200,
+        body: JSON.stringify(texts.map(text => ({ translations: [{ text: `译(${text})` }] }))),
+      };
+    },
+  });
+  try {
+    const { block, inner, pre } = makeBlock(closeBoot.bodyRoot, "Completed. [private label.\nstill typing");
+    const handle = closeBoot.decorator!(block, { open: true, streaming: true });
+    now += 3_200;
+    await wait(780);
+    assert.equal(closeSentTexts.length, 1);
+    assert.deepEqual(closeSentTexts[0], ["Completed."]);
+    assert.equal(
+      inner.querySelector(".ekdp-kct-translated")?.textContent,
+      "译(Completed.) [private label.\nstill typing",
+    );
+
+    // Even once closed while still streaming, neither the dot nor the newline inside the multiline link splits it.
+    pre.textContent = "Completed. [private label.\nstill typing](https://example.test/path) waiting";
+    handle.update({ open: true, streaming: true });
+    now += 3_200;
+    await wait(780);
+    assert.equal(closeSentTexts.length, 1, "closed multiline link was split across its internal newline or period");
+
+    pre.textContent = "Completed. [private label.\nstill typing](https://example.test/path) Tail.";
+    handle.update({ open: true, streaming: false });
+    await wait(80);
+    assert.equal(closeSentTexts.length, 2, "closing multiline link did not translate Tail.");
+    assert.deepEqual(closeSentTexts[1], ["Tail."]);
+    assert.ok(
+      !closeSentTexts.flat().some(text => text.includes("private label") || text.includes("still typing") || text.includes("example.test")),
+      "multiline Markdown link content leaked into translation",
+    );
+    assert.equal(
+      inner.querySelector(".ekdp-kct-translated")?.textContent,
+      "译(Completed.) [private label.\nstill typing](https://example.test/path) 译(Tail.)",
+    );
+    handle.dispose?.();
+  } finally {
+    Date.now = realDateNow;
+    closeBoot.cleanup();
+  }
+});
+
+test("streaming protects Markdown links with parentheses inside double- and single-quoted titles", async () => {
+  const realDateNow = Date.now;
+  let now = 5_200_000;
+  Date.now = () => now;
+  const cases = [
+    {
+      name: "double-quoted title",
+      unclosed: 'Completed. [Doc](https://example.test/path "Private ) title. still typing',
+      streamingClosed: 'Completed. [Doc](https://example.test/path "Private ) title. Done") waiting',
+      final: 'Completed. [Doc](https://example.test/path "Private ) title. Done") Tail.',
+      expectedFinal: '译(Completed.) [Doc](https://example.test/path "Private ) title. Done") 译(Tail.)',
+    },
+    {
+      name: "single-quoted title",
+      unclosed: "Completed. [Doc](https://example.test/path 'Private ) title. still typing",
+      streamingClosed: "Completed. [Doc](https://example.test/path 'Private ) title. Done') waiting",
+      final: "Completed. [Doc](https://example.test/path 'Private ) title. Done') Tail.",
+      expectedFinal: "译(Completed.) [Doc](https://example.test/path 'Private ) title. Done') 译(Tail.)",
+    },
+  ];
+  try {
+    for (const tc of cases) {
+      const sentTexts: string[][] = [];
+      now += 100_000;
+      const boot = await bootKct({
+        translate: async (_url: string, init: any) => {
+          const texts: string[] = JSON.parse(init.body);
+          sentTexts.push(texts);
+          return {
+            ok: true,
+            status: 200,
+            body: JSON.stringify(texts.map(text => ({ translations: [{ text: `译(${text})` }] }))),
+          };
+        },
+      });
+      try {
+        const { block, inner, pre } = makeBlock(boot.bodyRoot, tc.unclosed);
+        const handle = boot.decorator!(block, { open: true, streaming: true });
+        now += 3_200;
+        await wait(780);
+        assert.equal(sentTexts.length, 1, `${tc.name}: expected only Completed. to translate`);
+        assert.deepEqual(sentTexts[0], ["Completed."]);
+        assert.ok(
+          !sentTexts.flat().some(text => text.includes("Doc") || text.includes("Private") || text.includes("title") || text.includes("example.test")),
+          `${tc.name}: unclosed quoted title with ) leaked into translation`,
+        );
+        assert.equal(
+          inner.querySelector(".ekdp-kct-translated")?.textContent,
+          `译(Completed.) ${tc.unclosed.slice("Completed. ".length)}`,
+        );
+
+        pre.textContent = tc.streamingClosed;
+        handle.update({ open: true, streaming: true });
+        now += 3_200;
+        await wait(780);
+        assert.equal(sentTexts.length, 1, `${tc.name}: closed link title was split at internal period during streaming`);
+
+        pre.textContent = tc.final;
+        handle.update({ open: true, streaming: false });
+        await wait(80);
+        assert.equal(sentTexts.length, 2, `${tc.name}: closing link did not incrementally translate Tail.`);
+        assert.deepEqual(sentTexts[1], ["Tail."]);
+        assert.ok(
+          !sentTexts.flat().some(text => text.includes("Doc") || text.includes("Private") || text.includes("title") || text.includes("example.test")),
+          `${tc.name}: closed link content leaked into translation`,
+        );
+        assert.equal(inner.querySelector(".ekdp-kct-translated")?.textContent, tc.expectedFinal);
+        handle.dispose?.();
+      } finally {
+        boot.cleanup();
+      }
+    }
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
+test("non-streaming translation preserves closed multiline links and links with dotted quoted titles verbatim", async () => {
+  const sentTexts: string[][] = [];
+  const boot = await bootKct({
+    translate: async (_url: string, init: any) => {
+      const texts: string[] = JSON.parse(init.body);
+      sentTexts.push(texts);
+      return {
+        ok: true,
+        status: 200,
+        body: JSON.stringify(texts.map(text => ({ translations: [{ text: `译(${text})` }] }))),
+      };
+    },
+  });
+  try {
+    const multilineSource = "Completed. [private label.\nsecond line](https://example.test/path) Tail.";
+    const multilineBlock = makeBlock(boot.bodyRoot, multilineSource);
+    const multilineHandle = boot.decorator!(multilineBlock.block, { open: true, streaming: false });
+    await wait(80);
+    assert.equal(sentTexts.length, 1);
+    assert.deepEqual(sentTexts[0], ["Completed.", "Tail."]);
+    assert.equal(
+      multilineBlock.inner.querySelector(".ekdp-kct-translated")?.textContent,
+      "译(Completed.) [private label.\nsecond line](https://example.test/path) 译(Tail.)",
+    );
+    multilineHandle.dispose?.();
+
+    const quotedTitleSource = 'Intro. [Doc. Sub](https://example.test/path "Private ) title. Here") Outro.';
+    const quotedTitleBlock = makeBlock(boot.bodyRoot, quotedTitleSource);
+    const quotedTitleHandle = boot.decorator!(quotedTitleBlock.block, { open: true, streaming: false });
+    await wait(80);
+    assert.equal(sentTexts.length, 2);
+    assert.deepEqual(sentTexts[1], ["Intro.", "Outro."]);
+    assert.equal(
+      quotedTitleBlock.inner.querySelector(".ekdp-kct-translated")?.textContent,
+      '译(Intro.) [Doc. Sub](https://example.test/path "Private ) title. Here") 译(Outro.)',
+    );
+    quotedTitleHandle.dispose?.();
+
+    const imageAndBalancedSource = 'See ![Chart. v1](<https://example.test/a b> "Note ) here.") and [Wiki](https://en.wikipedia.org/wiki/Foo_(bar)) End.';
+    const imageBlock = makeBlock(boot.bodyRoot, imageAndBalancedSource);
+    const imageHandle = boot.decorator!(imageBlock.block, { open: true, streaming: false });
+    await wait(80);
+    assert.equal(sentTexts.length, 3);
+    assert.deepEqual(sentTexts[2], ["See", "and", "End."]);
+    assert.equal(
+      imageBlock.inner.querySelector(".ekdp-kct-translated")?.textContent,
+      '译(See) ![Chart. v1](<https://example.test/a b> "Note ) here.") 译(and) [Wiki](https://en.wikipedia.org/wiki/Foo_(bar)) 译(End.)',
+    );
+    imageHandle.dispose?.();
+
+    const targetLangWithLink = "已完成 [private label.\nsecond line](https://example.test/path) 结束。";
+    const zhBlock = makeBlock(boot.bodyRoot, targetLangWithLink);
+    const zhHandle = boot.decorator!(zhBlock.block, { open: true, streaming: false });
+    await wait(80);
+    assert.equal(sentTexts.length, 3, "target-language text with English multiline link should not invoke translator");
+    assert.equal(zhBlock.inner.querySelector(".ekdp-kct-translated"), null);
+    assert.equal(zhBlock.pre.textContent, targetLangWithLink);
+    assert.equal(zhBlock.pre.getAttribute("data-ekdp-kct-hidden"), null);
+    zhHandle.dispose?.();
+  } finally {
+    boot.cleanup();
+  }
+});
+
+test("streaming protects Markdown links with backticks in destination or title until closed", async () => {
+  const realDateNow = Date.now;
+  let now = 5_600_000;
+  Date.now = () => now;
+  const cases = [
+    {
+      name: "paired backticks in URL with quoted title",
+      unclosed: 'Completed. [label](https://example.test/foo`bar`baz "private title. more',
+      streamingClosed: 'Completed. [label](https://example.test/foo`bar`baz "private title. more") waiting',
+      final: 'Completed. [label](https://example.test/foo`bar`baz "private title. more") Tail.',
+      expectedFinal: '译(Completed.) [label](https://example.test/foo`bar`baz "private title. more") 译(Tail.)',
+    },
+    {
+      name: "single backtick in URL with quoted title",
+      unclosed: 'Completed. [label](https://example.test/foo`bar "private title. more',
+      streamingClosed: 'Completed. [label](https://example.test/foo`bar "private title. more") waiting',
+      final: 'Completed. [label](https://example.test/foo`bar "private title. more") Tail.',
+      expectedFinal: '译(Completed.) [label](https://example.test/foo`bar "private title. more") 译(Tail.)',
+    },
+    {
+      name: "backticks inside quoted title",
+      unclosed: 'Completed. [label](https://example.test/path "title `code` here. more',
+      streamingClosed: 'Completed. [label](https://example.test/path "title `code` here. more") waiting',
+      final: 'Completed. [label](https://example.test/path "title `code` here. more") Tail.',
+      expectedFinal: '译(Completed.) [label](https://example.test/path "title `code` here. more") 译(Tail.)',
+    },
+  ];
+  try {
+    for (const tc of cases) {
+      const sentTexts: string[][] = [];
+      now += 100_000;
+      const boot = await bootKct({
+        translate: async (_url: string, init: any) => {
+          const texts: string[] = JSON.parse(init.body);
+          sentTexts.push(texts);
+          return {
+            ok: true,
+            status: 200,
+            body: JSON.stringify(texts.map(text => ({ translations: [{ text: `译(${text})` }] }))),
+          };
+        },
+      });
+      try {
+        const { block, inner, pre } = makeBlock(boot.bodyRoot, tc.unclosed);
+        const handle = boot.decorator!(block, { open: true, streaming: true });
+        now += 3_200;
+        await wait(780);
+        assert.equal(sentTexts.length, 1, `${tc.name}: expected only Completed. to translate`);
+        assert.deepEqual(sentTexts[0], ["Completed."]);
+        assert.ok(
+          !sentTexts.flat().some(text => text.includes("label") || text.includes("title") || text.includes("example.test")),
+          `${tc.name}: unclosed backtick link leaked into translation`,
+        );
+        assert.equal(
+          inner.querySelector(".ekdp-kct-translated")?.textContent,
+          `译(Completed.) ${tc.unclosed.slice("Completed. ".length)}`,
+        );
+
+        pre.textContent = tc.streamingClosed;
+        handle.update({ open: true, streaming: true });
+        now += 3_200;
+        await wait(780);
+        assert.equal(sentTexts.length, 1, `${tc.name}: closed backtick link was split at internal period during streaming`);
+
+        pre.textContent = tc.final;
+        handle.update({ open: true, streaming: false });
+        await wait(80);
+        assert.equal(sentTexts.length, 2, `${tc.name}: closing backtick link did not incrementally translate Tail.`);
+        assert.deepEqual(sentTexts[1], ["Tail."]);
+        assert.ok(
+          !sentTexts.flat().some(text => text.includes("label") || text.includes("title") || text.includes("example.test")),
+          `${tc.name}: closed backtick link content leaked into translation`,
+        );
+        assert.equal(inner.querySelector(".ekdp-kct-translated")?.textContent, tc.expectedFinal);
+        handle.dispose?.();
+      } finally {
+        boot.cleanup();
+      }
+    }
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
+test("non-streaming translation preserves links with backticks in URL, title, and code-span labels", async () => {
+  const cases = [
+    {
+      name: "paired backticks in URL with quoted title",
+      source: 'Intro. [label](https://example.test/foo`bar`baz "private title. more") Outro.',
+      expectedSent: ["Intro.", "Outro."],
+      expectedRendered: '译(Intro.) [label](https://example.test/foo`bar`baz "private title. more") 译(Outro.)',
+    },
+    {
+      name: "single backtick in URL followed by inline code",
+      source: "Intro. [Doc](https://example.test/a`b) Next `inline` end.",
+      expectedSent: ["Intro.", "Next", "end."],
+      expectedRendered: "译(Intro.) [Doc](https://example.test/a`b) 译(Next) `inline` 译(end.)",
+    },
+    {
+      name: "single backtick in URL with quoted title",
+      source: 'Intro. [label](https://example.test/foo`bar "private title. more") Outro.',
+      expectedSent: ["Intro.", "Outro."],
+      expectedRendered: '译(Intro.) [label](https://example.test/foo`bar "private title. more") 译(Outro.)',
+    },
+    {
+      name: "backticks inside quoted title",
+      source: 'Intro. [label](https://example.test/path "title `code` here. more") Outro.',
+      expectedSent: ["Intro.", "Outro."],
+      expectedRendered: '译(Intro.) [label](https://example.test/path "title `code` here. more") 译(Outro.)',
+    },
+    {
+      name: "inline code containing closing bracket inside link label",
+      source: "Intro. [`a]b` label](https://example.test/path) Outro.",
+      expectedSent: ["Intro.", "Outro."],
+      expectedRendered: "译(Intro.) [`a]b` label](https://example.test/path) 译(Outro.)",
+    },
+  ];
+
+  for (const tc of cases) {
+    const sentTexts: string[][] = [];
+    const boot = await bootKct({
+      translate: async (_url: string, init: any) => {
+        const texts: string[] = JSON.parse(init.body);
+        sentTexts.push(texts);
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify(texts.map(text => ({ translations: [{ text: `译(${text})` }] }))),
+        };
+      },
+    });
+    try {
+      const { block, inner } = makeBlock(boot.bodyRoot, tc.source);
+      const handle = boot.decorator!(block, { open: true, streaming: false });
+      await wait(80);
+      assert.equal(sentTexts.length, 1, `${tc.name}: expected exactly one translate request`);
+      assert.deepEqual(sentTexts[0], tc.expectedSent, `${tc.name}: unexpected translated slices`);
+      assert.equal(
+        inner.querySelector(".ekdp-kct-translated")?.textContent,
+        tc.expectedRendered,
+        `${tc.name}: unexpected rendered translation`,
+      );
+      handle.dispose?.();
+    } finally {
+      boot.cleanup();
+    }
+  }
+
+  const zhSentTexts: string[][] = [];
+  const zhBoot = await bootKct({
+    translate: async (_url: string, init: any) => {
+      const texts: string[] = JSON.parse(init.body);
+      zhSentTexts.push(texts);
+      return {
+        ok: true,
+        status: 200,
+        body: JSON.stringify(texts.map(text => ({ translations: [{ text: `译(${text})` }] }))),
+      };
+    },
+  });
+  try {
+    const zhBacktickLink = '已完成 [label](https://example.test/foo`bar`baz "private title. more") 结束。';
+    const zhBlock = makeBlock(zhBoot.bodyRoot, zhBacktickLink);
+    const zhHandle = zhBoot.decorator!(zhBlock.block, { open: true, streaming: false });
+    await wait(80);
+    assert.equal(zhSentTexts.length, 0, "target-language text with backtick-URL link should not invoke translator");
+    assert.equal(zhBlock.inner.querySelector(".ekdp-kct-translated"), null);
+    assert.equal(zhBlock.pre.textContent, zhBacktickLink);
+    zhHandle.dispose?.();
+  } finally {
+    zhBoot.cleanup();
+  }
+});
+
+test("streaming protects links and images containing HTML comments, tags, or autolinks with brackets until closed", async () => {
+  const realDateNow = Date.now;
+  let now = 6_200_000;
+  Date.now = () => now;
+  const cases = [
+    {
+      name: "link with HTML comment containing closing bracket and unclosed title",
+      unclosed: 'Completed. [foo <!-- ] --> bar](https://example.test/x "Private title. More',
+      streamingClosed: 'Completed. [foo <!-- ] --> bar](https://example.test/x "Private title. More") waiting',
+      final: 'Completed. [foo <!-- ] --> bar](https://example.test/x "Private title. More") Tail.',
+      expectedFinal: '译(Completed.) [foo <!-- ] --> bar](https://example.test/x "Private title. More") 译(Tail.)',
+    },
+    {
+      name: "image with URI autolink containing closing bracket and unclosed title",
+      unclosed: 'Completed. ![alt <https://example.test/p?a=1]2> more](https://example.test/img.png "Private title. More',
+      streamingClosed: 'Completed. ![alt <https://example.test/p?a=1]2> more](https://example.test/img.png "Private title. More") waiting',
+      final: 'Completed. ![alt <https://example.test/p?a=1]2> more](https://example.test/img.png "Private title. More") Tail.',
+      expectedFinal: '译(Completed.) ![alt <https://example.test/p?a=1]2> more](https://example.test/img.png "Private title. More") 译(Tail.)',
+    },
+    {
+      name: "link with unclosed HTML comment containing period and bracket",
+      unclosed: "Completed. [foo <!-- Private title. More ] still comment",
+      streamingClosed: 'Completed. [foo <!-- Private title. More ] still comment --> bar](https://example.test/x "Private title. More") waiting',
+      final: 'Completed. [foo <!-- Private title. More ] still comment --> bar](https://example.test/x "Private title. More") Tail.',
+      expectedFinal: '译(Completed.) [foo <!-- Private title. More ] still comment --> bar](https://example.test/x "Private title. More") 译(Tail.)',
+    },
+    {
+      name: "link with unclosed HTML open tag quoted attribute containing period and bracket",
+      unclosed: 'Completed. [foo <span data-x="Private title. ] More',
+      streamingClosed: 'Completed. [foo <span data-x="Private title. ] More">bar</span>](https://example.test/x "Private title. More") waiting',
+      final: 'Completed. [foo <span data-x="Private title. ] More">bar</span>](https://example.test/x "Private title. More") Tail.',
+      expectedFinal: '译(Completed.) [foo <span data-x="Private title. ] More">bar</span>](https://example.test/x "Private title. More") 译(Tail.)',
+    },
+  ];
+  try {
+    for (const tc of cases) {
+      const sentTexts: string[][] = [];
+      now += 100_000;
+      const boot = await bootKct({
+        translate: async (_url: string, init: any) => {
+          const texts: string[] = JSON.parse(init.body);
+          sentTexts.push(texts);
+          return {
+            ok: true,
+            status: 200,
+            body: JSON.stringify(texts.map(text => ({ translations: [{ text: `译(${text})` }] }))),
+          };
+        },
+      });
+      try {
+        const { block, inner, pre } = makeBlock(boot.bodyRoot, tc.unclosed);
+        const handle = boot.decorator!(block, { open: true, streaming: true });
+        now += 3_200;
+        await wait(780);
+        assert.equal(sentTexts.length, 1, `${tc.name}: expected only Completed. to translate`);
+        assert.deepEqual(sentTexts[0], ["Completed."]);
+        assert.ok(
+          !sentTexts.flat().some(text => text.includes("Private title") || text.includes("foo") || text.includes("example.test")),
+          `${tc.name}: unclosed link with HTML/autolink leaked into translation`,
+        );
+        assert.equal(
+          inner.querySelector(".ekdp-kct-translated")?.textContent,
+          `译(Completed.) ${tc.unclosed.slice("Completed. ".length)}`,
+        );
+
+        pre.textContent = tc.streamingClosed;
+        handle.update({ open: true, streaming: true });
+        now += 3_200;
+        await wait(780);
+        assert.equal(sentTexts.length, 1, `${tc.name}: closed link was split at internal period during streaming`);
+
+        pre.textContent = tc.final;
+        handle.update({ open: true, streaming: false });
+        await wait(80);
+        assert.equal(sentTexts.length, 2, `${tc.name}: closing link did not incrementally translate Tail.`);
+        assert.deepEqual(sentTexts[1], ["Tail."]);
+        assert.ok(
+          !sentTexts.flat().some(text => text.includes("Private title") || text.includes("foo") || text.includes("example.test")),
+          `${tc.name}: closed link content leaked into translation`,
+        );
+        assert.equal(inner.querySelector(".ekdp-kct-translated")?.textContent, tc.expectedFinal);
+        handle.dispose?.();
+      } finally {
+        boot.cleanup();
+      }
+    }
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
+test("non-streaming translation preserves links/images with HTML constructs or autolinks and translates angle-bracket comparisons", async () => {
+  const cases = [
+    {
+      name: "link with HTML comment containing closing bracket",
+      source: 'Completed. [foo <!-- ] --> bar](https://example.test/x "Private title. More") Tail.',
+      expectedSent: ["Completed.", "Tail."],
+      expectedRendered: '译(Completed.) [foo <!-- ] --> bar](https://example.test/x "Private title. More") 译(Tail.)',
+    },
+    {
+      name: "image alt text with URI autolink containing closing bracket",
+      source: 'Intro. ![alt <https://example.test/p?a=1]2> more](https://example.test/img.png "Private title. More") Outro.',
+      expectedSent: ["Intro.", "Outro."],
+      expectedRendered: '译(Intro.) ![alt <https://example.test/p?a=1]2> more](https://example.test/img.png "Private title. More") 译(Outro.)',
+    },
+    {
+      name: "link label with HTML open tag quoted ] / > / backtick attribute and closing tag",
+      source: 'Intro. [foo <span data-x="a]b>c`d" data-y=\'e]f\'>bar</span> baz](https://example.test/x "Private title. More") Outro.',
+      expectedSent: ["Intro.", "Outro."],
+      expectedRendered: '译(Intro.) [foo <span data-x="a]b>c`d" data-y=\'e]f\'>bar</span> baz](https://example.test/x "Private title. More") 译(Outro.)',
+    },
+    {
+      name: "link label with CDATA section containing closing bracket",
+      source: 'Intro. [foo <![CDATA[a]b]]> bar](https://example.test/x "Private title. More") Outro.',
+      expectedSent: ["Intro.", "Outro."],
+      expectedRendered: '译(Intro.) [foo <![CDATA[a]b]]> bar](https://example.test/x "Private title. More") 译(Outro.)',
+    },
+    {
+      name: "link label with processing instruction containing closing bracket",
+      source: 'Intro. [foo <?pi ] ?> bar](https://example.test/x "Private title. More") Outro.',
+      expectedSent: ["Intro.", "Outro."],
+      expectedRendered: '译(Intro.) [foo <?pi ] ?> bar](https://example.test/x "Private title. More") 译(Outro.)',
+    },
+    {
+      name: "link label with HTML declarations including closing bracket",
+      source: 'Intro. [foo <!DOCTYPE html> <!ENTITY x "a]b"> bar](https://example.test/x "Private title. More") Outro.',
+      expectedSent: ["Intro.", "Outro."],
+      expectedRendered: '译(Intro.) [foo <!DOCTYPE html> <!ENTITY x "a]b"> bar](https://example.test/x "Private title. More") 译(Outro.)',
+    },
+    {
+      name: "link label with CommonMark short HTML comments",
+      source: 'Intro. [foo <!--> mid <!---> bar](https://example.test/x "Private title. More") Outro.',
+      expectedSent: ["Intro.", "Outro."],
+      expectedRendered: '译(Intro.) [foo <!--> mid <!---> bar](https://example.test/x "Private title. More") 译(Outro.)',
+    },
+    {
+      name: "link label with email autolinks",
+      source: 'Intro. [Contact <user@example.test> or </alt@example.test>](https://example.test/x "Private title. More") Outro.',
+      expectedSent: ["Intro.", "Outro."],
+      expectedRendered: '译(Intro.) [Contact <user@example.test> or </alt@example.test>](https://example.test/x "Private title. More") 译(Outro.)',
+    },
+    {
+      name: "prose with spaced angle-bracket comparisons still translates normally",
+      source: "When x < 5 and count < 10, check [docs](https://example.test/a).",
+      expectedSent: ["When x < 5 and count < 10, check", "."],
+      expectedRendered: "译(When x < 5 and count < 10, check) [docs](https://example.test/a)译(.)",
+    },
+    {
+      name: "prose with spaced comparisons including > and unspaced a<b and c<d",
+      source: "If a < b and c > d or a<b and c<d, check [docs](https://example.test/a).",
+      expectedSent: ["If a < b and c > d or a<b and c<d, check", "."],
+      expectedRendered: "译(If a < b and c > d or a<b and c<d, check) [docs](https://example.test/a)译(.)",
+    },
+    {
+      name: "blank line invalidates unclosed HTML comment before subsequent link",
+      source: "Intro <!-- unclosed\n\nNext [docs](https://example.test/a) Outro.",
+      expectedSent: ["Intro <!-- unclosed", "Next", "Outro."],
+      expectedRendered: "译(Intro <!-- unclosed)\n\n译(Next) [docs](https://example.test/a) 译(Outro.)",
+    },
+  ];
+
+  for (const tc of cases) {
+    const sentTexts: string[][] = [];
+    const boot = await bootKct({
+      translate: async (_url: string, init: any) => {
+        const texts: string[] = JSON.parse(init.body);
+        sentTexts.push(texts);
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify(texts.map(text => ({ translations: [{ text: `译(${text})` }] }))),
+        };
+      },
+    });
+    try {
+      const { block, inner } = makeBlock(boot.bodyRoot, tc.source);
+      const handle = boot.decorator!(block, { open: true, streaming: false });
+      await wait(80);
+      assert.equal(sentTexts.length, 1, `${tc.name}: expected exactly one translate request`);
+      assert.deepEqual(sentTexts[0], tc.expectedSent, `${tc.name}: unexpected translated slices`);
+      assert.equal(
+        inner.querySelector(".ekdp-kct-translated")?.textContent,
+        tc.expectedRendered,
+        `${tc.name}: unexpected rendered translation`,
+      );
+      handle.dispose?.();
+    } finally {
+      boot.cleanup();
+    }
   }
 });
