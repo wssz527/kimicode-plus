@@ -24,10 +24,11 @@
 | 打包与同步 | `scripts/test_package.py` 11/11、`scripts/test_sync_cnb_release.py` 7/7 通过 |
 | 真实二进制 | `scripts/acceptance.py --binary ./dist/enhanced-kimi` 27/27、`scripts/acceptance_m5.py ./dist/enhanced-kimi` 10/10 通过 |
 | 独立复审 | 业务改动与验收隔离脚本均经独立复审，发现项已修复闭合 |
+| 线上发布核验 | 核心 `v0.2.11` 为 GitHub 正式 Latest。GitHub 与 CNB 的固定清单均返回 HTTP 200，六个核心资产逐字节一致。清单 Ed25519 签名、三平台 SHA-256 和归档结构检查通过，下载的 macOS ARM64 二进制报告 `0.2.11`。`plugins-latest` 保持独立通道，双源清单与四个插件 ZIP 逐字节一致，签名、ZIP SHA-256 和目录内容摘要均通过内置公钥与发布工具校验。 |
 
 ### 发布与后续边界
 
-核心将由 `v0.2.11` 注释标签触发 `.github/workflows/release.yml`。工作流先将完整资产上传至 GitHub 草稿，再同步 CNB，随后将 GitHub 草稿公开为正式 Release。官方插件将由 `plugin-kct-v1.0.9` 标签触发 `.github/workflows/release-plugins.yml`，更新 GitHub 与 CNB 的 `plugins-latest`。两端均在归档上传完成后发布清单。
+核心已通过 `v0.2.11` 注释标签触发 `.github/workflows/release.yml` 完成发布。工作流将完整资产上传至 GitHub 草稿，同步 CNB 后公开 GitHub 正式 Release。官方插件已通过 `plugin-kct-v1.0.9` 标签触发 `.github/workflows/release-plugins.yml`，完成打包、签名和反向校验，并更新 GitHub 与 CNB 的 `plugins-latest`。两端均在归档上传完成后发布清单。[核心发布工作流](https://github.com/wssz527/kimicode-plus/actions/runs/45878157458) · [插件发布工作流](https://github.com/wssz527/kimicode-plus/actions/runs/45878152610)
 
 本轮未调用真实付费翻译服务、真实账号 KAP 流程和系统文件选择窗口，完整桌面客户端宿主也未进行实机操作。保活核对之后才落盘的步骤不回补记账。自定义中继仅在符合官方主机名单时发送私有 `thinking`。真实线上插件热替换、同账号有无保活的长周期缓存 TTL 对照以及八站登录态提取与回填仍待进一步实测。
 
