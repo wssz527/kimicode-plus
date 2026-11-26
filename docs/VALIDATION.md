@@ -24,10 +24,11 @@
 | 真实二进制 | `scripts/acceptance.py --binary ./dist/enhanced-kimi` 27/27 通过 |
 | 真实浏览器隔离页 | 同屏与规划器展开时不发翻译请求，两次手动点击共两次请求；Markdown 代码保留、原文切换、设置二次关闭、主题切换与停用清理通过 |
 | 独立复审 | DeepSeek 分别复核后端与前端；后端无新增代码发现，前端四项发现均已修复并闭合复核 |
+| 线上发布核验 | 核心 `v0.2.10` 为 GitHub 正式 Latest，六个资产完整；清单 Ed25519 签名、三平台 SHA-256、归档结构和 CNB 字节一致性通过，下载的 macOS ARM64 二进制实际报告 `0.2.10`。四个插件经内置公钥反向验签与内容摘要校验，GitHub/CNB 清单及安装包一致。 |
 
 ### 发布与后续边界
 
-核心由推送 `v0.2.10` 注释标签触发 `.github/workflows/release.yml`，先上传完整 GitHub 草稿并同步 CNB，再公开正式 Release。插件由 `plugin-kct-v1.0.8` 标签触发 `.github/workflows/release-plugins.yml`，打包、签名、反向校验后更新 GitHub 与 CNB 的 `plugins-latest`；清单在归档之后发布。
+核心已通过 `v0.2.10` 注释标签完成 `.github/workflows/release.yml` 发布，完整 GitHub 草稿同步 CNB 后公开为正式 Release。插件已由 `plugin-kct-v1.0.8` 标签完成 `.github/workflows/release-plugins.yml` 发布，打包、签名和反向校验后更新 GitHub 与 CNB 的 `plugins-latest`；清单在归档之后发布。线上核验记录见上表。
 
 真实付费翻译服务、真实账号 KAP 流程和系统文件选择窗口未调用；完整桌面客户端宿主未在本轮实测，内置浏览器的 Shadow DOM 验收不能替代该项。保活核对之后才落盘的步骤不回补记账。自定义中继即使转发到 Kimi，也只有符合官方主机名单时才发送私有 `thinking`。真实线上插件热替换、长周期缓存 TTL 对照和八站登录态提取/回填仍按既有边界继续观察。
 
