@@ -144,11 +144,11 @@ function MarkdownCode({ language, text }: { language?: string; text: string }) {
 }
 
 export function ReasoningBlock({ text, streaming }: { text: string; streaming: boolean }) {
-  return <details className="wb-reasoning">
+  return <details className="wb-reasoning" data-ekdp-thinking="" data-streaming={streaming || undefined}>
     <summary><Icon name="chevronDown" size={14} /><span>{streaming ? "思考中" : "思考过程"}</span>
       {streaming ? <span className="wb-breath" aria-hidden="true" /> : null}
     </summary>
-    <MarkdownBlock text={text} />
+    <div data-ekdp-thinking-body="" data-ekdp-thinking-source={text}><MarkdownBlock text={text} /></div>
   </details>;
 }
 

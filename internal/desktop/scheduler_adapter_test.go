@@ -160,3 +160,58 @@ func TestSchedulerCheckAccountCustomVsManagedProvider(t *testing.T) {
 		t.Fatalf("expected logged-in managed account to pass CheckAccount, got ok=%v reason=%q", ok, reason)
 	}
 }
+
+// TestSchedulerSendPromptReceiptAndTurnUserMessageIDs pins the attribution
+// contract between the prompts ACK and the turns listing: the ACK's
+// user_message_id equals the item_id of the turn's user_message item.
+func TestSchedulerSendPromptReceiptAndTurnUserMessageIDs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/prompts"):
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["permission_mode"] != "manual" {
+				t.Errorf("expected permission_mode manual, got %v", body["permission_mode"])
+			}
+			_, _ = w.Write([]byte(`{"prompt_id":"p1","user_message_id":"um_1","status":"accepted"}`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/turns"):
+			_, _ = w.Write([]byte(`{"turns":[` +
+				`{"turn_id":"t1","ordinal":2,"items":[{"item_id":"um_1","type":"user_message","text":"hi"},{"item_id":"a1","type":"assistant_message","text":"ok"}]},` +
+				`{"turn_id":"t2","ordinal":3,"items":[{"item_id":"um_2","type":"user_message","text":"go"}]}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	kap := NewKAPClient(t.TempDir())
+	kap.base = server.URL
+	kap.token = "test-token"
+	exec := &SchedulerExecutor{service: &NativeService{kap: kap}}
+
+	receipt, err := exec.SendPrompt(context.Background(), "s1", "hi", "", "", "manual")
+	if err != nil {
+		t.Fatalf("SendPrompt: %v", err)
+	}
+	if receipt.UserMessageID != "um_1" {
+		t.Fatalf("expected the ACK user_message_id, got %q", receipt.UserMessageID)
+	}
+
+	turns, err := exec.GetSessionTurns(context.Background(), "s1", 20)
+	if err != nil {
+		t.Fatalf("GetSessionTurns: %v", err)
+	}
+	if len(turns) != 2 {
+		t.Fatalf("expected 2 turns, got %d", len(turns))
+	}
+	if turns[0].TurnID != "t1" || !turns[0].HasAssistantMsg {
+		t.Fatalf("unexpected first turn: %+v", turns[0])
+	}
+	if len(turns[0].UserMessageIDs) != 1 || turns[0].UserMessageIDs[0] != "um_1" {
+		t.Fatalf("expected t1 to carry um_1, got %v", turns[0].UserMessageIDs)
+	}
+	if len(turns[1].UserMessageIDs) != 1 || turns[1].UserMessageIDs[0] != "um_2" {
+		t.Fatalf("expected t2 to carry um_2, got %v", turns[1].UserMessageIDs)
+	}
+}

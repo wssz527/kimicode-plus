@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -36,6 +38,7 @@ type fakeExecutor struct {
 	activities   []string
 	createdSeq   int
 	sentPrompts  []string
+	receipt      SendPromptReceipt
 	archivedIDs  []string
 	batchArchIDs [][]string
 	abortedIDs   []string
@@ -114,7 +117,7 @@ func (f *fakeExecutor) CreateSession(ctx context.Context, cwd, title, model, eff
 	return s, nil
 }
 
-func (f *fakeExecutor) SendPrompt(ctx context.Context, sessionID, text, model, effort, permissionMode string) error {
+func (f *fakeExecutor) SendPrompt(ctx context.Context, sessionID, text, model, effort, permissionMode string) (SendPromptReceipt, error) {
 	if f.onPrompt != nil {
 		f.onPrompt(ctx, sessionID, text, model, effort, permissionMode)
 	}
@@ -124,7 +127,7 @@ func (f *fakeExecutor) SendPrompt(ctx context.Context, sessionID, text, model, e
 	if _, ok := f.turns[sessionID]; !ok {
 		f.turns[sessionID] = []TurnInfo{{TurnID: "turn_1", HasAssistantMsg: true}}
 	}
-	return nil
+	return f.receipt, nil
 }
 
 func (f *fakeExecutor) ArchiveSession(_ context.Context, sessionID string) error {
@@ -834,25 +837,492 @@ func (d *delayedTurnExecutor) GetSession(ctx context.Context, id string) (Sessio
 	return d.fakeExecutor.GetSession(ctx, id)
 }
 
+// flakyTurnsExecutor fails every turns read until the first prompt went out,
+// reproducing a broken pre-send baseline.
+type flakyTurnsExecutor struct {
+	*delayedTurnExecutor
+	failTurnsUntilPrompt bool
+}
+
+func (f *flakyTurnsExecutor) GetSessionTurns(ctx context.Context, id string, pageSize int) ([]TurnInfo, error) {
+	if f.failTurnsUntilPrompt {
+		f.mu.Lock()
+		sent := len(f.sentPrompts) > 0
+		f.mu.Unlock()
+		if !sent {
+			return nil, errors.New("官方回合接口暂时不可用")
+		}
+	}
+	return f.fakeExecutor.GetSessionTurns(ctx, id, pageSize)
+}
+
+// pagingTurnsExecutor mimics the official turns endpoint: it only ever returns
+// the newest pageSize turns.
+type pagingTurnsExecutor struct {
+	*delayedTurnExecutor
+	pageSizes []int
+}
+
+func (p *pagingTurnsExecutor) GetSessionTurns(ctx context.Context, id string, pageSize int) ([]TurnInfo, error) {
+	p.mu.Lock()
+	p.pageSizes = append(p.pageSizes, pageSize)
+	p.mu.Unlock()
+	turns, err := p.fakeExecutor.GetSessionTurns(ctx, id, pageSize)
+	if err != nil {
+		return nil, err
+	}
+	if len(turns) > pageSize {
+		turns = turns[len(turns)-pageSize:]
+	}
+	return turns, nil
+}
+
 func TestObserveTurnOutcomeRequiresProgressEvidence(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		before int
-		prior  string
+		name     string
+		baseline sendOutcome
 	}{
-		{"unchanged history", 1, "old"}, {"unknown history baseline", -1, ""},
+		{"unchanged history", sendOutcome{baselineKnown: true, anchor: "old"}},
+		{"unknown history baseline", sendOutcome{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			executor := newFakeExecutor()
 			executor.sessions["s1"] = SessionInfo{ID: "s1", PendingInteraction: "none"}
 			executor.turns["s1"] = []TurnInfo{{TurnID: "old", HasAssistantMsg: true}}
-			e := &Engine{exec: executor, pollInterval: time.Millisecond}
+			e := &Engine{exec: executor, pollInterval: time.Millisecond, now: time.Now}
 			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 			defer cancel()
-			status, failure, _ := e.observeTurnOutcome(ctx, context.Background(), "s1", tc.before, tc.prior, 1, 0)
+			status, failure, _ := e.observeTurnOutcome(ctx, context.Background(), "s1", tc.baseline, 1, 0)
 			if status != RunFailed || failure != FailureTimeout || len(executor.abortedIDs) != 1 {
 				t.Fatalf("idle observation = %s/%s, aborts=%v", status, failure, executor.abortedIDs)
 			}
 		})
+	}
+}
+
+// setBusy flips a fake session's busy flag.
+func setBusy(base *fakeExecutor, sessionID string, busy bool) {
+	base.mu.Lock()
+	s := base.sessions[sessionID]
+	s.Busy = busy
+	base.sessions[sessionID] = s
+	base.mu.Unlock()
+}
+
+// TestEngineFailedTurnStillFailsWithoutBaseline is the regression for the
+// confirmed misattribution bug: when the pre-send history read fails the run
+// has no baseline, and a short busy/idle cycle used to be reported as
+// RunCompleted even though the ACK-attributed turn carries an error.
+func TestEngineFailedTurnStillFailsWithoutBaseline(t *testing.T) {
+	db := openTestDB(t)
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newFakeExecutor()
+	base.receipt = SendPromptReceipt{UserMessageID: "um_bug"}
+	base.onPrompt = func(_ context.Context, sid, _, _, _, _ string) {
+		base.mu.Lock()
+		s := base.sessions[sid]
+		s.Busy = true
+		base.sessions[sid] = s
+		base.turns[sid] = []TurnInfo{
+			{TurnID: "turn_new", UserMessageIDs: []string{"um_bug"}, ErrorMessage: "boom", HasAssistantMsg: true},
+		}
+		base.mu.Unlock()
+	}
+	var reads atomic.Int32
+	exec := &flakyTurnsExecutor{delayedTurnExecutor: &delayedTurnExecutor{
+		fakeExecutor: base,
+		onGetSession: func(id string) {
+			if reads.Add(1) >= 2 {
+				setBusy(base, id, false)
+			}
+		},
+	}, failTurnsUntilPrompt: true}
+
+	engine, err := NewEngine(store, exec, WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	task, err := engine.SaveTask(context.Background(), "kimicode-plus.scheduler", SaveTaskInput{
+		Name: "坏基线回归", Prompt: "work", CWD: t.TempDir(), Mode: ModeNewSession, PermissionMode: "manual",
+		Schedule: ScheduleRule{Kind: "daily", Time: "09:00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.RunNow(context.Background(), "kimicode-plus.scheduler", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool {
+		runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+		return len(runs) == 1 && runs[0].Status != RunQueued && runs[0].Status != RunRunning
+	})
+	runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+	if runs[0].Status != RunFailed || runs[0].FailureKind != FailureExecution {
+		t.Fatalf("ACK-attributed error turn must fail the run, got %+v", runs[0])
+	}
+	if !strings.Contains(runs[0].Message, "boom") {
+		t.Fatalf("expected the turn error in the message, got %q", runs[0].Message)
+	}
+	exec.mu.Lock()
+	aborted := len(exec.abortedIDs)
+	exec.mu.Unlock()
+	if aborted != 0 {
+		t.Fatalf("execution failures must not abort the session, aborts=%d", aborted)
+	}
+}
+
+// TestEngineUnprovableRunIsNotReportedCompleted pins the other half of the
+// contract: without an ACK receipt and without a baseline the run must not be
+// declared completed just because the session was briefly busy.
+func TestEngineUnprovableRunIsNotReportedCompleted(t *testing.T) {
+	db := openTestDB(t)
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newFakeExecutor()
+	base.onPrompt = func(_ context.Context, sid, _, _, _, _ string) {
+		base.mu.Lock()
+		s := base.sessions[sid]
+		s.Busy = true
+		base.sessions[sid] = s
+		base.turns[sid] = []TurnInfo{{TurnID: "turn_ghost", ErrorMessage: "无人认领的错误", HasAssistantMsg: true}}
+		base.mu.Unlock()
+	}
+	var reads atomic.Int32
+	exec := &flakyTurnsExecutor{delayedTurnExecutor: &delayedTurnExecutor{
+		fakeExecutor: base,
+		onGetSession: func(id string) {
+			if reads.Add(1) >= 2 {
+				setBusy(base, id, false)
+			}
+		},
+	}, failTurnsUntilPrompt: true}
+
+	engine, err := NewEngine(store, exec, WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	task, err := engine.SaveTask(context.Background(), "kimicode-plus.scheduler", SaveTaskInput{
+		Name: "无证据不判成功", Prompt: "work", CWD: t.TempDir(), Mode: ModeNewSession, PermissionMode: "manual",
+		Schedule: ScheduleRule{Kind: "daily", Time: "09:00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.RunNow(context.Background(), "kimicode-plus.scheduler", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool {
+		runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+		return len(runs) == 1 && runs[0].Status != RunQueued && runs[0].Status != RunRunning
+	})
+	runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+	if runs[0].Status == RunCompleted {
+		t.Fatalf("unprovable run must not be completed: %+v", runs[0])
+	}
+	if runs[0].Status != RunFailed || runs[0].FailureKind != FailureExecution || !strings.Contains(runs[0].Message, "无法确认") {
+		t.Fatalf("expected explicit unverifiable failure, got %+v", runs[0])
+	}
+	exec.mu.Lock()
+	aborted := len(exec.abortedIDs)
+	exec.mu.Unlock()
+	if aborted != 0 {
+		t.Fatalf("unverifiable runs must not abort the session, aborts=%d", aborted)
+	}
+}
+
+// TestEngineACKAttributionIgnoresUnrelatedTurn proves the ACK scoping: a
+// concurrent turn (from the user) that errors before the run's own turn must
+// not fail the scheduled run.
+func TestEngineACKAttributionIgnoresUnrelatedTurn(t *testing.T) {
+	db := openTestDB(t)
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newFakeExecutor()
+	base.sessions["s_ack"] = SessionInfo{ID: "s_ack", Title: "并发会话", CWD: t.TempDir(), PendingInteraction: "none"}
+	base.turns["s_ack"] = []TurnInfo{{TurnID: "turn_old", HasAssistantMsg: true}}
+	base.receipt = SendPromptReceipt{UserMessageID: "um_ack"}
+	base.onPrompt = func(_ context.Context, sid, _, _, _, _ string) {
+		base.mu.Lock()
+		s := base.sessions[sid]
+		s.Busy = true
+		base.sessions[sid] = s
+		base.turns[sid] = []TurnInfo{
+			{TurnID: "turn_old", HasAssistantMsg: true},
+			{TurnID: "turn_user", ErrorMessage: "用户自己触发的错误", HasAssistantMsg: true},
+			{TurnID: "turn_ours", UserMessageIDs: []string{"um_ack"}, HasAssistantMsg: true},
+		}
+		base.mu.Unlock()
+	}
+	var reads atomic.Int32
+	exec := &delayedTurnExecutor{fakeExecutor: base, onGetSession: func(id string) {
+		if reads.Add(1) >= 2 {
+			setBusy(base, id, false)
+		}
+	}}
+
+	engine, err := NewEngine(store, exec, WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	task, err := engine.SaveTask(context.Background(), "kimicode-plus.scheduler", SaveTaskInput{
+		Name: "并发回合不误杀", Prompt: "work", Mode: ModeBoundSession, SessionID: "s_ack",
+		PermissionMode: "manual", Schedule: ScheduleRule{Kind: "daily", Time: "09:00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.RunNow(context.Background(), "kimicode-plus.scheduler", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool {
+		runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+		return len(runs) == 1 && runs[0].Status != RunQueued && runs[0].Status != RunRunning
+	})
+	runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+	if runs[0].Status != RunCompleted {
+		t.Fatalf("the unrelated error turn must not fail the run, got %+v", runs[0])
+	}
+}
+
+// TestEngineConcurrentRunsAttributeIndependently runs two tasks at once and
+// requires each run to be judged only by its own session's turns.
+func TestEngineConcurrentRunsAttributeIndependently(t *testing.T) {
+	db := openTestDB(t)
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newFakeExecutor()
+	base.sessions["s1"] = SessionInfo{ID: "s1", Title: "失败会话", CWD: t.TempDir(), PendingInteraction: "none"}
+	base.sessions["s2"] = SessionInfo{ID: "s2", Title: "成功会话", CWD: t.TempDir(), PendingInteraction: "none"}
+	base.turns["s1"] = []TurnInfo{{TurnID: "t1_old", HasAssistantMsg: true}}
+	base.turns["s2"] = []TurnInfo{{TurnID: "t2_old", HasAssistantMsg: true}}
+	base.onPrompt = func(_ context.Context, sid, _, _, _, _ string) {
+		base.mu.Lock()
+		s := base.sessions[sid]
+		s.Busy = true
+		base.sessions[sid] = s
+		switch sid {
+		case "s1":
+			base.turns[sid] = append(base.turns[sid], TurnInfo{TurnID: "t1_new", ErrorMessage: "s1 执行失败", HasAssistantMsg: true})
+		case "s2":
+			base.turns[sid] = append(base.turns[sid], TurnInfo{TurnID: "t2_new", HasAssistantMsg: true})
+		}
+		base.mu.Unlock()
+	}
+	var r1, r2 atomic.Int32
+	exec := &delayedTurnExecutor{fakeExecutor: base, onGetSession: func(id string) {
+		switch id {
+		case "s1":
+			if r1.Add(1) >= 2 {
+				setBusy(base, id, false)
+			}
+		case "s2":
+			if r2.Add(1) >= 2 {
+				setBusy(base, id, false)
+			}
+		}
+	}}
+
+	engine, err := NewEngine(store, exec, WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	task1, err := engine.SaveTask(context.Background(), "kimicode-plus.scheduler", SaveTaskInput{
+		Name: "并发失败方", Prompt: "work", Mode: ModeBoundSession, SessionID: "s1",
+		PermissionMode: "manual", Schedule: ScheduleRule{Kind: "daily", Time: "09:00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task2, err := engine.SaveTask(context.Background(), "kimicode-plus.scheduler", SaveTaskInput{
+		Name: "并发成功方", Prompt: "work", Mode: ModeBoundSession, SessionID: "s2",
+		PermissionMode: "manual", Schedule: ScheduleRule{Kind: "daily", Time: "09:00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.RunNow(context.Background(), "kimicode-plus.scheduler", task1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.RunNow(context.Background(), "kimicode-plus.scheduler", task2.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool {
+		runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", "", 10)
+		if len(runs) != 2 {
+			return false
+		}
+		for _, r := range runs {
+			if r.Status == RunQueued || r.Status == RunRunning {
+				return false
+			}
+		}
+		return true
+	})
+	runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", "", 10)
+	statusByTask := map[string]RunRecord{}
+	for _, r := range runs {
+		statusByTask[r.TaskID] = r
+	}
+	if r := statusByTask[task1.ID]; r.Status != RunFailed || !strings.Contains(r.Message, "s1 执行失败") {
+		t.Fatalf("task1 must fail with its own error, got %+v", r)
+	}
+	if r := statusByTask[task2.ID]; r.Status != RunCompleted {
+		t.Fatalf("task2 must complete independently, got %+v", r)
+	}
+}
+
+// TestEngineLongHistoryManyTurnsStillAttributed covers the silent-completion
+// variant of the bug: with more new turns than fit in the old fixed 20-turn
+// page the baseline anchor rotated out and any error went unnoticed.
+func TestEngineLongHistoryManyTurnsStillAttributed(t *testing.T) {
+	db := openTestDB(t)
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newFakeExecutor()
+	base.sessions["s_long"] = SessionInfo{ID: "s_long", Title: "长历史会话", CWD: t.TempDir(), PendingInteraction: "none"}
+	pre := make([]TurnInfo, 0, 45)
+	for i := 1; i <= 45; i++ {
+		pre = append(pre, TurnInfo{TurnID: fmt.Sprintf("t%02d", i), HasAssistantMsg: true})
+	}
+	base.turns["s_long"] = pre
+	base.onPrompt = func(_ context.Context, sid, _, _, _, _ string) {
+		base.mu.Lock()
+		s := base.sessions[sid]
+		s.Busy = true
+		base.sessions[sid] = s
+		for i := 46; i <= 66; i++ {
+			turn := TurnInfo{TurnID: fmt.Sprintf("t%02d", i), HasAssistantMsg: true}
+			if i == 66 {
+				turn.ErrorMessage = "迟到失败"
+			}
+			base.turns[sid] = append(base.turns[sid], turn)
+		}
+		base.mu.Unlock()
+	}
+	var reads atomic.Int32
+	exec := &pagingTurnsExecutor{delayedTurnExecutor: &delayedTurnExecutor{
+		fakeExecutor: base,
+		onGetSession: func(id string) {
+			if reads.Add(1) >= 2 {
+				setBusy(base, id, false)
+			}
+		},
+	}}
+
+	engine, err := NewEngine(store, exec, WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	task, err := engine.SaveTask(context.Background(), "kimicode-plus.scheduler", SaveTaskInput{
+		Name: "长历史归属", Prompt: "work", Mode: ModeBoundSession, SessionID: "s_long",
+		PermissionMode: "manual", Schedule: ScheduleRule{Kind: "daily", Time: "09:00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.RunNow(context.Background(), "kimicode-plus.scheduler", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool {
+		runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+		return len(runs) == 1 && runs[0].Status != RunQueued && runs[0].Status != RunRunning
+	})
+	runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+	if runs[0].Status != RunFailed || !strings.Contains(runs[0].Message, "迟到失败") {
+		t.Fatalf("the errored turn must be attributed despite page rotation, got %+v", runs[0])
+	}
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	largest := 0
+	for _, size := range exec.pageSizes {
+		if size > largest {
+			largest = size
+		}
+	}
+	if largest <= 20 {
+		t.Fatalf("observation must enlarge the turns page beyond the old fixed 20, got max %d", largest)
+	}
+}
+
+// TestEngineStateDelayKeepsWaitingForACKTurn ensures an idle report that
+// arrives before the run's turn is visible in the history does not complete the
+// run without evidence; the turn lands one poll later and carries the verdict.
+func TestEngineStateDelayKeepsWaitingForACKTurn(t *testing.T) {
+	db := openTestDB(t)
+	store, err := NewStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := newFakeExecutor()
+	base.sessions["s_late"] = SessionInfo{ID: "s_late", Title: "延迟会话", CWD: t.TempDir(), PendingInteraction: "none"}
+	base.turns["s_late"] = []TurnInfo{{TurnID: "turn_old", HasAssistantMsg: true}}
+	base.receipt = SendPromptReceipt{UserMessageID: "um_late"}
+	base.onPrompt = func(_ context.Context, sid, _, _, _, _ string) {
+		base.mu.Lock()
+		s := base.sessions[sid]
+		s.Busy = true
+		base.sessions[sid] = s
+		base.mu.Unlock()
+	}
+	var reads atomic.Int32
+	exec := &delayedTurnExecutor{fakeExecutor: base, onGetSession: func(id string) {
+		switch n := reads.Add(1); {
+		case n >= 3:
+			setBusy(base, id, false)
+			base.mu.Lock()
+			base.turns[id] = []TurnInfo{
+				{TurnID: "turn_old", HasAssistantMsg: true},
+				{TurnID: "turn_late", UserMessageIDs: []string{"um_late"}, ErrorMessage: "延迟失败", HasAssistantMsg: true},
+			}
+			base.mu.Unlock()
+		case n == 2:
+			setBusy(base, id, false)
+		}
+	}}
+
+	engine, err := NewEngine(store, exec, WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	task, err := engine.SaveTask(context.Background(), "kimicode-plus.scheduler", SaveTaskInput{
+		Name: "状态延迟不早判", Prompt: "work", Mode: ModeBoundSession, SessionID: "s_late",
+		PermissionMode: "manual", Schedule: ScheduleRule{Kind: "daily", Time: "09:00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.RunNow(context.Background(), "kimicode-plus.scheduler", task.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool {
+		runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+		return len(runs) == 1 && runs[0].Status != RunQueued && runs[0].Status != RunRunning
+	})
+	runs, _ := store.ListRuns(context.Background(), "kimicode-plus.scheduler", task.ID, 5)
+	if runs[0].Status != RunFailed || !strings.Contains(runs[0].Message, "延迟失败") {
+		t.Fatalf("the delayed ACK turn must decide the verdict, got %+v", runs[0])
 	}
 }

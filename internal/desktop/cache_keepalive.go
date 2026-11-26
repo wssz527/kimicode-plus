@@ -76,10 +76,19 @@ func applyRetentionPolicy(policy ResolvedCachePolicy, buckets []cache.RetentionB
 	return policy
 }
 
+// idleKeepAliveTokenBudget caps the weighted token spend of one keepalive cycle,
+// from one real user message to the next. Cache reads count at the full
+// input-token weight so a miss fits the same allowance.
 const idleKeepAliveTokenBudget int64 = 400_000
 
-// Count cache reads at the full input-token weight so a miss fits the same
-// allowance. Reserve a small amount for the probe and its reply.
+// keepAliveTokenEstimate is the pre-send lower bound for one probe, not a ceiling.
+// It covers the context the probe re-reads (the last main step's input, or the
+// session's reported context when larger) plus a fixed reserve for the probe text
+// and its short reply. The official prompt endpoint publishes no per-reply output
+// limit, so the reserve is not claimed to bound a misbehaving turn: once the
+// official turn settles, completeIdleKeepAlive bills max(estimate, settled usage),
+// and that settlement is what keeps an overrunning turn inside the budget at the
+// next check.
 func keepAliveTokenEstimate(session NativeSession, step cache.Step) int64 {
 	input := step.InputOther + step.InputCacheRead + step.InputCacheCreation
 	if session.Usage != nil {

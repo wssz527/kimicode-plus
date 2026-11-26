@@ -96,6 +96,99 @@ func TestPlannerNativeProtocolsContinueSignedToolTurn(t *testing.T) {
 	}
 }
 
+// The strict-endpoint contract: an OpenAI-protocol planner request carries only
+// parameters the model config verified. The adopted constraints:
+//   - max_tokens is sent only from a configured output limit (official model
+//     readback, registry `output` capability); the 8192 default exists solely
+//     on Kimi/Moonshot endpoints where the parameter is documented.
+//   - the Kimi-private `thinking` parameter never leaves Kimi/Moonshot hosts,
+//     decided by endpoint identity, not by model ID.
+//   - reasoning_effort is sent only for an effort the model config declares.
+func TestPlannerOpenAIRequestOnlySendsVerifiedCapabilities(t *testing.T) {
+	messages := []Message{{Role: "user", Content: "检查"}}
+	tools := []map[string]any{{"type": "function", "function": map[string]any{"name": "read_file", "parameters": map[string]any{"type": "object"}}}}
+	cases := []struct {
+		name, baseURL string
+		options       PlannerModelOptions
+		present       []string
+		absent        []string
+	}{
+		{"generic host omits unverified limit and private thinking", "https://api.openai.com/v1",
+			PlannerModelOptions{Thinking: "toggle", AdaptiveThinking: true, DefaultEffort: "high", SupportEfforts: []string{"high"}},
+			[]string{`"reasoning_effort":"high"`},
+			[]string{"max_tokens", "thinking"}},
+		{"configured output limit is sent on a strict endpoint", "https://api.openai.com/v1",
+			PlannerModelOptions{Thinking: "toggle", AdaptiveThinking: true, MaxOutput: 4096},
+			[]string{`"max_tokens":4096`},
+			[]string{"thinking", "reasoning_effort"}},
+		{"no declared effort, no effort parameter", "https://api.openai.com/v1",
+			PlannerModelOptions{Thinking: "toggle"},
+			nil,
+			[]string{"max_tokens", "thinking", "reasoning_effort"}},
+		{"kimi keeps the verified default limit and thinking", "https://api.moonshot.cn/v1",
+			PlannerModelOptions{Thinking: "toggle"},
+			[]string{`"max_tokens":8192`, `"thinking":{"type":"enabled"}`},
+			[]string{"reasoning_effort"}},
+		{"kimi thinking off suppresses thinking and effort", "https://api.moonshot.ai/v1",
+			PlannerModelOptions{Thinking: "none", DefaultEffort: "high", SupportEfforts: []string{"high"}},
+			nil,
+			[]string{"thinking", "reasoning_effort"}},
+		{"kimi configured limit wins over the default", "https://api.kimi.com/coding/v1",
+			PlannerModelOptions{Thinking: "toggle", AdaptiveThinking: true, MaxOutput: 12000},
+			[]string{`"max_tokens":12000`, `"thinking":{"type":"enabled"}`},
+			nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := plannerOpenAIRequest(Config{ID: "p", Protocol: "openai", BaseURL: tc.baseURL}, "m", tc.options, messages, tools)
+			encoded, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, field := range tc.present {
+				if !strings.Contains(string(encoded), field) {
+					t.Errorf("request missing %s: %s", field, encoded)
+				}
+			}
+			for _, field := range tc.absent {
+				if strings.Contains(string(encoded), field) {
+					t.Errorf("request carried unverified %s: %s", field, encoded)
+				}
+			}
+		})
+	}
+}
+
+func TestPlannerOpenAIStreamKeepsStrictEndpointsUntouched(t *testing.T) {
+	var body map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"部分\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	options := PlannerModelOptions{Thinking: "toggle", AdaptiveThinking: true}
+	var event StreamEvent
+	if err := New(nil, nil).StreamPlanner(context.Background(), Config{ID: "p", Protocol: "openai", BaseURL: upstream.URL}, "gpt-test", options, []Message{{Role: "user", Content: "检查"}}, nil, func(value StreamEvent) error {
+		event.Text += value.Text
+		if value.Finish != "" {
+			event.Finish = value.Finish
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"max_tokens", "thinking", "reasoning_effort", "tools", "tool_choice"} {
+		if _, ok := body[key]; ok {
+			t.Fatalf("unverified %s sent to a strict endpoint: %v", key, body)
+		}
+	}
+	if event.Text != "部分" || event.Finish != "length" {
+		t.Fatalf("stream not relayed: %+v", event)
+	}
+}
+
 func assertPlannerRequestParts(t *testing.T, request string, fields []string) {
 	t.Helper()
 	for _, field := range fields {

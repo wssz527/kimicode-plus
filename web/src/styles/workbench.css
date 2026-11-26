@@ -1207,7 +1207,7 @@
 .wb-tool-state[data-tone="danger"] { color: var(--danger); }
 
 .wb-tool-detail,
-.wb-reasoning > .wb-markdown {
+.wb-reasoning > [data-ekdp-thinking-body] {
   padding: 2px 12px 10px;
   overflow-wrap: anywhere;
 }

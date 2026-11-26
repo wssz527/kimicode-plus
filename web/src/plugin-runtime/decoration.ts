@@ -18,10 +18,17 @@ export interface TargetSpec {
   role?(block: HTMLElement): string | undefined;
 }
 
+const THINKING_ROOT = "data-ekdp-thinking-root";
+const THINKING_BLOCK = "[data-ekdp-thinking]";
+const THINKING_SOURCE = "data-ekdp-thinking-source";
+
 export const DECORATION_TARGETS = {
   thinking: {
     selector: ".think",
     state(block: HTMLElement) {
+      if (block.matches(THINKING_BLOCK)) {
+        return { open: block.hasAttribute("open"), streaming: block.hasAttribute("data-streaming") };
+      }
       const body = block.querySelector(".think-body");
       const open = Boolean(body && body.classList.contains("open"));
       const streaming =
@@ -75,6 +82,7 @@ interface Registration {
   target: DecorationTarget;
   decorator: (block: HTMLElement, info: BlockInfo) => Cleanup | DecorationHandle | void;
   onError?: (error: unknown) => void;
+  includeEnhanced: boolean;
   blocks: Map<HTMLElement, BlockState>;
 }
 
@@ -102,6 +110,8 @@ interface BlockState {
  * every real update.
  */
 function blockText(block: HTMLElement): string {
+  const raw = block.querySelector(`[${THINKING_SOURCE}]`)?.getAttribute(THINKING_SOURCE);
+  if (raw != null) return raw;
   const parts: string[] = [];
   const walk = (node: unknown): void => {
     if (!node || typeof node !== "object") return;
@@ -125,6 +135,7 @@ export class DecorationHub implements Disposable {
   private registrations = new Set<Registration>();
   private observer: DecorationObserver | null = null;
   private doc: DecorationDocument | null = null;
+  private thinkingRoots = new Set<ShadowRoot>();
   private scheduled = false;
   private readonly options: DecorationHubOptions;
   private readonly schedule: (flush: () => void) => void;
@@ -151,8 +162,9 @@ export class DecorationHub implements Disposable {
     decorator: Registration["decorator"],
     scope: { add(cleanup: Cleanup | void): void },
     onError?: (error: unknown) => void,
+    includeEnhanced = false,
   ): Disposable {
-    const registration: Registration = { target, decorator, onError, blocks: new Map() };
+    const registration: Registration = { target, decorator, onError, includeEnhanced: target === "thinking" && includeEnhanced, blocks: new Map() };
     this.registrations.add(registration);
     this.ensureObserving();
     this.sweep();
@@ -163,6 +175,7 @@ export class DecorationHub implements Disposable {
       this.registrations.delete(registration);
       for (const block of [...registration.blocks.keys()]) this.releaseBlock(registration, block);
       if (this.registrations.size === 0) this.stop();
+      else if (registration.includeEnhanced) this.syncThinkingRoots();
     };
     scope.add(release);
     return { dispose: release };
@@ -174,11 +187,15 @@ export class DecorationHub implements Disposable {
     if (this.registrations.size === 0) return;
     const doc = this.doc;
     if (!doc) return;
+    this.syncThinkingRoots();
     for (const registration of this.registrations) {
       const spec = DECORATION_TARGETS[registration.target];
       let blocks: HTMLElement[] = [];
       try {
         blocks = Array.from(doc.querySelectorAll(spec.selector));
+        if (registration.includeEnhanced) {
+          for (const root of this.thinkingRoots) blocks.push(...root.querySelectorAll<HTMLElement>(THINKING_BLOCK));
+        }
       } catch (error) {
         registration.onError?.(error);
         continue;
@@ -288,16 +305,37 @@ export class DecorationHub implements Disposable {
     const observer = create(records => this.handleMutations(records));
     if (!observer) return;
     this.observer = observer;
-    observer.observe(doc.body, {
+    this.observe(doc.body);
+  }
+
+  private observe(root: unknown): void {
+    this.observer?.observe(root, {
       childList: true,
       subtree: true,
       characterData: true,
-      // `.think-body.open` and `.think.streaming` are the two state bits the
-      // thinking target needs; observing every attribute would wake the hub for
-      // unrelated host churn (style, aria, data-* written by other panels).
       attributes: true,
-      attributeFilter: ["class", "data-streaming"],
+      attributeFilter: ["class", "open", "data-streaming", THINKING_ROOT, "data-ekdp-thinking", THINKING_SOURCE],
     });
+  }
+
+  private syncThinkingRoots(): void {
+    const doc = this.doc;
+    if (!doc) return;
+    const wanted = new Set<ShadowRoot>();
+    if (Array.from(this.registrations).some(registration => registration.includeEnhanced)) {
+      for (const host of Array.from(doc.querySelectorAll(`[${THINKING_ROOT}]`))) {
+        if (host.shadowRoot) wanted.add(host.shadowRoot);
+      }
+    }
+    if (Array.from(this.thinkingRoots).some(root => !wanted.has(root))) {
+      this.observer?.disconnect();
+      this.observe(doc.body);
+      this.thinkingRoots.clear();
+    }
+    for (const root of wanted) {
+      if (!this.thinkingRoots.has(root)) this.observe(root);
+    }
+    this.thinkingRoots = wanted;
   }
 
   /**
@@ -313,11 +351,12 @@ export class DecorationHub implements Disposable {
   private handleMutations(records: DecorationMutation[]): void {
     if (this.registrations.size === 0) return;
     let dirty = false;
+    const enhanced = Array.from(this.registrations).some(registration => registration.includeEnhanced);
     for (const record of records) {
       const target = record.target;
       const element = elementOf(target);
-      if (!element) continue;
-      if (isOwned(element)) continue;
+      if (!element || isOwned(element)) continue;
+      if (enhanced && (record.attributeName === THINKING_ROOT || record.attributeName === "data-ekdp-thinking")) dirty = true;
       if (record.type === "childList") {
         // A decorator renders into a host container it does not own — appending
         // its translation node to the block body is a childList change whose
@@ -331,8 +370,12 @@ export class DecorationHub implements Disposable {
             const node = addedNodes[index];
             const added = elementOf(node);
             if (!added) continue;
+            if (enhanced && enclosesThinkingRoot(added)) {
+              dirty = true;
+              break;
+            }
             for (const registration of this.registrations) {
-              const selector = DECORATION_TARGETS[registration.target].selector;
+              const selector = matchingSelector(registration);
               if (closestMatch(added, selector) || added.querySelector?.(selector)) {
                 dirty = true;
                 break;
@@ -345,13 +388,13 @@ export class DecorationHub implements Disposable {
         if (removed) {
           for (let index = 0; index < removed.length; index += 1) {
             const node = removed[index];
-            if (node && this.releaseInside(node)) dirty = true;
+            if (!node) continue;
+            if (this.releaseInside(node) || (enhanced && enclosesThinkingRoot(elementOf(node)))) dirty = true;
           }
         }
       }
       for (const registration of this.registrations) {
-        const spec = DECORATION_TARGETS[registration.target];
-        const block = closestMatch(element, spec.selector);
+        const block = closestMatch(element, matchingSelector(registration));
         if (!block) continue;
         const state = registration.blocks.get(block);
         if (state) {
@@ -392,6 +435,7 @@ export class DecorationHub implements Disposable {
     this.observer?.disconnect();
     this.observer = null;
     this.doc = null;
+    this.thinkingRoots.clear();
   }
 
   dispose(): void {
@@ -420,9 +464,20 @@ function cleanupRunner(result: Cleanup | DecorationHandle | void): () => void {
   return () => {};
 }
 
+function matchingSelector(registration: Registration): string {
+  const selector = DECORATION_TARGETS[registration.target].selector;
+  return registration.includeEnhanced ? `${selector}, ${THINKING_BLOCK}` : selector;
+}
+
+function enclosesThinkingRoot(element: HTMLElement | null): boolean {
+  const selector = `[${THINKING_ROOT}]`;
+  return Boolean(element?.matches(selector) || element?.querySelector(selector));
+}
+
 function elementOf(node: Node | null | undefined): HTMLElement | null {
   if (!node) return null;
   if (node.nodeType === 1) return node as HTMLElement;
+  if (node.nodeType === 11) return ((node as ShadowRoot).host as HTMLElement | undefined) ?? null;
   return (node.parentElement as HTMLElement | null) ?? null;
 }
 

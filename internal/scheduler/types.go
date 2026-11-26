@@ -126,10 +126,10 @@ type RunRecord struct {
 }
 
 type Prefs struct {
-	AutoMarkRead          bool `json:"autoMarkRead"`
-	MaxConcurrent         int  `json:"maxConcurrent"`
-	MinQuotaPercent       int  `json:"minQuotaPercent"`
-	MinQuotaPercentSet    bool `json:"-"`
+	AutoMarkRead       bool `json:"autoMarkRead"`
+	MaxConcurrent      int  `json:"maxConcurrent"`
+	MinQuotaPercent    int  `json:"minQuotaPercent"`
+	MinQuotaPercentSet bool `json:"-"`
 }
 
 type AutoAttachInfo struct {
@@ -184,6 +184,15 @@ type TurnInfo struct {
 	ApprovalTitle   string
 	ErrorMessage    string
 	HasAssistantMsg bool
+	// UserMessageIDs carries the item ids of the turn's user messages. The
+	// prompts endpoint echoes the accepted user_message_id, which is how a run
+	// proves which turns belong to it.
+	UserMessageIDs []string
+}
+
+// SendPromptReceipt is the official acknowledgment of an accepted prompt.
+type SendPromptReceipt struct {
+	UserMessageID string
 }
 
 type SessionCacheStat struct {
@@ -201,7 +210,7 @@ type Executor interface {
 	GetSession(ctx context.Context, id string) (SessionInfo, error)
 	GetSessionTurns(ctx context.Context, id string, pageSize int) ([]TurnInfo, error)
 	CreateSession(ctx context.Context, cwd, title, model, effort, permissionMode string) (SessionInfo, error)
-	SendPrompt(ctx context.Context, sessionID, text, model, effort, permissionMode string) error
+	SendPrompt(ctx context.Context, sessionID, text, model, effort, permissionMode string) (SendPromptReceipt, error)
 	ArchiveSession(ctx context.Context, sessionID string) error
 	ArchiveSessions(ctx context.Context, sessionIDs []string) error
 	AbortSession(ctx context.Context, sessionID string) error

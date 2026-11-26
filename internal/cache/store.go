@@ -486,17 +486,27 @@ func (s *Store) LastMainStep(ctx context.Context, sessionID string) (Step, bool,
 	return step, true, nil
 }
 
-// FirstMainStepForTurn attributes usage to the exact official turn that incurred it.
-func (s *Store) FirstMainStepForTurn(ctx context.Context, sessionID, turnID string) (Step, bool, error) {
-	step := Step{SessionID: sessionID, Agent: "main", TurnID: turnID}
-	var at string
-	err := s.db.QueryRowContext(ctx, `SELECT step_uuid,model,time,input_other,input_cache_read,input_cache_creation,output FROM cache_steps WHERE session_id=? AND agent='main' AND turn_id=? ORDER BY time,rowid LIMIT 1`, sessionID, turnID).
-		Scan(&step.StepUUID, &step.Model, &at, &step.InputOther, &step.InputCacheRead, &step.InputCacheCreation, &step.Output)
-	if errors.Is(err, sql.ErrNoRows) {
-		return step, false, nil
+// MainStepsForTurn returns every persisted main-agent step recorded for one
+// official turn, oldest first. Keepalive settles a whole keepalive turn with it:
+// a probe that called tools or was interrupted still spent every step recorded so
+// far, and the earliest step alone decides the cache verdict.
+func (s *Store) MainStepsForTurn(ctx context.Context, sessionID, turnID string) ([]Step, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT step_uuid,model,time,input_other,input_cache_read,input_cache_creation,output FROM cache_steps WHERE session_id=? AND agent='main' AND turn_id=? ORDER BY time,rowid`, sessionID, turnID)
+	if err != nil {
+		return nil, err
 	}
-	step.At = parseTime(at)
-	return step, err == nil, err
+	defer rows.Close()
+	steps := []Step{}
+	for rows.Next() {
+		step := Step{SessionID: sessionID, Agent: "main", TurnID: turnID}
+		var at string
+		if err = rows.Scan(&step.StepUUID, &step.Model, &at, &step.InputOther, &step.InputCacheRead, &step.InputCacheCreation, &step.Output); err != nil {
+			return nil, err
+		}
+		step.At = parseTime(at)
+		steps = append(steps, step)
+	}
+	return steps, rows.Err()
 }
 
 // StepAfter returns the first main-agent step newer than after. keepalive uses it

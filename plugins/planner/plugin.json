@@ -1,7 +1,7 @@
 {
   "id": "kimicode-plus.planner",
   "name": "规划",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "minCoreVersion": "0.2.10",
   "apiVersion": 2,
   "description": "右侧面板里的规划：网页来源按站点去噪提取对话并提供直接提取与可选模型归纳双入口，本地来源使用核心规划引擎，结果经可编辑预览交接给 Code 会话。",

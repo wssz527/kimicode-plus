@@ -1205,7 +1205,19 @@ func (s *NativeService) completeIdleKeepAlive(job idleKeepAliveJob) {
 	for {
 		select {
 		case <-ctx.Done():
-			s.finishIdleKeepAlive(job, turn.TurnID, keepAliveUnknown, "保活回合未在核对窗口内完成，等待下一次真实请求", "unconfirmed", false, false)
+			// The turn never settled, but the steps already recorded for it are real
+			// spend; bill what exists before the cycle is closed out. Recorded
+			// evidence keeps its verdict in the result, while the turn itself still
+			// ends unconfirmed.
+			state, note := keepAliveUnknown, "保活回合未在核对窗口内完成，等待下一次真实请求"
+			if turn.TurnID != "" {
+				settleCtx, settleCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if evidence, evidenceNote := s.settleKeepAliveTurnUsage(settleCtx, &job, turn.TurnID); evidenceNote != "" {
+					state, note = evidence, suffixKeepAliveNote(evidenceNote, "保活回合未在核对窗口内完成，等待下一次真实请求")
+				}
+				settleCancel()
+			}
+			s.finishIdleKeepAlive(job, turn.TurnID, state, note, "unconfirmed", false, false)
 			return
 		case <-poll.C:
 		}
@@ -1220,7 +1232,8 @@ func (s *NativeService) completeIdleKeepAlive(job idleKeepAliveJob) {
 		turn = candidate
 		s.setIdleInFlight(job.sessionID, idleInFlightState{UserMessageID: job.userMessageID, TurnID: turn.TurnID})
 		if !isLast {
-			s.finishIdleKeepAlive(job, turn.TurnID, keepAliveUnknown, "保活后已有新回合，保留当前对话", "", false, false)
+			state, evidence := s.settleKeepAliveTurnUsage(ctx, &job, turn.TurnID)
+			s.finishIdleKeepAlive(job, turn.TurnID, state, suffixKeepAliveNote(evidence, "保活后已有新回合，保留当前对话"), "", false, false)
 			return
 		}
 		snapshot := snapshotFromCache(loaded)
@@ -1228,29 +1241,14 @@ func (s *NativeService) completeIdleKeepAlive(job idleKeepAliveJob) {
 			break
 		}
 	}
+	state, evidence := s.settleKeepAliveTurnUsage(ctx, &job, turn.TurnID)
 	if turnHasToolCall(turn) {
-		s.finishIdleKeepAlive(job, turn.TurnID, keepAliveUnknown, "保活回合触发工具，已保留回合供检查", "undo_failed", false, false)
+		s.finishIdleKeepAlive(job, turn.TurnID, state, suffixKeepAliveNote(evidence, "保活回合触发工具，已保留回合供检查"), "undo_failed", false, false)
 		return
 	}
-
-	state, note := keepAliveUnknown, "保活回合尚无可核实的缓存用量"
-	if store := s.initializedCacheStore(); store != nil {
-		for attempt := 0; attempt < 3 && ctx.Err() == nil; attempt++ {
-			_, _ = store.Scan(ctx, time.Now().UTC(), true)
-			step, found, err := store.FirstMainStepForTurn(ctx, job.sessionID, turn.TurnID)
-			if err == nil && found && step.StepUUID != job.priorStep.StepUUID {
-				reportsCache := job.priorStep.Model == step.Model && (job.priorStep.InputCacheRead > 0 || job.priorStep.InputCacheCreation > 0)
-				state, note = judgeKeepAlive(step, reportsCache)
-				job.actualTokens = step.InputOther + step.InputCacheRead + step.InputCacheCreation + step.Output
-				break
-			}
-			if attempt < 2 {
-				select {
-				case <-ctx.Done():
-				case <-poll.C:
-				}
-			}
-		}
+	note := evidence
+	if note == "" {
+		note = "保活回合尚无可核实的缓存用量"
 	}
 	postGit, err := gitStatusFingerprint(ctx, job.cwd)
 	if err != nil || postGit != job.preGit {
@@ -1289,11 +1287,63 @@ func (s *NativeService) completeIdleKeepAlive(job idleKeepAliveJob) {
 
 	s.mu.Lock()
 	if cached, ok := s.cache[job.sessionID]; ok {
-		cached.turns = slices.DeleteFunc(cached.turns, func(item NativeTurn) bool { return item.TurnID == turn.TurnID })
+		// Rebuild instead of deleting in place: already published views still hold
+		// the old backing array, and DeleteFunc would zero it under them.
+		kept := make([]NativeTurn, 0, len(cached.turns))
+		for _, item := range cached.turns {
+			if item.TurnID != turn.TurnID {
+				kept = append(kept, item)
+			}
+		}
+		cached.turns = kept
 		s.cache[job.sessionID] = cached
 	}
 	s.mu.Unlock()
 	s.finishIdleKeepAlive(job, turn.TurnID, state, note+"。已撤回保活回合", "", false, false)
+}
+
+// settleKeepAliveTurnUsage settles the real token cost of the official keepalive
+// turn from the main-agent steps already persisted for its turn ID: one forced
+// scan, and the returned state and note describe exactly that snapshot. The
+// earliest persisted step alone decides the cache verdict; every attributable
+// step adds to job.actualTokens, because a turn that called tools, was
+// interrupted or lost its last step still spent the tokens recorded so far. A
+// step whose usage lands in the store after this scan is not back-billed. An
+// empty note with keepAliveUnknown means no step could be attributed, and
+// finishIdleKeepAlive then bills the pre-send estimate as the floor.
+func (s *NativeService) settleKeepAliveTurnUsage(ctx context.Context, job *idleKeepAliveJob, turnID string) (state, note string) {
+	state = keepAliveUnknown
+	store := s.initializedCacheStore()
+	if store == nil || turnID == "" {
+		return state, ""
+	}
+	_, _ = store.Scan(ctx, time.Now().UTC(), true)
+	found, err := store.MainStepsForTurn(ctx, job.sessionID, turnID)
+	if err != nil {
+		return state, ""
+	}
+	attributable := make([]cache.Step, 0, len(found))
+	for _, step := range found {
+		if step.StepUUID != job.priorStep.StepUUID {
+			attributable = append(attributable, step)
+		}
+	}
+	if len(attributable) == 0 {
+		return state, ""
+	}
+	reportsCache := job.priorStep.Model == attributable[0].Model && (job.priorStep.InputCacheRead > 0 || job.priorStep.InputCacheCreation > 0)
+	state, note = judgeKeepAlive(attributable[0], reportsCache)
+	for _, step := range attributable {
+		job.actualTokens += step.InputOther + step.InputCacheRead + step.InputCacheCreation + step.Output
+	}
+	return state, note
+}
+
+func suffixKeepAliveNote(evidence, tail string) string {
+	if evidence == "" {
+		return tail
+	}
+	return evidence + "。" + tail
 }
 
 func (s *NativeService) finishIdleKeepAlive(job idleKeepAliveJob, turnID, state, note, stopReason string, retry, release bool) {
@@ -1327,6 +1377,9 @@ func (s *NativeService) finishIdleKeepAlive(job idleKeepAliveJob, turnID, state,
 				record.SpentTokens = job.before.SpentTokens
 				record.LastPrompt, record.LastKeepAliveAt = job.before.LastPrompt, job.before.LastKeepAliveAt
 			} else {
+				// The estimate is the floor: a turn without a usable usage record is
+				// still billed at what it was expected to cost, and a settled turn
+				// bills the higher of the two so the budget can only tighten.
 				record.SpentTokens = job.before.SpentTokens + max(job.estimate, job.actualTokens)
 			}
 			if retry || release || state == keepAliveUnknown {

@@ -3181,7 +3181,7 @@ export async function activate(ctx) {
           view = messageView(message);
           messageViews.set(message.id, view);
         }
-        view.update(message);
+        view.update(message, thread.status === "running" && message === messages.at(-1));
         if (view.wrapper !== cursor) el.threadList.insertBefore(view.wrapper, cursor || threadFooter);
         cursor = view.wrapper.nextElementSibling;
       }
@@ -3274,6 +3274,8 @@ export async function activate(ctx) {
     wrapper.append(head);
     const details = node("details", "ekd-tool ekd-reasoning");
     const reasoning = node("div");
+    const text = node("div");
+    reasoning.append(text);
     details.append(node("summary", "", "思考过程"), reasoning);
     const content = node("div", mine ? "ekd-msg-text" : "ekd-plan-text");
     wrapper.append(details, content);
@@ -3298,13 +3300,19 @@ export async function activate(ctx) {
     wrapper.append(actions);
     return {
       wrapper,
-      update(next) {
+      update(next, streaming) {
         const previous = current;
         current = next;
+        const thinking = Boolean(next.reasoning && !next.tool);
+        details.toggleAttribute("data-streaming", thinking && streaming);
         if (!previous || previous.reasoning !== next.reasoning || previous.tool !== next.tool || (next.tool && previous.text !== next.text)) {
           details.hidden = !next.reasoning && !next.tool;
+          details.toggleAttribute("data-ekdp-thinking", thinking);
+          reasoning.toggleAttribute("data-ekdp-thinking-body", thinking);
+          if (thinking) reasoning.setAttribute("data-ekdp-thinking-source", next.reasoning);
+          else reasoning.removeAttribute("data-ekdp-thinking-source");
           details.firstElementChild.textContent = next.tool ? "工具 · " + next.tool : "思考过程";
-          reasoning.textContent = next.tool ? next.text || "" : next.reasoning || "";
+          text.textContent = next.tool ? next.text || "" : next.reasoning || "";
         }
         actions.hidden = !next.text?.trim();
         const hideEmpty = !next.text?.trim() && !next.reasoning && !next.tool;
@@ -4345,6 +4353,7 @@ export async function activate(ctx) {
     render: element => {
       mountHost = element;
       const host = document.createElement("div");
+      host.setAttribute("data-ekdp-thinking-root", "");
       host.style.cssText = "display:flex;flex-direction:column;flex:1 1 auto;min-height:0;min-width:0;height:100%";
       shadow = host.attachShadow({ mode: "open" });
       const style = document.createElement("style");

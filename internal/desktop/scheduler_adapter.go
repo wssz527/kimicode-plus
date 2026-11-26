@@ -92,9 +92,15 @@ func (e *SchedulerExecutor) GetSessionTurns(ctx context.Context, id string, page
 			info.ErrorMessage = turn.Error.Message
 		}
 		for _, item := range turn.Items {
-			if item.Type == "assistant_message" {
+			switch item.Type {
+			case "assistant_message":
 				info.HasAssistantMsg = true
-				break
+			case "user_message":
+				// The prompts endpoint echoes this id, letting a scheduled run
+				// claim exactly the turn its prompt created.
+				if itemID := strings.TrimSpace(item.ItemID); itemID != "" {
+					info.UserMessageIDs = append(info.UserMessageIDs, itemID)
+				}
 			}
 		}
 		out = append(out, info)
@@ -136,7 +142,7 @@ func (e *SchedulerExecutor) CreateSession(ctx context.Context, cwd, title, model
 	return toSchedulerSession(sess), nil
 }
 
-func (e *SchedulerExecutor) SendPrompt(ctx context.Context, sessionID, text, model, effort, permissionMode string) error {
+func (e *SchedulerExecutor) SendPrompt(ctx context.Context, sessionID, text, model, effort, permissionMode string) (scheduler.SendPromptReceipt, error) {
 	input := map[string]any{
 		"id":   sessionID,
 		"text": text,
@@ -151,8 +157,17 @@ func (e *SchedulerExecutor) SendPrompt(ctx context.Context, sessionID, text, mod
 	if permissionMode != "" {
 		input["permissionMode"] = permissionMode
 	}
-	_, err := e.service.sendPrompt(ctx, input)
-	return err
+	raw, err := e.service.sendPrompt(ctx, input)
+	if err != nil {
+		return scheduler.SendPromptReceipt{}, err
+	}
+	receipt := scheduler.SendPromptReceipt{}
+	if body, ok := raw.(map[string]any); ok {
+		if id, ok := body["user_message_id"].(string); ok {
+			receipt.UserMessageID = strings.TrimSpace(id)
+		}
+	}
+	return receipt, nil
 }
 
 func (e *SchedulerExecutor) ArchiveSession(ctx context.Context, sessionID string) error {

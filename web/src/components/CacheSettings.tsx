@@ -442,7 +442,7 @@ export function CacheSettings({ host }: { host: NativeHost }) {
           />
         </div>
         <p className="eks-row is-sub is-note">
-          所有供应商都受 Token 预算限制，连续两次未命中会停止。保活回合仅在安全检查通过后自动撤回，仍可能触发官方通知及会话钩子。
+          所有供应商都按剩余 Token 预算决定是否发送。单次实际用量可能超过估算，连续两次未命中会停止。保活回合仅在安全检查通过后自动撤回，仍可能触发官方通知及会话钩子。
         </p>
       </> : null}
       {keepAliveAlert ? <p className="eks-row is-sub is-note" role="status">{keepAliveAlert}</p> : null}

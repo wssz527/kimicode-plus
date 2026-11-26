@@ -87,8 +87,11 @@ func TestStreamKAPModelStreamsOfficialCatalogModelWithoutPersistingSecret(t *tes
 	if seenModel != "synthetic-fast" {
 		t.Fatalf("unexpected upstream model: %q", seenModel)
 	}
-	if seenProvider != "provider" || seenOverride != "model" || seenOptions["max_tokens"] != float64(16000) || seenOptions["reasoning_effort"] != "low" || seenOptions["thinking"].(map[string]any)["type"] != "enabled" {
+	if seenProvider != "provider" || seenOverride != "model" || seenOptions["max_tokens"] != float64(16000) || seenOptions["reasoning_effort"] != "low" {
 		t.Fatalf("planner ignored model settings: %#v provider=%q override=%q", seenOptions, seenProvider, seenOverride)
+	}
+	if _, ok := seenOptions["thinking"]; ok {
+		t.Fatalf("Kimi-specific thinking leaked to a generic OpenAI endpoint: %#v", seenOptions["thinking"])
 	}
 	if !strings.Contains(collected.String(), "规划摘要") {
 		t.Fatalf("unexpected streamed text: %q", collected.String())

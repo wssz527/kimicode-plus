@@ -732,6 +732,11 @@ test("mounted planner panel invalidates preview confirmation across all 6 fields
       if (this.tagName !== "#FRAGMENT" && this.children.length > 0) this.children = [];
     }
     setAttribute(k: string, v: string) { this.attrs.set(k, String(v)); }
+    toggleAttribute(k: string, force = !this.attrs.has(k)) {
+      if (force) this.attrs.set(k, "");
+      else this.attrs.delete(k);
+      return force;
+    }
     getAttribute(k: string) { return this.attrs.get(k) ?? null; }
     hasAttribute(k: string) { return this.attrs.has(k); }
     removeAttribute(k: string) { this.attrs.delete(k); }

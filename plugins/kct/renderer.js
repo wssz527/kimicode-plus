@@ -49,9 +49,10 @@ const DEFAULTS = {
 
 export async function activate(ctx) {
   const engine = await createEngine(ctx);
-  const style = injectStyles();
+  injectStyles(document);
+  ctx.onDispose(() => removeStyles(document));
   const blocks = new Set();
-  const popover = createSettingsPopover({ ctx, engine, blocks });
+  const popover = createSettingsPopover({ ctx, engine, blocks, root: document });
 
   function current() {
     return engine.settings;
@@ -98,9 +99,11 @@ export async function activate(ctx) {
   window.addEventListener("ekdp-kct:cache", onCacheCleared);
 
   const decoration = ctx.ui.decorate("thinking", (block, info) => {
-    const head = block.querySelector("button.think-head");
-    const body = block.querySelector(".think-body-inner") ?? block.querySelector(".think-body");
-    // 没有头部或正文的块不是思考块，宿主可能只是复用了类名。
+    const enhanced = block.matches("[data-ekdp-thinking]");
+    const style = enhanced ? injectStyles(block.getRootNode()) : null;
+    const root = block.getRootNode();
+    const head = enhanced ? block.querySelector("summary") : block.querySelector("button.think-head");
+    const body = enhanced ? block.querySelector("[data-ekdp-thinking-body]") : block.querySelector(".think-body-inner") ?? block.querySelector(".think-body");
     if (!head || !body) return;
 
     const bar = document.createElement("div");
@@ -137,6 +140,9 @@ export async function activate(ctx) {
       block,
       body,
       bar,
+      enhanced,
+      style,
+      root,
       status,
       toggle,
       info,
@@ -160,7 +166,7 @@ export async function activate(ctx) {
       signature: translationSignature(engine.settings),
     };
     blocks.add(state);
-    bar.hidden = !info.open;
+    bar.hidden = !info.open || enhanced;
 
     toggle.addEventListener("click", () => {
       if (state.rendered) {
@@ -180,29 +186,33 @@ export async function activate(ctx) {
       state.requested = true;
       schedule(state, true);
     });
-    settings.addEventListener("click", () => popover.toggle(settings));
+    const manual = createSettingsPopover({ ctx, engine, blocks: state.enhanced ? new Set([state]) : blocks, root: state.root?.ownerDocument ?? document });
+    state.manual = manual;
+    settings.addEventListener("click", () => manual.toggle(settings));
 
     schedule(state, false);
 
     return {
       update(next) {
         state.info = next;
-        bar.hidden = !next.open;
-        if (!next.open) popover.closeFor(settings);
+        bar.hidden = !next.open || state.enhanced;
+        if (!next.open) state.manual.closeFor(settings);
         schedule(state, false);
       },
       dispose() {
         cancel(state);
         blocks.delete(state);
+        for (const node of state.body.querySelectorAll("[data-ekdp-kct-hidden]")) node.removeAttribute("data-ekdp-kct-hidden");
+        state.manual.dispose();
         popover.closeFor(settings);
+        if (state.style) removeStyles(state.root);
         bar.remove();
-        if (state.sourceNode) state.sourceNode.removeAttribute("data-ekdp-kct-hidden");
         const node = state.body.querySelector(".ekdp-kct-translated");
         node?.remove();
         state.block.removeAttribute("data-ekdp-kct-view");
       },
     };
-  });
+  }, { includeEnhanced: true });
   ctx.onDispose(() => {
     window.removeEventListener("ekdp-kct:settings", onSettingsChanged);
     window.removeEventListener("ekdp-kct:cache", onCacheCleared);
@@ -210,7 +220,6 @@ export async function activate(ctx) {
     decoration.dispose();
     blocks.clear();
     engine.dispose();
-    style.remove();
   });
 
   ctx.log("info", "思考内容翻译已启用");
@@ -258,13 +267,13 @@ export async function activate(ctx) {
     state.bar.hidden = false;
 
     // 宿主可能替换正文节点（虚拟列表），此时旧译文与旧状态全部作废。
-    const body = state.block.querySelector(".think-body-inner") ?? state.block.querySelector(".think-body");
+    const body = state.enhanced ? state.block.querySelector("[data-ekdp-thinking-body]") : state.block.querySelector(".think-body-inner") ?? state.block.querySelector(".think-body");
     if (!body) return;
     if (body !== state.body) {
       state.generation += 1;
       state.running = false;
       state.body = body;
-      state.sourceNode = pickSource(body);
+      state.sourceNode = state.enhanced ? null : pickSource(body);
       state.source = "";
       state.done = false;
       state.rendered = false;
@@ -273,7 +282,7 @@ export async function activate(ctx) {
       setView(state, "original");
     }
     if (!state.bar.isConnected) {
-      const head = state.block.querySelector("button.think-head");
+      const head = state.enhanced ? state.block.querySelector("summary") : state.block.querySelector("button.think-head");
       if (head) head.after(state.bar);
       else state.block.prepend(state.bar);
     }
@@ -300,13 +309,14 @@ export async function activate(ctx) {
       state.done = false;
       state.rendered = false;
       setView(state, "original");
+      if (state.enhanced && state.requested) state.requested = false;
     } else if (state.done) {
       if (!state.skipped && !state.body.querySelector(".ekdp-kct-translated")) state.done = false;
       setView(state, state.view);
     }
 
     const settings = current();
-    if (!state.running && state.info.open && (settings.autoTranslate || state.requested || force)) {
+    if (!state.running && state.info.open && ((!state.enhanced && settings.autoTranslate) || state.requested || force)) {
       if (!source.trim()) return;
       if (source === state.source && state.done) return;
       // 自动扫描遇到与上次失败完全相同的原文时不再重试：429/断网会让每次
@@ -347,10 +357,21 @@ export async function activate(ctx) {
       return;
     }
     if (source === state.source && state.rendered) {
-      if (!state.info.streaming) state.done = true;
+      if (!state.info.streaming) {
+        state.done = true;
+        // 流式期间的收尾分支：全部内容已译出但状态还停在「后续内容待翻译」，
+        // 这里必须一并清掉。
+        setStatus(state, "ok", "");
+      }
       return;
     }
 
+    if (state.enhanced && state.info.streaming) {
+      if (!state.running) setStatus(state, "loading", "等待思考完成");
+      state.running = false;
+      state.generation += 1;
+      return;
+    }
     const generation = ++state.generation;
     const body = state.body;
     const valid = () =>
@@ -391,7 +412,10 @@ export async function activate(ctx) {
     } finally {
       if (state.generation === generation) {
         state.running = false;
-        if (valid() && readSource(state) !== fullSource) schedule(state, false);
+        // valid() 为假除了折叠与断开，还可能是原文被整体替换：这时必须重新调
+        // 度，否则新原文永远得不到翻译，状态也停在「翻译中…」。schedule 会经
+        // maybeRun 按当前状态重新判断，块已折叠或已断开时它自己会退出。
+        if (!valid() || readSource(state) !== fullSource) schedule(state, false);
       }
     }
   }
@@ -406,17 +430,13 @@ export async function activate(ctx) {
   function setView(state, view) {
     state.view = view;
     state.block.setAttribute("data-ekdp-kct-view", view);
-    const source = pickSource(state.body);
-    if (source) {
-      state.sourceNode = source;
+    const source = state.enhanced ? null : pickSource(state.body);
+    if (state.enhanced || source) {
+      if (source) state.sourceNode = source;
       // Written as an attribute rather than a class: the hub observes class
       // changes on host nodes, and a class toggle here would look like host churn
       // and invalidate the very translation that caused it.
-      //
-      // A thinking body is not always one <pre>. When it holds several
-      // paragraphs, the picked source is only one of them and hiding it alone
-      // would leave the rest of the original visible above the translation.
-      const originals = [source];
+      const originals = source ? [source] : [];
       const siblings = state.body.children;
       if (siblings && typeof siblings.length === "number") {
         for (let index = 0; index < siblings.length; index += 1) {
@@ -448,8 +468,8 @@ export async function activate(ctx) {
       return;
     }
     if (!node) {
-      const source = pickSource(state.body);
-      node = source?.cloneNode(false) ?? document.createElement("pre");
+      const source = state.enhanced ? null : pickSource(state.body);
+      node = source?.cloneNode(false) ?? document.createElement(state.enhanced ? "div" : "pre");
       node.removeAttribute("id");
       node.removeAttribute("data-ekdp-kct-hidden");
       node.classList.add("ekdp-kct-translated");
@@ -462,6 +482,10 @@ export async function activate(ctx) {
   }
 
   function readSource(state) {
+    if (state.enhanced) {
+      const source = state.body.getAttribute("data-ekdp-thinking-source");
+      return source ?? sourceFromBody(state.body);
+    }
     const cached = state.sourceNode;
     if (cached && state.body.contains(cached)) return cached.textContent ?? "";
     const node = pickSource(state.body);
@@ -599,15 +623,54 @@ async function createEngine(ctx) {
   const queue = [];
   let active = 0;
   let cooldownUntil = 0;
+  // 在途请求登记表：键由缓存代次、服务、端点/模型、凭据口径、语言与片段摘要组
+  // 成，值是可共享的请求槽位。相同内容、相同配置的翻译挂到同一槽位，只发一次
+  // 请求；槽位的消费者全部失效后，还没出队的任务会被丢弃，不再发往任何服务。
+  const inflight = new Map();
+
+  // 出队与重试前核对：摘掉已失效的消费者，返回是否还有效。
+  function slotLive(slot) {
+    let live = false;
+    for (const isValid of slot.lives) {
+      if (isValid()) live = true;
+      else slot.lives.delete(isValid);
+    }
+    return live;
+  }
+
+  function settleSlot(slot, text, error) {
+    if (slot.done) return;
+    slot.done = true;
+    slot.text = text;
+    slot.error = error;
+    if (inflight.get(slot.key) === slot) inflight.delete(slot.key);
+    const waiters = slot.waiters;
+    slot.waiters = [];
+    for (const waiter of waiters) waiter();
+  }
+
+  function snapshotSettings() {
+    return {
+      provider: settings.provider,
+      customEndpoint: settings.customEndpoint,
+      customModel: settings.customModel,
+      useCredential: settings.useCredential,
+    };
+  }
 
   function pump() {
     while (active < CONCURRENCY && queue.length) {
+      const job = queue.shift();
+      if (!job.slots.some(slotLive)) {
+        job.cancel();
+        continue;
+      }
       if (Date.now() < cooldownUntil) {
-        const delay = cooldownUntil - Date.now();
-        setTimeout(pump, delay);
+        queue.unshift(job);
+        setTimeout(pump, cooldownUntil - Date.now());
         return;
       }
-      const job = queue.shift();
+      for (const slot of job.slots) slot.started = true;
       active += 1;
       void execute(job)
         .catch(error => job.reject(error))
@@ -634,6 +697,11 @@ async function createEngine(ctx) {
         if (retryable && attempt < 2) {
           attempt += 1;
           await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** (attempt - 1) * (0.8 + Math.random() * 0.4)));
+          // 退避期间消费者可能已失效（折叠、设置变更、停用）：不再重试。
+          if (!job.slots.some(slotLive)) {
+            job.cancel();
+            return;
+          }
           continue;
         }
         job.reject(error);
@@ -643,21 +711,28 @@ async function createEngine(ctx) {
   }
 
   function callProvider(job) {
-    const provider = settings.provider;
-    if (provider === "google") return translateGoogle(ctx, job.texts[0], job.lang);
-    if (provider === "bing") return translateBing(ctx, job.texts, job.lang);
-    return translateCustom(ctx, job.texts, job.lang, settings);
+    const snapshot = job.snapshot;
+    if (snapshot.provider === "google") return translateGoogle(ctx, job.texts[0], job.lang);
+    if (snapshot.provider === "bing") return translateBing(ctx, job.texts, job.lang);
+    return translateCustom(ctx, job.texts, job.lang, snapshot);
   }
 
   async function translate(source, lang, onProgress, valid) {
+    // 设置在进入时定格：缓存键与实际请求必须来自同一组服务信息，排队或重试期
+    // 间被改动的设置不能改变已在途任务的去向，也不能让响应串进别的服务的缓存。
+    const snapshot = snapshotSettings();
     const generation = cacheGeneration;
-    const provider = settings.provider;
-    const scope = provider === "custom" ? `${settings.customEndpoint}\u0000${settings.customModel}` : "";
+    const provider = snapshot.provider;
+    const scope = provider === "custom" ? `${snapshot.customEndpoint}\u0000${snapshot.customModel}` : "";
     const prefix = hashKey(`${provider}\u0000${lang}\u0000${scope ? scope + "\u0000" : ""}`);
+    const sharePrefix = hashKey(
+      `${provider}\u0000${lang}\u0000${provider === "custom" ? `${scope}\u0000${snapshot.useCredential}\u0000` : ""}`,
+    );
     const pieces = translationPieces(source, lang);
     const out = pieces.map(piece => piece.text);
     const missing = [];
     let completed = 0;
+    let firstError = null;
     const total = pieces.filter(piece => !piece.skip).length;
 
     for (const [i, piece] of pieces.entries()) {
@@ -675,14 +750,67 @@ async function createEngine(ctx) {
     }
     if (completed) onProgress(preserveFencedCode(source, out.join("")), completed, total);
 
+    // 已有在途请求且仍在执行（或仍有有效消费者）的片段直接挂靠，不再发请求；
+    // 其余片段新建槽位并按服务要求分批。挂靠与新建在此汇合，下面的等待、进度
+    // 与缓存逻辑对两者一视同仁。
+    for (const item of missing) {
+      const shareKey = `${generation}\u0000${sharePrefix}:${hashKey(item.text)}`;
+      const existing = inflight.get(shareKey);
+      if (existing && (existing.started || slotLive(existing))) {
+        existing.lives.add(valid);
+        item.slot = existing;
+      } else {
+        const slot = { key: shareKey, lives: new Set([valid]), waiters: [], started: false, done: false, text: "", error: null };
+        inflight.set(shareKey, slot);
+        item.slot = slot;
+        item.fresh = true;
+      }
+    }
+
+    let pending = missing.length;
+    function applyItem(item, translated) {
+      const safe = preserveFencedCode(item.text, translated);
+      out[item.index] = safe;
+      // The user cleared the cache while this request was running: the text is
+      // still delivered, but it must not repopulate the cache that was deleted.
+      if (generation === cacheGeneration) remember(item.key, safe);
+    }
+    function settle(item, error) {
+      if (item.settled) return;
+      item.settled = true;
+      pending = Math.max(0, pending - 1);
+      if (error) {
+        firstError ??= error;
+        persist();
+      }
+      if (!valid()) return;
+      // The count is paragraphs, so a batch of eight still reports eight.
+      const done = total - pending;
+      completed = done;
+      onProgress(preserveFencedCode(source, out.join("")), done, total);
+      persist();
+    }
+    // 槽位由发请求的一方结算；挂靠方与请求方都在这里等到同一个结果。
+    const awaited = missing.map(item => new Promise(resolve => {
+      item.slot.waiters.push(() => {
+        if (item.slot.error) settle(item, item.slot.error);
+        else {
+          applyItem(item, item.slot.text);
+          settle(item, null);
+        }
+        resolve();
+      });
+    }));
+
     const batches = [];
     if (provider === "google") {
-      for (const item of missing) batches.push([item]);
+      for (const item of missing) if (item.fresh) batches.push([item]);
     } else {
       let batch = [];
       let chars = 0;
       const numbering = provider === "custom" ? 4 : 0;
       for (const item of missing) {
+        if (!item.fresh) continue;
         if (batch.length && (batch.length >= 8 || chars + item.text.length + numbering > BATCH_CHARS)) {
           batches.push(batch);
           batch = [];
@@ -697,102 +825,64 @@ async function createEngine(ctx) {
     // A batch is one request, so one failure must not throw away the items that
     // did translate: each item settles on its own and a missing one is retried
     // alone. Only a request that fails outright fails the items it carried.
-    const retryAlone = item =>
-      new Promise((resolve, reject) => {
-        queue.push({
-          texts: [item.text],
-          lang,
-          resolve: single => {
-            const text = single?.[0];
-            if (typeof text === "string" && text.trim()) {
-              apply(item, text);
-              settle(item, null);
-              resolve();
-              return;
-            }
-            const error = new Error("译文为空，请重试");
-            settle(item, error);
-            reject(error);
-          },
-          reject: error => {
-            settle(item, error);
-            reject(error);
-          },
-        });
-        pump();
+    const retryAlone = item => {
+      queue.push({
+        snapshot,
+        lang,
+        texts: [item.text],
+        slots: [item.slot],
+        resolve: results => {
+          const text = results?.[0];
+          if (typeof text === "string" && text.trim()) settleSlot(item.slot, text, null);
+          else settleSlot(item.slot, null, new Error("译文为空，请重试"));
+        },
+        reject: error => settleSlot(item.slot, null, error),
+        cancel: () => settleSlot(item.slot, null, new Error("翻译已取消")),
       });
+      pump();
+    };
 
-    const runs = batches.map(batch =>
-      new Promise((resolve, reject) => {
-        queue.push({
-          texts: batch.map(item => item.text),
-          lang,
-          resolve: results => {
-            const failed = [];
-            for (const [i, item] of batch.entries()) {
-              const translated = results?.[i];
-              if (typeof translated === "string" && translated.trim()) {
-                apply(item, translated);
-                settle(item, null);
-              } else {
-                failed.push(item);
-              }
-            }
-            if (!failed.length) {
-              resolve();
-              return;
-            }
-            // Batching changes the service's answer shape, not the user's text;
-            // retrying one by one keeps the parts that worked.
-            void Promise.allSettled(failed.map(item => retryAlone(item))).then(results => {
-              const firstError = results.find(result => result.status === "rejected");
-              if (firstError) reject(firstError.reason);
-              else resolve();
-            });
-          },
-          reject: error => {
-            for (const item of batch) settle(item, error);
-            reject(error);
-          },
-        });
-        pump();
-      }),
-    );
-
-    // A cache hit was already reported above, so only the missing paragraphs are
-    // still pending.
-    let pending = missing.length;
-    function apply(item, translated) {
-      const safe = preserveFencedCode(item.text, translated);
-      out[item.index] = safe;
-      // The user cleared the cache while this request was running: the text is
-      // still delivered, but it must not repopulate the cache that was deleted.
-      if (generation === cacheGeneration) remember(item.key, safe);
+    for (const batch of batches) {
+      const slots = batch.map(item => item.slot);
+      queue.push({
+        snapshot,
+        lang,
+        texts: batch.map(item => item.text),
+        slots,
+        resolve: results => {
+          const failed = [];
+          for (const [i, item] of batch.entries()) {
+            const translated = results?.[i];
+            if (typeof translated === "string" && translated.trim()) settleSlot(slots[i], translated, null);
+            else failed.push(item);
+          }
+          // Batching changes the service's answer shape, not the user's text;
+          // retrying one by one keeps the parts that worked.
+          for (const item of failed) retryAlone(item);
+        },
+        reject: error => {
+          for (const slot of slots) settleSlot(slot, null, error);
+        },
+        cancel: () => {
+          for (const slot of slots) settleSlot(slot, null, new Error("翻译已取消"));
+        },
+      });
     }
-    function settle(item, error) {
-      if (item.settled) return;
-      item.settled = true;
-      pending = Math.max(0, pending - 1);
-      if (error) persist();
-      if (!valid()) return;
-      // The count is paragraphs, so a batch of eight still reports eight.
-      const done = total - pending;
-      completed = done;
-      onProgress(preserveFencedCode(source, out.join("")), done, total);
-      persist();
-    }
+    pump();
 
-    await Promise.all(runs);
+    await Promise.all(awaited);
     persist();
+    if (firstError) throw firstError;
     const final = preserveFencedCode(source, out.join(""));
     if (valid()) onProgress(final, total, total);
     return final;
   }
 
   function dispose() {
-    // 排队中的任务不会再被处理：它们的 promise 必须结束，否则调度方会一直
-    // 挂起；冷却与退避定时器也要清掉，否则插件停用后仍有回调在跑。
-    for (const job of queue.splice(0)) job.reject(new Error("翻译已停止"));
+    // 排队中的任务不会再被处理：槽位结算后所有等待它的 promise 都会结束，调度
+    // 方不会挂起；冷却与退避定时器也要清掉，否则插件停用后仍有回调在跑。
+    for (const job of queue.splice(0)) job.cancel();
+    for (const slot of [...inflight.values()]) settleSlot(slot, null, new Error("翻译已停止"));
     active = 0;
     cooldownUntil = 0;
     if (persistTimer) window.clearTimeout(persistTimer);
@@ -809,7 +899,7 @@ async function createEngine(ctx) {
 // 每个思考块工具栏上的“设置”共用同一个浮层。浮层写入与设置页相同的存储键并
 // 派发 ekdp-kct:settings，因此内联改动会让已展开的思考块按新设置重译，设置页
 // 也能读到同一份值。
-function createSettingsPopover({ ctx, engine, blocks }) {
+function createSettingsPopover({ ctx, engine, blocks, root, doc = root.ownerDocument ?? document }) {
   let panel = null;
   let anchor = null;
 
@@ -830,7 +920,7 @@ function createSettingsPopover({ ctx, engine, blocks }) {
     panel.setAttribute("role", "dialog");
     panel.setAttribute("aria-label", "思考内容翻译设置");
     anchor.setAttribute("aria-expanded", "true");
-    document.body.appendChild(panel);
+    doc.body.appendChild(panel);
     render();
     window.addEventListener("pointerdown", onPointerDown, true);
     window.addEventListener("keydown", onKeyDown, true);
@@ -867,7 +957,8 @@ function createSettingsPopover({ ctx, engine, blocks }) {
 
   function onPointerDown(event) {
     if (!panel) return;
-    if (panel.contains(event.target) || anchor?.contains(event.target)) return;
+    const target = event.composedPath?.()[0] ?? event.target;
+    if (panel.contains(target) || anchor?.contains(target)) return;
     close();
   }
 
@@ -1426,15 +1517,22 @@ function sourceFromBody(body) {
   return clone.textContent || "";
 }
 
-let injected = null;
+const injected = new WeakMap();
 
-function injectStyles() {
-  if (injected?.isConnected) return injected;
-  const style = document.createElement("style");
+function injectStyles(root) {
+  let entry = injected.get(root);
+  if (entry?.node.isConnected) {
+    entry.count += 1;
+    return entry.node;
+  }
+  const style = (root.ownerDocument ?? root).createElement("style");
   style.setAttribute("data-ekdp-owned", "1");
+  style.count = 1;
+  entry = { node: style, count: 1 };
+  injected.set(root, entry);
   style.textContent = `
-.think[data-ekdp-kct-view] [data-ekdp-kct-hidden]{display:none!important}
-.think[data-ekdp-kct-view="original"] .ekdp-kct-translated{display:none!important}
+[data-ekdp-kct-view="translated"] [data-ekdp-kct-hidden]{display:none!important}
+[data-ekdp-kct-view="original"] .ekdp-kct-translated{display:none!important}
 .ekdp-kct-bar{display:flex;align-items:center;justify-content:flex-end;gap:4px;font:12px/20px var(--font-ui,sans-serif);color:var(--color-text-secondary,var(--color-text-muted,light-dark(#666,#aaa)))}
 .ekdp-kct-bar[hidden]{display:none}
 .ekdp-kct-btn{font:inherit;color:inherit;background:transparent;border:0;border-radius:4px;padding:0 5px;cursor:pointer;white-space:nowrap}
@@ -1461,9 +1559,18 @@ function injectStyles() {
 .ekdp-kct-custom{display:flex;flex-direction:column;gap:10px}
 .ekdp-kct-stats{opacity:.85}
 `;
-  document.head.appendChild(style);
-  injected = style;
+  (root.head ?? root).appendChild(style);
   return style;
+}
+
+export function removeStyles(root) {
+  const entry = injected.get(root);
+  if (!entry) return;
+  entry.count -= 1;
+  if (entry.count === 0) {
+    entry.node.remove();
+    injected.delete(root);
+  }
 }
 
 function messageOf(error) {

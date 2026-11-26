@@ -18,14 +18,17 @@ class FakeObserverBox implements DecorationObserver {
   callback: ((records: DecorationMutation[]) => void) | null = null;
   observed = false;
   disconnected = false;
+  targets = new Set<unknown>();
   constructor(callback: (records: DecorationMutation[]) => void) {
     this.callback = callback;
   }
-  observe(): void {
+  observe(target: unknown): void {
     this.observed = true;
+    this.targets.add(target);
   }
   disconnect(): void {
     this.disconnected = true;
+    this.targets.clear();
   }
   emit(records: Partial<FakeMutation>[]): void {
     this.callback?.(
@@ -432,5 +435,55 @@ test("an unrelated DOM change does not re-dispatch an unchanged block", () => {
   h.observer.emit([{ type: "attributes", target: body, attributeName: "class" }]);
   h.flush();
   assert.equal(updates, 2, "an open-state change was suppressed");
+  h.hub.dispose();
+});
+
+
+test("enhanced thinking opt-in follows open shadow roots and releases removed blocks", () => {
+  const h = harness();
+  const native = h.think("native", { id: "native" });
+  const regular: string[] = [];
+  h.hub.register("thinking", (_block, info) => { regular.push(info.key); }, new Scope());
+  const enhanced: BlockInfo[] = [];
+  const disposed: string[] = [];
+  const scope = new Scope();
+  h.hub.register("thinking", (_block, info) => {
+    enhanced.push(info);
+    return { update: next => enhanced.push(next), dispose: () => disposed.push(info.key) };
+  }, scope, undefined, true);
+
+  const host = new FakeElement("div");
+  const root = new FakeElement("div");
+  const block = new FakeElement("details");
+  const body = new FakeElement("div");
+  block.id = "enhanced";
+  block.setAttribute("data-ekdp-thinking", "");
+  block.setAttribute("data-streaming", "");
+  body.setAttribute("data-ekdp-thinking-source", "First line");
+  block.append(body);
+  root.append(block);
+  root.setConnected(true);
+  Object.assign(host, { shadowRoot: root });
+  host.setAttribute("data-ekdp-thinking-root", "");
+  h.doc.body.append(host);
+  h.observer.emit([{ target: h.doc.body, addedNodes: [host] }]);
+  h.flush();
+  assert.deepEqual(regular, [native.id]);
+  assert.ok(h.observer.targets.has(root));
+  assert.deepEqual(enhanced.map(info => [info.key, info.open, info.streaming]), [[native.id, true, false], [block.id, false, true]]);
+
+  block.setAttribute("open", "");
+  block.removeAttribute("data-streaming");
+  body.setAttribute("data-ekdp-thinking-source", "Final **line**");
+  h.observer.emit([{ type: "attributes", target: block, attributeName: "open" }, { type: "attributes", target: body, attributeName: "data-ekdp-thinking-source" }]);
+  h.flush();
+  assert.deepEqual([enhanced.at(-1)?.open, enhanced.at(-1)?.streaming], [true, false]);
+
+  host.remove();
+  root.setConnected(false);
+  h.observer.emit([{ target: h.doc.body, removedNodes: [host] }]);
+  h.flush();
+  assert.deepEqual(disposed, [block.id]);
+  assert.equal(h.observer.targets.has(root), false);
   h.hub.dispose();
 });

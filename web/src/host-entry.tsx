@@ -254,6 +254,7 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
   container.className = `ekd-root ekd-surface ekd-surface-${surface}`;
   const releaseTheme = watchColorScheme(container, element.ownerDocument, options.colorScheme);
   shadow.append(styles, container);
+  if (surface === "sessions") element.setAttribute("data-ekdp-thinking-root", "");
   const needsSettingsTransport = surface === "settings" || surface.startsWith("settings-") || surface === "account-switch-modal";
   const releaseTransport = needsSettingsTransport
     ? acquireTransport(createCoreTransport(options.host), SETTINGS_PERMISSIONS)
@@ -287,6 +288,7 @@ export function mountSurface(element: HTMLElement, surface: SurfaceName, options
     unmount: () => {
       if (!mounted) return;
       mounted = false;
+      if (surface === "sessions") element.removeAttribute("data-ekdp-thinking-root");
       releaseTheme();
       root.unmount();
       container.remove();

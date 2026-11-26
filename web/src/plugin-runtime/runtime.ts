@@ -59,7 +59,7 @@ export interface RuntimeOptions {
   rightPanelHost?: RightPanelHost;
   layoutHost?: LayoutHost;
   browserHost?: BrowserHost;
-  /** File picker for `attachments.pick`. Absent means the core dialog is used. */
+  /** File picker for host surfaces that provide one; `attachments.pick` uses a renderer file input. */
   pickFiles?: () => Promise<Array<{ path: string; name: string }>>;
   /** Native directory picker for workspace/project selection. */
   pickDirectory?: (options?: { title?: string; defaultPath?: string }) => Promise<string | null>;
@@ -231,11 +231,21 @@ export function createPluginRuntime(options: RuntimeOptions) {
     const commandsV2 = granted.includes("commands") ? createCommandsApi(id, bridge) : undefined;
     const attachmentsV2 = granted.includes("attachments")
       ? {
-        async pick() {
-          if (!options.pickFiles) {
-            throw new PluginError(409, "PLUGIN_ATTACHMENT_UNAVAILABLE", "当前宿主没有文件选择器");
+        async pick(): Promise<{ files: AttachmentPick[]; batch: string }> {
+          const input = document.createElement("input");
+          input.type = "file";
+          input.multiple = true;
+          try {
+            const selected = new Promise<File[]>(resolve => {
+              input.addEventListener("change", () => resolve(Array.from(input.files ?? [])), { once: true });
+              input.addEventListener("cancel", () => resolve([]), { once: true });
+            });
+            input.click();
+            const files = await selected;
+            return files.length ? await attachmentsV2!.stage(files) : { files: [], batch: "" };
+          } finally {
+            input.remove();
           }
-          return options.pickFiles();
         },
         /**
          * Stages files the user dropped. A renderer only holds the File object,
@@ -535,7 +545,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
           }
           return { dispose: release };
         },
-        decorate(target, decorator) {
+        decorate(target, decorator, decoratorOptions) {
           const slot = target as DecorationTarget;
           if (!granted.includes(SLOT_CAPABILITY[slot])) {
             throw new PluginError(403, "PLUGIN_CAPABILITY_DENIED", `插件没有装饰 ${slot} 的能力`);
@@ -552,6 +562,7 @@ export function createPluginRuntime(options: RuntimeOptions) {
             },
             scope,
             error => reportFailure(id, error, "PLUGIN_DECORATE_FAILED", `装饰 ${slot} 失败`),
+            decoratorOptions?.includeEnhanced === true,
           );
         },
         theme,

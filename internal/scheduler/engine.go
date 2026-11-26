@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -133,6 +134,11 @@ type Engine struct {
 	activeTasks map[string]activeRun
 	closed      bool
 	pauseCount  int
+
+	// turnEvidenceGrace bounds how long the observer waits for attribution
+	// evidence (the ACK turn surfacing, or the history catching up) before the
+	// run is declared unverifiable instead of completed.
+	turnEvidenceGrace time.Duration
 }
 
 type activeRun struct {
@@ -169,21 +175,22 @@ func NewEngine(store *Store, exec Executor, opts ...Option) (*Engine, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
-		store:           store,
-		exec:            exec,
-		now:             time.Now,
-		loc:             time.Local,
-		maxConcurrent:   DefaultMaxConcurrent,
-		tickInterval:    5 * time.Second,
-		busyWaitTimeout: 10 * time.Minute,
-		pollInterval:    1 * time.Second,
-		catchupGrace:    90 * time.Second,
-		timeoutScale:    time.Minute,
-		pluginEnabled:   func(string) bool { return true },
-		gitChecker:      CheckGitWorktree,
-		ctx:             ctx,
-		cancel:          cancel,
-		activeTasks:     map[string]activeRun{},
+		store:             store,
+		exec:              exec,
+		now:               time.Now,
+		loc:               time.Local,
+		maxConcurrent:     DefaultMaxConcurrent,
+		tickInterval:      5 * time.Second,
+		busyWaitTimeout:   10 * time.Minute,
+		pollInterval:      1 * time.Second,
+		catchupGrace:      90 * time.Second,
+		timeoutScale:      time.Minute,
+		pluginEnabled:     func(string) bool { return true },
+		gitChecker:        CheckGitWorktree,
+		ctx:               ctx,
+		cancel:            cancel,
+		activeTasks:       map[string]activeRun{},
+		turnEvidenceGrace: 15 * time.Second,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -1030,22 +1037,15 @@ func (e *Engine) executeRun(ctx context.Context, task Task, run RunRecord) {
 		}
 	}
 
-	beforeTurns, beforeErr := e.exec.GetSessionTurns(execCtx, targetSessionID, 20)
-	prevTurnCount := len(beforeTurns)
-	if beforeErr != nil {
-		prevTurnCount = -1
-	}
-	prevLastTurnID := ""
-	if prevTurnCount > 0 {
-		prevLastTurnID = beforeTurns[prevTurnCount-1].TurnID
-	}
+	outcome := e.sessionBaseline(execCtx, targetSessionID)
 
 	expandedPrompt := ExpandPrompt(task.Prompt, e.now(), e.loc, task.LastRunAt, task.LastSummary)
 	if e.Paused() {
 		e.finishRun(task, run, RunSkipped, FailureCancelled, "账号切换中，定时任务已暂停", targetSessionID)
 		return
 	}
-	if err := e.exec.SendPrompt(execCtx, targetSessionID, expandedPrompt, task.Model, task.Effort, task.PermissionMode); err != nil {
+	receipt, err := e.exec.SendPrompt(execCtx, targetSessionID, expandedPrompt, task.Model, task.Effort, task.PermissionMode)
+	if err != nil {
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
 			e.abortRemoteSession(targetSessionID)
 			e.finishRun(task, run, RunFailed, FailureTimeout, fmt.Sprintf("运行超时（超过单次超时限制 %d 分钟），已尝试中止当前会话", timeoutMin), targetSessionID)
@@ -1062,9 +1062,10 @@ func (e *Engine) executeRun(ctx context.Context, task Task, run RunRecord) {
 		e.finishRun(task, run, RunFailed, FailureExecution, "发送提示词失败："+err.Error(), targetSessionID)
 		return
 	}
+	outcome.receipt = receipt
 	e.exec.RecordPluginActivity(context.Background(), task.PluginID, fmt.Sprintf("定时任务「%s」向会话 %s 发送提示词", task.Name, targetSessionID))
 
-	status, failureKind, msg := e.observeTurnOutcome(execCtx, ctx, targetSessionID, prevTurnCount, prevLastTurnID, timeoutMin, task.MaxTurns)
+	status, failureKind, msg := e.observeTurnOutcome(execCtx, ctx, targetSessionID, outcome, timeoutMin, task.MaxTurns)
 	e.finishRun(task, run, status, failureKind, msg, targetSessionID)
 }
 
@@ -1100,28 +1101,162 @@ func (e *Engine) waitForSessionIdle(ctx context.Context, task Task, run *RunReco
 	}
 }
 
-// newTurnsSince returns only the turns produced after prevLastTurnID. A bound
-// session carries its whole history, and an approval left in that history must
-// not immediately fail every new run.
-func newTurnsSince(turns []TurnInfo, prevLastTurnID string, prevTurnCount int) []TurnInfo {
-	if len(turns) == 0 {
-		return nil
+// sendOutcome ties one SendPrompt call to the session turns that belong to it.
+// The receipt's user_message_id comes from the official prompt ACK; a run may
+// only judge success or failure over turns it can prove are its own.
+type sendOutcome struct {
+	receipt SendPromptReceipt
+	// anchor is the newest turn seen just before sending. It is only set when
+	// a baseline read succeeded; an empty pre-send session owns every turn.
+	anchor        string
+	baselineKnown bool
+}
+
+// sessionBaseline reads the newest turn as the attribution anchor for a run.
+// Transient read failures are retried: a missing anchor would leave the run
+// unable to prove anything about its own outcome.
+func (e *Engine) sessionBaseline(ctx context.Context, sessionID string) sendOutcome {
+	var out sendOutcome
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return out
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
+		turns, err := e.exec.GetSessionTurns(ctx, sessionID, 1)
+		if err != nil {
+			continue
+		}
+		if len(turns) == 0 {
+			out.baselineKnown = true
+			return out
+		}
+		if id := turns[len(turns)-1].TurnID; id != "" {
+			out.anchor = id
+			out.baselineKnown = true
+		}
+		return out
 	}
-	if prevLastTurnID != "" {
-		for i := len(turns) - 1; i >= 0; i-- {
-			if turns[i].TurnID == prevLastTurnID {
-				return turns[i+1:]
+	return out
+}
+
+// turnOwnership tracks which session turns belong to the current run. The
+// preferred anchor is the ACK's user_message_id; without it the pre-send
+// baseline turn marks the boundary. Turns that cannot be claimed are never
+// judged, so an unrelated concurrent turn can neither fail nor complete this
+// run, and an approval left in the session history stays ignored.
+type turnOwnership struct {
+	ackID     string
+	baseline  sendOutcome
+	resolved  bool
+	boundary  string
+	inclusive bool
+	justSet   bool
+	seen      map[string]bool
+	count     int
+	view      []TurnInfo
+}
+
+func (o *turnOwnership) update(turns []TurnInfo, allowBaseline bool) {
+	if len(turns) == 0 {
+		return
+	}
+	if o.seen == nil {
+		o.seen = make(map[string]bool, len(turns))
+	}
+	if !o.resolved {
+		o.resolve(turns, allowBaseline)
+	}
+	if !o.resolved {
+		o.markSeen(turns)
+		o.view = nil
+		return
+	}
+	start := 0
+	if o.boundary != "" {
+		if idx := indexOfTurnID(turns, o.boundary); idx >= 0 {
+			start = idx
+			if !o.inclusive {
+				start++
+			}
+		}
+		// A boundary that scrolled out of the page leaves only newer turns
+		// visible, and every one of them belongs to this run.
+	}
+	o.view = turns[start:]
+	if o.justSet {
+		// Seeding from the whole view keeps turns that were watched before the
+		// boundary was found, for example one whose items stream in late.
+		o.count = len(o.view)
+		o.justSet = false
+	} else {
+		for _, turn := range o.view {
+			if !o.seen[turn.TurnID] {
+				o.count++
 			}
 		}
 	}
-	if len(turns) > prevTurnCount && prevTurnCount >= 0 {
-		return turns[prevTurnCount:]
-	}
-	return nil
+	o.markSeen(turns)
 }
 
-func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionID string, prevTurnCount int, prevLastTurnID string, timeoutMin, maxTurns int) (string, string, string) {
+func (o *turnOwnership) resolve(turns []TurnInfo, allowBaseline bool) {
+	if o.ackID != "" {
+		for i := len(turns) - 1; i >= 0; i-- {
+			if slices.Contains(turns[i].UserMessageIDs, o.ackID) {
+				o.setBoundary(turns[i].TurnID, true)
+				return
+			}
+		}
+	}
+	if !allowBaseline || !o.baseline.baselineKnown {
+		return
+	}
+	o.setBoundary(o.baseline.anchor, o.baseline.anchor == "")
+}
+
+func (o *turnOwnership) setBoundary(boundary string, inclusive bool) {
+	o.resolved = true
+	o.justSet = true
+	o.boundary = boundary
+	o.inclusive = inclusive
+}
+
+func (o *turnOwnership) markSeen(turns []TurnInfo) {
+	for _, turn := range turns {
+		o.seen[turn.TurnID] = true
+	}
+}
+
+func indexOfTurnID(turns []TurnInfo, id string) int {
+	for i := range turns {
+		if turns[i].TurnID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// observePageSize keeps the boundary turn visible for the whole observation:
+// only the turns this run creates can push it towards the page head.
+func observePageSize(maxTurns int) int {
+	size := 20
+	if maxTurns > 0 {
+		size = max(size, maxTurns+8)
+	} else {
+		size = max(size, 38)
+	}
+	return size
+}
+
+func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionID string, outcome sendOutcome, timeoutMin, maxTurns int) (string, string, string) {
+	ackID := strings.TrimSpace(outcome.receipt.UserMessageID)
+	observedAt := e.now()
 	sawBusy := false
+	var idleWithoutProof time.Time
+	ownership := &turnOwnership{ackID: ackID, baseline: outcome}
+	unprovableMsg := "已发送提示词，但无法确认本次运行的执行结果（无官方消息回执且缺少可信基线），请打开会话查看实际执行情况"
 	for {
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
 			e.abortRemoteSession(sessionID)
@@ -1144,19 +1279,19 @@ func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionI
 			}
 			return RunFailed, FailureExecution, "读取会话执行状态失败：" + err.Error()
 		}
-		pageSize := 20
-		if maxTurns > 0 && prevTurnCount+maxTurns+5 > pageSize {
-			pageSize = prevTurnCount + maxTurns + 5
-		}
-		turns, tErr := e.exec.GetSessionTurns(execCtx, sessionID, pageSize)
-		var newTurns []TurnInfo
+		// While the ACK turn has not surfaced yet, baseline attribution is held
+		// back briefly so a concurrent user's turn is not judged as ours.
+		allowBaseline := ackID == "" || e.now().Sub(observedAt) > e.turnEvidenceGrace
+		turns, tErr := e.exec.GetSessionTurns(execCtx, sessionID, observePageSize(maxTurns))
 		if tErr == nil {
-			newTurns = newTurnsSince(turns, prevLastTurnID, prevTurnCount)
-			if maxTurns > 0 && len(newTurns) > maxTurns {
+			ownership.update(turns, allowBaseline)
+		}
+		if ownership.count > 0 {
+			if maxTurns > 0 && ownership.count > maxTurns {
 				e.abortRemoteSession(sessionID)
 				return RunFailed, FailureMaxTurns, fmt.Sprintf("已超过单次最大回合数限制（%d 回合），已尝试中止本次运行", maxTurns)
 			}
-			for _, turn := range newTurns {
+			for _, turn := range ownership.view {
 				if turn.HasApproval {
 					detail := "会话出现待批准操作，无人值守模式不会自动批准，请打开会话处理"
 					if turn.ApprovalTitle != "" {
@@ -1171,16 +1306,31 @@ func (e *Engine) observeTurnOutcome(execCtx, parentCtx context.Context, sessionI
 		}
 		if sess.Busy || sess.MainTurnActive {
 			sawBusy = true
-		} else {
-			if len(newTurns) > 0 {
-				if latestErr := newTurns[len(newTurns)-1].ErrorMessage; latestErr != "" {
-					return RunFailed, FailureExecution, "执行失败：" + latestErr
-				}
+		} else if len(ownership.view) > 0 {
+			// Idle over turns this run owns: their outcome is real evidence.
+			if latestErr := ownership.view[len(ownership.view)-1].ErrorMessage; latestErr != "" {
+				return RunFailed, FailureExecution, "执行失败：" + latestErr
 			}
-			if sawBusy || len(newTurns) > 0 {
-				return RunCompleted, FailureNone, "已完成"
+			return RunCompleted, FailureNone, "已完成"
+		} else if sawBusy {
+			// Idle but nothing provably ours yet. A busy/idle cycle alone is
+			// not success evidence, so give the session history a short grace
+			// period to catch up before declaring the run unverifiable.
+			if idleWithoutProof.IsZero() {
+				idleWithoutProof = e.now()
+			}
+			waitMore := false
+			switch {
+			case ownership.resolved:
+				waitMore = e.now().Sub(idleWithoutProof) <= e.turnEvidenceGrace
+			case ackID != "" && e.now().Sub(observedAt) <= e.turnEvidenceGrace:
+				waitMore = true
+			}
+			if !waitMore {
+				return RunFailed, FailureExecution, unprovableMsg
 			}
 		}
+
 		select {
 		case <-execCtx.Done():
 			if errors.Is(execCtx.Err(), context.DeadlineExceeded) {

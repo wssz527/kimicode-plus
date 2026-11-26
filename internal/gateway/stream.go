@@ -45,11 +45,10 @@ func (g *Gateway) Stream(ctx context.Context, model string, messages []provider.
 	if err != nil {
 		return err
 	}
-	options, headers, err := g.plannerModelSettings(ctx, providerID, model)
+	options, err := g.plannerModelSettings(ctx, providerID, model)
 	if err != nil {
 		return err
 	}
-	config.CustomHeaders = headers
 	attribution := usage.EventInput{
 		ProviderID: providerID, Model: model, RequestID: security.Random()[:24], AttemptID: "1",
 		SessionID: sessionID, AgentID: "planner", Role: "main", RequestKind: "chat",
@@ -73,44 +72,33 @@ func (g *Gateway) Stream(ctx context.Context, model string, messages []provider.
 	return err
 }
 
-func (g *Gateway) plannerModelSettings(ctx context.Context, providerID, model string) (provider.PlannerModelOptions, map[string]string, error) {
-	var raw string
+// plannerModelSettings reads the planner knobs the registry actually produces:
+// the per-model `output` and `thinking` capability rows imported with the
+// catalog. Production metadata_json writes only autoName, manualName and
+// autoCapabilities, so effort levels, thinking adaptations and custom headers
+// have no registry source — those knobs exist only on the desktop model config
+// that desktop.StreamKAPModel reads directly.
+func (g *Gateway) plannerModelSettings(ctx context.Context, providerID, model string) (provider.PlannerModelOptions, error) {
 	var output sql.NullFloat64
 	var thinking sql.NullBool
-	err := g.client.DB.QueryRowContext(ctx, `SELECT m.metadata_json, output.value_number, thinking.value_boolean
+	err := g.client.DB.QueryRowContext(ctx, `SELECT output.value_number, thinking.value_boolean
 		FROM registry_models m
 		LEFT JOIN registry_capabilities output ON output.provider_id=m.provider_id AND output.model_id=m.model_id AND output.field='output'
 		LEFT JOIN registry_capabilities thinking ON thinking.provider_id=m.provider_id AND thinking.model_id=m.model_id AND thinking.field='thinking'
-		WHERE m.provider_id=? AND m.model_id=?`, providerID, model).Scan(&raw, &output, &thinking)
+		WHERE m.provider_id=? AND m.model_id=?`, providerID, model).Scan(&output, &thinking)
 	if err != nil {
-		return provider.PlannerModelOptions{}, nil, err
+		return provider.PlannerModelOptions{}, err
 	}
-	var metadata struct {
-		Thinking         string            `json:"thinking"`
-		AdaptiveThinking bool              `json:"adaptiveThinking"`
-		DefaultEffort    string            `json:"defaultEffort"`
-		SupportEfforts   []string          `json:"supportEfforts"`
-		OffEffort        string            `json:"offEffort"`
-		MaxOutputSize    int64             `json:"maxOutputSize"`
-		CustomHeaders    map[string]string `json:"customHeaders"`
-	}
-	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
-		return provider.PlannerModelOptions{}, nil, err
-	}
-	options := provider.PlannerModelOptions{
-		Thinking: metadata.Thinking, AdaptiveThinking: metadata.AdaptiveThinking,
-		DefaultEffort: metadata.DefaultEffort, SupportEfforts: metadata.SupportEfforts,
-		OffEffort: metadata.OffEffort, MaxOutput: metadata.MaxOutputSize,
-	}
-	if options.MaxOutput == 0 && output.Valid {
+	var options provider.PlannerModelOptions
+	if output.Valid {
 		options.MaxOutput = int64(output.Float64)
 	}
-	if options.Thinking == "" && thinking.Valid {
+	if thinking.Valid {
 		if thinking.Bool {
 			options.Thinking = "toggle"
 		} else {
 			options.Thinking = "none"
 		}
 	}
-	return options, metadata.CustomHeaders, nil
+	return options, nil
 }

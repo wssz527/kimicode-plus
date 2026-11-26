@@ -56,18 +56,7 @@ func (o PlannerModelOptions) thinking() bool {
 
 func (c *Client) StreamPlanner(ctx context.Context, cfg Config, model string, options PlannerModelOptions, messages []Message, tools []map[string]any, emit func(StreamEvent) error) error {
 	if cfg.Protocol == "openai" {
-		body := map[string]any{"model": model, "messages": messages, "max_tokens": options.output()}
-		if options.Thinking == "toggle" || options.AdaptiveThinking && options.Thinking != "none" {
-			body["thinking"] = map[string]string{"type": "enabled"}
-		}
-		if effort := options.effort(); effort != "" && options.Thinking != "none" {
-			body["reasoning_effort"] = effort
-		}
-		if len(tools) != 0 {
-			body["tools"] = tools
-			body["tool_choice"] = "auto"
-		}
-		return c.OpenStream(ctx, cfg, model, body, emit, nil)
+		return c.OpenStream(ctx, cfg, model, plannerOpenAIRequest(cfg, model, options, messages, tools), emit, nil)
 	}
 
 	suffix, body, err := plannerNativeRequest(cfg, model, options, messages, tools)
@@ -91,6 +80,64 @@ func (c *Client) StreamPlanner(ctx context.Context, cfg Config, model string, op
 	return emit(event)
 }
 
+// kimiThinkingAPIHost reports whether the endpoint is a Kimi/Moonshot API host
+// whose Chat Completions surface documents the private `thinking` parameter:
+// the Kimi Code managed endpoint and the Moonshot open platform. The check is
+// endpoint identity, not a model ID list, so a reasoning model on any other
+// supplier is never handed a vendor-private field.
+func kimiThinkingAPIHost(cfg Config) bool {
+	base, err := url.Parse(cfg.BaseURL)
+	if err != nil {
+		return false
+	}
+	switch base.Hostname() {
+	case "api.kimi.com", "api.moonshot.cn", "api.moonshot.ai":
+		return true
+	}
+	return false
+}
+
+// plannerOpenAIRequest builds the Chat Completions body from config-verified
+// capabilities only.
+//
+//   - max_tokens is sent when the model config carries an output limit (the
+//     official model readback or the registry `output` capability): that value
+//     was stored for this model, so the field is chosen deliberately. Strict
+//     OpenAI/Azure deployments that reject max_tokens for reasoning models are
+//     never sent an unverified limit — the request simply omits it and the
+//     supplier default applies. On Kimi/Moonshot endpoints the parameter and
+//     its 8192 default are verified behavior and stay.
+//   - `thinking` is Kimi/Moonshot-private and never leaves those endpoints;
+//     other reasoning suppliers are served by reasoning_effort.
+//   - reasoning_effort is sent only for an effort the model config declares
+//     (defaultEffort within supportEfforts, or a declared single effort).
+func plannerOpenAIRequest(cfg Config, model string, options PlannerModelOptions, messages []Message, tools []map[string]any) map[string]any {
+	kimi := kimiThinkingAPIHost(cfg)
+	body := map[string]any{"model": model, "messages": messages}
+	limit := options.MaxOutput
+	if limit <= 0 && kimi {
+		limit = plannerDefaultOutput
+	}
+	if limit > 0 {
+		body["max_tokens"] = limit
+	}
+	if kimi && (options.Thinking == "toggle" || options.AdaptiveThinking && options.Thinking != "none") {
+		body["thinking"] = map[string]string{"type": "enabled"}
+	}
+	if effort := options.effort(); effort != "" && options.Thinking != "none" {
+		body["reasoning_effort"] = effort
+	}
+	if len(tools) != 0 {
+		body["tools"] = tools
+		body["tool_choice"] = "auto"
+	}
+	return body
+}
+
+// plannerNativeRequest keeps the native limits: anthropic requires max_tokens,
+// and the Responses and Gemini fields are accepted for every model on their
+// protocols, so the 8192 default is verified behavior there rather than an
+// invented Chat Completions parameter.
 func plannerNativeRequest(cfg Config, model string, options PlannerModelOptions, messages []Message, tools []map[string]any) (string, map[string]any, error) {
 	var system []string
 	for _, message := range messages {

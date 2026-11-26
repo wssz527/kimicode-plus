@@ -116,7 +116,7 @@ export function SessionKeepAliveMenu({ host, sessionId, onClose, onUpdated }: {
             <dt>间隔</dt><dd>{view.policy.intervalMinutes} 分钟 · {view.policy.source === "observed" ? "模型实测" : "样本不足，默认值"}</dd>
           </div> : null}
           <div className="ekka-meta-row"><dt>每次估算</dt><dd>{view.estimatedTokens > 0 ? `${tokenLabel(view.estimatedTokens)} Token` : "暂无用量记录"}</dd></div>
-          <div className="ekka-meta-row"><dt>本轮 Token 预算</dt><dd>{tokenLabel(view.spentTokens)} / {tokenLabel(view.budgetTokens)}</dd></div>
+          <div className="ekka-meta-row"><dt>本轮记账 / 发送预算</dt><dd>{tokenLabel(view.spentTokens)} / {tokenLabel(view.budgetTokens)}</dd></div>
         </dl> : null}
         {view.lastResult ? <p className="ekka-note"><strong>上次{view.lastResultLabel}</strong>{view.lastNote ? ` · ${view.lastNote}` : ""}</p> : null}
       </div>

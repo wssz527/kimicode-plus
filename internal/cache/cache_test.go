@@ -1532,6 +1532,44 @@ func TestSummaryHitRateExcludesSilentModelsInputOther(t *testing.T) {
 	}
 }
 
+// A turn that produced several model steps must come back oldest first and
+// complete: keepalive settles the whole official turn from this query.
+func TestMainStepsForTurnReturnsEveryStepInOrder(t *testing.T) {
+	home := t.TempDir()
+	base := time.Now().UTC().Truncate(time.Millisecond)
+	usage := sampleUsage(1000, 10, 900, 0)
+	writeWire(t, home, "session_multi", "main",
+		plainLine(usageRecord("synthetic/model", usage, "turn", base)),
+		plainLine(stepEnd("uuid-1", "turn-ka", 1, usage, 500, 1200, "end_turn", base)),
+		plainLine(usageRecord("synthetic/model", usage, "turn", base.Add(time.Second))),
+		plainLine(stepEnd("uuid-2", "turn-ka", 2, usage, 500, 1200, "end_turn", base.Add(time.Second))),
+		plainLine(usageRecord("synthetic/model", usage, "turn", base.Add(2*time.Second))),
+		plainLine(stepEnd("uuid-3", "turn-other", 1, usage, 500, 1200, "end_turn", base.Add(2*time.Second))),
+	)
+	// A subagent step sharing the official turn ID must stay unattributed:
+	// settlement only bills the main agent's steps.
+	writeWire(t, home, "session_multi", "sub",
+		plainLine(stepEnd("uuid-sub", "turn-ka", 1, sampleUsage(500, 5, 0, 0), 500, 1200, "end_turn", base)),
+	)
+	store := newTestStore(t, home)
+	if _, err := store.Scan(context.Background(), base.Add(3*time.Second), true); err != nil {
+		t.Fatal(err)
+	}
+	steps, err := store.MainStepsForTurn(context.Background(), "session_multi", "turn-ka")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 2 || steps[0].StepUUID != "uuid-1" || steps[1].StepUUID != "uuid-2" {
+		t.Fatalf("steps = %+v, want uuid-1 then uuid-2", steps)
+	}
+	if steps[1].At.Before(steps[0].At) {
+		t.Fatalf("steps out of order: %v then %v", steps[0].At, steps[1].At)
+	}
+	if missing, err := store.MainStepsForTurn(context.Background(), "session_multi", "turn-absent"); err != nil || len(missing) != 0 {
+		t.Fatalf("absent turn = %+v, %v, want no steps", missing, err)
+	}
+}
+
 // A session that mixed a reporting model with an unreported one must not have the
 // unreported model's uncached input counted in the "recent 5 steps" rate, and the
 // synthetic UNKNOWN identity must never be treated as reporting.

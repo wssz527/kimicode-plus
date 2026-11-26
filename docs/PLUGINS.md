@@ -130,7 +130,7 @@ KimiCode+ 支持本地受信增强插件。插件是运行在宿主渲染进程�
 | `sessions.watch` / `sessions.unwatch` | `{id}` | `{sessionId, watching, forwarded}`；`forwarded` 表示这次是否真的向官方订阅/退订 |
 | `attachments.stage` | `{files:[{name, data}]}`，`data` 为 base64 | `{files:[{path, name, size}], batch}`；单文件 ≤ 8 MiB，总量 ≤ 16 MiB，最多 16 个 |
 | `attachments.release` | `{batch}` | `{released:true}` |
-| `attachments.send` | `{id, text?, paths[], mode?, batch?}` | `{sessionId}`；路径必须是本机绝对路径，最多 16 个。带 `batch` 时无论成功失败都会清理该批次 |
+| `attachments.send` | `{id, text?, paths[], mode?, batch?}` | `{sessionId}`；路径必须是本机绝对路径，最多 16 个。发送结束后按暂存路径清理对应批次，成功失败均如此 |
 | `browser.open` | `{viewId, url}` | `{pluginId, viewId, url, visible, createdAt}` |
 | `browser.navigate` | `{viewId, url}` | 同上 |
 | `browser.back` / `browser.forward` / `browser.reload` | `{viewId}` | 授权结果含当前视图归属；宿主执行对应导航，后退/前进不可用时返回 `changed:false` |
@@ -165,18 +165,18 @@ KimiCode+ 支持本地受信增强插件。插件是运行在宿主渲染进程�
 
 ### 拖入文件与站点适配器
 
-`attachments.pick()` 走系统文件选择器，返回真实路径，可直接交给 `attachments.send`。拖入的文件没有路径，必须经过暂存：
+`attachments.pick()` 通过渲染层的文件选择控件获得 `File` 对象，再调用与拖放相同的 `stage` 暂存流程，返回 `{files, batch}`；不会把任意路径当作可发送凭据。发送时传入 `files` 中的暂存路径，核心按路径校验当前插件会话登记的批次。`batch` 可用于发送前调用 `attachments.release` 主动释放；拖入的文件同样经过暂存：
 
 ```js
 element.addEventListener('drop', async event => {
   const staged = await ctx.attachments.stageFromDrop(event);   // 已 preventDefault
-  await ctx.attachments.send({ id: sessionId, text: '看附件', paths: staged.files.map(f => f.path), batch: staged.batch });
+  await ctx.attachments.send({ id: sessionId, text: '看附件', paths: staged.files.map(f => f.path) });
 });
 ```
 
 - 字节由渲染层读成 base64 交给核心，核心写入 `<dataDir>/staged/<插件ID>/<批次>/`，不落在插件安装目录，也不会被资源路由当静态文件提供。
 - 文件名会清洗（去掉路径分隔符与控制字符、限制长度），写盘路径强制落在批次目录内；`../` 无法逃逸。
-- 一个批次只属于一次发送：`attachments.send` 带 `batch` 时，成功与否都会删除该批次；没发送的批次由 30 分钟 TTL 清扫。
+- 一个批次只属于一次发送：`attachments.send` 结束后，无论成功与否都会按暂存路径删除对应批次；发送前可调用 `attachments.release` 主动释放，没发送的批次由 30 分钟 TTL 清扫。
 - 停用、卸载、故障和安全模式会在停止运行实例时删除该插件的整个暂存根 `<dataDir>/staged/<插件ID>/`。TTL 只在插件再次暂存时才跑，一个已经停用或卸载的插件不会再触发它，所以清理不能只依赖 TTL。
 - 清理失败不会被静默忽略：卸载会在活动记录里留下带真实错误的条目，停用与安全模式同样记录，卸载本身仍继续。
 - 核心没有数据目录时直接拒绝暂存，不会退回到共享临时目录。
@@ -230,7 +230,7 @@ interface PluginContext {
   events: { on(name: string, listener: (payload: unknown) => void): Disposable };
   ui: {
     mount(slot: "sidebar" | "settings", render: (element: HTMLElement) => Disposable | void): Disposable;
-    decorate(target: "thinking" | "message", decorator: (block: HTMLElement, info: BlockInfo) => Disposable | DecorationHandle | void): Disposable;
+    decorate(target: "thinking" | "message", decorator: (block: HTMLElement, info: BlockInfo) => Disposable | DecorationHandle | void, options?: { includeEnhanced?: boolean }): Disposable;
     theme(): { scheme: "light" | "dark"; tokens: Record<string, string> };
   };
   net: { fetch(url: string, init?: ProxyRequestInit & { credential?: string }): Promise<ProxyResponse> };
@@ -259,7 +259,7 @@ interface PluginContext {
     unwatch(id): Promise<{ watching: boolean; sessionId: string }>;
   };
   attachments?: {
-    pick(): Promise<Array<{ path: string; name: string }>>;
+    pick(): Promise<{ files: Array<{ path: string; name: string }>; batch: string }>;
     /** 暂存拖入的 File；返回的 batch 随 send 一起清理 */
     stage(files: ArrayLike<File>): Promise<{ files: Array<{ path: string; name: string }>; batch: string }>;
     /** 完整的 drop 处理器：已 preventDefault 并暂存 dataTransfer.files */
@@ -290,6 +290,8 @@ interface DecorationHandle {
   update?(info: BlockInfo): void;  // 同一元素状态变化时调用，不必重建界面
 }
 ```
+
+`thinking` 默认装饰官方聊天的思考块。传入 `{ includeEnhanced: true }` 后，也会收到同屏会话与本地规划面板公开的思考块。增强思考块是带 `data-ekdp-thinking` 的 `<details>`，正文容器带 `data-ekdp-thinking-body`，原始文本保存在其 `data-ekdp-thinking-source` 属性。块在 Shadow DOM 内时，插件样式需挂到对应根节点。KCT 在这两处仅于用户点击「翻译」后发送正文。
 
 装饰的两个约束：
 

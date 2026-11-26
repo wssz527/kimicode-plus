@@ -57,9 +57,20 @@ type idleTestHarness struct {
 	wirePath         string
 	probeCacheRead   int
 	probeCacheWrite  int
-	rejectPrompt     bool
-	slowPrompt       bool
-	acknowledge      chan struct{}
+	// probeSteps replaces the default single probe step when non-empty, so a test
+	// can model an official keepalive turn that produced several model steps.
+	probeSteps   []idleProbeStep
+	rejectPrompt bool
+	slowPrompt   bool
+	acknowledge  chan struct{}
+}
+
+type idleProbeStep struct {
+	uuid       string
+	inputOther int64
+	output     int64
+	read       int64
+	creation   int64
 }
 
 func newIdleTestHarness(model string) *idleTestHarness {
@@ -151,8 +162,14 @@ func (h *idleTestHarness) handler(t *testing.T) http.Handler {
 				items = append(items, NativeItem{ItemID: "msg-ka-a", Type: "assistant_message", Text: "1"})
 			}
 			h.turns = append(h.turns, NativeTurn{TurnID: turnID, Items: items})
-			if h.wirePath != "" && (h.probeCacheRead > 0 || h.probeCacheWrite > 0) {
-				appendIdleTestStep(t, h.wirePath, h.session["agent_config"].(map[string]any)["model"].(string), turnID, time.Now().UTC(), h.probeCacheRead, h.probeCacheWrite)
+			if h.wirePath != "" {
+				if len(h.probeSteps) > 0 {
+					for index, spec := range h.probeSteps {
+						appendIdleTestStepUsage(t, h.wirePath, h.session["agent_config"].(map[string]any)["model"].(string), turnID, spec.uuid, index+1, time.Now().UTC(), spec.inputOther, spec.output, spec.read, spec.creation)
+					}
+				} else if h.probeCacheRead > 0 || h.probeCacheWrite > 0 {
+					appendIdleTestStep(t, h.wirePath, h.session["agent_config"].(map[string]any)["model"].(string), turnID, time.Now().UTC(), h.probeCacheRead, h.probeCacheWrite)
+				}
 			}
 			if h.acknowledge != nil {
 				close(h.acknowledge)
@@ -238,15 +255,20 @@ func startIdleKeepAliveService(t *testing.T, h *idleTestHarness, home string, la
 
 func appendIdleTestStep(t *testing.T, path, model, turn string, at time.Time, read, creation int) {
 	t.Helper()
+	appendIdleTestStepUsage(t, path, model, turn, "step-"+turn, 1, at, 1000, 1, int64(read), int64(creation))
+}
+
+func appendIdleTestStepUsage(t *testing.T, path, model, turn, uuid string, index int, at time.Time, inputOther, output, read, creation int64) {
+	t.Helper()
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer file.Close()
-	usage := fmt.Sprintf(`{"inputOther":1000,"output":1,"inputCacheRead":%d,"inputCacheCreation":%d}`, read, creation)
+	usage := fmt.Sprintf(`{"inputOther":%d,"output":%d,"inputCacheRead":%d,"inputCacheCreation":%d}`, inputOther, output, read, creation)
 	if _, err = fmt.Fprintf(file, `{"type":"usage.record","agentId":"main","model":%q,"usage":%s,"usageScope":"turn","time":%d}`+"\n"+
-		`{"type":"context.append_loop_event","agentId":"main","event":{"type":"step.end","uuid":%q,"turnId":%q,"step":1,"finishReason":"end_turn","usage":%s},"time":%d}`+"\n",
-		model, usage, at.UnixMilli(), "step-"+turn, turn, usage, at.UnixMilli()); err != nil {
+		`{"type":"context.append_loop_event","agentId":"main","event":{"type":"step.end","uuid":%q,"turnId":%q,"step":%d,"finishReason":"end_turn","usage":%s},"time":%d}`+"\n",
+		model, usage, at.UnixMilli(), uuid, turn, index, usage, at.UnixMilli()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1113,5 +1135,373 @@ func TestKeepAliveTurnMustOnlyContainMatchingUserMessage(t *testing.T) {
 		if isIdleKeepAliveTurn(NativeTurn{TurnID: "candidate", Items: items}, job) {
 			t.Errorf("accepted misattributed turn with items %+v", items)
 		}
+	}
+}
+
+// The probe turn's usage in these tests: the earliest step reads the cache, the
+// second step is an expensive uncached step that the old first-step-only
+// settlement would have ignored. estimate = max(1900, 150000) + 256 = 150256.
+func keepAliveProbeSteps() []idleProbeStep {
+	return []idleProbeStep{
+		{uuid: "ka-step-a", inputOther: 1000, output: 1, read: 900},
+		{uuid: "ka-step-b", inputOther: 300000, output: 50, creation: 2000},
+	}
+}
+
+const keepAliveProbeStepsTotal int64 = (1000 + 900 + 0 + 1) + (300000 + 0 + 2000 + 50)
+
+func TestIdleKeepAliveSettlesWholeTurnUsage(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	model := "kimi-code/kimi-for-coding"
+	keepAliveFixture{home: home, mainAge: 26 * time.Minute, lastCacheRead: 900}.write(t, model)
+	h := newIdleTestHarness(model)
+	h.probeSteps = keepAliveProbeSteps()
+	service := startIdleKeepAliveService(t, h, home, now.Add(-26*time.Minute))
+	settings := defaultAutomationSettings()
+	settings.IdleKeepAlive.Enabled = true
+	settings.IdleKeepAlive.DefaultCount = 2
+	if err := service.storeAutomationSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+
+	service.runIdleKeepAliveOnce(ctx, settings, "s1", now)
+	waitUntilIdleDone(t, service, "s1")
+
+	h.mu.Lock()
+	prompts, undos := len(h.prompts), len(h.undos)
+	h.mu.Unlock()
+	if prompts != 1 || undos != 1 {
+		t.Fatalf("prompts=%d undos=%d, want 1/1", prompts, undos)
+	}
+	view, err := service.sessionKeepAliveView(ctx, "s1", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.SpentTokens != keepAliveProbeStepsTotal {
+		t.Fatalf("SpentTokens = %d, want the whole-turn settlement %d (estimate floor 150256)", view.SpentTokens, keepAliveProbeStepsTotal)
+	}
+	if view.LastResult != keepAliveHit {
+		t.Fatalf("LastResult = %q, want hit from the earliest step", view.LastResult)
+	}
+	// The settled spend must tighten the budget: the next probe no longer fits.
+	service.runIdleKeepAliveOnce(ctx, settings, "s1", now.Add(26*time.Minute))
+	h.mu.Lock()
+	prompts = len(h.prompts)
+	h.mu.Unlock()
+	if prompts != 1 {
+		t.Fatalf("prompts after settlement = %d, want 1 (blocked by token budget)", prompts)
+	}
+	if view, err = service.sessionKeepAliveView(ctx, "s1", now.Add(26*time.Minute)); err != nil || view.StoppedReason != "token_budget" {
+		t.Fatalf("StoppedReason = %q, err = %v, want token_budget", view.StoppedReason, err)
+	}
+}
+
+func TestIdleKeepAliveToolCallTurnStillSettlesUsage(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	model := "kimi-code/kimi-for-coding"
+	keepAliveFixture{home: home, mainAge: 26 * time.Minute, lastCacheRead: 900}.write(t, model)
+	h := newIdleTestHarness(model)
+	h.emitToolCall = true
+	h.probeSteps = keepAliveProbeSteps()
+	service := startIdleKeepAliveService(t, h, home, now.Add(-26*time.Minute))
+	settings := defaultAutomationSettings()
+	settings.IdleKeepAlive.Enabled = true
+	if err := service.storeAutomationSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+
+	service.runIdleKeepAliveOnce(ctx, settings, "s1", now)
+	waitUntilIdleDone(t, service, "s1")
+
+	h.mu.Lock()
+	prompts, undos := len(h.prompts), len(h.undos)
+	h.mu.Unlock()
+	if prompts != 1 || undos != 0 {
+		t.Fatalf("prompts=%d undos=%d, want 1/0", prompts, undos)
+	}
+	view, err := service.sessionKeepAliveView(ctx, "s1", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.StoppedReason != "undo_failed" {
+		t.Fatalf("StoppedReason = %q, want undo_failed", view.StoppedReason)
+	}
+	if view.SpentTokens != keepAliveProbeStepsTotal {
+		t.Fatalf("SpentTokens = %d, want the settled spend %d on the tool-call terminal path", view.SpentTokens, keepAliveProbeStepsTotal)
+	}
+	if view.LastResult != keepAliveHit {
+		t.Fatalf("LastResult = %q, want hit from the earliest step", view.LastResult)
+	}
+}
+
+func TestIdleKeepAliveKeepsEstimateFloorWithoutUsageEvidence(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	model := "kimi-code/kimi-for-coding"
+	keepAliveFixture{home: home, mainAge: 26 * time.Minute, lastCacheRead: 900}.write(t, model)
+	h := newIdleTestHarness(model)
+	h.probeCacheRead, h.probeCacheWrite = 0, 0 // the probe turn never produces a usable usage record
+	service := startIdleKeepAliveService(t, h, home, now.Add(-26*time.Minute))
+	settings := defaultAutomationSettings()
+	settings.IdleKeepAlive.Enabled = true
+	if err := service.storeAutomationSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+
+	service.runIdleKeepAliveOnce(ctx, settings, "s1", now)
+	waitUntilIdleDone(t, service, "s1")
+
+	h.mu.Lock()
+	prompts, undos := len(h.prompts), len(h.undos)
+	h.mu.Unlock()
+	if prompts != 1 || undos != 1 {
+		t.Fatalf("prompts=%d undos=%d, want 1/1", prompts, undos)
+	}
+	view, err := service.sessionKeepAliveView(ctx, "s1", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok := service.automationSnapshot("s1")
+	if !ok {
+		t.Fatal("session snapshot missing")
+	}
+	prior, _, err := service.initializedCacheStore().LastMainStep(ctx, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	estimate := keepAliveTokenEstimate(snapshot.session, prior)
+	if estimate <= 0 {
+		t.Fatalf("estimate = %d, want positive", estimate)
+	}
+	if view.SpentTokens != estimate {
+		t.Fatalf("SpentTokens = %d, want the pre-send estimate %d as the floor", view.SpentTokens, estimate)
+	}
+	if view.LastResult != keepAliveUnknown {
+		t.Fatalf("LastResult = %q, want unknown without usage evidence", view.LastResult)
+	}
+}
+
+func TestIdleKeepAliveSettlesAfterBusyTurnCompletes(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	model := "kimi-code/kimi-for-coding"
+	keepAliveFixture{home: home, mainAge: 26 * time.Minute, lastCacheRead: 900}.write(t, model)
+	h := newIdleTestHarness(model)
+	h.slowPrompt = true
+	h.probeSteps = keepAliveProbeSteps()
+	h.acknowledge = make(chan struct{})
+	service := startIdleKeepAliveService(t, h, home, now.Add(-26*time.Minute))
+	settings := defaultAutomationSettings()
+	settings.IdleKeepAlive.Enabled = true
+	if err := service.storeAutomationSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+
+	service.runIdleKeepAliveOnce(ctx, settings, "s1", now)
+	select {
+	case <-h.acknowledge:
+	case <-time.After(3 * time.Second):
+		t.Fatal("prompt never reached the official API")
+	}
+	// While the keepalive turn is busy the keeper must neither settle nor undo.
+	time.Sleep(60 * time.Millisecond)
+	if !service.isIdleKeepAliveInFlight("s1") {
+		t.Fatal("keeper gave up on the busy turn early")
+	}
+	h.mu.Lock()
+	prompts, undos := len(h.prompts), len(h.undos)
+	h.mu.Unlock()
+	if prompts != 1 || undos != 0 {
+		t.Fatalf("while busy: prompts=%d undos=%d, want 1/0", prompts, undos)
+	}
+	h.mu.Lock()
+	tail := &h.turns[len(h.turns)-1]
+	tail.Items = append(tail.Items, NativeItem{ItemID: "msg-ka-a", Type: "assistant_message", Text: "1"})
+	h.mu.Unlock()
+	waitUntilIdleDone(t, service, "s1")
+
+	h.mu.Lock()
+	prompts, undos = len(h.prompts), len(h.undos)
+	h.mu.Unlock()
+	if prompts != 1 || undos != 1 {
+		t.Fatalf("after completion: prompts=%d undos=%d, want 1/1", prompts, undos)
+	}
+	view, err := service.sessionKeepAliveView(ctx, "s1", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.LastResult != keepAliveHit || view.SpentTokens != keepAliveProbeStepsTotal {
+		t.Fatalf("settlement after busy turn: result=%q spent=%d, want hit and %d", view.LastResult, view.SpentTokens, keepAliveProbeStepsTotal)
+	}
+}
+
+func TestIdleKeepAliveTimeoutSettlesRecordedEvidence(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	model := "kimi-code/kimi-for-coding"
+	keepAliveFixture{home: home, mainAge: 26 * time.Minute, lastCacheRead: 900}.write(t, model)
+	h := newIdleTestHarness(model)
+	h.slowPrompt = true // the turn never settles inside the verification window
+	h.probeSteps = keepAliveProbeSteps()
+	service := startIdleKeepAliveService(t, h, home, now.Add(-26*time.Minute))
+	settings := defaultAutomationSettings()
+	settings.IdleKeepAlive.Enabled = true
+	if err := service.storeAutomationSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+
+	service.runIdleKeepAliveOnce(ctx, settings, "s1", now)
+	waitUntilIdleDone(t, service, "s1")
+
+	h.mu.Lock()
+	prompts, undos := len(h.prompts), len(h.undos)
+	keptTurn := false
+	for _, turn := range h.turns {
+		keptTurn = keptTurn || turn.TurnID == "turn-ka-1"
+	}
+	h.mu.Unlock()
+	if prompts != 1 || undos != 0 {
+		t.Fatalf("timeout: prompts=%d undos=%d, want 1/0", prompts, undos)
+	}
+	if !keptTurn {
+		t.Fatal("the unconfirmed keepalive turn must stay in the session")
+	}
+	view, err := service.sessionKeepAliveView(ctx, "s1", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.StoppedReason != "unconfirmed" {
+		t.Fatalf("StoppedReason = %q, want unconfirmed", view.StoppedReason)
+	}
+	if view.LastResult != keepAliveHit {
+		t.Fatalf("LastResult = %q, want the recorded hit evidence", view.LastResult)
+	}
+	if !strings.Contains(view.LastNote, "保活请求读取了缓存") || !strings.Contains(view.LastNote, "保活回合未在核对窗口内完成") {
+		t.Fatalf("LastNote = %q, want the evidence plus the timeout explanation", view.LastNote)
+	}
+	if view.SpentTokens != keepAliveProbeStepsTotal {
+		t.Fatalf("SpentTokens = %d, want the settled spend %d", view.SpentTokens, keepAliveProbeStepsTotal)
+	}
+}
+
+func TestIdleKeepAliveMissVerdictComesFromEarliestStep(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	model := "kimi-code/kimi-for-coding"
+	keepAliveFixture{home: home, mainAge: 26 * time.Minute, lastCacheRead: 900}.write(t, model)
+	h := newIdleTestHarness(model)
+	h.probeSteps = []idleProbeStep{
+		{uuid: "ka-step-a", inputOther: 1000, creation: 2000},
+		{uuid: "ka-step-b", read: 900},
+	}
+	service := startIdleKeepAliveService(t, h, home, now.Add(-26*time.Minute))
+	settings := defaultAutomationSettings()
+	settings.IdleKeepAlive.Enabled = true
+	if err := service.storeAutomationSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+
+	service.runIdleKeepAliveOnce(ctx, settings, "s1", now)
+	waitUntilIdleDone(t, service, "s1")
+
+	h.mu.Lock()
+	prompts, undos := len(h.prompts), len(h.undos)
+	h.mu.Unlock()
+	if prompts != 1 || undos != 1 {
+		t.Fatalf("prompts=%d undos=%d, want 1/1", prompts, undos)
+	}
+	view, err := service.sessionKeepAliveView(ctx, "s1", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.LastResult != keepAliveMiss || !strings.Contains(view.LastNote, "保活请求未读取缓存") {
+		t.Fatalf("result=%q note=%q, want miss: the later step's cache read must not override the earliest one", view.LastResult, view.LastNote)
+	}
+}
+
+func TestKeepAliveSettlementExcludesPriorStep(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	model := "kimi-code/kimi-for-coding"
+	keepAliveFixture{home: home, mainAge: 26 * time.Minute, lastCacheRead: 900}.write(t, model)
+	service := startIdleKeepAliveService(t, newIdleTestHarness(model), home, now.Add(-26*time.Minute))
+	store, err := service.cacheStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Scan(ctx, now, true); err != nil {
+		t.Fatal(err)
+	}
+	prior, ok, err := store.LastMainStep(ctx, "s1")
+	if err != nil || !ok {
+		t.Fatalf("prior main step missing: found=%v err=%v", ok, err)
+	}
+	stepAt := func(offset time.Duration) string { return now.Add(offset).UTC().Format("2006-01-02T15:04:05.000000000Z") }
+	// A persisted row that carries the prior step's UUID under the keepalive
+	// turn's id must neither judge the verdict nor be billed twice; replacing
+	// the prior row models the official client re-attributing that step.
+	insert := `INSERT OR REPLACE INTO cache_steps(session_id,agent,step_uuid,model,time,turn_id,step_index,finish_reason,input_other,input_cache_read,input_cache_creation,output,first_token_ms,decode_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	if _, err = service.db.Exec(insert, "s1", "main", prior.StepUUID, model, stepAt(0), "turn-ka-1", 1, "end_turn", 250000, 0, 0, 30, -1, -1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.db.Exec(insert, "s1", "main", "ka-step-a", model, stepAt(time.Second), "turn-ka-1", 2, "end_turn", 1000, 900, 0, 1, -1, -1); err != nil {
+		t.Fatal(err)
+	}
+	found, err := store.MainStepsForTurn(ctx, "s1", "turn-ka-1")
+	if err != nil || len(found) != 2 {
+		t.Fatalf("precondition: turn steps = %d, err = %v, want 2", len(found), err)
+	}
+	job := idleKeepAliveJob{sessionID: "s1", priorStep: prior}
+	state, note := service.settleKeepAliveTurnUsage(ctx, &job, "turn-ka-1")
+	if state != keepAliveHit || note != "保活请求读取了缓存" {
+		t.Fatalf("settlement = %q %q, want the earliest attributable step's hit, not the decoy's miss", state, note)
+	}
+	if job.actualTokens != 1901 {
+		t.Fatalf("actualTokens = %d, want only the attributable step's 1901", job.actualTokens)
+	}
+}
+
+func TestKeepAliveSettlementCoversStepsPersistedAtVerification(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	model := "kimi-code/kimi-for-coding"
+	keepAliveFixture{home: home, mainAge: 26 * time.Minute, lastCacheRead: 900}.write(t, model)
+	h := newIdleTestHarness(model)
+	service := startIdleKeepAliveService(t, h, home, now.Add(-26*time.Minute))
+	store, err := service.cacheStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Scan(ctx, now, true); err != nil {
+		t.Fatal(err)
+	}
+	prior, ok, err := store.LastMainStep(ctx, "s1")
+	if err != nil || !ok {
+		t.Fatalf("prior main step missing: found=%v err=%v", ok, err)
+	}
+	appendIdleTestStepUsage(t, h.wirePath, model, "turn-ka-1", "ka-step-a", 1, now, 1000, 1, 900, 0)
+	job := idleKeepAliveJob{sessionID: "s1", priorStep: prior}
+	if state, note := service.settleKeepAliveTurnUsage(ctx, &job, "turn-ka-1"); state != keepAliveHit || note != "保活请求读取了缓存" || job.actualTokens != 1901 {
+		t.Fatalf("first settlement = %q %q %d, want hit with 1901", state, note, job.actualTokens)
+	}
+	// A step whose usage lands after that snapshot is not back-billed into it.
+	appendIdleTestStepUsage(t, h.wirePath, model, "turn-ka-1", "ka-step-b", 2, now.Add(time.Second), 300000, 50, 0, 2000)
+	if job.actualTokens != 1901 {
+		t.Fatalf("late step was back-billed: actualTokens = %d", job.actualTokens)
+	}
+	// The next settlement covers whatever is persisted at its own verification time.
+	late := idleKeepAliveJob{sessionID: "s1", priorStep: prior}
+	if state, _ := service.settleKeepAliveTurnUsage(ctx, &late, "turn-ka-1"); state != keepAliveHit || late.actualTokens != 303951 {
+		t.Fatalf("second settlement = %q %d, want hit with 303951", state, late.actualTokens)
 	}
 }

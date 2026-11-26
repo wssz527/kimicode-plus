@@ -178,3 +178,51 @@ function dropEvent(files: File[], onPrevent: () => void): DragEvent {
     dataTransfer: { files } as unknown as DataTransfer,
   } as unknown as DragEvent;
 }
+
+
+test("picked files follow the same staging contract as dropped files", async () => {
+  const staged: Array<{ name: string; data: string }> = [];
+  let picked = droppedFiles()[0]!;
+  let pickerOpens = 0;
+  const input = new EventTarget();
+  Object.assign(input, { type: "", multiple: false, click() { pickerOpens += 1; }, remove() {}, files: [picked] });
+  const runtime = globalThis as { document?: unknown };
+  const previous = runtime.document;
+  runtime.document = { createElement: () => input };
+  try {
+    const plugin = createPluginRuntime({
+      slots: {},
+      request: async (path, body) => {
+        if (path === "/plugin-runtime/attachments.stage") {
+          for (const file of (body as { params: { files: Array<{ name: string; data: string }> } }).params.files) staged.push(file);
+          return { value: { files: [{ path: "/data/staged/test/p/00-diagram.png", name: "diagram.png" }], batch: "/data/staged/test/p" } };
+        }
+        return { value: {} };
+      },
+    });
+    let result: { batch: string } | null = null;
+    await plugin.activate({
+      activate: async context => {
+        const pending = context.attachments!.pick();
+        input.dispatchEvent(new Event("change"));
+        result = await pending;
+        await context.attachments!.send({ id: "s1", text: "see attached", paths: ["/data/staged/test/p/00-diagram.png"], batch: result.batch });
+      },
+    }, { id: "test.plugin", version: "2.0.0", granted: ["attachments"], token: "t" });
+    assert.equal(staged.length, 1);
+    assert.equal(staged[0]!.name, picked.name);
+    assert.equal(result!.batch, "/data/staged/test/p");
+    assert.equal(pickerOpens, 1, "pick did not open the renderer file selector");
+    picked = new File(["replacement"], "other.txt", { type: "text/plain" });
+    await plugin.activate({ activate: async context => {
+      const pending = context.attachments!.pick();
+      input.dispatchEvent(new Event("cancel"));
+      assert.deepEqual(await pending, { files: [], batch: "" });
+    } }, { id: "test.cancel", version: "2.0.0", granted: ["attachments"], token: "t" });
+    assert.equal(staged.length, 1);
+    assert.equal(pickerOpens, 2, "cancelling did not open a fresh selection flow");
+    plugin.dispose();
+  } finally {
+    runtime.document = previous;
+  }
+});

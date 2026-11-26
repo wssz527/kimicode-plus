@@ -284,6 +284,7 @@ export interface PluginContext {
     decorate(
       target: Exclude<SlotName, "sidebar" | "settings">,
       decorator: (block: HTMLElement, info: BlockInfo) => Cleanup | DecorationHandle | void,
+      options?: { includeEnhanced?: boolean },
     ): Disposable;
     theme(): PluginTheme;
     pickDirectory?(options?: { title?: string; defaultPath?: string }): Promise<string | null>;
@@ -326,8 +327,8 @@ export interface PluginContext {
     unwatch(id: string): Promise<{ watching: boolean; sessionId: string }>;
   };
   attachments?: {
-    pick(): Promise<AttachmentPick[]>;
-    /** Stages files the user dropped; the returned batch is released with `send`. */
+    pick(): Promise<{ files: AttachmentPick[]; batch: string }>;
+    /** Stages picked or dropped files; the returned batch is released with `send`. */
     stage(files: ArrayLike<File>): Promise<{ files: AttachmentPick[]; batch: string }>;
     /** The full drop handler: refuses the browser default, then stages. */
     stageFromDrop(event: DragEvent): Promise<{ files: AttachmentPick[]; batch: string }>;

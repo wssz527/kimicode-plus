@@ -455,6 +455,11 @@ func (c *Client) Complete(ctx context.Context, p Config, model string, extras ma
 				Text string `json:"text"`
 			} `json:"content"`
 		} `json:"output"`
+		Status            string `json:"status"`
+		IncompleteDetails struct {
+			Reason string `json:"reason"`
+		} `json:"incomplete_details"`
+		StopReason string `json:"stop_reason"`
 		Content []struct {
 			Text string `json:"text"`
 		} `json:"content"`
@@ -465,6 +470,7 @@ func (c *Client) Complete(ctx context.Context, p Config, model string, extras ma
 					Thought bool   `json:"thought"`
 				} `json:"parts"`
 			} `json:"content"`
+			FinishReason string `json:"finishReason"`
 		} `json:"candidates"`
 		Usage         json.RawMessage `json:"usage"`
 		UsageMetadata json.RawMessage `json:"usageMetadata"`
@@ -472,6 +478,12 @@ func (c *Client) Complete(ctx context.Context, p Config, model string, extras ma
 	if json.Unmarshal(raw, &v) != nil {
 		return Reply{}, errors.New("invalid chat response")
 	}
+	// The buffered path must keep the upstream completion reason: the gateway
+	// relays it as finish_reason, and an output-limit cut reported as a normal
+	// stop would read as a complete answer. Only reasons the protocols document
+	// are translated; a tool stop without parsed tool calls (Complete does not
+	// extract native tool calls) stays unparsed instead of being guessed into
+	// tool_calls, and anything unverified maps to stop through CompletionFinish.
 	reply := Reply{Usage: v.Usage}
 	switch p.Protocol {
 	case "openai":
@@ -491,9 +503,15 @@ func (c *Client) Complete(ctx context.Context, p Config, model string, extras ma
 				reply.Text += part.Text
 			}
 		}
+		if v.Status == "incomplete" && v.IncompleteDetails.Reason == "max_output_tokens" {
+			reply.FinishReason = "length"
+		}
 	case "anthropic":
 		for _, part := range v.Content {
 			reply.Text += part.Text
+		}
+		if v.StopReason == "max_tokens" {
+			reply.FinishReason = "length"
 		}
 	case "gemini":
 		reply.Usage = v.UsageMetadata
@@ -502,6 +520,9 @@ func (c *Client) Complete(ctx context.Context, p Config, model string, extras ma
 				if !part.Thought {
 					reply.Text += part.Text
 				}
+			}
+			if v.Candidates[0].FinishReason == "MAX_TOKENS" {
+				reply.FinishReason = "length"
 			}
 		}
 	}
