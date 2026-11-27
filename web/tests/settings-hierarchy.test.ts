@@ -5,6 +5,7 @@ import {
   evaluateDOMContracts,
   findOfficialSettingsPanel,
   findOfficialSettingsSection,
+  hasActiveSettingsSubpage,
   resolveSettingsFallbacks,
 } from "../src/plugin-runtime/contracts.js";
 import { FakeDocument } from "./helpers/fake-dom.js";
@@ -266,4 +267,75 @@ test("PluginSettingsPanel binds mountSettings to version, updatedAt, and capabil
   assert.ok(pluginSettings.includes('host?.subscribe("plugins"'));
   assert.ok(pluginSettings.includes("pluginHostBridge()?.subscribe?.("));
   assert.ok(pluginSettings.includes("<PluginSettingsPanel plugin={current} onRevisionMismatch={() => plugins.reload()} />"));
+});
+
+test("1.5.0 agent settings nested wrappers and SettingsSubpage avoid misplaced or leaked injected sections", () => {
+  const doc = new FakeDocument();
+  const dialog = doc.createElement("div");
+  dialog.className = "settings-dialog";
+  dialog.setAttribute("role", "dialog");
+  const list = doc.createElement("div");
+  list.className = "settings-tab-list";
+  list.setAttribute("role", "tablist");
+  const tab = doc.createElement("button");
+  tab.className = "tab on";
+  tab.setAttribute("role", "tab");
+  tab.setAttribute("aria-selected", "true");
+  tab.textContent = "智能体与会话";
+  list.append(tab);
+  const region = doc.createElement("section");
+  region.className = "settings-region";
+  const body = doc.createElement("div");
+  body.className = "body";
+
+  // 1.5.0 wraps Agent Defaults and Subagents inside v-show divs next to GlobalAgentsMdSetting
+  const agentPanel = doc.createElement("section");
+  agentPanel.className = "panel";
+  const defaultsWrap = doc.createElement("div");
+  const defaultsSec = doc.createElement("section");
+  defaultsSec.className = "sec";
+  const defaultsTitle = doc.createElement("h3");
+  defaultsTitle.className = "sec-title";
+  defaultsTitle.textContent = "Agent 默认值";
+  defaultsSec.append(defaultsTitle);
+  defaultsWrap.append(defaultsSec);
+
+  const subagentWrap = doc.createElement("div");
+  const subagentSec = doc.createElement("section");
+  subagentSec.className = "sec";
+  const subagentTitle = doc.createElement("h3");
+  subagentTitle.className = "sec-title";
+  subagentTitle.textContent = "子智能体";
+  subagentSec.append(subagentTitle);
+  subagentWrap.append(subagentSec);
+
+  agentPanel.append(defaultsWrap, subagentWrap);
+  body.append(agentPanel);
+  region.append(body);
+  dialog.append(list, region);
+  doc.body.append(dialog);
+
+  assert.equal(findOfficialSettingsPanel(doc as unknown as Document, "agent"), agentPanel);
+  assert.equal(findOfficialSettingsSection(agentPanel as unknown as Element, doc as unknown as Document, "settings.agentDefaults"), defaultsSec);
+  assert.equal(findOfficialSettingsSection(agentPanel as unknown as Element, doc as unknown as Document, "settings.secondaryModelSection"), subagentSec);
+  assert.equal(hasActiveSettingsSubpage(agentPanel as unknown as Element), false);
+
+  // Opening Global AGENTS.md subpage hides both wrapper divs and renders .settings-subpage
+  defaultsWrap.setAttribute("style", "display: none;");
+  subagentWrap.setAttribute("style", "display: none;");
+  const subpage = doc.createElement("section");
+  subpage.className = "settings-subpage";
+  agentPanel.append(subpage);
+
+  assert.equal(hasActiveSettingsSubpage(agentPanel as unknown as Element), true);
+  assert.equal(findOfficialSettingsSection(agentPanel as unknown as Element, doc as unknown as Document, "settings.agentDefaults"), null);
+  assert.equal(findOfficialSettingsSection(agentPanel as unknown as Element, doc as unknown as Document, "settings.secondaryModelSection"), null);
+  assert.equal(evaluateDOMContracts(doc as unknown as Document).byId["dom.settings_agent"]?.status, "available");
+
+  // Renderer keeps relative insertion inside wrapper container and avoids subpages
+  const renderer = source("../internal/desktop/assets/renderer.js");
+  assert.ok(renderer.includes("panel.contains(placement.anchor)"));
+  assert.ok(renderer.includes("module.hasActiveSettingsSubpage("));
+  assert.ok(renderer.includes("module.findSidebarToggleButton(document, 'collapse')"));
+  assert.ok(renderer.includes("module.findSidebarToggleButton(document, 'expand')"));
 });

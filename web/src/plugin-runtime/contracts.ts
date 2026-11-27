@@ -46,6 +46,8 @@ const SETTINGS_MOUNT_CLASS = "ekd-settings-mount";
 
 const OFFICIAL_KEY_FALLBACKS: Record<string, readonly string[]> = {
   "sidebar.newChat": ["新建会话", "New Session", "New Chat"],
+  "sidebar.collapseSidebar": ["收起侧边栏", "Collapse sidebar"],
+  "sidebar.expandSidebar": ["展开侧边栏", "Expand sidebar"],
   "header.sessionInfo": ["会话信息", "Session Info"],
   "header.sessionInfoAvailableTabs": ["可打开", "Available to open"],
   "header.toggleSideChat": ["侧边聊天", "Side chat", "Side Chat"],
@@ -318,7 +320,7 @@ function isInjectedSettingsNode(element: Element): boolean {
 function isElementHidden(element: Element, stopAt?: Element | null): boolean {
   let current: Element | null = element;
   while (current && current !== stopAt) {
-    if (current.hasAttribute("hidden")) return true;
+    if ((current as HTMLElement).hidden || current.hasAttribute("hidden")) return true;
     const inlineDisplay = (current as HTMLElement).style?.display;
     if (inlineDisplay === "none") return true;
     const styleAttr = current.getAttribute("style");
@@ -346,13 +348,22 @@ function firstVisibleCandidate(container: Element, selectors: readonly string[])
   return null;
 }
 
+export function hasActiveSettingsSubpage(container: Element | null): boolean {
+  if (!container) return false;
+  for (const subpage of Array.from(container.querySelectorAll(".settings-subpage"))) {
+    if (isInjectedSettingsNode(subpage)) continue;
+    if (!isElementHidden(subpage, container)) return true;
+  }
+  return false;
+}
+
 export function findOfficialSettingsPanel(document: Document, key: Exclude<OfficialSettingsTabKey, "archived">): Element | null {
   const parts = findSettingsDialogParts(document);
   if (!parts?.body) return null;
   const tab = findOfficialSettingsTab(document, key);
   if (!isOfficialSettingsTabSelected(tab)) return null;
   if (key === "providers") {
-    return firstVisibleCandidate(parts.body, [".pf", ".panel-sections", ".panel"]);
+    return firstVisibleCandidate(parts.body, [".pf", ".ap", ".panel-sections", ".panel"]);
   }
   if (key === "plugins") {
     return firstVisibleCandidate(parts.body, [".plugins-panel", ".panel", ".panel-sections", ".sec"]);
@@ -373,6 +384,32 @@ export function findOfficialSettingsSection(
     if (matchesAnyLabel(elementText(heading), candidates)) {
       return section;
     }
+  }
+  return null;
+}
+
+export function findSidebarToggleButton(document: Document, action: "collapse" | "expand"): HTMLElement | null {
+  const labels = resolveOfficialTexts(
+    document,
+    action === "collapse" ? "sidebar.collapseSidebar" : "sidebar.expandSidebar",
+  ).map(normalizeLabel).filter(Boolean);
+  const matchesExactLabel = (button: Element): boolean => {
+    const aria = normalizeLabel(button.getAttribute("aria-label"));
+    const title = normalizeLabel(button.getAttribute("title"));
+    return labels.some(target => aria === target || title === target);
+  };
+  for (const button of Array.from(document.querySelectorAll("button.sidebar-toggle-btn, button.custom-sidebar-toggle"))) {
+    if (isElementHidden(button)) continue;
+    if (matchesExactLabel(button)) return button as HTMLElement;
+  }
+  if (action === "collapse") {
+    for (const button of Array.from(document.querySelectorAll("button.ch-collapse"))) {
+      if (!isElementHidden(button)) return button as HTMLElement;
+    }
+  }
+  for (const button of Array.from(document.querySelectorAll("button[aria-label], button[title]"))) {
+    if (isElementHidden(button)) continue;
+    if (matchesExactLabel(button)) return button as HTMLElement;
   }
   return null;
 }
@@ -534,8 +571,12 @@ export function evaluateDOMContracts(document: Document, previous?: DOMContractS
       if (isOfficialSettingsTabSelected(tab)) {
         const panel = findOfficialSettingsPanel(document, key);
         if (key === "providers") {
-          const form = settings.body.querySelector(".pf");
-          if (form && form.querySelector(".pf-back") && !form.querySelector(".pmt")) {
+          const visibleForms = Array.from(settings.body.querySelectorAll(".pf"))
+            .filter(node => !isInjectedSettingsNode(node) && !isElementHidden(node, settings.body));
+          const editForm = visibleForms.find(node =>
+            !node.closest(".ap") && Boolean(node.querySelector(".pf-back, .pf-nav, .pf-head-sticky")),
+          ) ?? null;
+          if (editForm && !editForm.querySelector(".pmt")) {
             const reason = "模型供应商编辑页缺少模型列表（.pmt），行内能力增强已停用";
             state.disabledReasons[meta.id] = reason;
             push(meta.id, meta.label, "disabled", reason);
@@ -544,7 +585,7 @@ export function evaluateDOMContracts(document: Document, previous?: DOMContractS
           if (panel) {
             state.seen[meta.id] = true;
             delete state.disabledReasons[meta.id];
-            const hasRows = Boolean(settings.body.querySelector(".pf .pmt .pmt-grid"));
+            const hasRows = visibleForms.some(node => Boolean(node.querySelector(".pmt")?.querySelector(".pmt-grid")));
             push(meta.id, meta.label, "available", undefined, hasRows ? "已检测到模型供应商表单与模型行" : "已检测到模型供应商设置页内容区");
           } else {
             const reason = "「模型供应商」设置页缺少内容区容器";

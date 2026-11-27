@@ -188,8 +188,32 @@ func (s *Service) refreshCatalog(ctx context.Context, client *http.Client, sourc
 
 // FindPublicModel matches an official provider endpoint and model ID to the public catalog.
 func (s *Service) FindPublicModel(ctx context.Context, providerID, baseURL, modelID string) (map[string]Capability, error) {
+	if modelID == "" {
+		return nil, nil
+	}
+	found, err := s.FindPublicModels(ctx, providerID, baseURL, []string{modelID})
+	if err != nil || len(found) == 0 {
+		return nil, err
+	}
+	return found[modelID], nil
+}
+
+// FindPublicModels matches a batch of model IDs for one official provider endpoint against a single cached catalog read.
+func (s *Service) FindPublicModels(ctx context.Context, providerID, baseURL string, modelIDs []string) (map[string]map[string]Capability, error) {
 	endpoint := publicCatalogEndpoint(baseURL)
-	if endpoint == "" || modelID == "" {
+	if endpoint == "" || len(modelIDs) == 0 {
+		return nil, nil
+	}
+	uniqueIDs := make([]string, 0, len(modelIDs))
+	seen := make(map[string]bool, len(modelIDs))
+	for _, id := range modelIDs {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		uniqueIDs = append(uniqueIDs, id)
+	}
+	if len(uniqueIDs) == 0 {
 		return nil, nil
 	}
 	cached, err := s.cachedCatalog(ctx)
@@ -206,8 +230,25 @@ func (s *Service) FindPublicModel(ctx context.Context, providerID, baseURL, mode
 		}
 	}
 
+	result := make(map[string]map[string]Capability, len(uniqueIDs))
+	for _, modelID := range uniqueIDs {
+		caps, err := matchPublicModel(cached.providers, cached.status.RetrievedAt, providerID, endpoint, modelID)
+		if err != nil {
+			return nil, err
+		}
+		if len(caps) > 0 {
+			result[modelID] = caps
+		}
+	}
+	if len(result) == 0 {
+		return nil, nil
+	}
+	return result, nil
+}
+
+func matchPublicModel(providers map[string]modelsDevProvider, retrievedAt, providerID, endpoint, modelID string) (map[string]Capability, error) {
 	matches := make(map[string]modelsDevProvider)
-	for id, provider := range cached.providers {
+	for id, provider := range providers {
 		model, ok := provider.Models[modelID]
 		if !ok || (model.ID != "" && model.ID != modelID) || catalogProviderEndpoint(id, provider.API) != endpoint {
 			continue
@@ -220,7 +261,7 @@ func (s *Service) FindPublicModel(ctx context.Context, providerID, baseURL, mode
 	if len(matches) != 1 {
 		return nil, nil
 	}
-	models, err := parseModelsDev(ModelsDevCatalog{Source: PublicCatalogURL, RetrievedAt: cached.status.RetrievedAt, Providers: matches})
+	models, err := parseModelsDev(ModelsDevCatalog{Source: PublicCatalogURL, RetrievedAt: retrievedAt, Providers: matches})
 	if err != nil {
 		return nil, err
 	}

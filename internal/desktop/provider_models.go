@@ -741,12 +741,100 @@ type publicModelCatalog interface {
 	FindPublicModel(ctx context.Context, providerID, baseURL, modelID string) (map[string]registry.Capability, error)
 }
 
+type publicModelBatchCatalog interface {
+	FindPublicModels(ctx context.Context, providerID, baseURL string, modelIDs []string) (map[string]map[string]registry.Capability, error)
+}
+
 func (s *NativeService) UsePublicModelCatalog(catalog publicModelCatalog) {
 	s.publicModelCatalog = catalog
 }
 
+func suggestionFromCapabilities(capabilities map[string]registry.Capability) map[string]any {
+	suggestion := map[string]any{}
+	for source, field := range map[string]string{
+		"vision":   "image_in",
+		"video":    "video_in",
+		"tools":    "tool_use",
+		"thinking": "thinking",
+		"context":  "max_context_size",
+		"output":   "max_output_size",
+	} {
+		if capability, known := capabilities[source]; known {
+			suggestion[field] = capability.Value
+		}
+	}
+	return suggestion
+}
+
 func (s *NativeService) providerModelSuggestion(ctx context.Context, input map[string]any) (any, error) {
 	providerID := stringInput(input, "providerId")
+	if rawModels, hasBatch := input["models"]; hasBatch {
+		if providerID == "" || isManagedProvider(providerID) {
+			return nil, errors.New("请选择已保存的自定义供应商模型")
+		}
+		rawKeys, err := modelEditStrings(rawModels)
+		if err != nil || len(rawKeys) == 0 {
+			return nil, errors.New("请至少选择一个已保存的模型")
+		}
+		modelIDs := make([]string, 0, len(rawKeys))
+		seen := make(map[string]bool, len(rawKeys))
+		for _, rawKey := range rawKeys {
+			owner, modelID := splitModelKey(rawKey)
+			if owner != providerID || modelID == "" {
+				return nil, errors.New("请选择已保存的自定义供应商模型")
+			}
+			if !seen[modelID] {
+				seen[modelID] = true
+				modelIDs = append(modelIDs, modelID)
+			}
+		}
+		if s.publicModelCatalog == nil {
+			return map[string]any{"suggestions": map[string]any{}}, nil
+		}
+		config, err := s.readConfig(ctx)
+		if err != nil {
+			return nil, err
+		}
+		provider, ok := config.Providers[providerID]
+		if !ok {
+			return nil, errors.New("找不到已保存的供应商")
+		}
+		savedIDs := make([]string, 0, len(modelIDs))
+		for _, modelID := range modelIDs {
+			if _, _, exists := lookupProviderModel(config.Models, providerID, modelID); exists {
+				savedIDs = append(savedIDs, modelID)
+			}
+		}
+		if len(savedIDs) == 0 {
+			return map[string]any{"suggestions": map[string]any{}}, nil
+		}
+		var capabilitiesByModel map[string]map[string]registry.Capability
+		if batchCatalog, ok := s.publicModelCatalog.(publicModelBatchCatalog); ok {
+			capabilitiesByModel, err = batchCatalog.FindPublicModels(ctx, providerID, provider.BaseURL, savedIDs)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			capabilitiesByModel = make(map[string]map[string]registry.Capability, len(savedIDs))
+			for _, modelID := range savedIDs {
+				caps, lookupErr := s.publicModelCatalog.FindPublicModel(ctx, providerID, provider.BaseURL, modelID)
+				if lookupErr != nil {
+					return nil, lookupErr
+				}
+				if len(caps) > 0 {
+					capabilitiesByModel[modelID] = caps
+				}
+			}
+		}
+		suggestions := make(map[string]any, len(capabilitiesByModel))
+		for _, modelID := range savedIDs {
+			suggestion := suggestionFromCapabilities(capabilitiesByModel[modelID])
+			if len(suggestion) > 0 {
+				suggestions[modelID] = suggestion
+			}
+		}
+		return map[string]any{"suggestions": suggestions}, nil
+	}
 	owner, modelID := splitModelKey(stringInput(input, "model"))
 	if providerID == "" || owner != providerID || isManagedProvider(providerID) {
 		return nil, errors.New("请选择已保存的自定义供应商模型")
@@ -769,12 +857,7 @@ func (s *NativeService) providerModelSuggestion(ctx context.Context, input map[s
 	if err != nil {
 		return nil, err
 	}
-	suggestion := map[string]any{}
-	for source, field := range map[string]string{"vision": "image_in", "video": "video_in", "tools": "tool_use", "thinking": "thinking", "output": "max_output_size"} {
-		if capability, known := capabilities[source]; known {
-			suggestion[field] = capability.Value
-		}
-	}
+	suggestion := suggestionFromCapabilities(capabilities)
 	if len(suggestion) == 0 {
 		return map[string]any{}, nil
 	}
@@ -1019,6 +1102,7 @@ func (s *NativeService) saveOfficialProviderForm(ctx context.Context, input map[
 		return nil, errors.New("供应商表单缺少模型列表")
 	}
 	opening := parseOfficialFormOpening(input["opening"])
+	preserveCatalogImport, _ := input["preserveCatalogImport"].(bool)
 
 	payload := maps.Clone(rawPayload)
 	models := make([]any, len(rawModels))
@@ -1043,6 +1127,26 @@ func (s *NativeService) saveOfficialProviderForm(ctx context.Context, input map[
 		return nil, err
 	}
 
+	if preserveCatalogImport {
+		if storedProvider, hasProvider := before.Providers[providerID]; hasProvider {
+			if !hasAnyMapKey(payload, "base_url", "baseUrl") && storedProvider.BaseURL != "" {
+				payload["base_url"] = storedProvider.BaseURL
+			}
+			if !hasAnyMapKey(payload, "default_model", "defaultModel") && storedProvider.DefaultModel != "" {
+				defaultModelID := strings.TrimSpace(storedProvider.DefaultModel)
+				if owner, modelID := splitModelKey(defaultModelID); owner == providerID && modelID != "" {
+					defaultModelID = modelID
+				}
+				for _, elem := range models {
+					if itemMap, ok := elem.(map[string]any); ok && strings.TrimSpace(stringInput(itemMap, "model")) == defaultModelID {
+						payload["default_model"] = defaultModelID
+						break
+					}
+				}
+			}
+		}
+	}
+
 	mergedModels := make(map[string]wireCapabilitySnapshot, len(models))
 	for _, elem := range models {
 		itemMap, ok := elem.(map[string]any)
@@ -1065,9 +1169,12 @@ func (s *NativeService) saveOfficialProviderForm(ctx context.Context, input map[
 					itemMap["max_output_size"] = *stored.MaxOutputSize
 				}
 			}
-			modelOpening := opening[modelID]
-			if modelOpening == nil && opening != nil {
-				modelOpening = opening[providerModelKey(providerID, modelID)]
+			var modelOpening *officialFormModelOpening
+			if !preserveCatalogImport {
+				modelOpening = opening[modelID]
+				if modelOpening == nil && opening != nil {
+					modelOpening = opening[providerModelKey(providerID, modelID)]
+				}
 			}
 			if !hasAnyMapKey(itemMap, "capabilities") || isUnchangedFromOpening(modelOpening, "capabilities", rawSnap) {
 				if len(stored.Capabilities) > 0 {

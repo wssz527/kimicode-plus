@@ -240,6 +240,8 @@ var SupportedHosts = []HostContract{
 	{AppVersion: "1.3.7", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1, Verified: true},
 	{AppVersion: "1.4.2", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1, Verified: true},
 	{AppVersion: "1.4.3", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1, Verified: true},
+	{AppVersion: "1.5.0", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1, Verified: true},
+	{AppVersion: "1.5.1", Electron: SupportedElectron, RendererScheme: "app://renderer/", DOMRevision: 1, Verified: true},
 }
 
 type HostIdentity struct {

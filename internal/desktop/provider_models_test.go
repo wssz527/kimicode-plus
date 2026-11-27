@@ -1857,3 +1857,121 @@ func TestSaveOfficialProviderFormRejectsRedirectsWithoutLeakingAPIKey(t *testing
 		}
 	})
 }
+
+func TestSaveOfficialProviderFormPreserveCatalogImport(t *testing.T) {
+	maxOut := int64(32768)
+	adaptiveFalse := false
+	var capturedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config"):
+			writeNativeTestEnvelope(w, map[string]any{
+				"providers": map[string]providerConfig{
+					"deepseek": {
+						Type:         "openai",
+						BaseURL:      "https://api.deepseek.com",
+						DefaultModel: "deepseek/deepseek-reasoner",
+					},
+				},
+				"models": map[string]modelConfig{
+					"deepseek/deepseek-reasoner": {
+						Provider:         "deepseek",
+						Model:            "deepseek-reasoner",
+						MaxContextSize:   131072,
+						MaxOutputSize:    &maxOut,
+						Capabilities:     []string{"image_in", "tool_use", "always_thinking"},
+						SupportEfforts:   []string{"low", "medium", "high"},
+						AdaptiveThinking: &adaptiveFalse,
+						DefaultEffort:    "medium",
+						OffEffort:        "minimal",
+					},
+					"deepseek/deepseek-chat": {
+						Provider:       "deepseek",
+						Model:          "deepseek-chat",
+						MaxContextSize: 131072,
+						Capabilities:   []string{"tool_use"},
+					},
+				},
+			})
+		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/providers/deepseek"):
+			if err := json.NewDecoder(r.Body).Decode(&capturedBody); err != nil {
+				t.Errorf("decode PUT body: %v", err)
+			}
+			writeNativeTestEnvelope(w, map[string]any{"provider": map[string]any{"id": "deepseek"}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	service := &NativeService{
+		kap:   &KAPClient{client: server.Client(), base: server.URL, token: "secret-kap-token"},
+		bus:   NewEventBus(),
+		cache: map[string]cachedSession{},
+	}
+
+	// Simulate 1.5.0 AddProviderPage catalog follow-up PUT: omits base_url, default_model,
+	// max_output_size, support_efforts, default_effort, off_effort and hardcodes adaptive_thinking: true.
+	// Also simulates stale opening metadata so preserveCatalogImport must ignore opening diffs.
+	_, err := service.Action(context.Background(), "providers.saveOfficialForm", json.RawMessage(fmt.Sprintf(`{
+		"providerId": "deepseek",
+		"expectedOrigin": %q,
+		"preserveCatalogImport": true,
+		"opening": {
+			"deepseek-reasoner": {
+				"raw": {"capabilities": ["tool_use"], "support_efforts": [], "adaptive_thinking": false}
+			}
+		},
+		"payload": {
+			"type": "openai",
+			"models": [
+				{
+					"model": "deepseek-reasoner",
+					"display_name": "DeepSeek R1 Custom",
+					"max_context_size": 131072,
+					"capabilities": ["tool_use", "thinking"],
+					"adaptive_thinking": true
+				},
+				{
+					"model": "custom-added",
+					"max_context_size": 65536,
+					"capabilities": ["tool_use"]
+				}
+			]
+		}
+	}`, server.URL)))
+	if err != nil {
+		t.Fatalf("saveOfficialForm preserveCatalogImport failed: %v", err)
+	}
+	if capturedBody["base_url"] != "https://api.deepseek.com" {
+		t.Fatalf("base_url = %#v, want https://api.deepseek.com", capturedBody["base_url"])
+	}
+	if capturedBody["default_model"] != "deepseek-reasoner" {
+		t.Fatalf("default_model = %#v, want deepseek-reasoner", capturedBody["default_model"])
+	}
+	models, ok := capturedBody["models"].([]any)
+	if !ok || len(models) != 2 {
+		t.Fatalf("models = %#v, want 2 models (removed deepseek-chat, kept reasoner + custom-added)", capturedBody["models"])
+	}
+	reasoner := models[0].(map[string]any)
+	if reasoner["display_name"] != "DeepSeek R1 Custom" {
+		t.Fatalf("display_name = %#v, want DeepSeek R1 Custom", reasoner["display_name"])
+	}
+	if int64(reasoner["max_output_size"].(float64)) != 32768 {
+		t.Fatalf("max_output_size = %#v, want 32768", reasoner["max_output_size"])
+	}
+	if reasoner["adaptive_thinking"] != false {
+		t.Fatalf("adaptive_thinking = %#v, want false (preserved from catalog import)", reasoner["adaptive_thinking"])
+	}
+	if reasoner["default_effort"] != "medium" || reasoner["off_effort"] != "minimal" {
+		t.Fatalf("efforts = %v / %v, want medium / minimal", reasoner["default_effort"], reasoner["off_effort"])
+	}
+	capsRaw, _ := json.Marshal(reasoner["capabilities"])
+	if string(capsRaw) != `["image_in","tool_use","always_thinking"]` {
+		t.Fatalf("capabilities = %s, want catalog capabilities", capsRaw)
+	}
+	effortsRaw, _ := json.Marshal(reasoner["support_efforts"])
+	if string(effortsRaw) != `["low","medium","high"]` {
+		t.Fatalf("support_efforts = %s, want [low medium high]", effortsRaw)
+	}
+}

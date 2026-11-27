@@ -36,6 +36,8 @@ export {
   findSettingsDialogParts,
   findSidebarFooter,
   findSidebarNewChatButtons,
+  findSidebarToggleButton,
+  hasActiveSettingsSubpage,
   isOfficialSettingsTabSelected,
   resolveOfficialTexts,
 } from "./plugin-runtime/contracts";

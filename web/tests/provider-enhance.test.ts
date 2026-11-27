@@ -118,6 +118,7 @@ function createMiniDocument() {
           defaultPrevented: false,
           stopped: false,
           preventDefault() { this.defaultPrevented = true; },
+          stopPropagation() { this.stopped = true; },
           stopImmediatePropagation() { this.stopped = true; },
           ...metadata,
         };
@@ -175,10 +176,14 @@ function createMiniDocument() {
         const idx = parent.children.indexOf(this);
         if (idx === -1) return;
         const inserted: MiniNode[] = [];
+        function connect(node: MiniNode, connected: boolean) {
+          node.isConnected = connected;
+          node.children.forEach(child => connect(child, connected));
+        }
         for (const child of nodes) {
           const item = typeof child === "string" ? makeNode("#text", child) : child;
           item.parentElement = parent;
-          item.isConnected = parent.isConnected;
+          connect(item, parent.isConnected);
           inserted.push(item);
         }
         parent.children.splice(idx + 1, 0, ...inserted);
@@ -735,7 +740,7 @@ function loadFixture(
 }
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 5));
-const inspector = (form: MiniNode) => form.querySelector("dialog.ekd-px-dialog")!;
+const inspector = (form: MiniNode) => form.querySelector(".ekd-px-drawer")!;
 
 function allText(node: MiniNode): string {
   return node.textContent + node.children.map(allText).join("");
@@ -754,63 +759,79 @@ function key(window: EventTarget, key: string, shiftKey = false) {
   return event.defaultPrevented;
 }
 
-test("preserves official columns, displays saved capabilities and keeps a tracked modal focus loop", async () => {
-  const { doc, window, heading, form, alpha, beta, enhance } = loadFixture();
+test("mounts inline row button, expands drawer in-place, toggles cleanly and guards unsaved edits on Escape", async () => {
+  const { doc, window, table, heading, form, alpha, beta, enhance } = loadFixture();
   await settle();
-  assert.equal(heading.children.length, 3);
-  assert.equal(alpha.row.children.slice(0, 3).map(node => node.tagName).join(","), "INPUT,INPUT,BUTTON");
-  const trigger = findButton(alpha.row, "图片 · 工具 · 思考 · 其他 1 项 · 256K");
-  assert.equal(findButton(beta.row, "未配置 · 64K").getAttribute("aria-expanded"), "false");
+  assert.equal(table.getAttribute("data-ekd-px-table"), "1");
+  assert.ok(heading.querySelector(".ekd-px-head-pad"));
+  assert.equal(heading.querySelector(".ekd-px-head-sel")?.hidden, true);
+  assert.equal(alpha.row.getAttribute("data-ekd-px-row"), "1");
+  const trigger = alpha.row.querySelector("[data-ekd-px-button]")!;
+  assert.equal(allText(trigger).trim(), "能力与限制");
+  assert.equal(trigger.getAttribute("data-ekd-px-summary"), "图片 · 工具 · 思考 · 其他 1 项 · 256K");
+  const betaTrigger = beta.row.querySelector("[data-ekd-px-button]")!;
+  assert.equal(betaTrigger.getAttribute("data-ekd-px-summary"), "未配置 · 64K");
+  assert.equal(betaTrigger.getAttribute("aria-expanded"), "false");
+
   trigger.click();
   await settle();
   const panel = inspector(form);
-  assert.ok(panel.shown);
+  assert.ok(panel);
+  assert.equal(panel.tagName, "DIV");
   assert.equal(trigger.getAttribute("aria-controls"), panel.getAttribute("id"));
   assert.equal(trigger.getAttribute("aria-expanded"), "true");
-  assert.equal(panel.parentElement, form);
+  assert.equal(panel.parentElement, alpha.row);
   assert.match(allText(panel), /audio_in/);
-  const close = findButton(panel, "关闭");
+  const close = findButton(panel, "收起");
   assert.equal(doc.activeElement, close);
-  assert.equal(key(window, "Tab"), true);
-  assert.equal(doc.activeElement, findButton(panel, "填入目录建议"));
-  assert.equal(key(window, "Tab", true), true);
-  assert.equal(doc.activeElement, close);
-  const output = panel.querySelectorAll("input.ekd-px-input")[1]!;
+
+  // Clicking the same trigger again collapses a clean drawer.
+  trigger.click();
+  assert.equal(inspector(form), null);
+  assert.equal(trigger.getAttribute("aria-expanded"), "false");
+
+  // Re-open, edit output, and confirm Escape guards dirty changes.
+  trigger.click();
+  await settle();
+  const reopened = inspector(form);
+  const output = reopened.querySelectorAll("input.ekd-px-input")[1]!;
   output.value = "32K";
   output.fire("input");
   assert.equal(key(window, "Escape"), true);
-  assert.equal(inspector(form), panel);
-  assert.match(allText(panel), /有未保存的修改/);
-  assert.equal(doc.activeElement, findButton(panel, "放弃修改"));
-  findButton(panel, "放弃修改").click();
+  assert.equal(inspector(form), reopened);
+  assert.match(allText(reopened), /有未保存的修改/);
+  assert.equal(doc.activeElement, findButton(reopened, "放弃修改"));
+  findButton(reopened, "放弃修改").click();
   assert.equal(inspector(form), null);
   assert.equal(doc.activeElement, trigger);
   assert.equal(trigger.getAttribute("aria-expanded"), "false");
   enhance.remove();
   assert.equal(alpha.row.querySelector("[data-ekd-px-button]"), null);
+  assert.equal(table.getAttribute("data-ekd-px-table"), null);
 });
 
-test("validates output against saved context and sends only edited capability fields", async () => {
+test("validates output against saved context, supports presets and sends only edited capability fields", async () => {
   const { calls, form, alpha } = loadFixture();
   await settle();
   alpha.row.querySelector("[data-ekd-px-button]")!.click();
   await settle();
   const panel = inspector(form);
   const output = panel.querySelectorAll("input.ekd-px-input")[1]!;
-  const adaptive = panel.querySelector('input[role="switch"]')!;
-  assert.equal(adaptive.checked, true);
-  assert.equal(panel.querySelector('input[name="ekd-px-thinking"][value="toggle"]')?.checked, true);
-  assert.equal(panel.querySelectorAll("input[type=radio]").length, 3);
+  const adaptive = panel.querySelector('[data-kind="adaptive"]')!;
+  assert.equal(adaptive.getAttribute("aria-pressed"), "true");
+  assert.equal(panel.querySelector('[data-kind="mode"][data-mode="toggle"]')?.getAttribute("aria-pressed"), "true");
+  assert.equal(panel.querySelectorAll('[data-kind="mode"]').length, 3);
   assert.doesNotMatch(allText(panel), /\bno\b/i);
-  assert.equal(panel.querySelectorAll("label").filter(node => allText(node) === "high").length, 1);
+  assert.equal(panel.querySelectorAll('[data-kind="effort"][data-effort="high"]').length, 1);
   const save = findButton(panel, "保存");
   output.value = "1M";
   output.fire("input");
   assert.equal(output.getAttribute("aria-invalid"), "true");
   assert.equal(save.disabled, true);
-  output.value = "";
-  output.fire("input");
-  panel.querySelector('input[value="always"]')!.click();
+  findButton(panel, "不限制").click();
+  assert.equal(output.value, "");
+  assert.equal(output.getAttribute("aria-invalid"), "false");
+  panel.querySelector('[data-kind="mode"][data-mode="always"]')!.click();
   assert.equal(adaptive.disabled, true);
   save.click();
   await settle();
@@ -857,13 +878,14 @@ test("re-reads just-imported rows and renders managed rows read-only", async () 
   const fresh = addRow("just-imported");
   enhance.scan();
   await settle();
-  const trigger = findButton(fresh.row, "未保存");
+  const trigger = fresh.row.querySelector("[data-ekd-px-button]")!;
+  assert.equal(trigger.getAttribute("data-ekd-px-summary"), "未保存");
   config.models["team/just-imported"] = { maxContextSize: 131072, capabilities: ["video_in"] };
   trigger.click();
   await settle();
   assert.ok(inspector(form));
   assert.equal(inspector(form).querySelector("input.ekd-px-input")?.value, "128K");
-  assert.equal(allText(trigger), "视频 · 128K");
+  assert.equal(trigger.getAttribute("data-ekd-px-summary"), "视频 · 128K");
 
   const managed = loadFixture(undefined, "managed:kimi-code");
   await settle();
@@ -872,6 +894,8 @@ test("re-reads just-imported rows and renders managed rows read-only", async () 
   const panel = inspector(managed.form);
   assert.match(allText(panel), /内置订阅供应商/);
   assert.equal(panel.querySelectorAll("input").every(input => input.disabled), true);
+  assert.equal(panel.querySelectorAll(".ekd-px-pill").every(pill => pill.disabled), true);
+  assert.equal(panel.querySelectorAll(".ekd-px-preset").every(preset => preset.disabled), true);
   assert.equal(managed.form.querySelector(".ekd-px-toolbar")?.hidden, true);
 });
 
@@ -903,21 +927,25 @@ test("uses exact official and public suggestions only as a draft", async () => {
   });
 });
 
-test("submits selected models once from the batch template and returns focus to the toolbar", async () => {
-  const { doc, form, calls, alpha, beta } = loadFixture();
+test("submits selected models once from the inline batch template and returns focus to the toolbar", async () => {
+  const { doc, table, form, calls, alpha, beta } = loadFixture();
   await settle();
   const toolbar = form.querySelector(".ekd-px-toolbar")!;
   const toggle = findButton(toolbar, "批量配置");
   toggle.click();
+  assert.equal(table.getAttribute("data-ekd-px-selecting"), "1");
   findButton(toolbar, "全选已保存模型").click();
   for (const item of [alpha, beta]) assert.equal(item.row.querySelector("input[type=checkbox]")?.checked, true);
   findButton(toolbar, "编辑能力模板").click();
   await settle();
   const panel = inspector(form);
-  panel.querySelector("input[type=checkbox]")!.click();
+  assert.equal(panel.getAttribute("data-ekd-px-batch"), "1");
+  assert.equal(panel.parentElement, form);
+  panel.querySelector('[data-kind="capability"][data-capability="image_in"]')!.click();
   findButton(panel, "保存到 2 个模型").click();
   await settle();
   assert.equal(inspector(form), null);
+  assert.equal(table.getAttribute("data-ekd-px-selecting"), null);
   assert.equal(doc.activeElement, toggle);
   assert.deepEqual(calls.filter(call => call.action.startsWith("providers.update")), [{
     action: "providers.updateModels",
@@ -925,15 +953,19 @@ test("submits selected models once from the batch template and returns focus to 
   }]);
 });
 
-test("theme rules keep state text separate from the host accent and preserve the official grid", async () => {
+test("theme rules restore inline drawer styling with host CSS tokens and no side modal dialog", async () => {
   const { doc } = loadFixture();
   const css = doc.head.querySelector("style")!.textContent;
-  assert.doesNotMatch(css, /pmt-grid|96px/);
-  assert.match(css, /--px-bg:var\(--color-bg,/);
-  assert.match(css, /--px-ink:var\(--color-text,/);
-  assert.match(css, /\.ekd-px-mode:has\(:checked\)\{background:var\(--px-fill\);color:var\(--px-ink\)/);
-  assert.match(css, /--px-error:light-dark\(#9b2325,#ffb4ab\)/);
-  assert.match(css, /--px-muted:color-mix\(in srgb,var\(--px-ink\) 86%,var\(--px-bg\)\)/);
+  assert.doesNotMatch(css, /\.ekd-px-dialog/);
+  assert.match(css, /\.pmt\[data-ekd-px-table="1"\]/);
+  assert.match(css, /\.ekd-px-drawer\{/);
+  assert.match(css, /\.ekd-px-pill\[aria-pressed="true"\]/);
+  assert.match(css, /var\(--color-accent,/);
+  assert.match(css, /var\(--color-surface,/);
+  assert.match(css, /var\(--color-bg,/);
+  assert.match(css, /var\(--color-text,/);
+  assert.match(css, /var\(--color-success,/);
+  assert.match(css, /var\(--color-danger,/);
 });
 
 function applyTestModelEdit(base: Model, edit: Record<string, unknown>): Model {
@@ -1028,10 +1060,9 @@ test("merges max_output_size and inspector capabilities atomically via providers
   alpha.row.querySelector("[data-ekd-px-button]")!.click();
   await settle();
   const panel = inspector(form);
-  const checkboxes = panel.querySelectorAll('input[type="checkbox"]').filter(input => input.getAttribute("role") !== "switch");
-  checkboxes[1]!.click(); // video_in ON
-  checkboxes[2]!.click(); // tool_use OFF
-  panel.querySelector('input[value="always"]')!.click();
+  panel.querySelector('[data-kind="capability"][data-capability="video_in"]')!.click(); // video_in ON
+  panel.querySelector('[data-kind="capability"][data-capability="tool_use"]')!.click(); // tool_use OFF
+  panel.querySelector('[data-kind="mode"][data-mode="always"]')!.click();
   const [contextInput, outputInput] = panel.querySelectorAll("input.ekd-px-input");
   contextInput!.value = "384K";
   contextInput!.fire("input");
@@ -1041,7 +1072,7 @@ test("merges max_output_size and inspector capabilities atomically via providers
   await settle();
 
   assert.equal(alpha.ctxInput.value, "393216");
-  findButton(panel, "关闭").click();
+  findButton(panel, "收起").click();
 
   // Official ProviderForm submits stale opening capabilities and omits max_output_size.
   const officialBody = {
@@ -1126,7 +1157,7 @@ test("preserves external config edits and clearings with or without a subsequent
 
   assert.equal(calls.filter(call => call.action === "providers.updateModels").length, 0);
   assert.equal(config.models["team/beta"]?.maxOutputSize, undefined);
-  assert.equal(allText(alpha.row.querySelector("[data-ekd-px-button]")!), "视频 · 128K");
+  assert.equal(alpha.row.querySelector("[data-ekd-px-button]")!.getAttribute("data-ekd-px-summary"), "视频 · 128K");
 
   // Later official PUT still carries the stale form-open copy; authoritative external changes and clearings must win.
   await context.fetch("http://127.0.0.1:54321/api/v1/providers/team", {
@@ -1791,5 +1822,227 @@ test("honors Fetch AbortSignal end-to-end without calling backend on pre-aborted
     (err: unknown) => (err as { name?: string })?.name === "AbortError",
   );
   setSaveOfficialFormOverride(null);
+  enhance.remove();
+});
+
+test("1.5.0 edit ProviderForm mounts without .pf-back and ignores hidden or AddProviderPage forms", async () => {
+  const { doc, form, backBtn, alpha, enhance, calls } = loadFixture(undefined, "team", {
+    officialOrigin: "http://127.0.0.1:54321",
+  });
+  await settle();
+  // Remove 1.4.x .pf-back and replace with 1.5.0 .pf-brand.pf-head-sticky > .pf-nav
+  backBtn.remove();
+  const brand = doc.createElement("div");
+  brand.className = "pf-brand pf-head-sticky";
+  const nav = doc.createElement("button");
+  nav.className = "pf-nav";
+  brand.append(nav);
+  form.children.unshift(brand);
+  brand.parentElement = form;
+  brand.isConnected = true;
+  nav.isConnected = true;
+
+  // Insert a hidden AddProviderPage (.ap) BEFORE the edit form with two .pf forms (v-show hidden + visible)
+  const ap = doc.createElement("div");
+  ap.className = "ap";
+  const hiddenPf = doc.createElement("div");
+  hiddenPf.className = "pf";
+  hiddenPf.setAttribute("style", "display: none;");
+  const hiddenTable = doc.createElement("div");
+  hiddenTable.className = "pmt";
+  hiddenPf.append(hiddenTable);
+  const manualPf = doc.createElement("div");
+  manualPf.className = "pf";
+  const manualTable = doc.createElement("div");
+  manualTable.className = "pmt";
+  manualPf.append(manualTable);
+  ap.append(hiddenPf, manualPf);
+  form.before(ap);
+
+  enhance.scan();
+  await settle();
+  assert.ok(form.querySelector(".ekd-px-toolbar"), "1.5.0 edit form must mount toolbar without .pf-back");
+  assert.ok(alpha.row.querySelector("[data-ekd-px-button]"), "1.5.0 edit form must mount inline capability button");
+  assert.equal(hiddenPf.querySelector(".ekd-px-toolbar"), null, "hidden v-show form must not be decorated");
+  assert.equal(manualPf.querySelector(".ekd-px-toolbar"), null, "AddProviderPage manual form must not be decorated");
+
+  // When only AddProviderPage is present (edit form removed), no edit decorations mount
+  form.remove();
+  enhance.scan();
+  await settle();
+  assert.equal(ap.querySelector("[data-ekd-px-mount]"), null, "AddProviderPage must never mount edit decorations");
+  assert.ok(calls.some(call => call.action === "config.get"));
+  enhance.remove();
+});
+
+test("toolbar catalog backfill repairs fetchModels defaults and single-model suggestion fills context", async () => {
+  const { form, alpha, beta, addRow, calls, config, enhance } = loadFixture(async (action, payload) => {
+    if (action === "providers.modelSuggestion") {
+      if (Array.isArray(payload?.models)) {
+        return {
+          suggestions: {
+            "family/alpha": {
+              image_in: true,
+              video_in: false,
+              tool_use: true,
+              thinking: true,
+              max_context_size: 200000,
+              max_output_size: 16384,
+            },
+            beta: {
+              image_in: true,
+              video_in: false,
+              tool_use: true,
+              thinking: false,
+              max_context_size: 128000,
+              max_output_size: 8192,
+            },
+          },
+        };
+      }
+      return {
+        suggestion: {
+          image_in: true,
+          thinking: true,
+          max_context_size: 131072,
+          max_output_size: 32768,
+        },
+      };
+    }
+    if (action === "models.list") return { items: [] };
+    if (action === "providers.updateModels" && Array.isArray(payload?.models)) {
+      for (const entry of payload.models as Array<{ model: string; edit: Record<string, unknown> }>) {
+        if (config.models[entry.model]) {
+          config.models[entry.model] = applyTestModelEdit(config.models[entry.model]!, entry.edit);
+        }
+      }
+      return { provider: payload.providerId, models: payload.models };
+    }
+    return {};
+  });
+  // Simulate fetchModels hardcoded 256000 + ["tool_use", "thinking"] on beta
+  config.models["team/beta"] = { maxContextSize: 256000, capabilities: ["tool_use", "thinking"], adaptiveThinking: true };
+  addRow("unsaved-new");
+  await settle();
+
+  const toolbar = form.querySelector(".ekd-px-toolbar")!;
+  const backfill = findButton(toolbar, "按目录补全");
+  backfill.click();
+  await settle();
+
+  const suggestCall = calls.find(call => call.action === "providers.modelSuggestion");
+  assert.deepEqual(suggestCall?.payload, {
+    providerId: "team",
+    models: ["team/family/alpha", "team/beta"],
+  });
+  const updateCall = calls.find(call => call.action === "providers.updateModels");
+  assert.deepEqual(updateCall?.payload, {
+    providerId: "team",
+    models: [
+      {
+        model: "team/family/alpha",
+        edit: { max_context_size: 200000, max_output_size: 16384 },
+      },
+      {
+        model: "team/beta",
+        edit: {
+          capabilities: ["image_in", "tool_use"],
+          thinking: "none",
+          max_context_size: 128000,
+          max_output_size: 8192,
+        },
+      },
+    ],
+  });
+  assert.equal(alpha.ctxInput.value, "200000");
+  assert.equal(beta.ctxInput.value, "128000");
+  assert.match(allText(toolbar), /已按目录补全 2 个模型.*1 个未保存模型/);
+
+  // Single-model suggestion also fills max_context_size, keeps decimal 128000 exact, and honors models.dev thinking: false
+  beta.row.querySelector("[data-ekd-px-button]")!.click();
+  await settle();
+  const panel = inspector(form);
+  const [ctxInput, outInput] = panel.querySelectorAll("input.ekd-px-input");
+  assert.equal(ctxInput!.value, "128000", "decimal round context 128000 must stay 128000 instead of 125K");
+  findButton(panel, "填入目录建议").click();
+  await settle();
+  assert.equal(ctxInput!.value, "128K");
+  assert.equal(outInput!.value, "32K");
+  enhance.remove();
+
+  // Single-model suggestion must honor models.dev thinking: false even when models.list echoes stale saved thinking.
+  const clearThinking = loadFixture(async action => {
+    if (action === "models.list") {
+      return { items: [{ id: "team/beta", provider: "team", model: "beta", capabilities: ["tool_use", "thinking"] }] };
+    }
+    if (action === "providers.modelSuggestion") {
+      return { suggestion: { image_in: true, tool_use: true, thinking: false, max_context_size: 128000, max_output_size: 16384 } };
+    }
+    return {};
+  });
+  clearThinking.config.models["team/beta"] = { maxContextSize: 256000, capabilities: ["tool_use", "thinking"] };
+  await settle();
+  clearThinking.beta.row.querySelector("[data-ekd-px-button]")!.click();
+  await settle();
+  const clearPanel = inspector(clearThinking.form);
+  assert.equal(clearPanel.querySelectorAll("input.ekd-px-input")[0]!.value, "256000");
+  assert.equal(clearPanel.querySelector('[data-kind="mode"][data-mode="toggle"]')?.getAttribute("aria-pressed"), "true");
+  findButton(clearPanel, "填入目录建议").click();
+  await settle();
+  assert.equal(clearPanel.querySelector('[data-kind="mode"][data-mode="none"]')?.getAttribute("aria-pressed"), "true");
+  assert.equal(clearPanel.querySelectorAll("input.ekd-px-input")[0]!.value, "128000");
+  assert.equal(clearPanel.querySelectorAll("input.ekd-px-input")[1]!.value, "16K");
+  clearThinking.enhance.remove();
+});
+
+test("intercepts post-import_catalog follow-up PUT with preserveCatalogImport and empty opening", async () => {
+  const { context, form, calls, setFetchResponder, setSaveOfficialFormOverride, enhance } = loadFixture(undefined, "team", {
+    officialOrigin: "http://127.0.0.1:54321",
+    provideResponse: true,
+  });
+  await settle();
+  // Leave edit form to simulate AddProviderPage catalog import flow
+  form.remove();
+  enhance.scan();
+  await settle();
+
+  setFetchResponder(async (input, init) => {
+    const url = typeof input === "string" ? input : String((input as { url?: string })?.url ?? "");
+    if (init?.method === "POST" && url.endsWith("/api/v1/providers:import_catalog")) {
+      return new Response(JSON.stringify({ code: 0, msg: "", data: { provider: { id: "deepseek" }, models_imported: 2 } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("{}", { status: 200 });
+  });
+
+  let capturedSavePayload: Record<string, unknown> | null = null;
+  setSaveOfficialFormOverride(async payload => {
+    capturedSavePayload = structuredClone(payload);
+    return { data: { provider: { id: "deepseek" } }, mergedModels: {} };
+  });
+
+  const importRes = await context.fetch("http://127.0.0.1:54321/api/v1/providers:import_catalog", {
+    method: "POST",
+    body: JSON.stringify({ catalog_id: "deepseek", api_key: "sk-test" }),
+  });
+  assert.equal(importRes.ok, true);
+  assert.equal((await importRes.json()).data.provider.id, "deepseek");
+
+  // AddProviderPage immediately fires an overwriting PUT without base_url/max_output_size/support_efforts
+  const putRes = await context.fetch("http://127.0.0.1:54321/api/v1/providers/deepseek", {
+    method: "PUT",
+    body: JSON.stringify({
+      type: "openai",
+      models: [{ model: "deepseek-reasoner", max_context_size: 131072, capabilities: ["tool_use", "thinking"], adaptive_thinking: true }],
+    }),
+  });
+  assert.equal(putRes.ok, true);
+  assert.ok(capturedSavePayload, "follow-up PUT must be routed through providers.saveOfficialForm");
+  assert.equal(capturedSavePayload!["providerId"], "deepseek");
+  assert.equal(capturedSavePayload!["preserveCatalogImport"], true);
+  assert.deepEqual(capturedSavePayload!["opening"], {});
+  assert.ok(calls.some(call => call.action === "providers.saveOfficialForm"));
   enhance.remove();
 });

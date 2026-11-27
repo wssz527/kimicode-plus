@@ -154,7 +154,80 @@ func TestModelSuggestionUsesSavedProviderEndpointAndExactModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, err := json.Marshal(value)
-	if err != nil || string(raw) != `{"suggestion":{"image_in":true,"max_output_size":4096,"thinking":true,"tool_use":true,"video_in":false}}` || called != 1 || len(store.bodies) != 0 {
+	if err != nil || string(raw) != `{"suggestion":{"image_in":true,"max_context_size":8192,"max_output_size":4096,"thinking":true,"tool_use":true,"video_in":false}}` || called != 1 || len(store.bodies) != 0 {
 		t.Fatalf("catalog result = %s, requests = %d, writes = %d, error = %v", raw, called, len(store.bodies), err)
+	}
+}
+
+type testPublicModelBatchCatalog struct {
+	single func(context.Context, string, string, string) (map[string]registry.Capability, error)
+	batch  func(context.Context, string, string, []string) (map[string]map[string]registry.Capability, error)
+}
+
+func (c testPublicModelBatchCatalog) FindPublicModel(ctx context.Context, provider, endpoint, model string) (map[string]registry.Capability, error) {
+	return c.single(ctx, provider, endpoint, model)
+}
+
+func (c testPublicModelBatchCatalog) FindPublicModels(ctx context.Context, provider, endpoint string, models []string) (map[string]map[string]registry.Capability, error) {
+	return c.batch(ctx, provider, endpoint, models)
+}
+
+func TestModelSuggestionBatchUsesBatchCatalogAndReturnsContextAndCapabilities(t *testing.T) {
+	store := newOfficialModelStore(map[string]modelConfig{
+		"r2-inspect/alpha": {Provider: "r2-inspect", Model: "alpha", MaxContextSize: 256000},
+		"r2-inspect/beta":  {Provider: "r2-inspect", Model: "beta", MaxContextSize: 256000},
+	})
+	service, _ := newAutomationTestService(t, store.handler())
+	singleCalls := 0
+	batchCalls := 0
+	service.UsePublicModelCatalog(testPublicModelBatchCatalog{
+		single: func(ctx context.Context, provider, endpoint, model string) (map[string]registry.Capability, error) {
+			singleCalls++
+			return nil, nil
+		},
+		batch: func(ctx context.Context, provider, endpoint string, models []string) (map[string]map[string]registry.Capability, error) {
+			batchCalls++
+			if provider != "r2-inspect" || endpoint != "https://example.invalid/v1" {
+				t.Fatalf("unexpected provider/endpoint %q %q", provider, endpoint)
+			}
+			if len(models) != 2 || models[0] != "alpha" || models[1] != "beta" {
+				t.Fatalf("batch received models = %#v, want [alpha beta]", models)
+			}
+			return map[string]map[string]registry.Capability{
+				"alpha": {
+					"vision":   {Value: true},
+					"tools":    {Value: true},
+					"thinking": {Value: false},
+					"context":  {Value: float64(128000)},
+					"output":   {Value: float64(16384)},
+				},
+			}, nil
+		},
+	})
+
+	if _, err := service.Action(context.Background(), "providers.modelSuggestion", json.RawMessage(`{"providerId":"r2-inspect","models":["other/alpha"]}`)); err == nil {
+		t.Fatal("accepted foreign model key in batch suggestion")
+	}
+	if _, err := service.Action(context.Background(), "providers.modelSuggestion", json.RawMessage(`{"providerId":"managed:kimi-code","models":["managed:kimi-code/alpha"]}`)); err == nil {
+		t.Fatal("accepted managed provider in batch suggestion")
+	}
+	if _, err := service.Action(context.Background(), "providers.modelSuggestion", json.RawMessage(`{"providerId":"r2-inspect","models":[]}`)); err == nil {
+		t.Fatal("accepted empty batch models")
+	}
+
+	value, err := service.Action(context.Background(), "providers.modelSuggestion", json.RawMessage(`{
+		"providerId": "r2-inspect",
+		"models": ["r2-inspect/alpha", "r2-inspect/unsaved", "r2-inspect/beta", "r2-inspect/alpha"]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"suggestions":{"alpha":{"image_in":true,"max_context_size":128000,"max_output_size":16384,"thinking":false,"tool_use":true}}}`
+	if string(raw) != want || batchCalls != 1 || singleCalls != 0 || len(store.bodies) != 0 {
+		t.Fatalf("batch result = %s (want %s), batchCalls = %d, singleCalls = %d, writes = %d", raw, want, batchCalls, singleCalls, len(store.bodies))
 	}
 }

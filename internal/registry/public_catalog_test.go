@@ -128,6 +128,10 @@ func TestFindPublicModelMatchesEndpointAndModelID(t *testing.T) {
 	if err != nil || caps["tools"].Value != true {
 		t.Fatalf("exact preset endpoint without catalog api = %#v, %v", caps, err)
 	}
+	batch, err := s.FindPublicModels(ctx, "exact", "https://EXAMPLE.com:443/v1/", []string{"family/model", "missing-model", "family/model"})
+	if err != nil || len(batch) != 1 || batch["family/model"]["output"].Value != float64(512) || batch["family/model"]["vision"].Value != true {
+		t.Fatalf("batch lookup = %#v, %v", batch, err)
+	}
 	var providers int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM registry_providers`).Scan(&providers); err != nil || providers != 0 || revision(t, s) != before {
 		t.Fatalf("catalog lookup changed registry config: %d, %v", providers, err)

@@ -2,6 +2,31 @@
 
 验收使用本项目 `work/` 下的隔离数据目录和独立宿主 profile（Windows 端使用独立临时隔离目录）。当前范围为核心 M0–M6、插件接口 v2（A1）、规划插件（A3）、修正轮（R0–R4）、下一轮（N0–N6）以及 v0.2.4 以来的发布修复。多屏会话插件 A2 延期。
 
+## v0.2.12 适配 Kimi Code 1.5.0/1.5.1 与供应商能力配置增强（2026-11-27）
+
+核心发布版本为 `0.2.12`，标签为 `v0.2.12`。本次仅更新核心，四个官方预装插件（KCT `1.0.9`、Planner `1.0.8`、Monitor `1.1.3`、Scheduler `1.1.1`）与独立通道 `plugins-latest` 保持不变。
+
+### 交付范围
+
+- Kimi Code `1.5.0` 与 `1.5.1` 宿主适配与登记：恢复模型供应商编辑页（`.pf-nav` / `.pf-head-sticky`）能力与限制 UI 和开窗快照，过滤 `AddProviderPage`（`.ap`）与 `v-show` 隐藏表单，零污染添加页；将 `1.5.0` 与 `1.5.1` 登记至 `SupportedHosts`。
+- 供应商模型目录补全与导入保护：后端 `FindPublicModels` 与 `providers.modelSuggestion` 支持批量查询与真实 `max_context_size` 映射；工具栏新增一键「按目录补全」批量回填 `models.dev` 真实能力、上下文长度与最大输出并同步刷新官方输入框；拦截 `POST /api/v1/providers:import_catalog` 后紧随的非编辑态覆盖 `PUT /api/v1/providers/{id}`，经 `preserveCatalogImport` 完整保留导入的扩展字段及缺省的 `base_url` / `default_model`。
+- 模型能力行内抽屉界面复原与交互细化：恢复每行同排「能力与限制」行内抽屉、胶囊选项与快捷长度预设，原地承载「填入目录建议」与「批量能力模板」抽屉，对齐五列表头与输入框高度，修复十进制上下文长度（如 `128000` / `256000`）误折算与单模型目录建议未清除误加 `thinking` 的问题。
+- 设置页面定位与侧栏折叠回退：修复「智能体与会话」页在 `1.5.0+` 内嵌 `v-show` 容器下的增强区块定位，对 `.settings-subpage`（如全局 `AGENTS.md`、字体子页）统一避让并在返回后恢复原位，修复宿主渲染层在窗口不可见或子页切换后 `ensure()` 停止触发的问题；补齐侧栏折叠/展开按钮的多布局与中英文标签回退。
+
+### 验证与复审
+
+| 项目 | 结果 |
+|---|---|
+| 前端 | TypeScript 类型检查、430/430 单测、普通与宿主生产构建通过 |
+| Go | `go vet ./cmd/... ./internal/... ./plugins/...` 与 `./cmd/... ./internal/... ./plugins/...` 全量测试通过 |
+| 打包与同步 | `scripts/test_package.py` 11/11、`scripts/test_sync_cnb_release.py` 7/7 通过 |
+| 真实二进制 | `scripts/acceptance.py --binary ./dist/enhanced-kimi` 27/27 通过 |
+| 实机宿主验收 | 隔离 profile 对接本机 Kimi Code `1.5.0` 与 `1.5.1` 完成端到端功能验证与明/暗双主题截图核验，覆盖智能体定位、子页避让恢复、供应商表单保护、真实 `models.dev` 补全与侧栏折叠 |
+
+### 发布与后续边界
+
+核心将由 `v0.2.12` 注释标签触发 `.github/workflows/release.yml`。工作流先将完整资产上传至 GitHub 草稿，再同步 CNB，随后将 GitHub 草稿公开为正式 Release。
+
 ## v0.2.11 审查修复与发布交接（2026-11-27）
 
 核心发布版本为 `0.2.11`，标签为 `v0.2.11`。官方插件使用独立的 `plugins-latest` 通道，同步更新 KCT 至 `1.0.9`（标签 `plugin-kct-v1.0.9`），Planner `1.0.8`（`minCoreVersion: 0.2.10`）、Monitor `1.1.3` 和 Scheduler `1.1.1` 保持不变。

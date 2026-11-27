@@ -380,7 +380,7 @@ async function installNativeRenderer(options) {
   // sidebar that was already collapsed is never expanded by us.
   function acquireSidebarCollapse() {
     if (!state.sidebarRefs) {
-      const collapse = document.querySelector('button.sidebar-toggle-btn[aria-label="收起侧边栏"]');
+      const collapse = module.findSidebarToggleButton(document, 'collapse');
       state.sidebarCollapsed = collapse ? (collapse.click(), true) : null;
     }
     state.sidebarRefs += 1;
@@ -392,7 +392,7 @@ async function installNativeRenderer(options) {
       if (state.sidebarRefs > 0) return;
       const shouldExpand = state.sidebarCollapsed === true;
       state.sidebarCollapsed = null;
-      if (shouldExpand) document.querySelector('button.sidebar-toggle-btn[aria-label="展开侧边栏"]')?.click();
+      if (shouldExpand) module.findSidebarToggleButton(document, 'expand')?.click();
     };
   }
   function composerStyleProbe(composer) {
@@ -524,8 +524,9 @@ async function installNativeRenderer(options) {
       }
       return entry;
     }
-    if (placement.kind === 'after' && placement.anchor && placement.anchor.parentElement === panel) {
-      if (hostEl.parentElement !== panel || placement.anchor.nextElementSibling !== hostEl) {
+    if (placement.kind === 'after' && placement.anchor && placement.anchor.parentElement && panel.contains(placement.anchor)) {
+      const container = placement.anchor.parentElement;
+      if (hostEl.parentElement !== container || placement.anchor.nextElementSibling !== hostEl) {
         placement.anchor.after(hostEl);
       }
       return entry;
@@ -535,6 +536,25 @@ async function installNativeRenderer(options) {
     }
     return entry;
   }
+  function hasHiddenOfficialSectionsOnly(panel) {
+    const sections = [...panel.querySelectorAll('section.sec, .sec')].filter(
+      el => !el.closest('[data-ekd-official-section], .ekd-settings-mount'),
+    );
+    if (!sections.length) return false;
+    return sections.every(el => {
+      let cur = el;
+      while (cur && cur !== panel) {
+        if (cur.hidden || cur.hasAttribute('hidden') || cur.style?.display === 'none') return true;
+        try {
+          if (getComputedStyle(cur).display === 'none') return true;
+        } catch {
+          // ignore
+        }
+        cur = cur.parentElement;
+      }
+      return false;
+    });
+  }
   function syncOfficialSettingsSections(evaluation) {
     if (!state.settingsDialog || state.settingsActiveTab || evaluation.byId['dom.settings_dialog']?.status === 'disabled') {
       unmountAllOfficialSections();
@@ -543,39 +563,41 @@ async function installNativeRenderer(options) {
     const desired = new Set();
     if (evaluation.byId['dom.settings_account']?.status !== 'disabled') {
       const accountPanel = module.findOfficialSettingsPanel(document, 'account');
-      if (accountPanel) {
+      if (accountPanel && !module.hasActiveSettingsSubpage(accountPanel)) {
         desired.add('account');
         placeOfficialSection(accountPanel, 'account', 'settings-account', { kind: 'prepend' });
       }
     }
     if (evaluation.byId['dom.settings_agent']?.status !== 'disabled') {
       const agentPanel = module.findOfficialSettingsPanel(document, 'agent');
-      if (agentPanel) {
+      if (agentPanel && !module.hasActiveSettingsSubpage(agentPanel)) {
         const agentDefaults = module.findOfficialSettingsSection(agentPanel, document, 'settings.agentDefaults');
         const secondarySection = module.findOfficialSettingsSection(agentPanel, document, 'settings.secondaryModelSection');
-        desired.add('agent-permissions');
-        const permEntry = placeOfficialSection(
-          agentPanel,
-          'agent-permissions',
-          'settings-agent-permissions',
-          agentDefaults ? { kind: 'after', anchor: agentDefaults } : { kind: 'append' },
-        );
-        desired.add('agent-subagent');
-        placeOfficialSection(
-          agentPanel,
-          'agent-subagent',
-          'settings-agent-subagent',
-          secondarySection
-            ? { kind: 'after', anchor: secondarySection }
-            : permEntry?.hostEl?.parentElement === agentPanel
-              ? { kind: 'after', anchor: permEntry.hostEl }
-              : { kind: 'append' },
-        );
+        if (agentDefaults || secondarySection || !hasHiddenOfficialSectionsOnly(agentPanel)) {
+          desired.add('agent-permissions');
+          const permEntry = placeOfficialSection(
+            agentPanel,
+            'agent-permissions',
+            'settings-agent-permissions',
+            agentDefaults ? { kind: 'after', anchor: agentDefaults } : { kind: 'append' },
+          );
+          desired.add('agent-subagent');
+          placeOfficialSection(
+            agentPanel,
+            'agent-subagent',
+            'settings-agent-subagent',
+            secondarySection
+              ? { kind: 'after', anchor: secondarySection }
+              : permEntry?.hostEl?.parentElement && agentPanel.contains(permEntry.hostEl)
+                ? { kind: 'after', anchor: permEntry.hostEl }
+                : { kind: 'append' },
+          );
+        }
       }
     }
     if (evaluation.byId['dom.settings_lab']?.status !== 'disabled') {
       const labPanel = module.findOfficialSettingsPanel(document, 'lab');
-      if (labPanel) {
+      if (labPanel && !module.hasActiveSettingsSubpage(labPanel)) {
         desired.add('lab');
         placeOfficialSection(labPanel, 'lab', 'settings-lab', { kind: 'append' });
       }
@@ -583,7 +605,7 @@ async function installNativeRenderer(options) {
     if (evaluation.byId['dom.settings_plugins']?.status !== 'disabled') {
       const pluginsPanel = module.findOfficialSettingsPanel(document, 'plugins');
       if (pluginsPanel) {
-        const officialDetailOpen = Boolean(pluginsPanel.querySelector('.plugin-details'));
+        const officialDetailOpen = Boolean(pluginsPanel.querySelector('.plugin-details')) || module.hasActiveSettingsSubpage(pluginsPanel);
         const seg = officialDetailOpen
           ? null
           : pluginsPanel.querySelector('.pp-toolbar [role="tablist"], .pp-toolbar .ui-seg');
@@ -1046,7 +1068,7 @@ async function installNativeRenderer(options) {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['style', 'aria-selected', 'class'],
+      attributeFilter: ['style', 'hidden', 'aria-selected', 'class'],
     });
   }
   function deactivateSettings() {
@@ -2115,7 +2137,7 @@ async function installNativeRenderer(options) {
             childList: true,
             subtree: true,
             attributes: true,
-            attributeFilter: ['style', 'aria-selected', 'class'],
+            attributeFilter: ['style', 'hidden', 'aria-selected', 'class'],
           });
         }
       }

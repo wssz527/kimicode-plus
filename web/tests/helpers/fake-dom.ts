@@ -159,6 +159,24 @@ export class FakeElement {
     this.append(...nodes);
   }
 
+  after(...nodes: FakeElement[]): void {
+    const parent = this.parentElement;
+    if (!parent) return;
+    let anchor: FakeElement = this;
+    for (const node of nodes) {
+      if (node.parentElement) {
+        const prevIndex = node.parentElement.children.indexOf(node);
+        if (prevIndex >= 0) node.parentElement.children.splice(prevIndex, 1);
+      }
+      const index = parent.children.indexOf(anchor);
+      parent.children.splice(index + 1, 0, node);
+      node.parentElement = parent;
+      node.ownerDocument = this.ownerDocument;
+      node.setConnected(parent.isConnected);
+      anchor = node;
+    }
+  }
+
   insertAdjacentElement(position: "afterend" | "beforebegin" | "afterbegin" | "beforeend", element: FakeElement): FakeElement | null {
     const parent = this.parentElement;
     if (!parent) return null;
@@ -376,15 +394,26 @@ function matchesChain(element: FakeElement, part: string): boolean {
 
 function matchesCompound(element: FakeElement, part: string): boolean {
   if (/[>+~]/.test(part)) throw new Error(`unsupported selector: ${part}`);
-  const tokens = part.match(/^[a-zA-Z][a-zA-Z0-9-]*|\.[A-Za-z0-9_-]+|\[[A-Za-z0-9_-]+\]|#[A-Za-z0-9_-]+/g) ?? [];
-  if (!tokens.length) throw new Error(`unsupported selector: ${part}`);
+  const tokens = part.match(/^[a-zA-Z][a-zA-Z0-9-]*|\.[A-Za-z0-9_-]+|\[[A-Za-z0-9_-]+(?:=(?:"[^"]*"|'[^']*'|[^\]]*))?\]|#[A-Za-z0-9_-]+/g) ?? [];
+  if (!tokens.length || tokens.join("") !== part) throw new Error(`unsupported selector: ${part}`);
   for (const token of tokens) {
     if (token.startsWith(".")) {
       if (!element.classList.contains(token.slice(1))) return false;
     } else if (token.startsWith("#")) {
       if (element.id !== token.slice(1)) return false;
     } else if (token.startsWith("[")) {
-      if (!element.hasAttribute(token.slice(1, -1))) return false;
+      const inner = token.slice(1, -1);
+      const eq = inner.indexOf("=");
+      if (eq === -1) {
+        if (!element.hasAttribute(inner)) return false;
+      } else {
+        const name = inner.slice(0, eq);
+        const rawValue = inner.slice(eq + 1);
+        const expected = (rawValue.startsWith("\"") && rawValue.endsWith("\"")) || (rawValue.startsWith("'") && rawValue.endsWith("'"))
+          ? rawValue.slice(1, -1)
+          : rawValue;
+        if (element.getAttribute(name) !== expected) return false;
+      }
     } else if (element.tagName !== token.toUpperCase()) {
       return false;
     }

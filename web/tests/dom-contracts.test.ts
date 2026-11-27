@@ -7,6 +7,8 @@ import {
   findChatHeaderTail,
   findOfficialSettingsPanel,
   findOfficialSettingsTab,
+  findSidebarToggleButton,
+  hasActiveSettingsSubpage,
   resolveSettingsFallbacks,
 } from "../src/plugin-runtime/contracts.js";
 import { createEntryMountManager, type EntryPlan, type SidebarNavPlan } from "../src/plugin-runtime/entries.js";
@@ -379,4 +381,123 @@ test("the same pane host follows the current header size and releases replaced o
   assert.equal(first.connected, false);
   assert.equal(observer?.connected, true);
   assert.deepEqual(changes, ["--ekd-header-h:46px", "--ekd-header-h:51px", "--ekd-header-h:60px"]);
+});
+
+test("1.5.0 providers edit form probe uses .pf-nav/.pf-head-sticky, supports .ap, detects subpages and multi-layout sidebar toggles", () => {
+  // 1. 1.5.0 edit form without .pf-back: missing .pmt must mark dom.settings_providers disabled
+  const { doc } = buildOfficialSnapshot({ locale: "en", includeSettings: true, activeTab: "providers" });
+  const body = doc.querySelector(".settings-region .body")!;
+  body.replaceChildren();
+  const ap = doc.createElement("div");
+  ap.className = "ap";
+  const hiddenPf = doc.createElement("div");
+  hiddenPf.className = "pf";
+  hiddenPf.setAttribute("style", "display: none;");
+  ap.append(hiddenPf);
+  const brokenEdit = doc.createElement("div");
+  brokenEdit.className = "pf";
+  const brand = doc.createElement("div");
+  brand.className = "pf-brand pf-head-sticky";
+  const nav = doc.createElement("button");
+  nav.className = "pf-nav";
+  brand.append(nav);
+  brokenEdit.append(brand);
+  body.append(ap, brokenEdit);
+
+  const disabledEval = evaluateDOMContracts(doc as unknown as Document);
+  assert.equal(disabledEval.byId["dom.settings_providers"]?.status, "disabled");
+
+  // Adding .pmt + .pmt-grid restores available status
+  const pmt = doc.createElement("div");
+  pmt.className = "pmt";
+  const row = doc.createElement("div");
+  row.className = "pmt-grid";
+  pmt.append(row);
+  brokenEdit.append(pmt);
+  const healthyEval = evaluateDOMContracts(doc as unknown as Document);
+  assert.equal(healthyEval.byId["dom.settings_providers"]?.status, "available");
+  assert.match(healthyEval.byId["dom.settings_providers"]?.detail ?? "", /模型行/);
+
+  // AddProviderPage (.ap) alone keeps panel discoverable and probe available
+  brokenEdit.remove();
+  assert.equal(findOfficialSettingsPanel(doc as unknown as Document, "providers"), ap);
+  assert.equal(evaluateDOMContracts(doc as unknown as Document).byId["dom.settings_providers"]?.status, "available");
+
+  // 2. SettingsSubpage visibility detection
+  const panel = doc.createElement("section");
+  panel.className = "panel";
+  const subpage = doc.createElement("section");
+  subpage.className = "settings-subpage";
+  subpage.setAttribute("style", "display: none;");
+  panel.append(subpage);
+  assert.equal(hasActiveSettingsSubpage(panel as unknown as Element), false);
+  subpage.setAttribute("style", "");
+  assert.equal(hasActiveSettingsSubpage(panel as unknown as Element), true);
+
+  // 3. Multi-layout & i18n sidebar toggle discovery
+  const toggleDoc = new FakeDocument();
+  const winCollapse = toggleDoc.createElement("button");
+  winCollapse.className = "custom-sidebar-toggle";
+  winCollapse.setAttribute("aria-label", "Collapse sidebar");
+  toggleDoc.body.append(winCollapse);
+  assert.equal(findSidebarToggleButton(toggleDoc as unknown as Document, "collapse"), winCollapse);
+  assert.equal(findSidebarToggleButton(toggleDoc as unknown as Document, "expand"), null);
+
+  winCollapse.setAttribute("aria-label", "Expand sidebar");
+  assert.equal(findSidebarToggleButton(toggleDoc as unknown as Document, "expand"), winCollapse);
+
+  winCollapse.remove();
+  const sideCollapse = toggleDoc.createElement("button");
+  sideCollapse.className = "ch-collapse";
+  sideCollapse.setAttribute("aria-label", "收起侧边栏");
+  toggleDoc.body.append(sideCollapse);
+  assert.equal(findSidebarToggleButton(toggleDoc as unknown as Document, "collapse"), sideCollapse);
+  assert.equal(findSidebarToggleButton(toggleDoc as unknown as Document, "expand"), null);
+});
+
+test("renderer.js placeOfficialSection inserts inside nested 1.5.0 wrappers and acquireSidebarCollapse uses localized fallback", () => {
+  const renderer = readFileSync("../internal/desktop/assets/renderer.js", "utf8");
+  const placeStart = renderer.indexOf("function placeOfficialSection(");
+  const placeEnd = renderer.indexOf("function hasHiddenOfficialSectionsOnly(", placeStart);
+  assert.ok(placeStart >= 0 && placeEnd > placeStart);
+  const doc = new FakeDocument();
+  const panel = doc.createElement("section");
+  panel.className = "panel";
+  const wrap = doc.createElement("div");
+  const anchor = doc.createElement("section");
+  anchor.className = "sec";
+  wrap.append(anchor);
+  const footer = doc.createElement("div");
+  panel.append(wrap, footer);
+  doc.body.append(panel);
+
+  const state = { officialSections: new Map() };
+  const makePlace = new Function(
+    "document", "state", "mount", "makeHost",
+    `${renderer.slice(placeStart, placeEnd)}\nreturn placeOfficialSection;`,
+  );
+  const placeOfficialSection = makePlace(doc, state, () => ({ unmount() {} }), () => ({}));
+  const entry = placeOfficialSection(panel, "agent-permissions", "settings-agent-permissions", { kind: "after", anchor });
+  assert.equal(entry.hostEl.parentElement, wrap, "must insert inside nested wrapper div rather than falling back to panel bottom");
+  assert.equal(anchor.nextElementSibling, entry.hostEl);
+
+  const sidebarStart = renderer.indexOf("function acquireSidebarCollapse()");
+  const sidebarEnd = renderer.indexOf("function composerStyleProbe(", sidebarStart);
+  assert.ok(sidebarStart >= 0 && sidebarEnd > sidebarStart);
+  const clicks: string[] = [];
+  const collapseBtn = { click() { clicks.push("collapse"); } };
+  const expandBtn = { click() { clicks.push("expand"); } };
+  const sidebarState = { sidebarRefs: 0, sidebarCollapsed: null };
+  const makeAcquire = new Function(
+    "document", "state", "module",
+    `${renderer.slice(sidebarStart, sidebarEnd)}\nreturn acquireSidebarCollapse;`,
+  );
+  const acquireSidebarCollapse = makeAcquire(doc, sidebarState, {
+    findSidebarToggleButton(_doc: unknown, action: string) {
+      return action === "collapse" ? collapseBtn : expandBtn;
+    },
+  });
+  const release = acquireSidebarCollapse();
+  release();
+  assert.deepEqual(clicks, ["collapse", "expand"]);
 });
