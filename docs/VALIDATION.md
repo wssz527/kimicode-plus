@@ -22,10 +22,11 @@
 | 打包与同步 | `scripts/test_package.py` 11/11、`scripts/test_sync_cnb_release.py` 7/7 通过 |
 | 真实二进制 | `scripts/acceptance.py --binary ./dist/enhanced-kimi` 27/27 通过 |
 | 实机宿主验收 | 隔离 profile 对接本机 Kimi Code `1.5.0` 与 `1.5.1` 完成端到端功能验证与明/暗双主题截图核验，覆盖智能体定位、子页避让恢复、供应商表单保护、真实 `models.dev` 补全与侧栏折叠 |
+| 线上发布核验 | 核心 `v0.2.12` 为 GitHub 正式 Latest。GitHub 与 CNB 的固定清单均返回 HTTP 200，六个核心资产逐字节一致。客户端 `updater` 强制验签模式在 CNB 主源与 GitHub 回退源下均通过 Ed25519 签名校验；三平台 SHA-256 与归档结构检查通过，下载的 macOS ARM64 二进制报告 `0.2.12`。`plugins-latest` 独立通道双源清单保持未变且逐字节一致。 |
 
 ### 发布与后续边界
 
-核心将由 `v0.2.12` 注释标签触发 `.github/workflows/release.yml`。工作流先将完整资产上传至 GitHub 草稿，再同步 CNB，随后将 GitHub 草稿公开为正式 Release。
+核心已通过 `v0.2.12` 注释标签触发 `.github/workflows/release.yml` 完成发布。工作流将完整资产上传至 GitHub 草稿，同步 CNB 后公开 GitHub 正式 Release。[核心发布工作流](https://github.com/wssz527/kimicode-plus/actions/runs/46010984686) · [v0.2.12 Release](https://github.com/wssz527/kimicode-plus/releases/tag/v0.2.12)
 
 ## v0.2.11 审查修复与发布交接（2026-11-27）
 
