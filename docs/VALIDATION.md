@@ -2,6 +2,33 @@
 
 验收使用本项目 `work/` 下的隔离数据目录和独立宿主 profile（Windows 端使用独立临时隔离目录）。当前范围为核心 M0–M6、插件接口 v2（A1）、规划插件（A3）、修正轮（R0–R4）、下一轮（N0–N6）以及 v0.2.4 以来的发布修复。多屏会话插件 A2 延期。
 
+## v0.2.13 修复多路由模型能力匹配与 macOS 关闭自动接入重开体验（2026-11-28）
+
+核心发布版本为 `0.2.13`，标签为 `v0.2.13`（提交 `85356cf`）。本次仅更新核心，四个官方预装插件（KCT `1.0.9`、Planner `1.0.8`、Monitor `1.1.3`、Scheduler `1.1.1`）与独立通道 `plugins-latest` 保持不变。
+
+### 交付范围
+
+- 多路由模型能力归属匹配与 `config.get` 自动重试：后端 `internal/desktop/provider_models.go` 与 `internal/desktop/planner_stream.go` 优先按条目内 `provider` 与 `model` 归属匹配，避免模型键前缀与条目 `provider` 字段不一致时跨供应商串并或误判；前端 `provider_enhance.js` 抽取统一身份解析逻辑，并在 `config.get` 瞬时失败时执行有限次自动重试（最多 3 次，关闭表单或卸载时清理定时器）。
+- macOS 关闭自动接入平滑交接：核心 plist 启用 `AbandonProcessGroup`；从运行中的日常常驻核心关闭「随 Kimi Code 启动自动接入」时，先写入交接状态并通过 LaunchServices 启动脱离 `launchd` 的接管核心，交接失败中止卸载、成功后才移除登录项，保持当前 Kimi Code 会话不断连。
+- macOS 轻量手动启动入口：新增 `internal/desktop/launcher_darwin.go`，在启用或关闭日常自动接入时自动维护 `~/Applications/KimiCode+.app`（隔离 `--host-profile` 不写入日常启动器），并在设置页「状态与诊断」展示路径，方便关闭自动接入或重启系统后随时从聚焦搜索或访达重新启动并接入；同步更新 `README.md` 与 `docs/NATIVE_INTEGRATION.md`。
+
+### 验证与复审
+
+| 项目 | 结果 |
+|---|---|
+| 前端 | TypeScript 类型检查、431/431 单测、普通与宿主生产构建通过 |
+| Go | `sh scripts/build.sh`、`go vet ./cmd/... ./internal/... ./plugins/...` 与 `./cmd/... ./internal/... ./plugins/...` 全量测试通过（含新增多路由匹配、规划器路由与 `launcher_darwin` 单测） |
+| 打包与同步 | `scripts/test_package.py` 11/11、`scripts/test_sync_cnb_release.py` 7/7 通过 |
+| 真实二进制 | `scripts/acceptance.py --binary ./dist/enhanced-kimi` 27/27 通过 |
+| 本机联调（Kimi Code `1.5.1`） | 运行中常驻核心实测 `attach.status` 返回 `launcherPath` 且 `providers.modelSuggestion` 对跨前缀多路由供应商正确匹配与隔离；`KimiCode+.app` 启动脚本通过 `/bin/sh -n` 语法检查 |
+| 线上发布核验 | 核心 `v0.2.13` 为 GitHub 正式 Latest（`isDraft: false`、`isPrerelease: false`）。GitHub 与 CNB 的固定清单均返回 HTTP 200，六个核心资产（`manifest.json`、`SHA256SUMS`、三平台压缩包、`THIRD_PARTY_NOTICES.txt`）逐字节一致且均小于 128 MiB。客户端 `updater` 启用 `RequireManifestSignature` 强制验签模式，在 CNB 主源（三平台 `darwin/arm64`、`darwin/amd64`、`windows/amd64`）、CNB 模拟故障回退 GitHub 源及直连 GitHub 源下均通过 Ed25519 签名校验并返回 `available` / `canApply: true`；三平台 SHA-256 与归档结构检查通过，下载的 macOS ARM64 二进制实测报告 `0.2.13`。`plugins-latest` 独立通道双源清单（7362 bytes）保持未变、逐字节一致，且通过内置公钥 Ed25519 验签（4 个插件版本未变）。 |
+
+### 发布与后续边界
+
+核心已通过 `v0.2.13` 注释标签触发 `.github/workflows/release.yml` 完成发布。工作流将完整资产上传至 GitHub 草稿，同步 CNB 后公开 GitHub 正式 Release。[核心发布工作流](https://github.com/wssz527/kimicode-plus/actions/runs/46038358746) · [v0.2.13 Release](https://github.com/wssz527/kimicode-plus/releases/tag/v0.2.13)
+
+本轮为避免打断桌面会话，未在真实图形界面中点击关闭自动接入开关或双击 `KimiCode+.app` 执行交互实测，该路径由单元测试、脚本语法检查与运行态接口联调覆盖。
+
 ## v0.2.12 适配 Kimi Code 1.5.0/1.5.1 与供应商能力配置增强（2026-11-27）
 
 核心发布版本为 `0.2.12`，标签为 `v0.2.12`。本次仅更新核心，四个官方预装插件（KCT `1.0.9`、Planner `1.0.8`、Monitor `1.1.3`、Scheduler `1.1.1`）与独立通道 `plugins-latest` 保持不变。
