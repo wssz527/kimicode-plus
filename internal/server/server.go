@@ -37,7 +37,7 @@ import (
 	bundledPlugins "enhancedkimi/plugins"
 )
 
-var Version = "0.2.12"
+var Version = "0.2.13"
 
 type Module struct {
 	ID      string `json:"id"`

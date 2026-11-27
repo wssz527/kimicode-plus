@@ -108,3 +108,59 @@ func TestStreamKAPModelStreamsOfficialCatalogModelWithoutPersistingSecret(t *tes
 		t.Fatalf("expected unknown bare model to fall through: handled=%v err=%v", unknownHandled, unknownErr)
 	}
 }
+
+func TestStreamKAPModelRoutesAliasedKeyToExplicitProvider(t *testing.T) {
+	var seenModel string
+	var seenRoute string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenRoute = r.URL.Path
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		seenModel, _ = body["model"].(string)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"1\",\"model\":\"group/glm-5-3-flash\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"1\",\"model\":\"group/glm-5-3-flash\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	kapHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config"):
+			writeNativeTestEnvelope(w, map[string]any{
+				"providers": map[string]any{
+					"magpie":            map[string]any{"type": "kimi", "base_url": "http://127.0.0.1:1/unused"},
+					"magpie-route-chat": map[string]any{"type": "openai", "base_url": upstream.URL + "/v1"},
+				},
+				"models": map[string]any{
+					"magpie/group/glm-5-3-flash": map[string]any{
+						"provider":       "magpie-route-chat",
+						"model":          "group/glm-5-3-flash",
+						"maxContextSize": 500000,
+					},
+				},
+			})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/providers/magpie-route-chat"):
+			writeNativeTestEnvelope(w, map[string]any{"api_key": "sk-ephemeral-test"})
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	service, _ := newAutomationTestService(t, kapHandler)
+	handled, err := service.StreamKAPModel(
+		context.Background(),
+		"magpie/group/glm-5-3-flash",
+		[]provider.Message{{Role: "user", Content: "ping"}},
+		nil,
+		func(provider.StreamEvent) error { return nil },
+	)
+	if err != nil || !handled {
+		t.Fatalf("StreamKAPModel aliased key failed: handled=%v err=%v", handled, err)
+	}
+	if seenModel != "group/glm-5-3-flash" || !strings.HasSuffix(seenRoute, "/chat/completions") {
+		t.Fatalf("unexpected upstream route/model: route=%q model=%q", seenRoute, seenModel)
+	}
+}

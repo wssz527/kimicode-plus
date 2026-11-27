@@ -35,6 +35,20 @@ func ReadRestartState(dir string) RestartState {
 	return state
 }
 
+func WriteRestartState(dir string, state RestartState) error {
+	if dir == "" {
+		return errors.New("缺少数据目录，无法写入交接状态")
+	}
+	if state.Port < 1 || state.Port > 65535 {
+		return errors.New("交接端口无效")
+	}
+	raw, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	return platform.AtomicPrivateFile(filepath.Join(dir, restartName), raw)
+}
+
 func ClearRestartState(dir string) {
 	_ = os.Remove(filepath.Join(dir, restartName))
 }

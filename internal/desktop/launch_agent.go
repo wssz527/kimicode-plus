@@ -90,7 +90,7 @@ func LaunchAgentPlist(config LaunchAgentConfig) (string, error) {
 
 func managedCorePlist(config LaunchAgentConfig) string {
 	args := append([]string{"--resident"}, launchHostArguments(config)...)
-	settings := "<key>KeepAlive</key><true/>\n<key>EnvironmentVariables</key><dict><key>" + managedCoreEnv + "</key><string>1</string></dict>"
+	settings := "<key>KeepAlive</key><true/>\n<key>AbandonProcessGroup</key><true/>\n<key>EnvironmentVariables</key><dict><key>" + managedCoreEnv + "</key><string>1</string></dict>"
 	return renderLaunchAgent(config, managedCoreLabel, args, "resident-core.log", settings)
 }
 
@@ -146,6 +146,7 @@ type LaunchAgentState struct {
 	Enabled           bool   `json:"enabled"`
 	Path              string `json:"path,omitempty"`
 	CorePath          string `json:"corePath,omitempty"`
+	LauncherPath      string `json:"launcherPath,omitempty"`
 	Error             string `json:"error,omitempty"`
 	ShortcutCount     int    `json:"shortcutCount,omitempty"`
 	BackupDir         string `json:"backupDir,omitempty"`
@@ -187,7 +188,10 @@ func (systemLaunch) bootout(label string) error {
 	return exec.Command("/bin/launchctl", "bootout", domain).Run()
 }
 
-var launches launchController = systemLaunch{}
+var (
+	launches         launchController = systemLaunch{}
+	selfBootoutDelay                  = time.Second
+)
 
 func managedCoreExecutable(dataDir string) string {
 	return filepath.Join(dataDir, "resident", "enhanced-kimi")
@@ -265,6 +269,7 @@ func LaunchAgentStatusForDataDir(dataDir string) LaunchAgentState {
 	core := launches.installed(corePath) && launches.loaded(managedCoreLabel)
 	state := LaunchAgentState{
 		Enabled: attached || core, Path: path, CorePath: corePath,
+		LauncherPath:      darwinLauncherInstalledPath(dataDir),
 		NeedsMigration:    attached != core,
 		LegacyCorePresent: launches.installed(legacyPath) || launches.loaded(legacyCoreLabel),
 	}
@@ -354,12 +359,48 @@ func UninstallLaunchAgent() (LaunchAgentState, error) {
 	return UninstallLaunchAgentForDataDir("")
 }
 
+func managedCoreConfigFromPlist(plist, fallbackDataDir string) LaunchAgentConfig {
+	cfg := LaunchAgentConfig{DataDir: fallbackDataDir}
+	if working := plistDataDir(plist); working != "" {
+		cfg.DataDir = working
+	}
+	args := plistStringArray(plist, "ProgramArguments")
+	if len(args) > 0 {
+		cfg.Executable = args[0]
+	}
+	for index := 1; index+1 < len(args); index++ {
+		switch args[index] {
+		case "--data-dir":
+			if cfg.DataDir == "" {
+				cfg.DataDir = filepath.Clean(args[index+1])
+			}
+		case "--kimi-home":
+			cfg.KimiHome = args[index+1]
+		case "--host-profile":
+			cfg.Profile = args[index+1]
+		}
+	}
+	return cfg
+}
+
 // UninstallLaunchAgentForDataDir removes the login items only when they belong
 // to dataDir. Disabling auto-attach from an isolated data directory must never
 // delete the login item the main configuration relies on.
 func UninstallLaunchAgentForDataDir(dataDir string) (LaunchAgentState, error) {
 	if err := ensureLaunchAgentOwner(dataDir); err != nil {
 		return LaunchAgentStatusForDataDir(dataDir), err
+	}
+	if os.Getenv(managedCoreEnv) == "1" && launches.loaded(managedCoreLabel) {
+		var raw []byte
+		if corePath, err := LaunchAgentPath(managedCoreLabel); err == nil {
+			raw, _ = os.ReadFile(corePath)
+		}
+		cfg := managedCoreConfigFromPlist(string(raw), dataDir)
+		if cfg.Profile == "" && cfg.DataDir != "" {
+			if err := handoffManagedCore(cfg); err != nil {
+				return LaunchAgentStatusForDataDir(dataDir), err
+			}
+		}
 	}
 	if err := removeLaunchAgent(LaunchAgentLabel); err != nil {
 		return LaunchAgentStatusForDataDir(dataDir), err
@@ -494,7 +535,7 @@ func removeLaunchAgent(label string) error {
 	if self && launches.loaded(label) {
 		// bootout stops the server itself. Let it finish serving this request.
 		controller := launches
-		time.AfterFunc(time.Second, func() {
+		time.AfterFunc(selfBootoutDelay, func() {
 			if err := controller.bootout(label); err != nil {
 				fmt.Fprintln(os.Stderr, "无法卸载核心登录项：", err)
 			}

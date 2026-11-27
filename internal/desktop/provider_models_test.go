@@ -1975,3 +1975,93 @@ func TestSaveOfficialProviderFormPreserveCatalogImport(t *testing.T) {
 		t.Fatalf("support_efforts = %s, want [low medium high]", effortsRaw)
 	}
 }
+
+func TestRoutedProviderModelKeyMatchesExplicitProviderWithoutCrossContamination(t *testing.T) {
+	var mu sync.Mutex
+	outputLimit := int64(65536)
+	models := map[string]modelConfig{
+		"magpie/auto/gemini-4-neon": {
+			Provider:       "magpie",
+			Model:          "auto/gemini-4-neon",
+			MaxContextSize: 500000,
+			Capabilities:   []string{"thinking", "image_in", "tool_use"},
+		},
+		"magpie/group/glm-5-3-flash": {
+			Provider:       "magpie-route-chat",
+			Model:          "group/glm-5-3-flash",
+			MaxContextSize: 500000,
+			MaxOutputSize:  &outputLimit,
+			Capabilities:   []string{"thinking", "image_in", "tool_use"},
+		},
+	}
+	providers := map[string]providerConfig{
+		"magpie":            {Type: "kimi", BaseURL: "http://127.0.0.1:3425/v1"},
+		"magpie-route-chat": {Type: "openai", BaseURL: "http://127.0.0.1:3425/v1"},
+	}
+	var lastPutProvider string
+	var lastPutModels []string
+	service, _ := newAutomationTestService(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/config"):
+			writeNativeTestEnvelope(w, map[string]any{"providers": providers, "models": models})
+		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/providers/"):
+			providerID := strings.TrimPrefix(r.URL.Path, "/api/v1/providers/")
+			var body struct {
+				Models []modelConfig `json:"models"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			lastPutProvider = providerID
+			lastPutModels = nil
+			for key, existing := range models {
+				if existing.Provider == providerID {
+					delete(models, key)
+				}
+			}
+			for _, item := range body.Models {
+				item.Provider = providerID
+				lastPutModels = append(lastPutModels, item.Model)
+				models[providerID+"/"+item.Model] = item
+			}
+			writeNativeTestEnvelope(w, map[string]any{"provider": map[string]any{"id": providerID}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+
+	// Updating magpie-route-chat resolves models["magpie/group/glm-5-3-flash"] via item.Provider.
+	if _, err := service.Action(context.Background(), "providers.updateModel", json.RawMessage(`{
+		"providerId": "magpie-route-chat",
+		"model": "magpie-route-chat/group/glm-5-3-flash",
+		"edit": {"capabilities": ["image_in", "video_in", "tool_use"], "thinking": "toggle"}
+	}`)); err != nil {
+		t.Fatalf("updateModel on routed provider failed: %v", err)
+	}
+	if lastPutProvider != "magpie-route-chat" || !reflect.DeepEqual(lastPutModels, []string{"group/glm-5-3-flash"}) {
+		t.Fatalf("unexpected routed PUT: provider=%q models=%v", lastPutProvider, lastPutModels)
+	}
+
+	// Updating magpie must NOT sweep in models owned by magpie-route-chat even when their TOML key starts with "magpie/".
+	mu.Lock()
+	models["magpie/group/deepseek-v4-1-flash"] = modelConfig{
+		Provider:       "magpie-route-chat",
+		Model:          "group/deepseek-v4-1-flash",
+		MaxContextSize: 500000,
+		Capabilities:   []string{"thinking", "tool_use"},
+	}
+	mu.Unlock()
+	if _, err := service.Action(context.Background(), "providers.updateModel", json.RawMessage(`{
+		"providerId": "magpie",
+		"model": "magpie/auto/gemini-4-neon",
+		"edit": {"capabilities": ["image_in", "tool_use"], "thinking": "always"}
+	}`)); err != nil {
+		t.Fatalf("updateModel on magpie failed: %v", err)
+	}
+	if lastPutProvider != "magpie" || !reflect.DeepEqual(lastPutModels, []string{"auto/gemini-4-neon"}) {
+		t.Fatalf("magpie PUT leaked routed models: provider=%q models=%v", lastPutProvider, lastPutModels)
+	}
+}

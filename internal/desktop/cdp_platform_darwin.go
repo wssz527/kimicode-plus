@@ -49,10 +49,14 @@ func enableAutoAttachPlatform(config AttachConfig, allowDaily bool) (LaunchAgent
 	if err != nil {
 		return LaunchAgentState{}, err
 	}
-	return InstallLaunchAgent(LaunchAgentConfig{
+	agentCfg := LaunchAgentConfig{
 		DataDir: dataDir, KimiHome: config.KimiHome, Profile: config.Profile,
 		AllowDailyInstance: allowDaily, Executable: managedCoreExecutable(dataDir),
-	})
+	}
+	if config.Profile == "" {
+		_, _ = InstallDarwinLauncherApp(agentCfg)
+	}
+	return InstallLaunchAgent(agentCfg)
 }
 
 func disableAutoAttachPlatform(dataDir string) (LaunchAgentState, error) {

@@ -80,7 +80,7 @@ sh scripts/crossbuild.sh   # 交叉编译 macOS Apple Silicon / Intel 和 Window
   --pairing-token "<runtime.pairingToken>"
 ```
 
-在 KimiCode+「状态与诊断」开启「随 Kimi Code 启动自动接入」后，产品会把核心复制到增强数据目录，登录项和自更新使用这份副本。之后可移动或清理下载的原文件。
+在 KimiCode+「状态与诊断」开启「随 Kimi Code 启动自动接入」后，产品会把核心复制到增强数据目录，并在 `~/Applications/KimiCode+.app` 创建手动启动入口；登录项和自更新使用这份副本，之后可移动或清理下载的原文件。关闭自动接入仅停用下次开机自启，当前运行中的核心会平滑接管保持连接，重启电脑后也可随时从聚焦搜索或访达打开 `KimiCode+.app` 重新启动并接入。
 
 ### Windows 接入官方客户端
 

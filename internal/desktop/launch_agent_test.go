@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
 type fakeLaunch struct {
+	mu             sync.Mutex
 	installedPaths map[string]bool
 	loadedLabels   map[string]bool
 	bootstrapped   []string
@@ -19,9 +21,19 @@ type fakeLaunch struct {
 	bootstrapErr   error
 }
 
-func (f *fakeLaunch) installed(path string) bool { return f.installedPaths[path] }
-func (f *fakeLaunch) loaded(label string) bool   { return f.loadedLabels[label] }
+func (f *fakeLaunch) installed(path string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.installedPaths[path]
+}
+func (f *fakeLaunch) loaded(label string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loadedLabels[label]
+}
 func (f *fakeLaunch) bootstrap(plist string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.bootstrapped = append(f.bootstrapped, plist)
 	if f.bootstrapErr != nil {
 		return f.bootstrapErr
@@ -31,6 +43,8 @@ func (f *fakeLaunch) bootstrap(plist string) error {
 	return nil
 }
 func (f *fakeLaunch) bootout(label string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.bootedOut = append(f.bootedOut, label)
 	delete(f.loadedLabels, label)
 	return nil
@@ -41,9 +55,15 @@ func withFakeLaunch(t *testing.T) *fakeLaunch {
 	fake := &fakeLaunch{installedPaths: map[string]bool{}, loadedLabels: map[string]bool{}}
 	previous := launches
 	previousDir := launchAgentDir
+	previousHandoff := handoffManagedCore
 	launches = fake
 	launchAgentDir = t.TempDir()
-	t.Cleanup(func() { launches = previous; launchAgentDir = previousDir })
+	handoffManagedCore = func(LaunchAgentConfig) error { return nil }
+	t.Cleanup(func() {
+		launches = previous
+		launchAgentDir = previousDir
+		handoffManagedCore = previousHandoff
+	})
 	return fake
 }
 

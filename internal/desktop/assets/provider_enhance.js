@@ -1,4 +1,4 @@
-function createProviderEnhance({ request, officialOrigin, excludeOrigins, readOfficialConfig } = {}) {
+function createProviderEnhance({ request, officialOrigin, excludeOrigins, readOfficialConfig, retryDelayMs } = {}) {
   const CAPABILITIES = [
     ['image_in', '图片输入', '图片'],
     ['video_in', '视频输入', '视频'],
@@ -44,6 +44,8 @@ function createProviderEnhance({ request, officialOrigin, excludeOrigins, readOf
     504: 'Gateway Timeout',
   };
   const CATALOG_IMPORT_TTL_MS = 60000;
+  const CONFIG_RETRY_BASE_MS = Number.isFinite(retryDelayMs) && retryDelayMs >= 0 ? retryDelayMs : 800;
+  const MAX_CONFIG_RETRIES = 3;
   const state = { panel: null, style: null, table: null };
   const openingModels = new Map();
   const recentCatalogImports = new Map();
@@ -51,6 +53,8 @@ function createProviderEnhance({ request, officialOrigin, excludeOrigins, readOf
   let removed = false;
   let observer;
   let timer;
+  let retryTimer;
+  let retryCount = 0;
   let generation = 0;
   let snapshot;
   let pending;
@@ -163,7 +167,14 @@ function createProviderEnhance({ request, officialOrigin, excludeOrigins, readOf
     return pending;
   }
 
+  function clearRetry() {
+    clearTimeout(retryTimer);
+    retryTimer = undefined;
+    retryCount = 0;
+  }
+
   function invalidate() {
+    clearRetry();
     generation += 1;
     snapshot = null;
     pending = null;
@@ -211,12 +222,42 @@ function createProviderEnhance({ request, officialOrigin, excludeOrigins, readOf
     return modelInputs(row)[0];
   }
 
+  function resolveModelEntryIdentity(key, item) {
+    if (!item || typeof item !== 'object') return { owner: '', modelId: '' };
+    const explicitProvider = typeof item.provider === 'string' ? item.provider.trim() : '';
+    const explicitModel = typeof item.model === 'string' ? item.model.trim() : '';
+    const slash = key.indexOf('/');
+    const hasSlash = slash > 0 && slash < key.length - 1;
+    const keyOwner = hasSlash ? key.slice(0, slash) : '';
+    const keyModel = hasSlash ? key.slice(slash + 1) : '';
+    if (explicitProvider) {
+      const modelId = explicitModel || (keyOwner === explicitProvider && keyModel ? keyModel : key.trim());
+      return { owner: explicitProvider, modelId };
+    }
+    if (hasSlash) return { owner: keyOwner, modelId: keyModel };
+    return { owner: '', modelId: explicitModel || key.trim() };
+  }
+
   function savedModel(config, providerId, modelId) {
+    if (!providerId || !modelId) return null;
+    const models = config?.models || {};
     const key = `${providerId}/${modelId}`;
-    const models = config.models || {};
-    if (Object.hasOwn(models, key)) return models[key];
-    const bare = Object.hasOwn(models, modelId) ? models[modelId] : null;
-    return bare?.provider === providerId && (bare.model || modelId) === modelId ? bare : null;
+    if (Object.hasOwn(models, key)) {
+      const identity = resolveModelEntryIdentity(key, models[key]);
+      if (identity.owner === providerId && identity.modelId === modelId) return models[key];
+    }
+    if (Object.hasOwn(models, modelId)) {
+      const identity = resolveModelEntryIdentity(modelId, models[modelId]);
+      if (identity.owner === providerId && identity.modelId === modelId) return models[modelId];
+    }
+    let matchedKey = '';
+    for (const [entryKey, item] of Object.entries(models)) {
+      const identity = resolveModelEntryIdentity(entryKey, item);
+      if (identity.owner === providerId && identity.modelId === modelId) {
+        if (!matchedKey || entryKey < matchedKey) matchedKey = entryKey;
+      }
+    }
+    return matchedKey ? models[matchedKey] : null;
   }
 
   function formTextInputs(form) {
@@ -325,14 +366,16 @@ function createProviderEnhance({ request, officialOrigin, excludeOrigins, readOf
   function providerModels(config, providerId) {
     const result = new Map();
     const models = config?.models || {};
+    const chosenKeys = new Map();
     for (const [key, item] of Object.entries(models)) {
-      if (!item || typeof item !== 'object') continue;
-      const slash = key.indexOf('/');
-      const owner = slash > 0 && slash < key.length - 1 ? key.slice(0, slash) : (item.provider || '');
-      const modelId = slash > 0 && slash < key.length - 1 ? key.slice(slash + 1) : (item.model || key);
+      const { owner, modelId } = resolveModelEntryIdentity(key, item);
       if (owner !== providerId || !modelId) continue;
       const qualified = `${providerId}/${modelId}`;
-      if (!result.has(modelId) || key === qualified) result.set(modelId, item);
+      const prevKey = chosenKeys.get(modelId);
+      if (!prevKey || key === qualified || (prevKey !== qualified && key < prevKey)) {
+        chosenKeys.set(modelId, key);
+        result.set(modelId, item);
+      }
     }
     return result;
   }
@@ -1580,7 +1623,9 @@ function createProviderEnhance({ request, officialOrigin, excludeOrigins, readOf
       request('models.list'), request('providers.modelSuggestion', { providerId, model: key }),
     ]);
     const items = official.value?.items;
-    const exact = Array.isArray(items) ? items.find(item => item.provider === providerId && (item.id === key || (item.id === id && item.model === id))) : null;
+    const exact = Array.isArray(items)
+      ? items.find(item => item.provider === providerId && (item.id === key || item.model === id))
+      : null;
     const metadata = publicCatalog.value?.suggestion;
     const fields = modelFields(exact ?? {});
     const known = new Map();
@@ -2082,9 +2127,17 @@ function createProviderEnhance({ request, officialOrigin, excludeOrigins, readOf
     try {
       const hasNewRows = [...current.table.querySelectorAll('.pmt-grid')].some(row => !row.classList.contains('pmt-head') && modelInput(row) && !current.rows.has(row));
       const config = snapshot && !hasNewRows ? snapshot : await readConfig();
+      clearRetry();
       if (startGeneration === generation && state.table === current && findForm() === form) render(current, config);
     } catch {
-      // The next official change or interaction retries the read.
+      if (enabled && !removed && startGeneration === generation && state.table === current && findForm() === form && retryCount < MAX_CONFIG_RETRIES && retryTimer === undefined) {
+        retryCount += 1;
+        retryTimer = setTimeout(() => {
+          retryTimer = undefined;
+          void refresh();
+        }, CONFIG_RETRY_BASE_MS * retryCount);
+        retryTimer?.unref?.();
+      }
     }
   }
 
@@ -2124,6 +2177,7 @@ function createProviderEnhance({ request, officialOrigin, excludeOrigins, readOf
   }
 
   function clearDecorations() {
+    clearRetry();
     closePanel(true);
     if (state.table?.table) {
       state.table.table.removeAttribute('data-ekd-px-table');
@@ -2161,6 +2215,7 @@ function createProviderEnhance({ request, officialOrigin, excludeOrigins, readOf
       observer?.disconnect();
       clearTimeout(timer);
       timer = undefined;
+      clearRetry();
       detachFetch();
       openingModels.clear();
       recentCatalogImports.clear();

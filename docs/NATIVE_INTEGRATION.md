@@ -57,7 +57,7 @@ EKD 由 `internal/desktop/inject.go`、`cdp.go`、`contracts.go`、`inspector_fu
 
 两个 plist 都使用 `0600` 和原子文件替换。接入项从对应数据目录读取并验证当前的环回地址和配对凭据。`attach.log`、`resident-core.log` 和 `attach-state.json` 用于查看启动和接入结果。
 
-迁移时先在「状态与诊断」开启产品的自动接入。若界面显示旧版接入已开启，先关闭再开启。手工创建的 `com.user.enhanced-kimi.core` 由原配置维护，产品仅检测其存在。需要交接时，请在开启产品常驻后停用旧手工任务，再确认产品核心已启动并接入。关闭产品开关会移除产品安装的两个任务。
+迁移时先在「状态与诊断」开启产品的自动接入。若界面显示旧版接入已开启，先关闭再开启。手工创建的 `com.user.enhanced-kimi.core` 由原配置维护，产品仅检测其存在。需要交接时，请在开启产品常驻后停用旧手工任务，再确认产品核心已启动并接入。针对日常实例开启或关闭自动接入时，产品会自动在 `~/Applications/KimiCode+.app` 维护轻量启动器供聚焦搜索和访达手动重开；从运行中的日常常驻核心关闭开关时，会先通过 LaunchServices 启动脱离 `launchd` 的接管核心，再移除两个登录项，避免直接中断当前已接入的会话。
 
 ### Electron fuse 位次与版本绑定
 

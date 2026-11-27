@@ -45,21 +45,21 @@ func (s *NativeService) StreamKAPModel(
 
 	var providerID, upstreamModel string
 	var model modelConfig
-	if owner, target := splitModelKey(modelKey); owner != "" {
-		item, _, ok := lookupProviderModel(snapshot.Models, owner, target)
-		if !ok {
-			return false, nil
-		}
-		providerID = owner
-		upstreamModel = strings.TrimPrefix(firstNonEmpty(item.Model, target), owner+"/")
-		model = item
-	} else if item, ok := snapshot.Models[modelKey]; ok {
+	if item, ok := snapshot.Models[modelKey]; ok {
 		owner, target := resolveProviderAndModelID(modelKey, item)
 		if owner == "" || target == "" {
 			return false, nil
 		}
 		providerID = owner
 		upstreamModel = strings.TrimPrefix(target, owner+"/")
+		model = item
+	} else if owner, target := splitModelKey(modelKey); owner != "" {
+		item, _, ok := lookupProviderModel(snapshot.Models, owner, target)
+		if !ok {
+			return false, nil
+		}
+		providerID = owner
+		upstreamModel = strings.TrimPrefix(firstNonEmpty(item.Model, target), owner+"/")
 		model = item
 	} else {
 		return false, nil

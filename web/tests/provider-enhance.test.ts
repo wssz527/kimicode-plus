@@ -333,6 +333,7 @@ interface FixtureEnv {
   readOfficialConfig?: (() => unknown) | null;
   installReadOfficialConfig?: (() => unknown) | null;
   officialConfig?: Record<string, unknown> | null;
+  retryDelayMs?: number;
 }
 
 interface SaveOfficialFormCall {
@@ -658,12 +659,14 @@ function loadFixture(
   };
   if (env.officialOrigin !== undefined) enhanceOptions.officialOrigin = env.officialOrigin;
   if (env.excludeOrigins !== undefined) enhanceOptions.excludeOrigins = env.excludeOrigins;
+  if (env.retryDelayMs !== undefined) enhanceOptions.retryDelayMs = env.retryDelayMs;
   if (env.readOfficialConfig !== null) {
     enhanceOptions.readOfficialConfig = env.readOfficialConfig ?? (() => officialConfig);
   }
   const enhance = context.createProviderEnhance(enhanceOptions) as {
     install(opts?: Record<string, unknown>): void;
     remove(): void;
+    clearDecorations(): void;
     scan(): void;
     setEnabled(next: boolean): void;
   };
@@ -2044,5 +2047,72 @@ test("intercepts post-import_catalog follow-up PUT with preserveCatalogImport an
   assert.equal(capturedSavePayload!["preserveCatalogImport"], true);
   assert.deepEqual(capturedSavePayload!["opening"], {});
   assert.ok(calls.some(call => call.action === "providers.saveOfficialForm"));
+  enhance.remove();
+});
+
+test("matches routed models whose config key prefix differs from item.provider and retries transient config.get failures", async () => {
+  const { form, nameInput, alpha, beta, config, calls, setConfigGetError, setConfigGetOverride, setOfficialConfig, enhance } = loadFixture(undefined, "magpie-route-chat", {
+    retryDelayMs: 10,
+  });
+  // Reconfigure as a routed provider sharing base_url with magpie, where model keys start with "magpie/".
+  const routedConfig = {
+    providers: {
+      magpie: { base_url: "http://127.0.0.1:3425/v1" },
+      "magpie-route-chat": { base_url: "http://127.0.0.1:3425/v1" },
+    },
+    models: {
+      "magpie/auto/gemini-4-neon": {
+        provider: "magpie",
+        model: "auto/gemini-4-neon",
+        maxContextSize: 500000,
+        capabilities: ["thinking", "image_in", "tool_use"],
+      },
+      "magpie/group/glm-5-3-flash": {
+        provider: "magpie-route-chat",
+        model: "group/glm-5-3-flash",
+        maxContextSize: 500000,
+        maxOutputSize: 131072,
+        capabilities: ["thinking", "image_in", "tool_use"],
+      },
+    },
+  };
+  config.providers = routedConfig.providers;
+  config.models = routedConfig.models;
+  setOfficialConfig(structuredClone(routedConfig));
+  nameInput.value = "magpie-route-chat";
+  alpha.row.querySelector("input")!.value = "group/glm-5-3-flash";
+  beta.row.querySelector("input")!.value = "auto/gemini-4-neon";
+
+  // Fail first config.get once, then recover automatically via retry timer without extra DOM mutations.
+  let remainingFailures = 1;
+  setConfigGetOverride(() => {
+    if (remainingFailures > 0) {
+      remainingFailures -= 1;
+      throw new Error("temporary bridge reconnect");
+    }
+    return structuredClone(config);
+  });
+  setConfigGetError(null);
+  enhance.clearDecorations();
+  enhance.scan();
+  await settle();
+  assert.equal(alpha.row.querySelector("[data-ekd-px-button]"), null, "initial failed config.get has not rendered row button yet");
+  await new Promise(resolve => setTimeout(resolve, 40));
+
+  const alphaBtn = alpha.row.querySelector("[data-ekd-px-button]");
+  const betaBtn = beta.row.querySelector("[data-ekd-px-button]");
+  assert.ok(alphaBtn, "retry timer must recover and mount capability button");
+  assert.match(alphaBtn!.getAttribute("data-ekd-px-summary") || "", /图片.*工具.*思考/);
+  assert.equal(betaBtn!.getAttribute("data-ekd-px-summary"), "未保存", "model owned by magpie must not leak into magpie-route-chat");
+
+  // Clicking the routed model opens the capability drawer instead of reporting unsaved.
+  alphaBtn!.click();
+  await settle();
+  const panel = inspector(form);
+  assert.ok(panel, "routed model must open inline capability drawer");
+  assert.equal(panel.querySelector('[data-kind="capability"][data-capability="image_in"]')?.getAttribute("aria-pressed"), "true");
+  assert.equal(panel.querySelectorAll("input.ekd-px-input")[0]!.value, "500000");
+  assert.equal(panel.querySelectorAll("input.ekd-px-input")[1]!.value, "128K");
+  assert.ok(calls.filter(c => c.action === "config.get").length >= 2);
   enhance.remove();
 });

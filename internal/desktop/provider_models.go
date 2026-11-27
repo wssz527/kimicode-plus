@@ -1341,7 +1341,7 @@ func (s *NativeService) saveProviderModels(ctx context.Context, providerID strin
 	}
 	updates := make([]providerModelUpdate, 0, len(edited))
 	for _, modelID := range modelIDs {
-		actual, _, ok := lookupProviderModel(after.Models, providerID, modelID)
+		actual, actualKey, ok := lookupProviderModel(after.Models, providerID, modelID)
 		if !ok {
 			return nil, fmt.Errorf("保存后读不到模型 %s", modelID)
 		}
@@ -1356,17 +1356,30 @@ func (s *NativeService) saveProviderModels(ctx context.Context, providerID strin
 		if err != nil {
 			return nil, err
 		}
-		updates = append(updates, providerModelUpdate{Key: providerModelKey(providerID, modelID), Model: model})
+		if actualKey == "" {
+			actualKey = providerModelKey(providerID, modelID)
+		}
+		updates = append(updates, providerModelUpdate{Key: actualKey, Model: model})
 	}
 	return updates, nil
 }
 
 func resolveProviderAndModelID(mapKey string, item modelConfig) (string, string) {
-	if owner, modelID := splitModelKey(mapKey); owner != "" && modelID != "" {
-		return owner, modelID
-	}
 	owner := strings.TrimSpace(item.Provider)
 	modelID := strings.TrimSpace(item.Model)
+	if owner != "" {
+		if modelID == "" {
+			if keyOwner, keyModel := splitModelKey(mapKey); keyOwner == owner && keyModel != "" {
+				modelID = keyModel
+			} else {
+				modelID = strings.TrimSpace(mapKey)
+			}
+		}
+		return owner, modelID
+	}
+	if keyOwner, keyModel := splitModelKey(mapKey); keyOwner != "" && keyModel != "" {
+		return keyOwner, keyModel
+	}
 	if modelID == "" {
 		modelID = strings.TrimSpace(mapKey)
 	}
@@ -1376,7 +1389,10 @@ func resolveProviderAndModelID(mapKey string, item modelConfig) (string, string)
 func lookupProviderModel(models map[string]modelConfig, providerID, targetModelID string) (modelConfig, string, bool) {
 	qualified := providerModelKey(providerID, targetModelID)
 	if model, ok := models[qualified]; ok {
-		return model, qualified, true
+		owner, modelID := resolveProviderAndModelID(qualified, model)
+		if owner == providerID && modelID == targetModelID {
+			return model, qualified, true
+		}
 	}
 	if model, ok := models[targetModelID]; ok {
 		owner, modelID := resolveProviderAndModelID(targetModelID, model)
@@ -1384,11 +1400,17 @@ func lookupProviderModel(models map[string]modelConfig, providerID, targetModelI
 			return model, targetModelID, true
 		}
 	}
+	var matchedKey string
 	for key, model := range models {
 		owner, modelID := resolveProviderAndModelID(key, model)
 		if owner == providerID && modelID == targetModelID {
-			return model, key, true
+			if matchedKey == "" || key < matchedKey {
+				matchedKey = key
+			}
 		}
+	}
+	if matchedKey != "" {
+		return models[matchedKey], matchedKey, true
 	}
 	return modelConfig{}, "", false
 }

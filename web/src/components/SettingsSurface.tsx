@@ -209,7 +209,7 @@ type AttachStatus = WindowsAttachReport & {
     debugPort?: number;
     debugPortWarning?: string;
   };
-  agent: { enabled: boolean; path?: string; error?: string; needsMigration?: boolean; corePath?: string; legacyCorePresent?: boolean };
+  agent: { enabled: boolean; path?: string; error?: string; needsMigration?: boolean; corePath?: string; launcherPath?: string; legacyCorePresent?: boolean };
   last?: {
     status?: string;
     error?: string;
@@ -677,7 +677,9 @@ function DiagnosticsSection({
             {status.available
               ? (status.agent.needsMigration
                 ? "当前使用旧版自动接入。请关闭后重新开启，启用登录常驻。"
-                : "开启后，登录系统时会启动增强核心。像平常一样打开 Kimi Code 即可自动接入。")
+                : (!isWindowsLauncher && status.agent.enabled
+                  ? "开启后，登录系统时会启动增强核心。关闭后仅停用下次开机自动接入，当前运行中的核心会平滑接管并保持连接。"
+                  : "开启后，登录系统时会启动增强核心。像平常一样打开 Kimi Code 即可自动接入。"))
               : status.unavailableReason}
           </small>
         </span>
@@ -692,6 +694,13 @@ function DiagnosticsSection({
           {busy ? "处理中…" : status.agent.enabled ? "已开启" : "已关闭"}
         </button>
       </div>
+      {status.platform === "darwin" && status.agent.launcherPath ? <div className="ekds-row">
+        <span className="ekds-row-label">
+          <strong>手动启动入口</strong>
+          <small>{`关闭自动接入或重启电脑后，可通过聚焦搜索或访达打开 ${status.agent.launcherPath} 重新启动并接入。`}</small>
+        </span>
+        <span className="ekds-state is-ready">已就绪</span>
+      </div> : null}
       {status.agent.legacyCorePresent ? <p className="ekds-note">检测到手工配置的旧核心登录项。如需迁移，请先开启产品的自动接入，再停用旧手工项。产品常驻核心会在已有核心退出后接管。</p> : null}
       {daily && !status.agent.enabled ? <div className="ekds-row">
         <span className="ekds-row-label">
